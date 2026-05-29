@@ -26,6 +26,10 @@ wasmparser = "0.221"
 hologram-substrate-tck = { workspace = true }
 hologram-store-mem = { workspace = true }
 hologram-store-native = { workspace = true }
+# Real container runtime — the e2e tier boots a real hologram.* Wasm container
+# through hologram's runtime (no mocks).
+hologram-runtime = { workspace = true }
+hologram-runtime-wasmtime = { workspace = true }
 # CC-2 — the native .holo executor (the differential oracle) and the compiler to build one.
 hologram-exec = { workspace = true }
 hologram-compiler = { workspace = true }
@@ -40,8 +44,10 @@ sha2 = "0.10"
 sha3 = "0.10"
 # Parse the imported KAT / Dev Container artifacts in the CC-1 / CC-4 witnesses.
 serde_json = "1"
-# CC-5 — assemble WebAssembly spec test modules from their text form.
+# CC-5 — drive the WebAssembly spec test/core .wast suite (directives + encode).
 wat = "1"
+wast = "251"
 # Drive the async ContainerRuntime trait in tests without a full async runtime.
 pollster = "0.4"
 async-trait = "0.1"
+jsonschema = "0.46.5"

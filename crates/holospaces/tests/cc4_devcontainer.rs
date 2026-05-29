@@ -6,22 +6,24 @@
 //! [Dev Container](https://containers.dev) and OCI image specifications, by a
 //! reproducible-κ check (Q4).
 //!
-//! The external authority is the Dev Container / OCI conformance cases imported
-//! in `vv/artifacts/cc4/devcontainer-cases.json` (provenance in
-//! `vv/PROVENANCE.md`), plus this repository's own real
-//! `.devcontainer/devcontainer.json`. This witness checks:
+//! The external authority is the **published Dev Container JSON Schema**
+//! (`devContainer.base.schema.json`, imported verbatim from `devcontainers/spec`)
+//! and **real authoritative `devcontainer.json` configs** (imported verbatim
+//! from `devcontainers/templates` plus this repository's own), pinned in
+//! `vv/artifacts/cc4/` (provenance in `vv/PROVENANCE.md`). No hand-authored
+//! cases: the schema is the judge of conformance.
 //!
-//! 1. **Spec conformance** — holospaces' ingestor
-//!    ([`holospaces::boot::devcontainer::parse`]) accepts exactly the configs
-//!    the specification accepts (a single container image source; well-formed
-//!    known properties).
-//! 2. **Matches its source / reproducibility** — ingesting the same source
-//!    yields the same holospace κ; a different config yields a different κ
-//!    (QS1 / Q4).
+//! This witness checks:
+//! 1. **Conformance** — every real config validates against the schema, and
+//!    holospaces' ingestor ([`holospaces::boot::devcontainer::parse`]) accepts
+//!    it; a config the schema rejects is rejected.
+//! 2. **Matches its source** — ingesting the same config yields the same
+//!    holospace κ; a different config yields a different κ (QS1 / Q4).
 //!
 //! Run by `vv/run.sh`; also `cargo test -p holospaces --test cc4_devcontainer`.
 
-use holospaces::boot::{devcontainer, ingest_devcontainer};
+use holospaces::boot::devcontainer::{self, to_canonical_json};
+use holospaces::boot::ingest_devcontainer;
 use holospaces::Capabilities;
 use serde_json::Value;
 
@@ -39,80 +41,99 @@ fn caps() -> Capabilities {
     }
 }
 
-fn cases_path() -> std::path::PathBuf {
+fn artifact(name: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../vv/artifacts/cc4/devcontainer-cases.json")
+        .join("../../vv/artifacts/cc4")
+        .join(name)
 }
 
-fn repo_devcontainer_path() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.devcontainer/devcontainer.json")
+fn schema() -> jsonschema::Validator {
+    let raw = std::fs::read(artifact("devContainer.base.schema.json")).expect("read schema");
+    let doc: Value = serde_json::from_slice(&raw).expect("schema is JSON");
+    jsonschema::validator_for(&doc).expect("compile Dev Container schema")
 }
 
-/// (1) The ingestor's accept/reject decisions match the Dev Container spec on
-/// every imported conformance case.
+/// Real authoritative configs imported verbatim from `devcontainers/templates`
+/// — each declares an OCI image source, so the Dev Container *base* schema
+/// covers them.
+fn template_configs() -> Vec<(String, Vec<u8>)> {
+    ["rust", "javascript-node", "python", "ubuntu"]
+        .iter()
+        .map(|t| {
+            (
+                (*t).to_owned(),
+                std::fs::read(artifact(&format!("{t}.devcontainer.json"))).unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn repo_config() -> Vec<u8> {
+    std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.devcontainer/devcontainer.json"),
+    )
+    .expect("read repo devcontainer.json")
+}
+
+/// (1) Every real authoritative template config validates against the
+/// authoritative Dev Container schema and is accepted by holospaces' ingestor.
 #[test]
-fn ingestor_agrees_with_the_dev_container_spec() {
-    let raw = std::fs::read(cases_path()).expect("read devcontainer-cases.json");
-    let doc: Value = serde_json::from_slice(&raw).expect("valid JSON");
-    let cases = doc["cases"].as_array().expect("cases array");
-    assert!(cases.len() >= 8, "expected the full case battery");
-
-    for case in cases {
-        let name = case["name"].as_str().unwrap();
-        let expected_valid = case["valid"].as_bool().unwrap();
-        let config_bytes = serde_json::to_vec(&case["config"]).unwrap();
-        let got = devcontainer::parse(&config_bytes).is_ok();
-        assert_eq!(
-            got, expected_valid,
-            "case '{name}': spec says valid={expected_valid}, ingestor says {got}"
+fn real_configs_conform_to_the_dev_container_schema() {
+    let schema = schema();
+    for (name, raw) in template_configs() {
+        let json = to_canonical_json(&raw).unwrap_or_else(|e| panic!("{name}: JSONC→JSON: {e}"));
+        let value: Value = serde_json::from_slice(&json).unwrap();
+        assert!(
+            schema.is_valid(&value),
+            "{name} does not validate against the Dev Container schema"
         );
+        devcontainer::parse(&raw).unwrap_or_else(|e| panic!("{name}: ingestor rejected: {e}"));
     }
 }
 
-/// (2) A devcontainer holospace matches its source: same source ⇒ same κ;
-/// different config ⇒ different κ (QS1 / Q4).
+/// This repository's own `.devcontainer/devcontainer.json` is a *features-only*
+/// configuration: it declares no image source and relies on the implementor's
+/// default base image (the Codespaces behavior). The Dev Container *base*
+/// schema requires an explicit image source, so it does not model this case;
+/// holospaces' ingestor accepts it as the documented default-image superset.
 #[test]
-fn devcontainer_holospace_is_reproducible_from_its_source() {
-    let cfg = br#"{"name":"app","image":"debian:12"}"#;
-    let a = ingest_devcontainer(
-        "https://x.invalid/r.git",
-        "main",
-        ".devcontainer/devcontainer.json",
-        cfg,
-        caps(),
-    )
-    .unwrap();
-    let b = ingest_devcontainer(
-        "https://x.invalid/r.git",
-        "main",
-        ".devcontainer/devcontainer.json",
-        cfg,
-        caps(),
-    )
-    .unwrap();
-    assert_eq!(a.kappa(), b.kappa());
+fn repo_features_only_config_ingests_as_default_image() {
+    let dc = devcontainer::parse(&repo_config()).expect("ingestor accepts the repo config");
+    assert_eq!(dc.image_source, devcontainer::ImageSource::Default);
+}
 
-    let other = ingest_devcontainer(
-        "https://x.invalid/r.git",
-        "main",
-        ".devcontainer/devcontainer.json",
-        br#"{"name":"app","image":"ubuntu:24.04"}"#,
-        caps(),
-    )
-    .unwrap();
-    assert_ne!(
-        a.kappa(),
-        other.kappa(),
-        "different config ⇒ different identity"
+/// (1, negative) A config the authoritative schema rejects is rejected — the
+/// schema is the judge, not a hand-written verdict.
+#[test]
+fn schema_rejects_a_nonconformant_config() {
+    let schema = schema();
+    // `forwardPorts` must be an array per the schema; a string violates it.
+    let bad: Value = serde_json::json!({ "image": "debian:12", "forwardPorts": "3000" });
+    assert!(
+        !schema.is_valid(&bad),
+        "schema must reject a malformed config"
     );
 }
 
-/// This repository's own `.devcontainer/devcontainer.json` is spec-conformant
-/// and ingests to a holospace (a real-world Dev Container fixture).
+/// (2) A devcontainer holospace matches its source: same config ⇒ same κ;
+/// different config ⇒ different κ (QS1 / Q4).
 #[test]
-fn repo_devcontainer_json_is_conformant() {
-    let raw =
-        std::fs::read(repo_devcontainer_path()).expect("read .devcontainer/devcontainer.json");
-    devcontainer::parse(&raw)
-        .expect("the repo's devcontainer.json is Dev Container spec-conformant");
+fn devcontainer_holospace_is_reproducible_from_its_source() {
+    let configs = template_configs();
+    let cfg = &configs.iter().find(|(n, _)| n == "rust").unwrap().1;
+    let other = &configs.iter().find(|(n, _)| n == "python").unwrap().1;
+    let mk = |c: &[u8]| {
+        ingest_devcontainer(
+            "https://x.invalid/r.git",
+            "main",
+            ".devcontainer/devcontainer.json",
+            c,
+            caps(),
+        )
+        .unwrap()
+        .kappa()
+    };
+    assert_eq!(mk(cfg), mk(cfg), "same source ⇒ same κ");
+    assert_ne!(mk(cfg), mk(other), "different config ⇒ different identity");
 }

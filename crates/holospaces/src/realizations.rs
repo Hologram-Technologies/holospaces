@@ -293,6 +293,19 @@ impl Holospace {
         &self.manifest
     }
 
+    /// The hologram [`ContainerManifest`] this holospace's Container ID
+    /// addresses — its code module κ (from the source) with empty initial
+    /// state and parameters. Persisting its canonical form into a `KappaStore`
+    /// is what lets hologram's runtime resolve and spawn the holospace.
+    #[must_use]
+    pub fn container_manifest(&self) -> ContainerManifest {
+        ContainerManifest {
+            code: self.source.code_kappa(),
+            initial_state: empty_kappa(),
+            parameters: empty_kappa(),
+        }
+    }
+
     /// The [`CapabilitySet`] κ — the authority the holospace runs under.
     #[must_use]
     pub fn capabilities(&self) -> &Kappa {
