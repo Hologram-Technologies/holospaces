@@ -9,21 +9,41 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+# `std` (default) enables the host-side provisioning surfaces — the Dev Container
+# ingestor (CC-4) and the Wasm validator (CC-5). With `--no-default-features`
+# the crate is `no_std` + `alloc`: the environment-agnostic boot core
+# (realizations, boot, identity, peer, manager, .holo engine) that the browser
+# and bare-metal peers compile (arc42 ch.7; portability Q6). Mirrors hologram's
+# own tri-target discipline (`just wasm` / `just embedded`).
+default = ["std"]
+std = [
+    "dep:serde_json",
+    "dep:wasmparser",
+    "dep:hologram-exec",
+    "dep:hologram-backend",
+    "hologram-substrate-core/std",
+    "hologram-realizations/std",
+    "hologram-exec/std",
+    "hologram-backend/std",
+]
+
 [dependencies]
 # The hologram substrate, consumed by reference (ADR-003, ADR-006). holospaces
-# composes these contracts; it never re-implements them. Pinned by rev.
+# composes these contracts; it never re-implements them. Pinned by rev,
+# no_std-capable (default features off; the `std` feature re-enables).
 hologram-substrate-core = { workspace = true }
 hologram-realizations = { workspace = true }
 # The .holo Engine building block: holospaces supplies the .holo execution
-# backend (arc42 ch.5 / ch.7), bound to hologram's executor.
-hologram-exec = { workspace = true }
-hologram-backend = { workspace = true }
-# The Ingestor parses devcontainer.json (the Dev Container spec) at the
-# provisioning boundary (Law L2). Conformance: CC-4.
-serde_json = "1"
-# Validate Wasm code modules against the WebAssembly specification before they
-# run on the substrate's execution surface. Conformance: CC-5.
-wasmparser = "0.221"
+# backend (arc42 ch.5 / ch.7), bound to hologram's executor. The CPU kernels'
+# float math needs std today, so the engine is a `std` surface (the bare-metal
+# core still drives the Wasm-container lifecycle).
+hologram-exec = { workspace = true, optional = true }
+hologram-backend = { workspace = true, features = ["cpu"], optional = true }
+# Host-side provisioning surfaces, gated by `std`: the Dev Container ingestor
+# (CC-4) parses devcontainer.json; the Wasm validator (CC-5) checks modules.
+serde_json = { version = "1", optional = true }
+wasmparser = { version = "0.221", optional = true }
 
 [dev-dependencies]
 # CC-3 — the substrate conformance battery + the stores holospaces resolves through.

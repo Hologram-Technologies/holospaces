@@ -20,7 +20,20 @@ use hologram_substrate_core::{
     ContainerRuntime, KappaStore, KappaSync, Realization, RuntimeError, StoreError,
 };
 
-use crate::realizations::{address, Holospace, Kappa, Source};
+#[cfg(feature = "std")]
+use crate::realizations::address;
+use crate::realizations::{Holospace, Kappa, Source};
+
+#[cfg(not(feature = "std"))]
+#[allow(unused_imports)]
+use alloc::{
+    borrow::ToOwned,
+    boxed::Box,
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 
 /// Provision a holospace *into a peer's store* so the substrate can resolve and
 /// spawn it (arc42 chapter 6, *Provisioning*; chapter 5, *Boot Layer*).
@@ -78,11 +91,13 @@ impl fmt::Display for ProvisionError {
     }
 }
 
-impl std::error::Error for ProvisionError {}
+impl core::error::Error for ProvisionError {}
 
 /// The Dev Container ingestor — parses and validates a `devcontainer.json`
 /// against the [Dev Container](https://containers.dev) specification at the
-/// provisioning boundary (Law L2). Conformance: `CC-4`.
+/// provisioning boundary (Law L2). Conformance: `CC-4`. A host-side
+/// provisioning surface, available with the `std` feature.
+#[cfg(feature = "std")]
 pub mod devcontainer {
     use core::fmt;
     use serde_json::Value;
@@ -287,7 +302,7 @@ pub mod devcontainer {
         }
     }
 
-    impl std::error::Error for DevcontainerError {}
+    impl core::error::Error for DevcontainerError {}
 }
 
 /// Ingest a devcontainer holospace from a git source + its `devcontainer.json`
@@ -303,6 +318,7 @@ pub mod devcontainer {
 ///
 /// [`IngestError`] if a required field is empty or the config is not
 /// spec-conformant.
+#[cfg(feature = "std")]
 pub fn ingest_devcontainer(
     repo: impl Into<String>,
     reference: impl Into<String>,
@@ -360,7 +376,8 @@ pub fn ingest(
 pub enum IngestError {
     /// A required field of the source was empty.
     EmptyField(&'static str),
-    /// The `devcontainer.json` is not Dev Container spec-conformant.
+    /// The `devcontainer.json` is not Dev Container spec-conformant (`std`).
+    #[cfg(feature = "std")]
     Devcontainer(devcontainer::DevcontainerError),
 }
 
@@ -370,12 +387,13 @@ impl fmt::Display for IngestError {
             IngestError::EmptyField(field) => {
                 write!(f, "provisioning source field '{field}' is empty")
             }
+            #[cfg(feature = "std")]
             IngestError::Devcontainer(e) => write!(f, "devcontainer source is invalid: {e}"),
         }
     }
 }
 
-impl std::error::Error for IngestError {}
+impl core::error::Error for IngestError {}
 
 /// Resolves κ-labels to their bytes, verifying them by re-derivation before
 /// accepting them (Law L5).
@@ -613,7 +631,7 @@ impl fmt::Display for LifecycleError {
     }
 }
 
-impl std::error::Error for LifecycleError {}
+impl core::error::Error for LifecycleError {}
 
 #[cfg(test)]
 mod tests {

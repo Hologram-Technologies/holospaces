@@ -95,7 +95,14 @@ change:
 - **Integration** — `cargo test --test integration`: building blocks
   composed.
 
-- **End-to-end** — `cargo test --test e2e`: whole operator flows.
+- **End-to-end** — `cargo test --test e2e`: whole operator flows (over
+  the real substrate runtime and a real content-addressed gateway).
+
+- **Portability** — the peer core builds for every supported
+  environment: native, browser (`--target wasm32-unknown-unknown`), and
+  bare-metal (`--no-default-features --target thumbv7em-none-eabi`,
+  `no_std`). The same holospace κ boots on any peer (Chapter 7; quality
+  goal Q6).
 
 The `CC` suites and the test tiers produce each component’s `CC` witness
 against its external authority. The gates exist and run from the first

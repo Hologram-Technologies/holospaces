@@ -56,12 +56,21 @@
 //! test tiers, and the V&V). Components are validated against external
 //! authorities (`CC-*`), never against themselves.
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
 pub mod boot;
+/// The `.holo` Engine (the host-side execution backend; `std` only — the CPU
+/// kernels' float math needs `std`).
+#[cfg(feature = "std")]
 pub mod engine;
 pub mod identity;
 pub mod manager;
 pub mod peer;
 pub mod realizations;
+/// Wasm module validation (the host-side provisioning surface; `std` only).
+#[cfg(feature = "std")]
 pub mod wasm;
 
 /// The substrate contracts holospaces drives, re-exported from

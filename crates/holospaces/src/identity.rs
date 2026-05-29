@@ -19,6 +19,16 @@
 use hologram_substrate_core::{Realization, RealizationError, References};
 
 use crate::realizations::{address, encode, extract_refs, Kappa};
+#[cfg(not(feature = "std"))]
+#[allow(unused_imports)]
+use alloc::{
+    borrow::ToOwned,
+    boxed::Box,
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 
 /// An operator, identified by the κ of their self-sovereign public key.
 ///

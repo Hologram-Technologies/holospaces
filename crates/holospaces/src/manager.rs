@@ -23,6 +23,16 @@ use crate::boot::{ProvisionError, Session};
 use crate::identity::{Operator, Roster};
 use crate::peer::Peer;
 use crate::realizations::{Holospace, Kappa, Source};
+#[cfg(not(feature = "std"))]
+#[allow(unused_imports)]
+use alloc::{
+    borrow::ToOwned,
+    boxed::Box,
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 
 /// A projection of the operator's holospaces — what the console renders.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -176,7 +186,7 @@ impl core::fmt::Display for ManagerError {
     }
 }
 
-impl std::error::Error for ManagerError {}
+impl core::error::Error for ManagerError {}
 
 impl From<ProvisionError> for ManagerError {
     fn from(e: ProvisionError) -> Self {

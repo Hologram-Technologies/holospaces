@@ -26,6 +26,17 @@
 
 use core::fmt;
 
+#[cfg(not(feature = "std"))]
+#[allow(unused_imports)]
+use alloc::{
+    borrow::ToOwned,
+    boxed::Box,
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
+
 use hologram_realizations::{CapabilitySet, ContainerManifest};
 use hologram_substrate_core::{
     address_bytes, address_bytes_axis, verify_kappa, AxisError, Capabilities, KappaLabel71,
