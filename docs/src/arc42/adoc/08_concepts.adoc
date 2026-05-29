@@ -35,12 +35,12 @@ Trust is in the math, not the source: every received byte is accepted only after
 // The concepts above are the actual cross-cutting concepts.
 === _<Concept 1>_
 
-See the concept sections above.
+_arc42 template structural anchor; the concrete cross-cutting concepts are the named sections above._
 
 === _<Concept 2>_
 
-See the concept sections above.
+_arc42 template structural anchor; the concrete cross-cutting concepts are the named sections above._
 
 === _<Concept n>_
 
-See the concept sections above.
+_arc42 template structural anchor; the concrete cross-cutting concepts are the named sections above._

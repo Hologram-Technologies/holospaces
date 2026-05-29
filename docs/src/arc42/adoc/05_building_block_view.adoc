@@ -23,4 +23,14 @@ The Boot Layer is the hub: it depends on Realizations (to resolve a holospace), 
 
 === Level 3
 
-Level-3 (component) decomposition of individual building blocks is recorded as each block is implemented, with its components linking back to the relevant Architecture Decisions (Chapter 9) and Concepts (Chapter 8). Component diagrams are added to the C4 model (`docs/src/c4/workspace.dsl`) as `c4-l3-*` views and referenced here.
+The Level-3 (component) responsibilities of the building blocks follow from the design:
+
+*Boot Layer* — an _Ingestor_ (canonicalizes a provisioning source, a git repo + devcontainer or a holo-file, at the boundary into κ-addressed content, Law L2); a _Resolver_ (resolves a holospace κ, fetching and verifying its parts, Law L5); a _Spawner_ (instantiates the holospace through the substrate runtime with its capabilities); and a _Lifecycle_ component (suspend → κ snapshot, resume, migrate, terminate).
+
+*.holo Engine* — a _ContainerEngine adapter_ (the seam the substrate runtime drives) bound to the https://github.com/Hologram-Technologies/hologram[hologram] executor; in the browser peer this binding is the executor compiled to Wasm.
+
+*Identity* — a _Key store_ (the self-sovereign sign-in key) and a _Sync binding_ (scopes which content an operator's instances announce and resolve over the substrate).
+
+*Platform Manager* — a _View_ (a projection of the operator's holospaces and the substrate) and an _Intent_ surface (lifecycle and provisioning actions); its own state is canonical and held in the store (Law L2).
+
+Each component realizes the Architecture Decisions of Chapter 9 and applies the Concepts of Chapter 8.

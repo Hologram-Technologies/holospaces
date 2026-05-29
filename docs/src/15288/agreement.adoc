@@ -1,0 +1,12 @@
+[[lifecycle-agreement]]
+== Lifecycle: Agreement Processes
+
+How holospaces establishes agreements with the parties that supply to it and that it supplies to.
+
+=== Acquisition
+
+holospaces acquires its substrate and addressing capabilities as upstream dependencies — the https://github.com/Hologram-Technologies/hologram[hologram] member crates (git) and the https://github.com/UOR-Foundation[UOR-Foundation] crates `uor-addr` and `uor-foundation` (crates.io) — under the consume-by-reference policy (Chapter 9, ADR-006). It acquires no services: there is no server to procure (ADR-001).
+
+=== Supply
+
+holospaces supplies the _Hologram_ platform (the Platform Manager) to operators by content-addressed delivery from GitHub Pages, which serves only as an untrusted cold-start gateway (Chapter 7). What is supplied is a κ-addressed artifact, verified by re-derivation on receipt (Law L5).

@@ -32,16 +32,16 @@ The runtime scenarios below show how holospaces behaves over time. (The arc42 te
 // arc42 template placeholder scenario headings retained for structural conformance.
 === <Runtime Scenario 1>
 
-See the scenarios above.
+_arc42 template structural anchor; the concrete runtime scenarios are the named sections above._
 
 === <Runtime Scenario 2>
 
-See the scenarios above.
+_arc42 template structural anchor; the concrete runtime scenarios are the named sections above._
 
 === ...
 
-See the scenarios above.
+_arc42 template structural anchor; the concrete runtime scenarios are the named sections above._
 
 === <Runtime Scenario n>
 
-See the scenarios above.
+_arc42 template structural anchor; the concrete runtime scenarios are the named sections above._

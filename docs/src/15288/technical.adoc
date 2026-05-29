@@ -1,0 +1,58 @@
+[[lifecycle-technical]]
+== Lifecycle: Technical Processes
+
+=== Business or mission analysis
+
+The mission: a UOR-native boot layer that provisions and runs holospaces across browser, native, and bare-metal with no server — for the development-environment case, a serverless Gitpod/Codespaces (Chapter 1).
+
+=== Stakeholder needs and requirements definition
+
+Stakeholders and their expectations are defined in Chapter 1 (Stakeholders); the operator's needs drive the requirements.
+
+=== System requirements definition
+
+The system requirements R1–R6 are defined in Chapter 1 (Requirements Overview).
+
+=== System architecture definition
+
+The architecture is defined in Chapters 3–7 (arc42) and the C4 model (`docs/src/c4/workspace.dsl`).
+
+=== Design definition
+
+Cross-cutting design concepts are in Chapter 8 and the formal conceptual model (OPM, ISO 19450); detailed decisions are in Chapter 9.
+
+=== System analysis
+
+Quality requirements and trade-offs are analysed in Chapter 10; risks and technical debts in Chapter 11.
+
+=== Implementation
+
+Implementation realizes the documentation: each building block (Chapter 5) is built to spec and links back to it. holospaces is a thin layer over the substrate (Law L4).
+
+=== Integration
+
+Integration composes the https://github.com/Hologram-Technologies/hologram[hologram] substrate pillars (storage, network, runtime) with the `.holo` execution backend into per-environment peers (Chapters 5, 7).
+
+=== Verification
+
+Verification is by external ground truth: the documentation by V1–V8, the implementation against imported external artifacts (Chapter 10, `docs/docs-definition.md`); every received byte is verified by re-derivation (Law L5).
+
+=== Transition
+
+Transition is content-addressed delivery: the Hologram platform is published to GitHub Pages and cold-started in the browser; a holospace transitions between an operator's instances by κ snapshot (Chapters 6, 7).
+
+=== Validation
+
+Validation confirms holospaces meets the operator's needs — booting a holospace from a git link with a devcontainer, or from a holo-file, and managing its lifecycle (Chapters 1, 6).
+
+=== Operation
+
+Operation is performed by peers: each becomes the substrate locally and runs holospaces; the Platform Manager is the operator's console (Chapters 6, 7).
+
+=== Maintenance
+
+Maintenance is append-only and content-addressed: an update is new canonical content under a new κ; unreferenced content is reclaimed by garbage collection (Law L3).
+
+=== Disposal
+
+Disposal is garbage collection: content no longer reachable from any pinned root is evicted. Because identity is content, removal never invalidates references that still hold (Laws L1, L3).
