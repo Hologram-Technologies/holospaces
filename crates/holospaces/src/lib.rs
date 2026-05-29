@@ -15,18 +15,30 @@
 //!   by re-derivation through the substrate (Laws L1, L2, L3, L5), and the
 //!   [`Holospace`] — a hologram `Realization` composing a `ContainerManifest`
 //!   and a `CapabilitySet`. Conformance: `CC-1`.
-//! - [`boot`] — the environment-agnostic core: ingest, resolve (the
-//!   substrate's verify-on-receipt read), and a [`Session`](boot::Session) that
-//!   drives the lifecycle through hologram's `ContainerRuntime`.
-//! - [`identity`] — self-sovereign sign-in and the keying that links an
-//!   operator's instances.
+//! - [`boot`] — the environment-agnostic core: ingest, `provision` (κ-address a
+//!   holospace's parts into the store), resolve (the substrate's
+//!   verify-on-receipt read), and a [`Session`](boot::Session) driving the
+//!   lifecycle through hologram's `ContainerRuntime`.
+//! - [`engine`] — the *.holo Engine*: runs a `.holo` compute artifact via the
+//!   hologram executor. Conformance: `CC-2`.
+//! - [`peer`] — a [`Peer`](peer::Peer) that composes the substrate for an
+//!   environment (storage · network · runtime) and supplies the boot
+//!   operations, incl. reachability-closure migration (arc42 chapter 7).
+//! - [`identity`] — self-sovereign sign-in ([`Operator`](identity::Operator))
+//!   and the [`Roster`](identity::Roster) that links an operator's instances so
+//!   their holospaces synchronise over the substrate (R5).
+//! - [`manager`] — the *Platform Manager* model: a [`View`](manager::View) of
+//!   the operator's holospaces and the Intent surface (provision · open a
+//!   lifecycle session · synchronise). A rendered console is a thin
+//!   presentation over this model.
+//! - [`wasm`] — WebAssembly module validation + the substrate's closed host
+//!   surface. Conformance: `CC-5`.
 //!
 //! The substrate seams holospaces drives — `KappaStore`, `KappaSync`,
 //! `ContainerRuntime`, the `.holo` executor — are defined in hologram and
-//! re-exported here for convenience under [`substrate`]. The *Platform
-//! Manager* (the Hologram platform — the operator console) is itself a
-//! holospace, managed through these types and hosted on this repo's GitHub
-//! Pages as content (not a host); it is not part of this library.
+//! re-exported here for convenience under [`substrate`]. Conformance: `CC-3`
+//! (peer storage). The *Platform Manager* (the Hologram platform) is itself a
+//! holospace, hosted on this repo's GitHub Pages as content (not a host).
 //!
 //! ## The laws
 //!
@@ -45,7 +57,10 @@
 //! authorities (`CC-*`), never against themselves.
 
 pub mod boot;
+pub mod engine;
 pub mod identity;
+pub mod manager;
+pub mod peer;
 pub mod realizations;
 pub mod wasm;
 

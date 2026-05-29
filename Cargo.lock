@@ -525,7 +525,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -859,6 +859,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hologram-net-http"
+version = "0.6.0"
+source = "git+https://github.com/Hologram-Technologies/hologram?rev=18f553d8578997ce32e7b653786a0bcf9b09a2c0#18f553d8578997ce32e7b653786a0bcf9b09a2c0"
+dependencies = [
+ "async-trait",
+ "hologram-substrate-core",
+]
+
+[[package]]
 name = "hologram-ops"
 version = "0.6.0"
 source = "git+https://github.com/Hologram-Technologies/hologram?rev=18f553d8578997ce32e7b653786a0bcf9b09a2c0#18f553d8578997ce32e7b653786a0bcf9b09a2c0"
@@ -966,6 +975,7 @@ dependencies = [
  "hologram-compiler",
  "hologram-exec",
  "hologram-graph",
+ "hologram-net-http",
  "hologram-realizations",
  "hologram-runtime",
  "hologram-runtime-wasmtime",
@@ -1857,7 +1867,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1913,7 +1923,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2852,7 +2862,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

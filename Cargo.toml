@@ -20,6 +20,7 @@ hologram-realizations   = { git = "https://github.com/Hologram-Technologies/holo
 hologram-substrate-tck  = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-substrate-tck" }
 hologram-store-mem      = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-store-mem" }
 hologram-store-native   = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-store-native" }
+hologram-net-http       = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-net-http" }
 hologram-exec           = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-exec" }
 hologram-compiler       = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-compiler" }
 hologram-backend        = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-backend" }

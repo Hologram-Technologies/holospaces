@@ -16,7 +16,9 @@
 //! keystore, consumed by reference (ADR-006); holospaces holds only the
 //! κ-addressed identity (Law L3).
 
-use crate::realizations::{address, Kappa};
+use hologram_substrate_core::{Realization, RealizationError, References};
+
+use crate::realizations::{address, encode, extract_refs, Kappa};
 
 /// An operator, identified by the κ of their self-sovereign public key.
 ///
@@ -50,6 +52,81 @@ impl Operator {
     }
 }
 
+/// A **roster** — the set of holospaces an operator owns, scoped to their
+/// identity (arc42 chapter 8, *Identity and sync*; R5). It is a hologram
+/// [`Realization`]: IRI-tagged canonical bytes embedding the operator identity
+/// and the operator's holospace κ-labels, so the whole roster is itself
+/// content (a κ). An operator's instances synchronise by resolving the roster
+/// κ over the substrate and then resolving each holospace it lists — all
+/// verified by re-derivation (Law L5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Roster {
+    operator: Kappa,
+    holospaces: Vec<Kappa>,
+}
+
+impl Roster {
+    /// The holospaces realization IRI for an operator roster.
+    pub const IRI: &'static str = "https://uor.foundation/holospaces/realization/roster";
+
+    /// A roster of `holospaces` owned by `operator`.
+    #[must_use]
+    pub fn new(operator: &Operator, holospaces: Vec<Kappa>) -> Self {
+        Self {
+            operator: *operator.identity(),
+            holospaces,
+        }
+    }
+
+    /// The operator identity this roster is scoped to.
+    #[must_use]
+    pub fn operator(&self) -> &Kappa {
+        &self.operator
+    }
+
+    /// The operator's holospace κ-labels.
+    #[must_use]
+    pub fn holospaces(&self) -> &[Kappa] {
+        &self.holospaces
+    }
+
+    /// The roster's κ — its content address (Law L1).
+    #[must_use]
+    pub fn kappa(&self) -> Kappa {
+        address(&self.canonicalize())
+    }
+
+    /// Recover a roster from its canonical form (the operator is the first
+    /// embedded operand; the rest are its holospaces).
+    ///
+    /// # Errors
+    ///
+    /// [`RealizationError`] if the bytes are not a well-formed roster.
+    pub fn from_canonical(bytes: &[u8]) -> Result<Self, RealizationError> {
+        let refs = <Self as Realization>::references(bytes)?;
+        let (operator, holospaces) = refs.split_first().ok_or(RealizationError::Malformed)?;
+        Ok(Self {
+            operator: *operator,
+            holospaces: holospaces.to_vec(),
+        })
+    }
+}
+
+impl Realization for Roster {
+    const IRI: hologram_substrate_core::RealizationId = Roster::IRI;
+
+    fn canonicalize(&self) -> Vec<u8> {
+        let mut refs = Vec::with_capacity(1 + self.holospaces.len());
+        refs.push(self.operator);
+        refs.extend_from_slice(&self.holospaces);
+        encode(Self::IRI, &refs, &[])
+    }
+
+    fn references(canonical_bytes: &[u8]) -> Result<References, RealizationError> {
+        extract_refs(Self::IRI, canonical_bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,5 +146,20 @@ mod tests {
             Operator::from_public_key(b"key-a"),
             Operator::from_public_key(b"key-b")
         );
+    }
+
+    #[test]
+    fn roster_round_trips_through_its_canonical_form() {
+        let operator = Operator::from_public_key(b"operator-key");
+        let holospaces = vec![address(b"holospace-a"), address(b"holospace-b")];
+        let roster = Roster::new(&operator, holospaces.clone());
+
+        let bytes = roster.canonicalize();
+        let back = Roster::from_canonical(&bytes).expect("decode roster");
+        assert_eq!(back, roster);
+        assert_eq!(back.operator(), operator.identity());
+        assert_eq!(back.holospaces(), holospaces.as_slice());
+        // The roster is itself content — a stable κ links the operator's instances.
+        assert_eq!(roster.kappa(), Roster::new(&operator, holospaces).kappa());
     }
 }

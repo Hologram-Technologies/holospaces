@@ -29,8 +29,23 @@ use core::fmt;
 use hologram_realizations::{CapabilitySet, ContainerManifest};
 use hologram_substrate_core::{
     address_bytes, address_bytes_axis, verify_kappa, AxisError, Capabilities, KappaLabel71,
-    Realization, RealizationError, References,
+    Realization, RealizationError, RealizationId, RefExtractor, References,
 };
+
+/// The realization registry holospaces resolves reachability (SPINE-3) with:
+/// its own [`Holospace`] realization plus hologram's
+/// (`hologram_realizations::REGISTRY` — `ContainerManifest`, `CapabilitySet`,
+/// …). Used to walk a holospace's transitive closure when migrating it to
+/// another peer.
+#[must_use]
+pub fn registry() -> Vec<(RealizationId, RefExtractor)> {
+    let mut reg: Vec<(RealizationId, RefExtractor)> = vec![(
+        Holospace::IRI,
+        <Holospace as Realization>::references as RefExtractor,
+    )];
+    reg.extend_from_slice(hologram_realizations::REGISTRY);
+    reg
+}
 
 /// A κ-label: a content address (`<axis>:<hex>`). The substrate's
 /// [`KappaLabel71`] (blake3, 71 bytes) is holospaces' identity type — the same
@@ -121,7 +136,7 @@ const KAPPA71: usize = 71;
 
 /// Encode a realization's canonical form: `IRI\0` + `u32` ref-count + each
 /// operand κ-label (71 bytes) + `u32` payload length + payload (SPINE-2).
-fn encode(iri: &str, refs: &[Kappa], payload: &[u8]) -> Vec<u8> {
+pub(crate) fn encode(iri: &str, refs: &[Kappa], payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(iri.len() + 1 + 8 + refs.len() * KAPPA71 + payload.len());
     out.extend_from_slice(iri.as_bytes());
     out.push(0);
@@ -136,7 +151,7 @@ fn encode(iri: &str, refs: &[Kappa], payload: &[u8]) -> Vec<u8> {
 
 /// Inverse projection (SPINE-3): validate the leading IRI and recover exactly
 /// the embedded operand κ-labels.
-fn extract_refs(iri: &str, bytes: &[u8]) -> Result<References, RealizationError> {
+pub(crate) fn extract_refs(iri: &str, bytes: &[u8]) -> Result<References, RealizationError> {
     let nul = bytes
         .iter()
         .position(|&b| b == 0)
@@ -171,6 +186,50 @@ fn read_u32(bytes: &[u8], cur: &mut usize) -> Result<u32, RealizationError> {
         .map_err(|_| RealizationError::Truncated)?;
     *cur = end;
     Ok(u32::from_le_bytes(arr))
+}
+
+/// The opaque payload after a realization's embedded operand κ-labels — the
+/// inverse of `encode`'s payload region.
+fn payload_of(iri: &str, bytes: &[u8]) -> Result<Vec<u8>, RealizationError> {
+    let nul = bytes
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or(RealizationError::Malformed)?;
+    if &bytes[..nul] != iri.as_bytes() {
+        return Err(RealizationError::WrongIri);
+    }
+    let mut cur = nul + 1;
+    let n = read_u32(bytes, &mut cur)? as usize;
+    cur = cur
+        .checked_add(n * KAPPA71)
+        .ok_or(RealizationError::Truncated)?;
+    let len = read_u32(bytes, &mut cur)? as usize;
+    let end = cur.checked_add(len).ok_or(RealizationError::Truncated)?;
+    Ok(bytes
+        .get(cur..end)
+        .ok_or(RealizationError::Truncated)?
+        .to_vec())
+}
+
+fn read_kappa(bytes: &[u8], cur: &mut usize) -> Result<Kappa, RealizationError> {
+    let end = cur
+        .checked_add(KAPPA71)
+        .ok_or(RealizationError::Truncated)?;
+    let arr: [u8; KAPPA71] = bytes
+        .get(*cur..end)
+        .ok_or(RealizationError::Truncated)?
+        .try_into()
+        .map_err(|_| RealizationError::Truncated)?;
+    *cur = end;
+    Kappa::from_bytes(&arr).map_err(|_| RealizationError::Malformed)
+}
+
+fn read_str(bytes: &[u8], cur: &mut usize) -> Result<String, RealizationError> {
+    let len = read_u32(bytes, cur)? as usize;
+    let end = cur.checked_add(len).ok_or(RealizationError::Truncated)?;
+    let slice = bytes.get(*cur..end).ok_or(RealizationError::Truncated)?;
+    *cur = end;
+    String::from_utf8(slice.to_vec()).map_err(|_| RealizationError::Malformed)
 }
 
 /// How a holospace is provisioned. Two paths, one lifecycle (ADR-004). The
@@ -227,6 +286,31 @@ impl Source {
             }
         }
         p
+    }
+
+    /// Recover a source from its [`Holospace`] payload bytes (the inverse of
+    /// [`encode_payload`](Source::encode_payload)).
+    fn decode_payload(payload: &[u8]) -> Result<Source, RealizationError> {
+        let kind = *payload.first().ok_or(RealizationError::Malformed)?;
+        let mut cur = 1usize;
+        match kind {
+            0 => Ok(Source::HoloFile {
+                artifact: read_kappa(payload, &mut cur)?,
+            }),
+            1 => {
+                let config = read_kappa(payload, &mut cur)?;
+                let repo = read_str(payload, &mut cur)?;
+                let reference = read_str(payload, &mut cur)?;
+                let config_path = read_str(payload, &mut cur)?;
+                Ok(Source::Devcontainer {
+                    repo,
+                    reference,
+                    config_path,
+                    config,
+                })
+            }
+            _ => Err(RealizationError::Malformed),
+        }
     }
 
     /// The code-module κ-label this source contributes to the manifest. For a
@@ -319,6 +403,28 @@ impl Holospace {
         address(&self.canonicalize())
     }
 
+    /// Recover a holospace from its canonical form — the inverse of
+    /// [`canonicalize`](Realization::canonicalize). This is what lets a peer
+    /// resolve a holospace κ (fetch + verify, Law L5) and then boot it: the
+    /// embedded operands give the manifest and capability-set κ, the payload
+    /// the provisioning source.
+    ///
+    /// # Errors
+    ///
+    /// [`RealizationError`] if the bytes are not a well-formed holospace.
+    pub fn from_canonical(bytes: &[u8]) -> Result<Self, RealizationError> {
+        let refs = <Self as Realization>::references(bytes)?;
+        if refs.len() != 2 {
+            return Err(RealizationError::Malformed);
+        }
+        let payload = payload_of(Self::IRI, bytes)?;
+        Ok(Self {
+            source: Source::decode_payload(&payload)?,
+            manifest: refs[0],
+            capabilities: refs[1],
+        })
+    }
+
     fn parts(&self) -> (Vec<Kappa>, Vec<u8>) {
         (
             alloc_vec(&[self.manifest, self.capabilities]),
@@ -409,6 +515,24 @@ mod tests {
         let bytes = hs.canonicalize();
         let refs = Holospace::references(&bytes).unwrap();
         assert_eq!(refs, vec![*hs.manifest(), *hs.capabilities()]);
+    }
+
+    #[test]
+    fn holospace_round_trips_through_its_canonical_form() {
+        for hs in [
+            Holospace::compose(devcontainer(), caps()),
+            Holospace::compose(
+                Source::HoloFile {
+                    artifact: address(b"a .holo artifact"),
+                },
+                caps(),
+            ),
+        ] {
+            let back = Holospace::from_canonical(&hs.canonicalize()).expect("decode");
+            assert_eq!(back, hs);
+            assert_eq!(back.kappa(), hs.kappa());
+            assert_eq!(back.source(), hs.source());
+        }
     }
 
     #[test]
