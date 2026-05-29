@@ -7,8 +7,8 @@
 //!
 //! A Wasm code module is accepted only if it is *specification-valid* (the
 //! [WebAssembly](https://webassembly.org) specification) — this is the κ
-//! boundary's structural guarantee for the Wasm form. [`validate`] checks
-//! spec-validity; [`validate_substrate_module`] additionally enforces the
+//! boundary's structural guarantee for the Wasm form. `validate` checks
+//! spec-validity; `validate_substrate_module` additionally enforces the
 //! substrate's closed host surface (spec §4.4): a substrate container may
 //! import only from the single `hologram` host module — WASI / `env` and other
 //! ambient imports are refused (SPINE-6), so the workload bound is structural.

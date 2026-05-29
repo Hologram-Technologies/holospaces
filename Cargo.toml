@@ -15,15 +15,18 @@ repository = "https://github.com/Hologram-Technologies/holospaces"
 # credentials; in CI a token with read access to Hologram-Technologies/hologram
 # is configured before the build (see .github/workflows/ci.yml).
 [workspace.dependencies]
-hologram-substrate-core = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-substrate-core" }
-hologram-realizations   = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-realizations" }
+# The lib-core hologram crates are no_std-capable (hologram's own `just embedded`
+# builds them for thumbv7em). holospaces takes them with default features off so
+# its core compiles for bare-metal / browser peers; the `std` feature re-enables.
+hologram-substrate-core = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-substrate-core", default-features = false }
+hologram-realizations   = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-realizations", default-features = false }
 hologram-substrate-tck  = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-substrate-tck" }
 hologram-store-mem      = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-store-mem" }
 hologram-store-native   = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-store-native" }
 hologram-net-http       = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-net-http" }
-hologram-exec           = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-exec" }
+hologram-exec           = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-exec", default-features = false }
 hologram-compiler       = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-compiler" }
-hologram-backend        = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-backend" }
+hologram-backend        = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-backend", default-features = false }
 hologram-graph          = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-graph" }
 hologram-archive        = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-archive" }
 hologram-runtime        = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-runtime" }

@@ -20,6 +20,18 @@ use hologram_substrate_core::{
 use crate::boot::{provision, ProvisionError, Resolver, Session};
 use crate::realizations::{Holospace, Kappa, Source};
 
+use alloc::collections::BTreeSet;
+#[cfg(not(feature = "std"))]
+#[allow(unused_imports)]
+use alloc::{
+    borrow::ToOwned,
+    boxed::Box,
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
+
 /// A holospaces peer: the composed substrate plus the boot operations over it.
 ///
 /// Borrows the substrate pillars it composes — the store, the runtime, and
@@ -102,7 +114,7 @@ impl<'a, R: ContainerRuntime> Peer<'a, R> {
     pub async fn resolve_closure(&self, root: &Kappa) -> Result<usize, AccessError> {
         let registry = crate::realizations::registry();
         let mut stack = vec![*root];
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = BTreeSet::new();
         let mut resolved = 0usize;
         while let Some(k) = stack.pop() {
             if !seen.insert(k.as_str().to_owned()) {

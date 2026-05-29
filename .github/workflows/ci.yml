@@ -83,6 +83,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: wasm32-unknown-unknown, thumbv7em-none-eabi
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all --check
@@ -98,3 +99,7 @@ jobs:
         run: cargo test --workspace --test integration --all-features
       - name: E2E tests
         run: cargo test --workspace --test e2e --all-features
+      - name: Portability — the peer builds for browser + bare-metal (ch.7 / Q6)
+        run: |
+          cargo build -p holospaces --target wasm32-unknown-unknown
+          cargo build -p holospaces --no-default-features --target thumbv7em-none-eabi

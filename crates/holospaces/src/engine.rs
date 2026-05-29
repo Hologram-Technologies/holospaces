@@ -15,6 +15,16 @@ use hologram_backend::CpuBackend;
 use hologram_exec::{BufferArena, InferenceSession, InputBuffer};
 
 use crate::realizations::{address, Kappa};
+#[cfg(not(feature = "std"))]
+#[allow(unused_imports)]
+use alloc::{
+    borrow::ToOwned,
+    boxed::Box,
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 
 /// The `.holo` execution backend: loads a `.holo` archive and runs it through
 /// the hologram executor, content-addressing the outputs.
@@ -59,4 +69,4 @@ impl core::fmt::Display for EngineError {
     }
 }
 
-impl std::error::Error for EngineError {}
+impl core::error::Error for EngineError {}

@@ -47,6 +47,28 @@ done
 [ -n "$witnessed" ] || witnessed=" (none yet)"
 echo
 
+# ── Portability (arc42 ch.7 deployment view; quality goal Q6) ──
+# The same holospaces peer core compiles for every environment hologram
+# supports — native, browser (wasm32), and bare-metal (no_std). Mirrors
+# hologram's own tri-target discipline (`just wasm` / `just embedded`).
+echo "── Portability (the peer builds for browser + bare-metal, ch.7 / Q6) ──"
+port_rc=0
+if command -v cargo >/dev/null 2>&1 && command -v rustup >/dev/null 2>&1; then
+    rustup target add wasm32-unknown-unknown thumbv7em-none-eabi >/dev/null 2>&1 || true
+    echo "  • native"
+    cargo build --manifest-path "$ROOT/Cargo.toml" -p holospaces >/dev/null 2>&1 || port_rc=1
+    echo "  • browser (wasm32-unknown-unknown)"
+    cargo build --manifest-path "$ROOT/Cargo.toml" -p holospaces \
+        --target wasm32-unknown-unknown >/dev/null 2>&1 || port_rc=1
+    echo "  • bare-metal (thumbv7em-none-eabi, no_std)"
+    cargo build --manifest-path "$ROOT/Cargo.toml" -p holospaces \
+        --no-default-features --target thumbv7em-none-eabi >/dev/null 2>&1 || port_rc=1
+    [ "$port_rc" -eq 0 ] && echo "  PASS (native · browser · bare-metal)" || echo "  FAIL"
+else
+    echo "  SKIP — cargo/rustup not available"
+fi
+echo
+
 # CC rows defined in the catalog (arc42 ch.10); those without a green suite
 # above are not-yet-witnessed.
 all_cc="CC-1 CC-2 CC-3 CC-4 CC-5"
@@ -68,11 +90,12 @@ else
 fi
 echo "CC witnessed:$witnessed  (component(s) validated against imported authorities)"
 echo "CC pending: ${pending:- none}  — not yet implemented; authorities defined in the catalog + PROVENANCE.md"
+[ "$port_rc" -eq 0 ] && echo "Portability  PASS  (native · browser · bare-metal peer builds)" || echo "Portability  FAIL"
 echo
-if [ "$spec_rc" -eq 0 ] && [ "$cc_rc" -eq 0 ]; then
-    echo "V&V: GREEN (specification conformance + all implemented components)."
+if [ "$spec_rc" -eq 0 ] && [ "$cc_rc" -eq 0 ] && [ "$port_rc" -eq 0 ]; then
+    echo "V&V: GREEN (specification conformance + all implemented components + portability)."
 else
     echo "V&V: FAILED."
 fi
-[ "$spec_rc" -eq 0 ] && [ "$cc_rc" -eq 0 ]
+[ "$spec_rc" -eq 0 ] && [ "$cc_rc" -eq 0 ] && [ "$port_rc" -eq 0 ]
 exit $?
