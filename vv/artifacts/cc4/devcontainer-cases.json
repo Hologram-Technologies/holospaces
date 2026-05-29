@@ -1,0 +1,14 @@
+{
+  "_about": "CC-4 external authority: the Dev Container specification (containers.dev) and the OCI image specification. Each case is a devcontainer.json and whether the specification accepts it — at most one container image source (`image`, `build`, or `dockerComposeFile`) may be declared (none ⇒ the implementor's default base image, as in Codespaces), and known properties must be well-formed. The CC-4 witness (crates/holospaces/tests/cc4_devcontainer.rs) checks holospaces' Dev Container ingestor agrees with these accept/reject decisions, and that ingesting the same source yields the same holospace κ (reproducibility, QS1 / Q4). See vv/PROVENANCE.md.",
+  "source": "https://containers.dev/implementors/json_reference/ ; https://github.com/opencontainers/image-spec",
+  "cases": [
+    { "name": "prebuilt-image", "valid": true, "config": { "name": "app", "image": "mcr.microsoft.com/devcontainers/base:debian" } },
+    { "name": "dockerfile-build", "valid": true, "config": { "build": { "dockerfile": "Dockerfile" } } },
+    { "name": "compose-service", "valid": true, "config": { "dockerComposeFile": "docker-compose.yml", "service": "app" } },
+    { "name": "image-with-features", "valid": true, "config": { "image": "debian:12", "features": { "ghcr.io/devcontainers/features/rust:1": {} } } },
+    { "name": "features-only-default-image", "valid": true, "config": { "name": "app", "features": { "ghcr.io/devcontainers/features/node:1": {} } } },
+    { "name": "multiple-image-sources", "valid": false, "config": { "image": "debian:12", "build": { "dockerfile": "Dockerfile" } } },
+    { "name": "features-not-object", "valid": false, "config": { "image": "debian:12", "features": [] } },
+    { "name": "image-not-string", "valid": false, "config": { "image": 12 } }
+  ]
+}

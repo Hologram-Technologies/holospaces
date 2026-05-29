@@ -8,6 +8,25 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/Hologram-Technologies/holospaces"
 
+# The hologram substrate is consumed by reference (ADR-006): git dependencies on
+# the private hologram repo, pinned to one rev so every member resolves the same
+# substrate. uor-addr / uor-foundation come transitively from crates.io. Auth:
+# `git-fetch-with-cli` (.cargo/config.toml) uses the environment's GitHub
+# credentials; in CI a token with read access to Hologram-Technologies/hologram
+# is configured before the build (see .github/workflows/ci.yml).
+[workspace.dependencies]
+hologram-substrate-core = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-substrate-core" }
+hologram-realizations   = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-realizations" }
+hologram-substrate-tck  = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-substrate-tck" }
+hologram-store-mem      = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-store-mem" }
+hologram-store-native   = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-store-native" }
+hologram-exec           = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-exec" }
+hologram-compiler       = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-compiler" }
+hologram-backend        = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-backend" }
+hologram-graph          = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-graph" }
+hologram-archive        = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-archive" }
+prism                   = { version = "0.4", package = "uor-prism" }
+
 # Quality commitments enforced from the beginning (arc42 ch.10). CI runs clippy
 # with `-D warnings`, so every workspace member upholds these.
 [workspace.lints.rust]

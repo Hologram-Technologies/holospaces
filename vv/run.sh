@@ -23,20 +23,56 @@ echo "── CS-* Specification conformance (docs vs arc42 / OPM ISO 19450 / ISO
 spec_rc=$?
 echo
 
-# CC-* component suites are registered here as components land, e.g.:
-#   "$ROOT/vv/suites/cc1-kappa-addressing.sh"   # κ-labels vs imported hash KATs
-# Until a component exists, its CC-* row in the catalog is the authoritative
-# requirement and is reported as not-yet-witnessed (not a failure: there is no
-# component to witness). Adding a component without its CC-* witness is a defect.
-cc_pending="CC-1 CC-2 CC-3 CC-4 CC-5"
+echo "── CC-* Component conformance (components vs their external authorities) ──"
+# Each suite in vv/suites/ witnesses one implemented component against its
+# imported external authority (provenance in vv/PROVENANCE.md). A component
+# whose CC-* row has no suite is not yet implemented: it is reported as
+# not-yet-witnessed (the catalog row is the authoritative requirement), not a
+# failure. Adding a component without its CC-* witness is a defect.
+cc_rc=0
+witnessed=""
+for suite in "$ROOT"/vv/suites/*.sh; do
+    [ -e "$suite" ] || continue
+    name="$(basename "$suite" .sh)"
+    echo "  • $name"
+    "$suite"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        witnessed="$witnessed ${name%%-*}"
+    else
+        echo "    FAILED ($name, rc=$rc)"
+        cc_rc=1
+    fi
+done
+[ -n "$witnessed" ] || witnessed=" (none yet)"
+echo
+
+# CC rows defined in the catalog (arc42 ch.10); those without a green suite
+# above are not-yet-witnessed.
+all_cc="CC-1 CC-2 CC-3 CC-4 CC-5"
+pending=""
+for cc in $all_cc; do
+    cc_key="${cc//-/}"        # CC-1 -> CC1
+    cc_key="${cc_key,,}"      # CC1  -> cc1 (matches suite prefix)
+    case " $witnessed " in
+        *" $cc_key "*) : ;;
+        *) pending="$pending $cc" ;;
+    esac
+done
 
 echo "── Summary ──"
 if [ "$spec_rc" -eq 0 ]; then
-    echo "CS-1..CS-6  PASS  (specification conforms to its external standards)"
+    echo "CS-1..CS-6   PASS  (specification conforms to its external standards)"
 else
-    echo "CS-1..CS-6  FAIL  (see the build output above)"
+    echo "CS-1..CS-6   FAIL  (see the build output above)"
 fi
-echo "CC-* ($cc_pending)  not yet witnessed — no component implemented; authorities defined in the catalog + PROVENANCE.md"
+echo "CC witnessed:$witnessed  (component(s) validated against imported authorities)"
+echo "CC pending: ${pending:- none}  — not yet implemented; authorities defined in the catalog + PROVENANCE.md"
 echo
-[ "$spec_rc" -eq 0 ] && echo "V&V: specification conformance GREEN." || echo "V&V: FAILED."
-exit "$spec_rc"
+if [ "$spec_rc" -eq 0 ] && [ "$cc_rc" -eq 0 ]; then
+    echo "V&V: GREEN (specification conformance + all implemented components)."
+else
+    echo "V&V: FAILED."
+fi
+[ "$spec_rc" -eq 0 ] && [ "$cc_rc" -eq 0 ]
+exit $?

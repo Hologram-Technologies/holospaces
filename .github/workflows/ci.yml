@@ -1,8 +1,15 @@
 name: ci
 
 # The repository upholds the documented quality commitments (arc42 ch.10) from
-# the beginning: every change runs the V&V alongside the Rust quality gates and
-# the unit / integration / e2e test tiers.
+# the beginning: every change runs the V&V (CS spec conformance + CC component
+# conformance) alongside the Rust quality gates and the test tiers.
+#
+# holospaces consumes the private hologram substrate as a pinned git dependency
+# (ADR-006). Both jobs mint a GitHub App token scoped to
+# Hologram-Technologies/hologram and configure git so Cargo's git-fetch-with-cli
+# (.cargo/config.toml) can fetch it. Required repository secrets:
+#   HOLOGRAM_APP_ID, HOLOGRAM_APP_PRIVATE_KEY
+# (a GitHub App installed on the hologram repo with Contents: read).
 
 on:
   push:
@@ -11,12 +18,22 @@ on:
 
 jobs:
   vv:
-    name: V&V (spec conformance V1–V8)
+    name: V&V (CS spec conformance V1–V8 + CC component conformance)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      - name: Mint hologram access token
+        uses: actions/create-github-app-token@v1
+        id: hologram-token
+        with:
+          app-id: ${{ secrets.HOLOGRAM_APP_ID }}
+          private-key: ${{ secrets.HOLOGRAM_APP_PRIVATE_KEY }}
+          owner: Hologram-Technologies
+          repositories: hologram
+      - name: Configure git for the hologram substrate dependency
+        run: git config --global url."https://x-access-token:${{ steps.hologram-token.outputs.token }}@github.com/Hologram-Technologies/".insteadOf "https://github.com/Hologram-Technologies/"
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
@@ -32,6 +49,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: lts/*
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Cache doc toolchain
         uses: actions/cache@v4
         with:
@@ -43,17 +62,24 @@ jobs:
           key: doc-tools-${{ hashFiles('docs/tools/checksums.txt', 'docs/scripts/install-tools.sh') }}
       - name: Provision the pinned doc toolchain
         run: docs/scripts/install-tools.sh
-      - name: V&V
+      - name: V&V (CS-1..CS-6 + CC-1..CC-5)
         run: vv/run.sh
 
   rust:
     name: Rust quality + tests (unit · integration · e2e)
     runs-on: ubuntu-latest
-    # NOTE: once holospaces consumes hologram's private git crates, add a
-    # GitHub App token step (actions/create-github-app-token, repositories:
-    # hologram) and configure git so Cargo's git-fetch-with-cli can fetch them.
     steps:
       - uses: actions/checkout@v4
+      - name: Mint hologram access token
+        uses: actions/create-github-app-token@v1
+        id: hologram-token
+        with:
+          app-id: ${{ secrets.HOLOGRAM_APP_ID }}
+          private-key: ${{ secrets.HOLOGRAM_APP_PRIVATE_KEY }}
+          owner: Hologram-Technologies
+          repositories: hologram
+      - name: Configure git for the hologram substrate dependency
+        run: git config --global url."https://x-access-token:${{ steps.hologram-token.outputs.token }}@github.com/Hologram-Technologies/".insteadOf "https://github.com/Hologram-Technologies/"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -62,6 +88,10 @@ jobs:
         run: cargo fmt --all --check
       - name: Lints (clippy -D warnings)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Docs (no broken links; every public item documented)
+        run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
       - name: Unit tests
         run: cargo test --workspace --lib --all-features
       - name: Integration tests
