@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hologram Platform Manager</title>
+    <style>
+      body { font: 14px/1.5 system-ui, sans-serif; max-width: 52rem; margin: 2rem auto; padding: 0 1rem; }
+      h1 { font-size: 1.3rem; }
+      button { font: inherit; padding: 0.3rem 0.7rem; margin-right: 0.4rem; }
+      code, pre { font-family: ui-monospace, monospace; }
+      .k { color: #555; word-break: break-all; }
+      #holospaces li { margin: 0.2rem 0; }
+      .muted { color: #777; }
+    </style>
+  </head>
+  <body>
+    <h1>Hologram Platform Manager</h1>
+    <p class="muted">
+      The browser is a peer that <em>is</em> the substrate — no server (Law L1).
+      Identity is content; every byte is verified by re-derivation (Law L5).
+    </p>
+    <p>
+      <button id="signin">Sign in</button>
+      <button id="provision">Provision a holospace</button>
+    </p>
+    <p>operator: <span id="operator" class="k muted">(signed out)</span></p>
+    <p>holospaces:</p>
+    <ul id="holospaces"><li class="muted">none yet</li></ul>
+    <p>roster κ: <span id="roster" class="k muted">—</span></p>
+    <pre id="log" class="muted">loading…</pre>
+
+    <script type="module">
+      import init, { kappa, verify_kappa, Console } from "./pkg/holospaces_web.js";
+      await init();
+
+      // Expose the Manager surface for the Playwright browser test.
+      window.hs = { kappa, verify_kappa, Console };
+
+      const console0 = new Console();
+      const $ = (id) => document.getElementById(id);
+      const log = (m) => ($("log").textContent = m);
+      let n = 0;
+
+      function render() {
+        const v = JSON.parse(console0.view());
+        $("operator").textContent = v.operator || "(signed out)";
+        $("holospaces").innerHTML =
+          v.holospaces.length === 0
+            ? '<li class="muted">none yet</li>'
+            : v.holospaces.map((k) => `<li class="k">${k}</li>`).join("");
+        $("roster").textContent = console0.roster_kappa() || "—";
+      }
+
+      $("signin").onclick = () => {
+        const id = console0.sign_in(new TextEncoder().encode("operator-self-sovereign-key"));
+        log("signed in — identity " + id);
+        render();
+      };
+      $("provision").onclick = () => {
+        const code = new TextEncoder().encode("holospace code module #" + ++n);
+        const k = console0.provision(code, 256 * 1024 * 1024);
+        log("provisioned holospace " + k);
+        render();
+      };
+
+      window.__ready = true;
+      log("ready — sign in, then provision holospaces (content-addressed, in-browser)");
+    </script>
+  </body>
+</html>

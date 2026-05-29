@@ -1,0 +1,66 @@
+name: pages
+
+# Deploy the Hologram Platform Manager (holospaces' browser peer) to GitHub
+# Pages — the cold-start, content-addressed delivery of the operator console
+# (arc42 ch.3 / ch.5 / ch.6: "served from GitHub Pages", an untrusted gateway;
+# every byte is verified by re-derivation on load, Law L5).
+#
+# Requires the same hologram access secrets as ci.yml (HOLOGRAM_APP_ID,
+# HOLOGRAM_APP_PRIVATE_KEY) to build the wasm bundle, plus Pages enabled for the
+# repository (Settings → Pages → Source: GitHub Actions).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/holospaces-web/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Mint hologram access token
+        uses: actions/create-github-app-token@v1
+        id: hologram-token
+        with:
+          app-id: ${{ secrets.HOLOGRAM_APP_ID }}
+          private-key: ${{ secrets.HOLOGRAM_APP_PRIVATE_KEY }}
+          owner: Hologram-Technologies
+          repositories: hologram
+      - name: Configure git for the hologram substrate dependency
+        run: git config --global url."https://x-access-token:${{ steps.hologram-token.outputs.token }}@github.com/Hologram-Technologies/".insteadOf "https://github.com/Hologram-Technologies/"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/holospaces-web
+      - uses: jetli/wasm-pack-action@v0.4.0
+      - name: Build the Platform Manager (wasm32)
+        run: wasm-pack build crates/holospaces-web --release --target web --out-dir web/pkg
+      - name: Assemble the site
+        run: |
+          mkdir -p _site
+          cp crates/holospaces-web/web/index.html _site/
+          cp -r crates/holospaces-web/web/pkg _site/pkg
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4
