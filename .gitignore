@@ -1,2 +1,7 @@
 /target
 **/*.rs.bk
+# Browser peer (holospaces-web): generated wasm bindings, its build dir, and
+# the Playwright install. Built on demand by scripts/browser-manager-test.sh.
+/crates/holospaces-web/target
+/crates/holospaces-web/web/pkg
+/crates/holospaces-web/web/node_modules

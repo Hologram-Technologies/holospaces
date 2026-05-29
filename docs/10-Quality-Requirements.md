@@ -104,6 +104,12 @@ change:
   `no_std`). The same holospace κ boots on any peer (Chapter 7; quality
   goal Q6).
 
+- **Browser** — `scripts/browser-manager-test.sh`: the Hologram Platform
+  Manager (the browser peer) runs in headless Chromium (Playwright) —
+  sign in, provision, view, resolve + verify by re-derivation (Law L5).
+  It is deployed to GitHub Pages by `.github/workflows/pages.yml` (the
+  cold-start, untrusted gateway of Chapter 6).
+
 The `CC` suites and the test tiers produce each component’s `CC` witness
 against its external authority. The gates exist and run from the first
 commit; the test tiers and `CC` suites are populated as components land.

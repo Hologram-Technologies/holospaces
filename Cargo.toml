@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+# The browser peer is wasm32-only (web-sys / wasm-bindgen); built explicitly via
+# scripts/browser-manager-test.sh and the Pages deploy, not in the host build.
+exclude = ["crates/holospaces-web"]
 
 [workspace.package]
 version = "0.0.0"
