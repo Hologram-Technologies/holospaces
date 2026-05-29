@@ -1,0 +1,47 @@
+[[section-runtime-view]]
+== Runtime View
+
+The runtime scenarios below show how holospaces behaves over time. (The arc42 template placeholder scenario headings are retained at the end for structural conformance.)
+
+=== Provisioning a holospace from a devcontainer
+
+. The operator gives the Manager a link to a git repository containing a valid `devcontainer.json`.
+. holospaces ingests the repository, the devcontainer config, and the base image at the boundary and *κ-addresses* them into the store (shared layers dedupe; Law L2).
+. It composes a *holospace definition* — a κ over those parts; the same `devcontainer.json` yields the same κ (reproducibility, Q4).
+. The Boot Layer spawns the holospace through the substrate's runtime as a hologram-native container providing the environment; I/O is expressed over the content-addressed graph.
+. The holospace appears in the Manager, ready to use.
+
+=== Provisioning a holospace from a holo-file
+
+. The operator supplies a `.holo` artifact (e.g. a model compiled by https://github.com/Hologram-Technologies/hologram-ai[hologram-ai]) by its κ.
+. The Boot Layer resolves the κ (locally, else fetched and verified, Law L5) and runs it via the *.holo Engine* over the https://github.com/Hologram-Technologies/hologram[hologram] executor.
+. Lifecycle is identical to any other holospace.
+
+=== Suspend, resume, and migrate
+
+. The operator suspends a running holospace; its state is captured as a *κ snapshot* (state is content).
+. Because the snapshot is a κ, any of the operator's instances that can resolve it may *resume* it — including a different environment.
+. This makes migration a content operation: suspend on one peer, resume on another; unchanged state dedupes in the store.
+
+=== Cold-start from GitHub Pages
+
+. The browser loads a minimal loader from GitHub Pages and the *Hologram* platform's κ.
+. The loader resolves that κ and *verifies it by re-derivation* (Law L5); the gateway cannot forge content.
+. The browser peer boots the Manager; from there everything is content-addressed.
+
+// arc42 template placeholder scenario headings retained for structural conformance.
+=== <Runtime Scenario 1>
+
+See the scenarios above.
+
+=== <Runtime Scenario 2>
+
+See the scenarios above.
+
+=== ...
+
+See the scenarios above.
+
+=== <Runtime Scenario n>
+
+See the scenarios above.

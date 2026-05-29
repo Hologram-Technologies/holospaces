@@ -1,0 +1,46 @@
+[[section-introduction-and-goals]]
+== Introduction and Goals
+
+holospaces is a UOR-native _boot layer_ over the https://github.com/Hologram-Technologies/hologram[hologram] substrate. It provisions and runs _holospaces_ — bootable, content-addressed environments that range from a single compute artifact to a full Linux development environment — across every environment hologram supports (browser, native, bare-metal), holding all state as content. Its first-party holospace, _Hologram_, is the _Platform Manager_: the operator console that provisions and manages the others. For the development-environment use case it is, in effect, a UOR-native, serverless https://www.gitpod.io[Gitpod] / https://github.com/features/codespaces[Codespaces].
+
+This documentation is *authoritative for holospaces only*. Where it refers to hologram, https://github.com/UOR-Foundation/uor-addr[UOR-ADDR], or https://github.com/UOR-Foundation/prism[Prism], it *links* to those projects rather than restating their internals — their APIs and guarantees are defined there, not here.
+
+=== Requirements Overview
+
+holospaces must let an operator provision, boot, and manage holospaces, uniformly, with no server.
+
+[options="header"]
+|===
+| # | Requirement
+| R1 | Provision a holospace from a *holo-file* (a `.holo` compute artifact, e.g. a model compiled upstream by https://github.com/Hologram-Technologies/hologram-ai[hologram-ai]).
+| R2 | Provision a holospace from a *git repository + devcontainer config* (a https://containers.dev[Dev Container] / Codespaces-like experience).
+| R3 | Manage a holospace's *lifecycle*: boot, suspend (to a κ snapshot), resume, migrate, terminate.
+| R4 | Run holospaces across the environments hologram supports: *browser*, *native*, *bare-metal*.
+| R5 | *Sign-in* with a self-sovereign identity so an operator's instances synchronise their holospaces over the substrate.
+| R6 | Serve the *Hologram* platform (the Platform Manager) from this repository's *GitHub Pages*.
+|===
+
+=== Quality Goals
+
+The top quality goals are the project's invariants (the "laws"); they constrain every design decision (see Chapter 2, Architecture Constraints).
+
+[options="header"]
+|===
+| # | Quality Goal | Motivation
+| Q1 | *Content, not location* | Identity is a κ-label (_what_ a thing is), never a host/path/URL. No servers.
+| Q2 | *Canonical forms only* | Every operation is canonical-in → canonical-out; holospaces holds κ-labels, not deserialized objects.
+| Q3 | *The store is the memory* | The content-addressed store is the address space; RAM is a cache. A holospace far larger than RAM remains bootable.
+| Q4 | *Reproducibility* | A holospace's identity is the κ of its definition: the same definition always yields the same holospace.
+| Q5 | *Verifiability* | Every received byte is accepted only after re-derivation against its κ; trust is in the math, not the source.
+| Q6 | *Portability* | The same holospace κ boots on any peer, in any supported environment.
+|===
+
+=== Stakeholders
+
+[options="header"]
+|===
+| Role | Expectation
+| *Operator* | Provision and manage holospaces from a familiar console; sign in once and find their holospaces on every instance.
+| *Contributors / agents* | A single authoritative specification (this documentation) with no gaps, inconsistencies, or assumptions; every implemented feature links back to it.
+| *Upstream projects* (https://github.com/Hologram-Technologies/hologram[hologram], https://github.com/UOR-Foundation[UOR-Foundation]) | holospaces consumes their published interfaces and describes them by reference, never forking or restating their internals.
+|===

@@ -1,0 +1,12 @@
+Operator is environmental and physical.
+Holospaces is informatical.
+Substrate is informatical.
+Holospace is informatical.
+Provisioning is informatical.
+Booting is informatical.
+Holospaces exhibits Provisioning and Booting.
+Operator handles Provisioning.
+Operator handles Booting.
+Provisioning yields Holospace.
+Booting requires Holospace.
+Booting requires Substrate.

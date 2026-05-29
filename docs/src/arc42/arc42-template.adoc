@@ -1,0 +1,27 @@
+= holospaces — Architecture
+:toc: left
+:numbered:
+
+include::adoc/01_introduction_and_goals.adoc[]
+
+include::adoc/02_architecture_constraints.adoc[]
+
+include::adoc/03_context_and_scope.adoc[]
+
+include::adoc/04_solution_strategy.adoc[]
+
+include::adoc/05_building_block_view.adoc[]
+
+include::adoc/06_runtime_view.adoc[]
+
+include::adoc/07_deployment_view.adoc[]
+
+include::adoc/08_concepts.adoc[]
+
+include::adoc/09_architecture_decisions.adoc[]
+
+include::adoc/10_quality_requirements.adoc[]
+
+include::adoc/11_technical_risks.adoc[]
+
+include::adoc/12_glossary.adoc[]

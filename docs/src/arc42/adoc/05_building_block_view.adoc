@@ -1,0 +1,26 @@
+[[section-building-block-view]]
+== Building Block View
+
+=== Whitebox Overall System
+
+holospaces, opened, is a thin set of building blocks over the https://github.com/Hologram-Technologies/hologram[hologram] substrate. None of them re-implement substrate functionality; they compose it.
+
+image::c4-l2-holospaces-containers.svg[Level 2: Containers, align="center"]
+
+[options="header"]
+|===
+| Building block | Responsibility
+| *Realizations* | holospaces' canonical-form types — chiefly the *holospace* (the κ-addressed bootable unit). Each is IRI-tagged canonical bytes, κ-addressed and verified by re-derivation, using https://github.com/UOR-Foundation/uor-addr[UOR-ADDR].
+| *Boot Layer* | The environment-agnostic core: resolve a holospace κ, fetch and verify its parts, and spawn it through hologram's ContainerRuntime with its capabilities; drive the lifecycle.
+| *.holo Engine* | A ContainerEngine backend that runs `.holo` compute artifacts via the https://github.com/Hologram-Technologies/hologram[hologram] executor. Native, and compiled to Wasm for the browser peer.
+| *Identity* | Self-sovereign sign-in key and the multi-instance sync keying (an operator's instances discover and synchronise their holospaces over the substrate).
+| *Platform Manager* | The Hologram platform: the operator console that provisions and manages holospaces. Itself a holospace.
+|===
+
+=== Level 2
+
+The Boot Layer is the hub: it depends on Realizations (to resolve a holospace), on the .holo Engine (to run a holospace whose code is a `.holo`), and on the hologram substrate (storage / network / runtime). The Platform Manager drives the Boot Layer; Identity scopes what the operator's instances share and sync. The substrate's contracts — KappaStore, KappaSync, ContainerRuntime, and the `.holo` executor — are defined in https://github.com/Hologram-Technologies/hologram[hologram] and consumed here by reference.
+
+=== Level 3
+
+Level-3 (component) decomposition of individual building blocks is recorded as each block is implemented, with its components linking back to the relevant Architecture Decisions (Chapter 9) and Concepts (Chapter 8). Component diagrams are added to the C4 model (`docs/src/c4/workspace.dsl`) as `c4-l3-*` views and referenced here.

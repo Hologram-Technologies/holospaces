@@ -1,0 +1,11 @@
+Provisioning is informatical.
+Holo-File Provisioning is informatical.
+Devcontainer Provisioning is informatical.
+Holo-File is informatical.
+Devcontainer is informatical.
+Holospace is informatical.
+Provisioning consists of Holo-File Provisioning and Devcontainer Provisioning.
+Holo-File Provisioning requires Holo-File.
+Devcontainer Provisioning requires Devcontainer.
+Holo-File Provisioning yields Holospace.
+Devcontainer Provisioning yields Holospace.

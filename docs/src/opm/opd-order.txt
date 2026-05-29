@@ -1,0 +1,6 @@
+# holospaces conceptual model (OPM, ISO 19450) — OPD presentation order.
+# Lines starting with '#' and blank lines are ignored. Each remaining line is
+# a subdirectory under src/opm/, in the order it appears in the index.
+SD
+SD1-Provisioning
+SD2-Lifecycle

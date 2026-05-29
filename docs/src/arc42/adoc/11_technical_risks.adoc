@@ -1,0 +1,13 @@
+[[section-technical-risks]]
+== Risks and Technical Debts
+
+[options="header"]
+|===
+| # | Risk / debt | Mitigation
+| RT1 | *Linux execution surface (open design question).* A devcontainer holospace needs a Linux/POSIX execution surface on a Wasm-only, no-WASI substrate. The choice — a hologram-native CPU/system _emulator-as-container_ (runs arbitrary OCI images) vs. a _Wasm-native POSIX layer_ over the substrate's host ABI (Wasm-recompiled userlands only) — is not yet decided. | Resolve with a dedicated Architecture Decision and a spike before committing the devcontainer path. Tracked as the primary open decision.
+| RT2 | *Browser `.holo` engine.* Running the https://github.com/Hologram-Technologies/hologram[hologram] executor in the browser (compiled to Wasm via `wasm-pack`) is the keystone build and is unproven here. | Validate against the native executor as an external oracle (identical `.holo` ⇒ identical κ); see the V&V approach.
+| RT3 | *Documentation toolchain weight.* The doc pipeline requires JDK 21, Docker, Ruby, a large Structurizr download, and a built cmark-gfm; it cannot run in a base container without provisioning. | Pinned in the devcontainer and `docs/scripts/install-tools.sh`; exercised in CI (`.github/workflows/docs.yml`). The JDK is pinned to 21 to match the pipeline.
+| RT4 | *Cross-peer rendezvous.* Discovering an operator's other instances without a server depends on hologram's content-addressed networking. | Use hologram's mechanism (KappaSync) as-is; do not introduce a signaling server or any host/peer-id naming (Law L1).
+|===
+
+This chapter is maintained as risks are resolved (becoming decisions in Chapter 9) or retired.

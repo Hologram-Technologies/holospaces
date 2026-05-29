@@ -1,0 +1,46 @@
+[[section-concepts]]
+== Cross-cutting Concepts
+
+This chapter is the prose conceptual model; the formal model is given in Object-Process Methodology in the Conceptual Model chapter (OPM, ISO 19450). Concepts that belong to the https://github.com/Hologram-Technologies/hologram[hologram] substrate are described here only as holospaces _uses_ them, and linked for their authoritative definitions.
+
+=== Canonical forms and κ-labels
+
+Everything in holospaces is a _canonical form_: deterministic bytes identified by a *κ-label* (a content address, `<axis>:<hex>` = `H(canonical_form)`), supplied by https://github.com/UOR-Foundation/uor-addr[UOR-ADDR]. Identity is _what a thing is_, never _where it is_ (Law L1). Data, code, images, running state, and holospaces' own state are all κ.
+
+=== The substrate (the one medium)
+
+holospaces holds and moves all content through hologram's three content-addressed pillars — storage (KappaStore), network (KappaSync), and runtime (ContainerRuntime) — and adds none of its own (Law L4). Their contracts are authoritative in https://github.com/Hologram-Technologies/hologram[hologram].
+
+=== Two compute forms
+
+Executable content takes two κ-addressed shapes: a *Wasm code module* (general/system code, run by the substrate's ContainerEngine) and a *tensor `.holo`* (compute, run by the hologram executor). A holospace is built from one or the other; the Manager manages both uniformly.
+
+=== The holospace
+
+A *holospace* is a bootable, κ-addressed environment — the unit holospaces provisions, runs, and manages. Its identity is the κ of its definition, so the same definition always yields the same holospace (reproducibility, Q4). It is provisioned from a holo-file or a devcontainer; booting resolves its κ and spawns it through the runtime with its capabilities.
+
+=== The store is the memory
+
+The content-addressed store is the address space; RAM is a cache (Law L3). Resolving a κ is the "page fault" (local, else fetched and verified); garbage collection is "eviction"; identical content is stored once (dedup). This is what lets a holospace exceed available RAM.
+
+=== Identity and sync
+
+The operator signs in by unlocking a self-sovereign key — not a server account. That identity links the operator's instances so their holospaces and state synchronise over the substrate; because state is content (a snapshot is a κ), a holospace can be suspended on one instance and resumed on another.
+
+=== Verify by re-derivation
+
+Trust is in the math, not the source: every received byte is accepted only after re-deriving its κ (Law L5). This is what makes an untrusted gateway (e.g. GitHub Pages, or any peer) safe to fetch from.
+
+// arc42 template placeholder headings retained for structural conformance.
+// The concepts above are the actual cross-cutting concepts.
+=== _<Concept 1>_
+
+See the concept sections above.
+
+=== _<Concept 2>_
+
+See the concept sections above.
+
+=== _<Concept n>_
+
+See the concept sections above.

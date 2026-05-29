@@ -1,0 +1,12 @@
+Holospace is informatical.
+Booting is informatical.
+Suspending is informatical.
+Resuming is informatical.
+Snapshot is informatical.
+Substrate is informatical.
+Booting requires Holospace.
+Booting requires Substrate.
+Suspending requires Holospace.
+Suspending yields Snapshot.
+Resuming requires Snapshot.
+Resuming yields Holospace.
