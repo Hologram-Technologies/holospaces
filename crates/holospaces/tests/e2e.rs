@@ -7,11 +7,16 @@
 //! concepts (chapter 8). CI runs this tier via
 //! `cargo test --workspace --test e2e`.
 
+use std::sync::Arc;
+
+use hologram_net_http::live::{serve_addr, HttpKappaSync};
 use hologram_runtime::Runtime;
 use hologram_runtime_wasmtime::WasmtimeEngine;
 use hologram_store_mem::MemKappaStore;
 use holospaces::boot::{provision, Phase, Resolver, Session};
 use holospaces::identity::Operator;
+use holospaces::manager::Manager;
+use holospaces::peer::Peer;
 use holospaces::substrate::{Capabilities, KappaStore, Realization};
 use holospaces::{Holospace, Source};
 
@@ -156,4 +161,73 @@ fn operator_validates_a_wasm_code_module_before_provisioning() {
     let code = store.put("blake3", &module).unwrap();
     let holospace = provision(&store, Source::HoloFile { artifact: code }, caps()).unwrap();
     assert!(store.contains(holospace.manifest()));
+}
+
+/// Whole operator-console flow across two peers: the Platform Manager
+/// provisions and boots a holospace on instance A, then on instance B (same
+/// operator) synchronises the operator's roster + holospaces over a real
+/// loopback HTTP-CAS gateway (verify-on-receipt, Law L5) and boots the migrated
+/// holospace (R5/QS5, QS2). Realizes arc42 ch.5 (Platform Manager, Peer),
+/// ch.7 (deployment), and ch.8 (Identity and sync).
+#[test]
+fn operator_console_provisions_on_a_then_syncs_and_boots_on_b() {
+    pollster::block_on(async {
+        let operator = Operator::from_public_key(b"operator-self-sovereign-key");
+
+        // Instance A: provision + boot through the Manager over a real peer.
+        let runtime_a = Runtime::new(WasmtimeEngine::new(), MemKappaStore::new());
+        let code = runtime_a
+            .store()
+            .put("blake3", &wat::parse_str(CONTAINER_WAT).unwrap())
+            .unwrap();
+        let peer_a = Peer::new(runtime_a.store(), &runtime_a);
+        let mut manager_a = Manager::sign_in(peer_a, operator.clone());
+        let holospace = manager_a
+            .provision(Source::HoloFile { artifact: code }, caps())
+            .expect("provision");
+        assert_eq!(manager_a.view().holospaces, vec![holospace]);
+
+        let mut session = manager_a.open(&holospace).await.expect("open");
+        session.boot().await.expect("boot on A");
+        assert_eq!(session.phase(), Phase::Running);
+        session.suspend().await.expect("suspend on A");
+        session.terminate().await.expect("terminate on A");
+        drop(session);
+        let roster = manager_a.roster().kappa();
+
+        // Serve A's store as an untrusted content-addressed gateway.
+        let gateway: Arc<dyn KappaStore> = runtime_a.store_arc();
+        let server = serve_addr(gateway, "127.0.0.1:0", false).expect("serve HTTP-CAS");
+
+        // Instance B: sign in, sync from A's roster, boot the synced holospace.
+        let runtime_b = Runtime::new(WasmtimeEngine::new(), MemKappaStore::new());
+        let sync = HttpKappaSync::new(vec![server.addr().to_string()]);
+        let peer_b = Peer::new(runtime_b.store(), &runtime_b).with_sync(&sync);
+        let mut manager_b = Manager::sign_in(peer_b, operator);
+        assert!(manager_b.view().holospaces.is_empty());
+
+        let synced = manager_b.sync_from(&roster).await.expect("sync from A");
+        assert_eq!(synced, 1);
+        assert_eq!(manager_b.view().holospaces, vec![holospace]);
+
+        let mut session_b = manager_b.open(&holospace).await.expect("open on B");
+        session_b
+            .boot()
+            .await
+            .expect("boot on B (migrated content)");
+        assert_eq!(session_b.phase(), Phase::Running);
+        session_b.terminate().await.unwrap();
+    });
+}
+
+/// A peer with no network pillar resolves only locally; a holospace it never
+/// provisioned is absent (no forging — Laws L1/L5).
+#[test]
+fn offline_peer_resolves_locally_only() {
+    pollster::block_on(async {
+        let runtime = Runtime::new(WasmtimeEngine::new(), MemKappaStore::new());
+        let peer = Peer::new(runtime.store(), &runtime);
+        let absent = holospaces::address(b"a holospace this peer never provisioned");
+        assert!(peer.resolve(&absent).await.unwrap().is_none());
+    });
 }

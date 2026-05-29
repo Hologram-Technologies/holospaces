@@ -92,6 +92,21 @@ fn identical_holo_yields_identical_kappa_across_independent_builds() {
     assert_ne!(holospaces::address(&out_c), kappa_a);
 }
 
+/// holospaces' `.holo Engine` building block runs a `.holo` and content-
+/// addresses its output, agreeing with the direct executor (the engine is the
+/// real component, not just the test harness).
+#[test]
+fn holo_engine_runs_and_addresses_the_output() {
+    let archive = compile_constant_holo(64.0);
+    let direct = holospaces::address(&execute_to_output(&archive));
+    let via_engine = holospaces::engine::HoloEngine::run(&archive, &[]).expect("engine run");
+    assert_eq!(via_engine.len(), 1);
+    assert_eq!(
+        via_engine[0], direct,
+        "the .holo Engine addresses the output"
+    );
+}
+
 /// (2) Cross-surface agreement: the address-boundary surface
 /// (`execute_addressed`, the pipeline / browser-FFI path) yields the same
 /// output κ as the byte-boundary surface (`execute`).

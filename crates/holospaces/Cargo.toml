@@ -14,6 +14,10 @@ workspace = true
 # composes these contracts; it never re-implements them. Pinned by rev.
 hologram-substrate-core = { workspace = true }
 hologram-realizations = { workspace = true }
+# The .holo Engine building block: holospaces supplies the .holo execution
+# backend (arc42 ch.5 / ch.7), bound to hologram's executor.
+hologram-exec = { workspace = true }
+hologram-backend = { workspace = true }
 # The Ingestor parses devcontainer.json (the Dev Container spec) at the
 # provisioning boundary (Law L2). Conformance: CC-4.
 serde_json = "1"
@@ -30,11 +34,11 @@ hologram-store-native = { workspace = true }
 # through hologram's runtime (no mocks).
 hologram-runtime = { workspace = true }
 hologram-runtime-wasmtime = { workspace = true }
-# CC-2 — the native .holo executor (the differential oracle) and the compiler to build one.
-hologram-exec = { workspace = true }
+# CC-2 — the compiler to build a .holo for the differential oracle.
 hologram-compiler = { workspace = true }
-hologram-backend = { workspace = true }
 hologram-graph = { workspace = true }
+# Real multi-peer sync over a loopback HTTP-CAS gateway (Identity sync, R5/QS5).
+hologram-net-http = { workspace = true, features = ["live"] }
 hologram-archive = { workspace = true }
 prism = { workspace = true }
 smallvec = "1"
