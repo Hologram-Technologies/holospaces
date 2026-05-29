@@ -1,24 +1,29 @@
-name: docs
+name: vv
 
-# Documentation V&V gate: provisions the pinned toolchain and runs the full
-# author → validate (V1–V8) → render → idempotence pipeline in docs/.
+# Verification & Validation gate. Provisions the pinned toolchain and runs the
+# authoritative V&V entry point (vv/run.sh): CS-* specification conformance
+# (the documentation validated against arc42 / OPM ISO 19450 / ISO 15288 /
+# CommonMark-GFM / Structurizr, via V1–V8), render, and idempotence.
 
 on:
   push:
     paths:
       - 'docs/**'
-      - '.github/workflows/docs.yml'
+      - 'vv/**'
+      - 'AGENTS.md'
+      - 'Justfile'
+      - '.github/workflows/vv.yml'
   pull_request:
     paths:
       - 'docs/**'
-      - '.github/workflows/docs.yml'
+      - 'vv/**'
+      - 'AGENTS.md'
+      - 'Justfile'
+      - '.github/workflows/vv.yml'
 
 jobs:
-  build:
+  vv:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: docs
     steps:
       - uses: actions/checkout@v4
         with:
@@ -43,7 +48,7 @@ jobs:
           node-version: lts/*
 
       - name: Provision the pinned doc toolchain
-        run: scripts/install-tools.sh
+        run: docs/scripts/install-tools.sh
 
-      - name: Build + validate docs (V1–V8 · render · idempotence)
-        run: scripts/build.sh
+      - name: V&V (vv/run.sh)
+        run: vv/run.sh
