@@ -16,14 +16,14 @@ These drive the documentation build (validators V1–V8) today.
 | github-markup | GitHub rendering | RubyGem (`docs/Gemfile.lock`) | locked version | runs in V5 |
 | Structurizr | C4 (Structurizr DSL) | `download.structurizr.com` | version in `versions.txt`; sha256 in `checksums.txt` | checksum-verified on download by `install-tools.sh`; runs in V3 |
 
-## To import with the component they validate (component conformance, `CC-*`)
+## Live (component conformance, `CC-*`)
 
-Each is the external authority for a component not yet implemented. It is imported (with its pin + checksum recorded here, content-verified) **at the same time** as the component, and the witness is added to `vv/run.sh`.
+Every component is implemented as a thin composition of the [hologram](https://github.com/Hologram-Technologies/hologram) substrate, consumed by reference (ADR-006) at the pinned rev `18f553d8578997ce32e7b653786a0bcf9b09a2c0` (git dependency, see the root `Cargo.toml`). Each `CC-*` row is witnessed against an external authority by its suite in `vv/suites/`, run by `vv/run.sh`.
 
-| Will validate | Authority to import | Source |
-|---|---|---|
-| `CC-1` κ-labels | BLAKE3 + FIPS 180-4 (SHA-2) + FIPS 202 (SHA-3) + Keccak test vectors | the BLAKE3 reference repo; NIST CAVS |
-| `CC-2` browser `.holo` engine | native `hologram` executor outputs (differential oracle) | `github.com/Hologram-Technologies/hologram` |
-| `CC-3` peer storage | `hologram` substrate conformance battery (TCK) | `github.com/Hologram-Technologies/hologram` |
-| `CC-4` devcontainer holospace | Dev Container spec + OCI image spec | `containers.dev`; OCI |
-| `CC-5` Wasm modules | WebAssembly spec test suite | `github.com/WebAssembly/spec` |
+| Row | Authority | Source / pin | Verified by |
+|---|---|---|---|
+| `CC-1` κ-labels | BLAKE3 + FIPS 180-4 (SHA-2) + FIPS 202 (SHA-3) + Keccak published test vectors | `vv/artifacts/cc1/hash-kats.json`, sha256 `34db64e7b06817634e7aeafe3b75d5b2f912fadb95cc7921bd3b59bc7d1dce90` (standards cited per-axis inside) | `cc1-kappa-addressing.sh` → `tests/cc1_kappa_kat.rs`: holospaces' κ-label digests (minted through the substrate) equal the published vectors directly (Law L5); the reference hash crates independently reproduce them |
+| `CC-2` `.holo` engine | the native hologram `.holo` executor (`hologram-exec`) as oracle | `Hologram-Technologies/hologram` (pinned rev) | `cc2-holo-engine.sh` → `tests/cc2_holo_engine.rs`: identical `.holo` yields identical κ across independent builds and across the byte- and address-boundary surfaces (determinism + content-addressing). The live browser-vs-native cross-host run is the browser peer's Playwright harness (hologram `store-opfs`), sharing this `address_bytes` σ-axis |
+| `CC-3` peer storage | the hologram substrate conformance battery (TCK) | `hologram-substrate-tck` (pinned rev) | `cc3-substrate-tck.sh` → `tests/cc3_substrate_tck.rs`: `store_battery` run against the stores holospaces resolves through (`hologram-store-mem`, `hologram-store-native`) |
+| `CC-4` devcontainer holospace | the Dev Container specification + the OCI image specification | `vv/artifacts/cc4/devcontainer-cases.json`, sha256 `244975212fccf4abc02823005246fdd5a7e78ef192456f62274c28b9fcb65f95` (`containers.dev`; OCI) | `cc4-devcontainer.sh` → `tests/cc4_devcontainer.rs`: the ingestor's accept/reject matches the spec on every case (incl. this repo's real `.devcontainer/devcontainer.json`); same source ⇒ same κ (Q4) |
+| `CC-5` Wasm modules | the WebAssembly specification (and its `test/core` suite) | `vv/artifacts/cc5/wasm-cases.json`, sha256 `76c115137aad874e052fc9d1a197586becb4809210e4c76d97df0c45577dc384` (`webassembly.org`; `WebAssembly/spec`) | `cc5-wasm.sh` → `tests/cc5_wasm.rs`: holospaces' validator accepts exactly the spec-valid modules and rejects the invalid ones; the substrate's closed host surface (spec §4.4) refuses non-`hologram` imports |

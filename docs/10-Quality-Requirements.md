@@ -49,25 +49,27 @@ The framework has two tiers:
 
 ## Conformance catalog
 
-| ID   | Invariant                                         | External authority                                                                                                                 | Enforcement                                  | Witness                                          |
-|------|---------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------|--------------------------------------------------|
-| CS-1 | Architecture structure conforms to arc42          | [arc42](https://arc42.org) template (pinned)                                                                                       | V1, V2                                       | every doc build (live)                           |
-| CS-2 | The C4 model is well-formed                       | Structurizr DSL                                                                                                                    | V3                                           | every doc build (live)                           |
-| CS-3 | Rendered docs are valid GitHub-flavoured Markdown | CommonMark / GFM; GitHub-markup                                                                                                    | V4, V5                                       | every doc build (live)                           |
-| CS-4 | The conceptual model is valid OPM                 | OPM (ISO 19450) OPL grammar                                                                                                        | V6                                           | every doc build (live)                           |
-| CS-5 | Each OPD agrees with its OPL                      | OPM (ISO 19450) bimodality                                                                                                         | V7                                           | every doc build (live)                           |
-| CS-6 | The lifecycle covers the standard processes       | ISO/IEC/IEEE 15288                                                                                                                 | V8                                           | every doc build (live)                           |
-| CC-1 | κ-labels are correct content addresses            | the σ-axis hash standards (BLAKE3; FIPS 180-4 SHA-2; FIPS 202 SHA-3; Keccak) and their published test vectors                      | re-derivation against imported KATs (Law L5) | with the κ-addressing / `Realizations` component |
-| CC-2 | The browser `.holo` engine equals the native one  | the native [hologram](https://github.com/Hologram-Technologies/hologram) executor as oracle (identical `.holo` yields identical κ) | differential check                           | with the `.holo` Engine                          |
-| CC-3 | A peer’s storage obeys the substrate contract     | the [hologram](https://github.com/Hologram-Technologies/hologram) substrate conformance battery (TCK)                              | run the imported battery                     | with a peer store                                |
-| CC-4 | A devcontainer holospace matches its source       | the [Dev Container](https://containers.dev) and OCI image specifications                                                           | reproducible-κ check (Q4)                    | with the devcontainer ingestor                   |
-| CC-5 | Wasm code modules are specification-valid         | the [WebAssembly](https://webassembly.org) specification                                                                           | module validation                            | with the Wasm execution path                     |
+| ID   | Invariant                                         | External authority                                                                                                                 | Enforcement                                  | Witness                                 |
+|------|---------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------|-----------------------------------------|
+| CS-1 | Architecture structure conforms to arc42          | [arc42](https://arc42.org) template (pinned)                                                                                       | V1, V2                                       | every doc build (live)                  |
+| CS-2 | The C4 model is well-formed                       | Structurizr DSL                                                                                                                    | V3                                           | every doc build (live)                  |
+| CS-3 | Rendered docs are valid GitHub-flavoured Markdown | CommonMark / GFM; GitHub-markup                                                                                                    | V4, V5                                       | every doc build (live)                  |
+| CS-4 | The conceptual model is valid OPM                 | OPM (ISO 19450) OPL grammar                                                                                                        | V6                                           | every doc build (live)                  |
+| CS-5 | Each OPD agrees with its OPL                      | OPM (ISO 19450) bimodality                                                                                                         | V7                                           | every doc build (live)                  |
+| CS-6 | The lifecycle covers the standard processes       | ISO/IEC/IEEE 15288                                                                                                                 | V8                                           | every doc build (live)                  |
+| CC-1 | κ-labels are correct content addresses            | the σ-axis hash standards (BLAKE3; FIPS 180-4 SHA-2; FIPS 202 SHA-3; Keccak) and their published test vectors                      | re-derivation against imported KATs (Law L5) | live (`vv/suites/cc1-kappa-addressing`) |
+| CC-2 | The browser `.holo` engine equals the native one  | the native [hologram](https://github.com/Hologram-Technologies/hologram) executor as oracle (identical `.holo` yields identical κ) | differential check                           | live (`vv/suites/cc2-holo-engine`)      |
+| CC-3 | A peer’s storage obeys the substrate contract     | the [hologram](https://github.com/Hologram-Technologies/hologram) substrate conformance battery (TCK)                              | run the imported battery                     | live (`vv/suites/cc3-substrate-tck`)    |
+| CC-4 | A devcontainer holospace matches its source       | the [Dev Container](https://containers.dev) and OCI image specifications                                                           | reproducible-κ check (Q4)                    | live (`vv/suites/cc4-devcontainer`)     |
+| CC-5 | Wasm code modules are specification-valid         | the [WebAssembly](https://webassembly.org) specification                                                                           | module validation                            | live (`vv/suites/cc5-wasm`)             |
 
-The `CS` rows are witnessed green by every documentation build (the
-specification is the part of holospaces implemented today). The `CC`
-rows are the authoritative requirement each component must meet against
-its external authority; they are witnessed as the component is
-implemented. Adding a component without satisfying its `CC` row leaves
+The `CS` rows are witnessed green by every documentation build. The `CC`
+rows are each witnessed by a suite in `vv/suites/` that validates the
+component against its external authority — never against itself — by
+composing the
+[hologram](https://github.com/Hologram-Technologies/hologram) substrate
+(consumed by reference, ADR-006), at the rev pinned in the workspace
+`Cargo.toml`. Adding a component without satisfying its `CC` row leaves
 holospaces incomplete by definition.
 
 ## Quality gates and test tiers
@@ -76,12 +78,17 @@ The quality commitments above are enforced from the first commit by
 continuous integration (`.github/workflows/ci.yml`), which runs on every
 change:
 
-- **V&V** — `vv/run.sh` (CS-1..CS-6 specification conformance, V1–V8).
+- **V&V** — `vv/run.sh`: CS-1..CS-6 specification conformance (V1–V8)
+  and the CC-1..CC-5 component suites (`vv/suites/`), each against its
+  external authority.
 
 - **Format** — `cargo fmt --check`.
 
 - **Lints** — `cargo clippy` with warnings denied; the workspace forbids
   `unsafe_code` and warns on `missing_docs`.
+
+- **Docs** — `cargo doc` with warnings denied (no broken links; every
+  public item documented).
 
 - **Unit** — `cargo test --lib`: a building block in isolation.
 
@@ -90,6 +97,6 @@ change:
 
 - **End-to-end** — `cargo test --test e2e`: whole operator flows.
 
-These tiers produce a component’s `CC` witness against its external
-authority. The gates exist and run from the beginning; only the test
-tiers are empty until components land — the gates are not.
+The `CC` suites and the test tiers produce each component’s `CC` witness
+against its external authority. The gates exist and run from the first
+commit; the test tiers and `CC` suites are populated as components land.
