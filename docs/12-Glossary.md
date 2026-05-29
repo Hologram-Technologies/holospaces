@@ -1,0 +1,18 @@
+# Glossary
+
+| Term                        | Definition                                                                                                                                                                                       |
+|-----------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **κ-label (kappa-label)**   | A content address, `<axis>:<hex>` = `H(canonical_form)`, supplied by [UOR-ADDR](https://github.com/UOR-Foundation/uor-addr). The identity of every thing in holospaces (*what*, not *where*).    |
+| **Canonical form**          | Deterministic bytes addressed by a κ-label; the only form holospaces operates on.                                                                                                                |
+| **holospace**               | A bootable, κ-addressed environment — the unit holospaces provisions, runs, and manages.                                                                                                         |
+| **holo-file**               | A `.holo` compute artifact; one way to provision a holospace (run via the hologram executor).                                                                                                    |
+| **devcontainer holospace**  | A holospace provisioned from a git repo + `devcontainer.json` (a Codespaces-like environment).                                                                                                   |
+| **peer**                    | An environment (browser / native / bare-metal) that becomes the substrate by realizing it locally.                                                                                               |
+| **Operator**                | The human who signs in and provisions/manages holospaces through the Manager.                                                                                                                    |
+| **Hologram (the platform)** | holospaces' first-party holospace; its code is the Platform Manager.                                                                                                                             |
+| **Platform Manager**        | The operator console that manages holospaces; served from GitHub Pages.                                                                                                                          |
+| **Sign-in / identity**      | Unlocking a self-sovereign key (not a server account) that links an operator’s instances for sync.                                                                                               |
+| **The substrate**           | The [hologram](https://github.com/Hologram-Technologies/hologram) storage (KappaStore) · network (KappaSync) · runtime (ContainerRuntime), plus the `.holo` executor. Authoritative in hologram. |
+| **Two compute forms**       | A Wasm code module (general/system code) or a tensor `.holo` (compute); both κ-addressed.                                                                                                        |
+| **Verify by re-derivation** | Accepting a received byte only after re-computing its κ.                                                                                                                                         |
+| **The store is the memory** | The content-addressed store is the address space; RAM is a cache.                                                                                                                                |

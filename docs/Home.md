@@ -1,0 +1,3 @@
+UOR-native boot layer over the [hologram](https://github.com/Hologram-Technologies/hologram) substrate. holospaces provisions and runs *holospaces* — bootable, content-addressed environments — and ships *Hologram*, the first-party holospace whose console (the Platform Manager) manages the rest.
+
+This documentation is the **authoritative specification** for holospaces, authored under arc42 + C4 (architecture), OPM ISO 19450 (conceptual model), and ISO/IEC/IEEE 15288 (lifecycle). Use the sidebar. Where it refers to hologram or other UOR-Foundation projects, it links to them rather than restating their internals.

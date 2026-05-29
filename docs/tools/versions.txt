@@ -1,7 +1,7 @@
-java	openjdk 21.0.10 2026-01-20 LTS
-ruby	ruby 3.4.7 (2025-10-08 revision 7a5688e2a2) +PRISM [x86_64-linux]
+java	openjdk 21.0.11 2026-04-21
+ruby	ruby 3.4.9 (2026-03-11 revision 76cca827ab) +PRISM [x86_64-linux]
 bundler	Bundler version 2.6.9
-docker	Docker version 29.3.0-1, build 5927d80c76b3ce5cf782be818922966e8a0d87a3
+docker	Docker version 29.4.3-1, build 055a478ea9010a19d0d4674c0d0e87ade37a4223
 docker-compose	2.40.3
 structurizr.war	2026.04.19
 structurizr-reported	2026.04.19

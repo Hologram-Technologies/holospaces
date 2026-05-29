@@ -5,9 +5,9 @@
     "ghcr.io/devcontainers/features/rust:1": {},
     "ghcr.io/guiyomh/features/just:0": {},
     "ghcr.io/lumenpink/devcontainer-features/wasm-pack:0": {},
-    // Documentation pipeline (docs/ — arc42+C4 / OPM ISO 19450 / ISO 15288).
-    // Prerequisites for docs/scripts/install-tools.sh + build.sh:
-    "ghcr.io/devcontainers/features/java:1": { "version": "21" },
+    // Documentation pipeline runtimes (docs/ — arc42+C4 / OPM / ISO 15288).
+    // JDK 21 is provided via apt in postCreate + pinned on PATH below
+    // (the pipeline pins JDK 21; the base image's default JDK is newer).
     "ghcr.io/devcontainers/features/ruby:1": { "version": "3.3" },
     "ghcr.io/devcontainers/features/node:1": { "version": "lts" },
     "ghcr.io/devcontainers/features/docker-in-docker:2": {}
@@ -40,11 +40,15 @@
     }
   },
   "remoteEnv": {
-    "PATH": "/home/codespace/.elan/bin:/home/codespace/.cargo/bin:${containerEnv:PATH}"
+    // The doc pipeline (docs/scripts/install-tools.sh) pins JDK 21. openjdk-21
+    // is installed in postCreate; pin JAVA_HOME and put it first on PATH so it
+    // takes precedence over the base image's default (newer) JDK.
+    "JAVA_HOME": "/usr/lib/jvm/java-1.21.0-openjdk-amd64",
+    "PATH": "/usr/lib/jvm/java-1.21.0-openjdk-amd64/bin:/home/codespace/.elan/bin:/home/codespace/.cargo/bin:${containerEnv:PATH}"
   },
-  // apt prereqs for docs/scripts/install-tools.sh (builds cmark-gfm from source;
-  // graphviz backs tools/opl-to-svg.rb) + the Lean toolchain. The heavier doc-build
-  // binaries (structurizr.war, pandoc, cmark-gfm, Playwright deps, submodules) are
-  // provisioned on demand by `docs/scripts/install-tools.sh`, not at container create.
-  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake build-essential pkg-config graphviz && curl https://elan.lean-lang.org/elan-init.sh -sSf | sh -s -- -y --default-toolchain none"
+  // Doc-pipeline prereqs: JDK 21 (pinned above), cmake/build-essential/pkg-config
+  // (cmark-gfm is built from source), graphviz (OPL->SVG); plus the Lean toolchain.
+  // The heavy doc-build binaries (structurizr.war, pandoc, cmark-gfm, Playwright
+  // deps, submodules) are provisioned on demand by docs/scripts/install-tools.sh.
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y --no-install-recommends openjdk-21-jdk cmake build-essential pkg-config graphviz && curl https://elan.lean-lang.org/elan-init.sh -sSf | sh -s -- -y --default-toolchain none"
 }

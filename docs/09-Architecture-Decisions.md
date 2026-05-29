@@ -1,0 +1,69 @@
+# Architecture Decisions
+
+Each decision records Status, Context, Decision, and Consequences.
+Implemented features link back to the decision they realize.
+
+## ADR-001: No server — content-addressed peers
+
+**Status:** Accepted. **Context:** hologram identifies everything by
+content (a κ-label), and forbids host/path identity. A client/server or
+control-plane design would reintroduce location as identity.
+**Decision:** holospaces has no server and no control plane. Every
+participant is a *peer* that becomes the substrate; identity is the
+κ-label (Law L1). **Consequences:** No backend to operate or trust;
+"remote management" is meaningless — there are only κ-labels and the
+peers that hold them. Bootstrap (e.g. GitHub Pages) is content delivery,
+not a host.
+
+## ADR-002: Canonical forms only; the store is the memory
+
+**Status:** Accepted. **Context:** Holding deserialized objects in RAM
+bounds what can run and duplicates content. **Decision:** Operate only
+on canonical forms; hold κ-labels, not objects; canonicalize at the
+ingest boundary. The content-addressed store is the address space; RAM
+is a cache (Laws L2, L3). **Consequences:** A holospace far larger than
+RAM remains bootable (demand-paged by κ-resolve); identical content is
+stored once; no serialize/deserialize seam.
+
+## ADR-003: Run `.holo` behind hologram’s runtime; everything through the substrate
+
+**Status:** Accepted. **Context:** Compute is the
+[hologram](https://github.com/Hologram-Technologies/hologram) `.holo`
+executor; deployment is hologram’s ContainerRuntime. Bypassing the
+substrate would create a parallel medium. **Decision:** holospaces runs
+`.holo` via a ContainerEngine backend behind hologram’s runtime, with
+all state in the store as κ (Law L4). **Consequences:** holospaces stays
+a thin layer; storage/network/runtime/compute are reused, never
+re-implemented.
+
+## ADR-004: The holospace is the unit; two provisioning paths
+
+**Status:** Accepted. **Context:** Workloads range from a single model
+to a full Linux environment. **Decision:** The unit of management is the
+*holospace* — a bootable, κ-addressed environment — provisioned from a
+**holo-file** or a **devcontainer**. All holospaces share one lifecycle.
+**Consequences:** Uniform management across kinds; platform-type
+specifics (e.g. ONNX/GGUF → `.holo`) stay upstream
+([hologram-ai](https://github.com/Hologram-Technologies/hologram-ai)),
+not in holospaces.
+
+## ADR-005: The documentation is authoritative
+
+**Status:** Accepted. **Context:** A second source of truth (e.g. a
+`specs/` directory) drifts from the docs. **Decision:** This
+documentation — arc42 + C4, OPM ISO 19450, ISO/IEC/IEEE 15288 — kept
+in-repo (no separate wiki), is the single authoritative source. No
+`specs/` directory; no narrative status doc. Every implemented feature
+links back here. **Consequences:** One spec, validated by the V1–V8
+pipeline; status lives in V&V/CI and git, not in prose.
+
+## ADR-006: Consume the stack by reference
+
+**Status:** Accepted. **Context:** holospaces depends on a private
+hologram and the public UOR-Foundation crates. **Decision:** Consume
+hologram member crates as git dependencies; `uor-addr` /
+`uor-foundation` from crates.io (Prism transitively). Describe their
+APIs by hyperlink, never by restating internals. Use GitHub Pages only
+as an untrusted, content-addressed gateway. **Consequences:** Upstream
+remains authoritative for its own interfaces; holospaces docs never
+assume external API details.
