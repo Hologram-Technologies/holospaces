@@ -1,5 +1,5 @@
 # Conceptual Model
 
-The holospaces conceptual model in Object-Process Methodology (OPM, ISO 19450). The top-level System Diagram (SD) presents holospaces at its highest abstraction; each in-zoom diagram (SD1, SD2, …) refines one part. Each diagram is bimodal — an Object-Process Diagram (OPD) paired with equivalent Object-Process Language (OPL) sentences.
+The holospaces conceptual model in Object-Process Methodology (OPM, ISO 19450). The top-level System Diagram (SD) presents holospaces at its highest abstraction; each in-zoom diagram refines one part — **SD1** provisioning, **SD2** the lifecycle (boot · suspend · resume · migrate · terminate), **SD3** identity and sync. Each diagram is bimodal: an Object-Process Diagram (OPD) paired with equivalent Object-Process Language (OPL) sentences.
 
-Concepts owned by the [hologram](https://github.com/Hologram-Technologies/hologram) substrate appear here only as holospaces relates to them; their authoritative definitions live in hologram.
+Scope: the substrate is modeled as a single external object (`Substrate`); its internal pillars are defined by [hologram](https://github.com/Hologram-Technologies/hologram), not here. Peer deployment topology (browser / native / bare-metal) is described in the Deployment View (arc42 chapter 7), not modeled as an OPD.

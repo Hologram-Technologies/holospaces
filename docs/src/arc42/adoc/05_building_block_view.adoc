@@ -27,7 +27,7 @@ The Level-3 (component) responsibilities of the building blocks follow from the 
 
 *Boot Layer* — an _Ingestor_ (canonicalizes a provisioning source, a git repo + devcontainer or a holo-file, at the boundary into κ-addressed content, Law L2); a _Resolver_ (resolves a holospace κ, fetching and verifying its parts, Law L5); a _Spawner_ (instantiates the holospace through the substrate runtime with its capabilities); and a _Lifecycle_ component (suspend → κ snapshot, resume, migrate, terminate).
 
-*.holo Engine* — a _ContainerEngine adapter_ (the seam the substrate runtime drives) bound to the https://github.com/Hologram-Technologies/hologram[hologram] executor; in the browser peer this binding is the executor compiled to Wasm.
+*.holo Engine* — a _ContainerEngine adapter_: the backend seam that hologram's runtime (`ContainerRuntime`) drives, here bound to hologram's `.holo` executor (see https://github.com/Hologram-Technologies/hologram[hologram] for the engine/runtime contract). In the browser peer this binding is the executor compiled to Wasm.
 
 *Identity* — a _Key store_ (the self-sovereign sign-in key) and a _Sync binding_ (scopes which content an operator's instances announce and resolve over the substrate).
 

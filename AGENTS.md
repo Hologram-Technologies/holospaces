@@ -8,16 +8,18 @@ holospaces is a UOR-native **boot layer** over the hologram substrate. It provis
 
 ## The stack it builds on
 
-- **UOR Framework** (`UOR-Foundation/UOR-Framework`) — the formal model: content-addressing grounded in the ring Z/(2ⁿ)Z.
-- **uor-foundation** / **Prism** (`uor-prism`) — the substrate crate (Layer 1) and standard library (Layer 2).
-- **UOR-ADDR** (`uor-addr`) — content addressing: a **κ-label** is `<axis>:<hex>` = `H(canonical_form)`.
-- **hologram** (`Hologram-Technologies/hologram`) — the substrate: a `.holo` tensor runtime (`crates/`) and the deployment substrate (`substrate/`: `KappaStore` · `KappaSync` · `ContainerRuntime`).
+holospaces consumes these by reference; their APIs and internals are authoritative in their own repositories (linked), never restated here.
+
+- [UOR Framework](https://github.com/UOR-Foundation/UOR-Framework) — the formal UOR model.
+- [Prism](https://github.com/UOR-Foundation/prism) / `uor-foundation` — the UOR substrate + standard library.
+- [UOR-ADDR](https://github.com/UOR-Foundation/uor-addr) — content addressing: a **κ-label** is `<axis>:<hex>` = `H(canonical_form)`.
+- [hologram](https://github.com/Hologram-Technologies/hologram) — the substrate holospaces runs on: content-addressed storage, networking, runtime, and a `.holo` executor.
 
 ## Concepts every contributor must know
 
 - **κ-label / canonical form** — identity is content (*what*, not *where*).
-- **The substrate's three pillars** — storage (`KappaStore`), network (`KappaSync`), runtime (`ContainerRuntime`).
-- **Two compute forms** — Wasm code modules (general/system code, via the `ContainerEngine` under the closed `hologram.*` ABI) and tensor `.holo` (compute, via `hologram-exec`).
+- **The substrate** — hologram's content-addressed storage, network, and runtime, plus its `.holo` executor; see [hologram](https://github.com/Hologram-Technologies/hologram).
+- **Two compute forms** — a Wasm code module (general/system code) or a tensor `.holo` (compute); both run by hologram, both κ-addressed.
 - **holospace** — the bootable, κ-addressed unit; provisioned from a holo-file or a devcontainer; managed by the Manager.
 - **peer** — an environment (browser / native / bare-metal) that *becomes* the substrate by running a holospace.
 - **operator / sign-in** — a self-sovereign identity that syncs an operator's holospaces across instances (not a server account).

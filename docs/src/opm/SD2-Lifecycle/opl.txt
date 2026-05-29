@@ -2,6 +2,8 @@ Holospace is informatical.
 Booting is informatical.
 Suspending is informatical.
 Resuming is informatical.
+Migrating is informatical.
+Terminating is informatical.
 Snapshot is informatical.
 Substrate is informatical.
 Booting requires Holospace.
@@ -10,3 +12,6 @@ Suspending requires Holospace.
 Suspending yields Snapshot.
 Resuming requires Snapshot.
 Resuming yields Holospace.
+Migrating requires Snapshot.
+Migrating yields Holospace.
+Terminating requires Holospace.

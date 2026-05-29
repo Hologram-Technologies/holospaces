@@ -6,11 +6,11 @@ A holospaces *peer* is any environment that **becomes** the substrate by
 realizing it locally — it does not connect to a server (Law L1). The
 same holospace κ boots on any peer.
 
-| Peer           | Realization (storage · network · execution)                                                            | Notes                                                                                                         |
-|----------------|--------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------|
-| **Browser**    | hologram’s OPFS storage · HTTP content-addressed gateway · the executor compiled to Wasm (`wasm-pack`) | Cold-started from GitHub Pages (untrusted gateway, verified on receipt). Hosts the Hologram Platform Manager. |
-| **Native**     | hologram’s native storage · content-addressed networking · the native executor                         | A full peer; can both serve and route content.                                                                |
-| **Bare-metal** | hologram’s block-device storage · bare networking · the no-std executor                                | Boots from firmware; the leanest peer.                                                                        |
+| Peer           | Realization (storage · network · execution)                                                                                                                   | Notes                                                                                                         |
+|----------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------|
+| **Browser**    | composes hologram’s browser storage + content-addressed networking backends; holospaces supplies the `.holo` execution backend compiled to Wasm (`wasm-pack`) | Cold-started from GitHub Pages (untrusted gateway, verified on receipt). Hosts the Hologram Platform Manager. |
+| **Native**     | composes hologram’s native storage + networking backends; the `.holo` execution backend runs natively                                                         | A full peer; can both serve and route content.                                                                |
+| **Bare-metal** | composes hologram’s bare-metal storage + networking backends; the `.holo` execution backend runs without an OS                                                | Boots from firmware; the leanest peer.                                                                        |
 
 The storage, network, and runtime backends are defined and implemented
 in [hologram](https://github.com/Hologram-Technologies/hologram) (the

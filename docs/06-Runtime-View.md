@@ -26,7 +26,8 @@ structural conformance.)
 
 1.  The operator supplies a `.holo` artifact (e.g. a model compiled by
     [hologram-ai](https://github.com/Hologram-Technologies/hologram-ai))
-    by its κ.
+    by its κ — reproducible by definition, since the κ *is* the
+    artifact’s content address (Q4).
 
 2.  The Boot Layer resolves the κ (locally, else fetched and verified,
     Law L5) and runs it via the **.holo Engine** over the

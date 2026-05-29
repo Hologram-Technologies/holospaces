@@ -1,0 +1,11 @@
+Operator is environmental and physical.
+Identity is informatical.
+Sign-In is informatical.
+Sync is informatical.
+Holospace is informatical.
+Substrate is informatical.
+Operator handles Sign-In.
+Sign-In requires Identity.
+Sync requires Identity.
+Sync requires Substrate.
+Sync affects Holospace.

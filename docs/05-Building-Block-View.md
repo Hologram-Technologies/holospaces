@@ -42,10 +42,12 @@ verifying its parts, Law L5); a *Spawner* (instantiates the holospace
 through the substrate runtime with its capabilities); and a *Lifecycle*
 component (suspend → κ snapshot, resume, migrate, terminate).
 
-**.holo Engine** — a *ContainerEngine adapter* (the seam the substrate
-runtime drives) bound to the
-[hologram](https://github.com/Hologram-Technologies/hologram) executor;
-in the browser peer this binding is the executor compiled to Wasm.
+**.holo Engine** — a *ContainerEngine adapter*: the backend seam that
+hologram’s runtime (`ContainerRuntime`) drives, here bound to hologram’s
+`.holo` executor (see
+[hologram](https://github.com/Hologram-Technologies/hologram) for the
+engine/runtime contract). In the browser peer this binding is the
+executor compiled to Wasm.
 
 **Identity** — a *Key store* (the self-sovereign sign-in key) and a
 *Sync binding* (scopes which content an operator’s instances announce

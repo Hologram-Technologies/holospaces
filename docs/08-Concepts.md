@@ -27,9 +27,14 @@ Their contracts are authoritative in
 ## Two compute forms
 
 Executable content takes two κ-addressed shapes: a **Wasm code module**
-(general/system code, run by the substrate’s ContainerEngine) and a
-**tensor `.holo`** (compute, run by the hologram executor). A holospace
-is built from one or the other; the Manager manages both uniformly.
+(general/system code, run by hologram’s runtime via its
+`ContainerEngine` seam) and a **tensor `.holo`** (compute, run by
+hologram’s executor) — both contracts defined by
+[hologram](https://github.com/Hologram-Technologies/hologram). A
+holospace is built from one or the other; the Manager manages both
+uniformly. For a devcontainer holospace, exactly how the Linux/POSIX
+execution surface maps onto these forms is an open decision (see Chapter
+11, RT1).
 
 ## The holospace
 
@@ -39,6 +44,17 @@ definition, so the same definition always yields the same holospace
 (reproducibility, Q4). It is provisioned from a holo-file or a
 devcontainer; booting resolves its κ and spawns it through the runtime
 with its capabilities.
+
+## Capabilities
+
+A holospace is spawned with a **capability set** that bounds what it may
+touch — its storage roots, the channels it may use, and its resource
+budgets. Capabilities are content: a capability set is itself
+κ-addressed, so the authority a holospace runs under is part of its
+reproducible definition and is verifiable. The capability model (how
+authority is represented, delegated, and enforced) is hologram’s;
+holospaces composes it (see
+[hologram](https://github.com/Hologram-Technologies/hologram)).
 
 ## The store is the memory
 
