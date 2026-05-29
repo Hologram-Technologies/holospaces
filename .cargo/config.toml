@@ -1,0 +1,6 @@
+# Fetch git dependencies via the git CLI (credential helper / gh keyring) rather
+# than libgit2. Required once holospaces consumes hologram's member crates as
+# private git dependencies; harmless before then. See AGENTS.md ("Consuming the
+# stack") and the import-pattern notes.
+[net]
+git-fetch-with-cli = true

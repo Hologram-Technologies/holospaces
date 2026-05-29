@@ -69,3 +69,27 @@ rows are the authoritative requirement each component must meet against
 its external authority; they are witnessed as the component is
 implemented. Adding a component without satisfying its `CC` row leaves
 holospaces incomplete by definition.
+
+## Quality gates and test tiers
+
+The quality commitments above are enforced from the first commit by
+continuous integration (`.github/workflows/ci.yml`), which runs on every
+change:
+
+- **V&V** — `vv/run.sh` (CS-1..CS-6 specification conformance, V1–V8).
+
+- **Format** — `cargo fmt --check`.
+
+- **Lints** — `cargo clippy` with warnings denied; the workspace forbids
+  `unsafe_code` and warns on `missing_docs`.
+
+- **Unit** — `cargo test --lib`: a building block in isolation.
+
+- **Integration** — `cargo test --test integration`: building blocks
+  composed.
+
+- **End-to-end** — `cargo test --test e2e`: whole operator flows.
+
+These tiers produce a component’s `CC` witness against its external
+authority. The gates exist and run from the beginning; only the test
+tiers are empty until components land — the gates are not.

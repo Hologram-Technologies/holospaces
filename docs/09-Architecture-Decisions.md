@@ -67,3 +67,17 @@ APIs by hyperlink, never by restating internals. Use GitHub Pages only
 as an untrusted, content-addressed gateway. **Consequences:** Upstream
 remains authoritative for its own interfaces; holospaces docs never
 assume external API details.
+
+## ADR-007: Enforce the quality commitments in CI from the beginning
+
+**Status:** Accepted. **Context:** The quality commitments (Chapter 10,
+and the laws of Chapter 2) must hold from the first commit, not be
+retrofitted once code exists. **Decision:** A Cargo workspace with
+workspace lints (forbid `unsafe_code`, warn on `missing_docs`, clippy)
+is established up front. CI (`.github/workflows/ci.yml`) runs, on every
+change, the V&V (`vv/run.sh`) alongside `cargo fmt`, `cargo clippy` with
+warnings denied, and the unit, integration, and e2e test tiers.
+**Consequences:** Every component lands already under the documented
+quality gates and is held to its external authority (`CC-*`); quality
+cannot silently regress. The test tiers are empty until components exist
+— the gates are not.
