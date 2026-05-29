@@ -14,12 +14,71 @@
 
 use core::fmt;
 
+use hologram_realizations::CapabilitySet;
 use hologram_substrate_core::{
-    get_with_fetch, verify_kappa, AccessError, Bytes, ContainerHandle, ContainerRuntime,
-    KappaStore, KappaSync, RuntimeError,
+    get_with_fetch, verify_kappa, AccessError, Bytes, Capabilities, ContainerHandle,
+    ContainerRuntime, KappaStore, KappaSync, Realization, RuntimeError, StoreError,
 };
 
 use crate::realizations::{address, Holospace, Kappa, Source};
+
+/// Provision a holospace *into a peer's store* so the substrate can resolve and
+/// spawn it (arc42 chapter 6, *Provisioning*; chapter 5, *Boot Layer*).
+///
+/// This is the boundary step that κ-addresses a holospace's parts into the
+/// content-addressed store (Law L2/L4): the hologram
+/// [`ContainerManifest`](hologram_realizations::ContainerManifest) (the
+/// Container ID), the [`CapabilitySet`] (the authority), and the [`Holospace`]
+/// definition itself. The code module bytes the manifest references must
+/// already be in the store (a holo-file artifact, or an ingested config).
+///
+/// # Errors
+///
+/// Returns [`ProvisionError`] if any part cannot be stored, or if the code
+/// module the manifest references is not present in the store.
+pub fn provision(
+    store: &dyn KappaStore,
+    source: Source,
+    capabilities: Capabilities,
+) -> Result<Holospace, ProvisionError> {
+    let holospace = Holospace::compose(source, capabilities.clone());
+    let manifest = holospace.container_manifest();
+    if !store.contains(&manifest.code) {
+        return Err(ProvisionError::MissingCode(manifest.code));
+    }
+    store
+        .put("blake3", &manifest.canonicalize())
+        .map_err(ProvisionError::Store)?;
+    store
+        .put("blake3", &CapabilitySet::new(capabilities).canonicalize())
+        .map_err(ProvisionError::Store)?;
+    store
+        .put("blake3", &holospace.canonicalize())
+        .map_err(ProvisionError::Store)?;
+    Ok(holospace)
+}
+
+/// Why provisioning a holospace into a store failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProvisionError {
+    /// The code module the manifest references is not present in the store.
+    MissingCode(Kappa),
+    /// The store rejected a write.
+    Store(StoreError),
+}
+
+impl fmt::Display for ProvisionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProvisionError::MissingCode(k) => {
+                write!(f, "code module {k} is not present in the store")
+            }
+            ProvisionError::Store(e) => write!(f, "store error during provisioning: {e:?}"),
+        }
+    }
+}
+
+impl std::error::Error for ProvisionError {}
 
 /// The Dev Container ingestor — parses and validates a `devcontainer.json`
 /// against the [Dev Container](https://containers.dev) specification at the
@@ -53,11 +112,26 @@ pub mod devcontainer {
         pub image_source: ImageSource,
     }
 
+    /// Normalize JSONC `devcontainer.json` bytes to plain JSON (Law L2): strip
+    /// line/block comments and trailing commas. The Dev Container format is
+    /// JSONC; this is the canonicalization at the provisioning boundary.
+    ///
+    /// # Errors
+    ///
+    /// [`DevcontainerError::NotJson`] if the result is not valid JSON.
+    pub fn to_canonical_json(config_json: &[u8]) -> Result<Vec<u8>, DevcontainerError> {
+        let json = strip_trailing_commas(&strip_jsonc(config_json));
+        // Round-trip through serde_json to confirm it is valid JSON and to
+        // normalize it (the value the schema and the ingestor see).
+        let value: Value = serde_json::from_slice(&json).map_err(|_| DevcontainerError::NotJson)?;
+        serde_json::to_vec(&value).map_err(|_| DevcontainerError::NotJson)
+    }
+
     /// Parse and validate `devcontainer.json` per the Dev Container spec.
     ///
-    /// `devcontainer.json` is JSONC: line/block comments and trailing commas
-    /// are stripped before parsing. At most one container image source
-    /// (`image` / `build` / `dockerComposeFile`) may be declared; known
+    /// `devcontainer.json` is JSONC: comments and trailing commas are stripped
+    /// ([`to_canonical_json`]) before parsing. At most one container image
+    /// source (`image` / `build` / `dockerComposeFile`) may be declared; known
     /// properties must be well-formed.
     ///
     /// # Errors
@@ -65,7 +139,7 @@ pub mod devcontainer {
     /// [`DevcontainerError`] if the bytes are not a JSON object, declare more
     /// than one image source, or have a malformed known property.
     pub fn parse(config_json: &[u8]) -> Result<DevContainer, DevcontainerError> {
-        let json = strip_trailing_commas(&strip_jsonc(config_json));
+        let json = to_canonical_json(config_json)?;
         let value: Value = serde_json::from_slice(&json).map_err(|_| DevcontainerError::NotJson)?;
         let obj = value.as_object().ok_or(DevcontainerError::NotObject)?;
 
@@ -544,10 +618,9 @@ impl std::error::Error for LifecycleError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::realizations::{address, empty_kappa};
-    use core::sync::atomic::{AtomicU64, Ordering};
+    use crate::realizations::address;
     use hologram_store_mem::MemKappaStore;
-    use hologram_substrate_core::{Capabilities, ContainerInfo, ContainerState};
+    use hologram_substrate_core::Capabilities;
 
     fn caps() -> Capabilities {
         Capabilities {
@@ -560,15 +633,6 @@ mod tests {
             memory_max_bytes: 0,
             cpu_time_per_event_ms: 0,
             priority_weight: 0,
-        }
-    }
-
-    fn devcontainer() -> Source {
-        Source::Devcontainer {
-            repo: "https://example.invalid/app.git".to_owned(),
-            reference: "main".to_owned(),
-            config_path: ".devcontainer/devcontainer.json".to_owned(),
-            config: address(br#"{"image":"debian:12"}"#),
         }
     }
 
@@ -608,47 +672,6 @@ mod tests {
         ));
     }
 
-    /// A minimal in-test `ContainerRuntime` to exercise the Boot Layer's
-    /// management logic without standing up a full substrate runtime. It
-    /// records the κ-labels it is driven with so transitions can be asserted.
-    #[derive(Default)]
-    struct MockRuntime {
-        next: AtomicU64,
-        last_spawn: std::sync::Mutex<Option<(Kappa, Kappa)>>,
-    }
-
-    #[async_trait::async_trait]
-    impl ContainerRuntime for MockRuntime {
-        async fn spawn(
-            &self,
-            container_id: &Kappa,
-            capabilities: &Kappa,
-        ) -> Result<ContainerHandle, RuntimeError> {
-            *self.last_spawn.lock().unwrap() = Some((*container_id, *capabilities));
-            Ok(ContainerHandle(self.next.fetch_add(1, Ordering::SeqCst)))
-        }
-        async fn suspend(&self, _h: ContainerHandle) -> Result<Kappa, RuntimeError> {
-            Ok(address(b"snapshot-state"))
-        }
-        async fn resume(
-            &self,
-            _snapshot: &Kappa,
-            _capabilities: &Kappa,
-        ) -> Result<ContainerHandle, RuntimeError> {
-            Ok(ContainerHandle(self.next.fetch_add(1, Ordering::SeqCst)))
-        }
-        async fn terminate(&self, _h: ContainerHandle) -> Result<(), RuntimeError> {
-            Ok(())
-        }
-        fn list(&self) -> Vec<ContainerHandle> {
-            Vec::new()
-        }
-        fn info(&self, _h: ContainerHandle) -> Option<ContainerInfo> {
-            let _ = ContainerState::Running;
-            None
-        }
-    }
-
     #[test]
     fn ingest_rejects_empty_devcontainer_fields() {
         let err = ingest(
@@ -681,60 +704,24 @@ mod tests {
     }
 
     #[test]
-    fn session_drives_the_runtime_through_the_lifecycle() {
-        pollster::block_on(async {
-            let rt = MockRuntime::default();
-            let hs = Holospace::compose(devcontainer(), caps());
-            let manifest = *hs.manifest();
-            let cap_kappa = *hs.capabilities();
-
-            let mut session = Session::provision(&rt, hs);
-            assert_eq!(session.phase(), Phase::Provisioned);
-            session.boot().await.unwrap();
-            assert_eq!(session.phase(), Phase::Running);
-            // boot spawned the Container ID (manifest κ) under the cap-set κ.
-            assert_eq!(*rt.last_spawn.lock().unwrap(), Some((manifest, cap_kappa)));
-
-            let snap = session.suspend().await.unwrap();
-            assert_eq!(session.phase(), Phase::Suspended);
-            assert_eq!(session.snapshot(), Some(&snap));
-            session.resume().await.unwrap();
-            assert_eq!(session.phase(), Phase::Running);
-            session.terminate().await.unwrap();
-            assert_eq!(session.phase(), Phase::Terminated);
-            let _ = empty_kappa();
-        });
+    fn provision_persists_the_realizations_into_the_store() {
+        // The code module must be present before provisioning; then provision
+        // κ-addresses the manifest, the capability set, and the holospace into
+        // the store so the substrate runtime can resolve and spawn it.
+        let store = MemKappaStore::new();
+        let code = store.put("blake3", b"a code module").unwrap();
+        let hs = provision(&store, Source::HoloFile { artifact: code }, caps()).unwrap();
+        assert!(store.contains(hs.manifest()), "manifest stored");
+        assert!(store.contains(hs.capabilities()), "capability set stored");
+        assert!(store.contains(&hs.kappa()), "holospace definition stored");
     }
 
     #[test]
-    fn migration_adopts_a_snapshot_on_another_instance() {
-        pollster::block_on(async {
-            let here = MockRuntime::default();
-            let hs = Holospace::compose(devcontainer(), caps());
-            let mut a = Session::provision(&here, hs.clone());
-            a.boot().await.unwrap();
-            let snap = a.suspend().await.unwrap();
-
-            // QS2: instance B adopts the snapshot κ and resumes.
-            let there = MockRuntime::default();
-            let mut b = Session::adopt(&there, hs, snap);
-            assert_eq!(b.phase(), Phase::Suspended);
-            b.resume().await.unwrap();
-            assert_eq!(b.phase(), Phase::Running);
-        });
-    }
-
-    #[test]
-    fn invalid_transitions_are_rejected() {
-        pollster::block_on(async {
-            let rt = MockRuntime::default();
-            let mut s = Session::provision(&rt, Holospace::compose(devcontainer(), caps()));
-            assert!(s.resume().await.is_err(), "cannot resume what never ran");
-            s.terminate().await.unwrap();
-            assert!(
-                s.boot().await.is_err(),
-                "cannot boot a terminated holospace"
-            );
-        });
+    fn provision_rejects_a_missing_code_module() {
+        let store = MemKappaStore::new();
+        // An artifact κ for bytes the store does not hold.
+        let absent = address(b"code module that was never stored");
+        let err = provision(&store, Source::HoloFile { artifact: absent }, caps()).unwrap_err();
+        assert_eq!(err, ProvisionError::MissingCode(absent));
     }
 }

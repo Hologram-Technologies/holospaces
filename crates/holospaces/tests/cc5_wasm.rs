@@ -5,99 +5,127 @@
 //! specification-valid, validated against the
 //! [WebAssembly](https://webassembly.org) specification by module validation.
 //!
-//! The external authority is the WebAssembly spec conformance cases imported in
-//! `vv/artifacts/cc5/wasm-cases.json` (provenance in `vv/PROVENANCE.md`),
-//! derived from the spec / its `test/core` suite. This witness assembles each
-//! module from its text form and checks:
+//! The external authority is the **WebAssembly specification's own `test/core`
+//! conformance suite** — real `.wast` files imported verbatim from
+//! `WebAssembly/spec` at the commit pinned in
+//! `vv/artifacts/cc5/SOURCE-COMMIT.txt` (provenance in `vv/PROVENANCE.md`). The
+//! witness drives the spec's own directives and checks holospaces' validator
+//! ([`holospaces::wasm::validate`]) agrees with the specification's verdict:
 //!
-//! 1. holospaces' validator ([`holospaces::wasm::validate`]) accepts exactly
-//!    the modules the spec considers valid, and rejects the invalid ones;
-//! 2. the substrate's closed host surface ([`holospaces::wasm::validate_substrate_module`])
-//!    accepts a `hologram`-only import and refuses WASI / `env` imports
-//!    (spec §4.4, SPINE-6).
+//! * `(module …)` / `(module definition …)` — must be **accepted**.
+//! * `(assert_invalid …)` / `(assert_malformed …)` — must be **rejected**
+//!   (at decode or validation).
+//!
+//! Execution directives (`assert_return`, `invoke`, …) are out of scope for
+//! module validation and are skipped.
 //!
 //! Run by `vv/run.sh`; also `cargo test -p holospaces --test cc5_wasm`.
 
 use holospaces::wasm::{validate, validate_substrate_module, WasmError};
-use serde_json::Value;
+use wast::parser::{self, ParseBuffer};
+use wast::{QuoteWat, Wast, WastDirective};
 
-fn cases() -> Value {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../vv/artifacts/cc5/wasm-cases.json");
-    let raw = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    serde_json::from_slice(&raw).expect("wasm-cases.json is valid JSON")
+fn artifact_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vv/artifacts/cc5")
 }
 
-fn assemble(case: &Value) -> Vec<u8> {
-    let wat = case["wat"].as_str().unwrap();
-    wat::parse_str(wat).unwrap_or_else(|e| panic!("assemble {}: {e}", case["name"]))
-}
-
-/// (1) The validator accepts exactly the spec-valid modules.
-#[test]
-fn validator_accepts_spec_valid_modules() {
-    let doc = cases();
-    let valid = doc["spec_valid"].as_array().unwrap();
-    assert!(valid.len() >= 5, "expected the full valid battery");
-    for case in valid {
-        let module = assemble(case);
-        assert!(
-            validate(&module).is_ok(),
-            "case '{}' is spec-valid but the validator rejected it",
-            case["name"]
-        );
+/// `(assert_invalid)` / `(assert_malformed)`: rejected at decode or validation.
+fn is_rejected(module: &mut QuoteWat<'_>) -> bool {
+    match module.encode() {
+        Err(_) => true, // malformed text/binary — rejected at decode
+        Ok(bytes) => validate(&bytes).is_err(),
     }
 }
 
-/// (1) The validator rejects modules the spec considers invalid.
-#[test]
-fn validator_rejects_spec_invalid_modules() {
-    let doc = cases();
-    for case in doc["spec_invalid"].as_array().unwrap() {
-        // These fail WebAssembly *validation* (they assemble, but are not valid
-        // modules — type mismatch, stack underflow, unknown index).
-        let module = match wat::parse_str(case["wat"].as_str().unwrap()) {
-            Ok(bytes) => bytes,
-            Err(_) => continue, // rejected already at the text level — also a rejection
-        };
-        assert!(
-            matches!(validate(&module), Err(WasmError::Invalid(_))),
-            "case '{}' is spec-invalid but the validator accepted it",
-            case["name"]
-        );
-    }
+struct Counts {
+    valid: usize,
+    rejected: usize,
 }
 
-/// (2) The closed host surface: a `hologram`-only import is accepted; WASI /
-/// `env` imports are refused (spec §4.4).
+fn drive_wast(file: &str) -> Counts {
+    let path = artifact_dir().join(file);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {file}: {e}"));
+    let buf = ParseBuffer::new(&text).unwrap_or_else(|e| panic!("lex {file}: {e}"));
+    let wast: Wast = parser::parse(&buf).unwrap_or_else(|e| panic!("parse {file}: {e}"));
+
+    let mut counts = Counts {
+        valid: 0,
+        rejected: 0,
+    };
+    for directive in wast.directives {
+        match directive {
+            WastDirective::Module(mut q) | WastDirective::ModuleDefinition(mut q) => {
+                let bytes = match q.encode() {
+                    Ok(b) => b,
+                    // A handful of spec modules are quoted/binary forms not meant
+                    // to round-trip through the text encoder; skip those.
+                    Err(_) => continue,
+                };
+                assert!(
+                    validate(&bytes).is_ok(),
+                    "{file}: a spec-valid module was rejected by holospaces' validator"
+                );
+                counts.valid += 1;
+            }
+            WastDirective::AssertInvalid { mut module, .. }
+            | WastDirective::AssertInvalidCustom { mut module, .. } => {
+                assert!(
+                    is_rejected(&mut module),
+                    "{file}: a spec-invalid module was accepted by holospaces' validator"
+                );
+                counts.rejected += 1;
+            }
+            WastDirective::AssertMalformed { mut module, .. } => {
+                assert!(
+                    is_rejected(&mut module),
+                    "{file}: a spec-malformed module was accepted by holospaces' validator"
+                );
+                counts.rejected += 1;
+            }
+            _ => {} // execution / linking directives are out of scope for CC-5
+        }
+    }
+    counts
+}
+
+/// holospaces' validator agrees with the WebAssembly spec's `func.wast` and
+/// `binary.wast` conformance suites on every module-validation directive.
+#[test]
+fn validator_agrees_with_the_webassembly_spec_suite() {
+    let mut valid = 0;
+    let mut rejected = 0;
+    for file in ["func.wast", "binary.wast"] {
+        let c = drive_wast(file);
+        valid += c.valid;
+        rejected += c.rejected;
+    }
+    assert!(valid >= 20, "expected many spec-valid modules, saw {valid}");
+    assert!(
+        rejected >= 20,
+        "expected many spec-rejected modules, saw {rejected}"
+    );
+}
+
+/// The substrate's closed host surface (hologram spec §4.4): a `hologram`-only
+/// import is accepted; WASI / `env` imports are refused (SPINE-6).
 #[test]
 fn substrate_surface_refuses_non_hologram_imports() {
-    let doc = cases();
+    let ok =
+        wat::parse_str(r#"(module (import "hologram" "log" (func (param i32 i32 i32))))"#).unwrap();
+    assert!(validate_substrate_module(&ok).is_ok());
 
-    let hologram_import = doc["spec_valid"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["name"] == "hologram-import")
-        .expect("hologram-import case");
-    assert!(validate_substrate_module(&assemble(hologram_import)).is_ok());
-
-    for case in doc["substrate_forbidden"].as_array().unwrap() {
-        let module = assemble(case);
-        // Spec-valid as a module...
-        assert!(
-            validate(&module).is_ok(),
-            "{} should be spec-valid",
-            case["name"]
-        );
-        // ...but refused on the substrate's closed surface.
+    for wat_src in [
+        r#"(module (import "wasi_snapshot_preview1" "fd_write" (func (param i32 i32 i32 i32) (result i32))))"#,
+        r#"(module (import "env" "abort" (func)))"#,
+    ] {
+        let module = wat::parse_str(wat_src).unwrap();
+        assert!(validate(&module).is_ok(), "module is spec-valid");
         assert!(
             matches!(
                 validate_substrate_module(&module),
                 Err(WasmError::ForbiddenImport { .. })
             ),
-            "case '{}' must be refused outside the hologram host surface",
-            case["name"]
+            "import outside the hologram host surface must be refused"
         );
     }
 }

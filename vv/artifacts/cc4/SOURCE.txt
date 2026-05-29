@@ -1,0 +1,2 @@
+devcontainers/spec@c95ffeed1d059abfe9ffbe79762dc2fa4e7c2421 : schemas/devContainer.base.schema.json
+devcontainers/templates@b364506648ae0ca14b8fe1a2ca3508f995acb101 : src/<t>/.devcontainer/devcontainer.json
