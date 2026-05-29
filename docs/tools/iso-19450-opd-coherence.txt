@@ -1,0 +1,67 @@
+# tools/iso-19450-opd-coherence.txt
+#
+# Workspace-authored coherence rule pin: maps OPL grammar productions
+# that introduce entity declarations to the productions carrying the
+# entity's name string. V7 (scripts/v7-opd-opl-coherence.rb) reads
+# this file via OPLEntityExtractor.parse_coherence and uses the
+# mappings to walk the V6-produced parse tree, collecting the set of
+# entity names declared by an opl.txt file. The collected set is then
+# compared against the <text> content set of the matching opd.svg.
+#
+# Authority:
+#   ISO/PAS 19450:2015, OPM bimodal-equivalence principle
+#   (Introduction; Clauses 6-13). Every entity present in an OPD MUST
+#   be present as a declaration in the matching OPL, and vice versa.
+#
+#   The standard does not specify which OPL productions are
+#   "entity-introducing"; that determination is a workspace decision
+#   made by reading the standard's Clauses 7 (objects), 8 (processes),
+#   and 9 (states) and identifying which sentence kinds introduce an
+#   entity into the model versus which sentence kinds reference
+#   entities introduced elsewhere.
+#
+# Format:
+#   Each non-comment, non-blank line maps an entity-introducing
+#   production name to the production that carries the entity's name
+#   string:
+#
+#     <entity-introducing-rule> : <name-bearing-rule>
+#
+#   Both names are EBNF rule names from tools/iso-19450-opl.ebnf
+#   (hyphens permitted; OPLEntityExtractor.parse_coherence converts
+#   to underscores when matching against V6-emitted rule names).
+#
+# Why these three productions:
+#
+#   The OPL grammar admits 16 sentence kinds. Of those, only three
+#   introduce a new entity into the model:
+#
+#     1. object-declaration   ("X is physical." / "X is informatical."
+#                              / "X is environmental and ..." )
+#                              -- introduces an object named X.
+#
+#     2. process-declaration  ("X is physical." / "X is informatical.")
+#                              -- introduces a process named X.
+#
+#     3. state-declaration    ("X can be a, b, or c.")
+#                              -- introduces states a, b, c. The
+#                                 introducing entity is the state-name
+#                                 production (each state in the list).
+#
+#   The remaining 13 sentence kinds reference entities introduced by
+#   the three above. Aggregation, exhibition, generalization, and
+#   classification reference object-name and process-name productions
+#   that name pre-introduced things; the procedural-link sentences
+#   reference pre-introduced processes and objects; the tagged
+#   structural-link sentences reference pre-introduced things.
+#
+#   This separation is what makes the bimodal-equivalence check
+#   tractable: the OPD shows every modeled entity exactly once,
+#   regardless of how many structural or procedural links connect it;
+#   the OPL declares every modeled entity exactly once via one of the
+#   three declaration productions, regardless of how many subsequent
+#   sentences reference it.
+
+object-declaration  : object-name
+process-declaration : process-name
+state-declaration   : state-name

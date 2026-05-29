@@ -1,0 +1,20 @@
+source "https://rubygems.org"
+
+gem "asciidoctor", "~> 2.0"
+gem "github-markup", "~> 5.0"
+# github-markup 5.0.1 calls CommonMarker.render_html(...), which is the 0.x
+# API. CommonMarker 1.x renamed to `Commonmarker.to_html` and is
+# incompatible. Pin to the last 0.x series until github-markup ships a
+# 1.x-compatible release.
+gem "commonmarker", "~> 0.23"
+
+# treetop: PEG parser used by V6 (parses OPL against the pinned EBNF at
+# tools/iso-19450-opl.ebnf) and V7 (reuses V6's parser to extract OPL
+# entities for SVG cross-reference). Declared in Phase 0 even though
+# V6/V7 land in Phase 4 — keeps the Gemfile stable across phases.
+gem "treetop", "~> 1.6"
+
+# rexml: pure-Ruby XML parser used by V7 to read opd.svg files. In
+# Ruby 3.0+ rexml is bundled but no longer a default gem (it must be
+# declared by Gemfile to be loadable from a Bundler context).
+gem "rexml", "~> 3.2"

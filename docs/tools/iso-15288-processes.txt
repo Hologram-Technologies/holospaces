@@ -1,0 +1,65 @@
+# tools/iso-15288-processes.txt
+#
+# Workspace-authored transcription of ISO/IEC/IEEE 15288:2023 Clause 6
+# (System life cycle processes). The transcribed catalog is the pin;
+# the published standard is the audit reference.
+#
+# Authority:
+#   ISO/IEC/IEEE 15288:2023, Second Edition, 2023-05-16,
+#   "Systems and software engineering -- System life cycle processes."
+#   Published jointly by ISO, IEC, and IEEE. This second edition
+#   cancels and replaces ISO/IEC/IEEE 15288:2015.
+#
+# Public source corroborating this transcription:
+#   ISO/IEC/IEEE 15288:2023 free preview (Foreword, Introduction,
+#   table of contents through Clause 6) hosted by iteh.ai at
+#   https://cdn.standards.iteh.ai/samples/81702/...
+#   The preview confirms the complete process catalog: four process
+#   groups containing 2 + 6 + 8 + 14 = 30 processes.
+#
+# Format:
+#   Group headers in lowercase brackets; process names follow on
+#   subsequent lines until the next group header. Group header
+#   strings match the .adoc filename stem under src/15288/. Process
+#   names are taken verbatim from the standard's Clause 6 section
+#   titles, omitting the redundant "process" suffix (each section in
+#   src/15288/<group>.adoc already sits under a chapter titled
+#   "...Processes").
+
+[agreement]
+Acquisition
+Supply
+
+[organizational-project-enabling]
+Life cycle model management
+Infrastructure management
+Portfolio management
+Human resource management
+Quality management
+Knowledge management
+
+[technical-management]
+Project planning
+Project assessment and control
+Decision management
+Risk management
+Configuration management
+Information management
+Measurement
+Quality assurance
+
+[technical]
+Business or mission analysis
+Stakeholder needs and requirements definition
+System requirements definition
+System architecture definition
+Design definition
+System analysis
+Implementation
+Integration
+Verification
+Transition
+Validation
+Operation
+Maintenance
+Disposal

@@ -1,0 +1,2 @@
+574d4d04bd0a055644438aa723a3ce0725ebc5b4d8ff68422ef7358c3ec8432b  structurizr.war
+ce4ac48f48aa7eadc1f5dbdf3449a1739f188ecb8c5421c5adc070fe7479e567  pandoc.deb

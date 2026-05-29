@@ -1,0 +1,4 @@
+[submodule "docs/vendor/arc42-generator"]
+	path = docs/vendor/arc42-generator
+	url = https://github.com/arc42/arc42-generator.git
+	ignore = dirty

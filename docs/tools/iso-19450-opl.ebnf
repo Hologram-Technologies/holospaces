@@ -1,0 +1,505 @@
+(* tools/iso-19450-opl.ebnf
+ *
+ * Workspace-authored transcription of the Object-Process Language (OPL)
+ * formal syntax, expressed in ISO/IEC 14977:1996 Extended Backus-Naur
+ * Form. The transcribed grammar is the pin; the published standard is
+ * the audit reference.
+ *
+ * Authority:
+ *   ISO/PAS 19450:2015, "Automation systems and integration --
+ *   Object-Process Methodology", First edition, 2015-12-15. Annex A
+ *   (normative) "OPL formal syntax in EBNF". Advanced to ISO 19450:2024
+ *   (Second edition); this transcription targets the 2015 edition's
+ *   Annex A as the original normative source.
+ *
+ * Patent acknowledgment:
+ *   Per the Foreword of ISO/PAS 19450:2015, compliance with the standard
+ *   may involve the use of a patent concerning OPM as a modelling system,
+ *   given in Clauses 6 to 14. The patent holder, Prof. Dov Dori
+ *   (Technion -- Israel Institute of Technology), has assured ISO that
+ *   he is willing to negotiate licences either free of charge or under
+ *   reasonable and non-discriminatory terms.
+ *
+ * Public sources corroborating this transcription:
+ *
+ *   [A] ISO 19450:2015 free preview (Foreword, Introduction, Clauses
+ *       1-3) hosted by iteh.ai. Confirms term vocabulary used by the
+ *       productions and the bimodal-equivalence principle that V7
+ *       enforces.
+ *
+ *   [B] Dori, D. (2002). "From Object-Process Diagrams to a Natural
+ *       Object-Process Language." In: A.B. Pidduck et al. (Eds.):
+ *       CAiSE 2002, LNCS 2348, pp. 221-238. Springer-Verlag. Hosted
+ *       on researchgate as publication 2623388. Predates ISO 19450
+ *       and establishes the canonical OPL production rules in their
+ *       original R-numbered form (R1-R20+).
+ *
+ *   [C] Dori, D. (2016). "Model-Based Systems Engineering with OPM
+ *       and SysML", Springer New York, ISBN 978-1-4939-3294-8.
+ *       Chapter 11 ("Object-Process Language: The Text") aligns with
+ *       Annex A of the standard.
+ *
+ *   [D] OPCAT Version 3.0 Getting Started Guide, June 2007. Authored
+ *       under Dori's direction at Technion; hosted by Prof. Olivier de
+ *       Weck (MIT) at web.mit.edu/deweck/Public/opcat/OPCAT_Manual_3.0.pdf.
+ *       Worked OPL examples for each construct.
+ *
+ *   [E] Svensson, P. (2004). "Modeling Software Measurement with OPM
+ *       and Development of Prototype Tool." MSc thesis, Lund Institute
+ *       of Technology, CODEN: LUTEDX(TETS-5518)/1-75/2004. Independent
+ *       academic walkthrough; comprehensive coverage of OPL sentence
+ *       templates with examples.
+ *
+ *   [F] OPCloud (Technion) source at github.com/ahmadjbara/model-opcloud,
+ *       file src/app/link-operating/linkTypeSelection.ts. Read as
+ *       reference for canonical OPL sentence templates per link type.
+ *       The OPCloud source has no explicit licence; this transcription
+ *       references the templates as facts about OPL output, not as
+ *       copied code.
+ *
+ *   [G] Wikipedia, "Object Process Methodology". Tertiary source
+ *       confirming OPL formatting conventions (entity names appear in
+ *       a distinguished face when typeset; in the text-only OPL of
+ *       this grammar we represent entity names as plain identifiers
+ *       with the typesetting convention out of grammar scope).
+ *
+ * Coverage scope:
+ *   This transcription covers the productions sufficient to express
+ *   the OPDs currently held in src/opm/. The covered constructs are:
+ *
+ *     - Object, process, and state declarations
+ *     - The four fundamental structural relations (aggregation-
+ *       participation, exhibition-characterization, generalization-
+ *       specialization, classification-instantiation)
+ *     - The basic transforming procedural links (consumption, result,
+ *       effect)
+ *     - The basic enabling procedural links (agent, instrument)
+ *     - The invocation link
+ *     - In-out link pairs (state-changing transformations)
+ *     - The unidirectional and bidirectional tagged structural links
+ *
+ *   Productions covering state-specified link variants, control-link
+ *   modifiers (event/condition/exception), in-zoom and unfolding
+ *   sentences, multiplicity expressions, and the path-label machinery
+ *   are deliberately omitted from this transcription. They land in
+ *   subsequent commits as additional OPDs require them, in accordance
+ *   with the wiki's reconciliation discipline.
+ *
+ * Conventions:
+ *   - Each production is preceded by a comment naming its source.
+ *     "[B-Rn]" cites Dori 2002's R-numbered rule n; "[A]" through
+ *     "[G]" cite the public sources listed above by their letter
+ *     identifiers.
+ *   - Identifiers in the productions are hyphenated for readability;
+ *     V6's translator converts hyphens to underscores when emitting
+ *     treetop rule names.
+ *   - Reserved words appear as quoted terminals; entity names are
+ *     productions matching identifier patterns.
+ *   - Whitespace handling is explicit: the grammar admits ASCII space
+ *     between tokens via the `ws` production; sentence-terminating
+ *     periods are bound to the sentence productions.
+ *
+ * Wire format:
+ *   This file is consumed by V6 via scripts/lib/ebnf_to_treetop.rb
+ *   (the workspace-authored mechanical EBNF -> treetop PEG translator).
+ *   Production references and operator semantics in this file conform
+ *   to ISO/IEC 14977:1996.
+ *)
+
+
+(* ----------------------------------------------------------------------
+ * Top-level OPL document structure
+ * ----------------------------------------------------------------------
+ *
+ * An opl-document is a sequence of one or more sentences, each
+ * terminated by a period and optional whitespace.
+ *
+ * Source: [B-R1] (S -> sentence sequence); aligned with [D] which
+ * presents OPL as a sequence of sentences corresponding to OPD
+ * constructs.
+ *)
+
+opl-document = sentence , { ws , sentence } , [ ws ] ;
+
+(* A sentence is one of the entity-introducing, structural-relation,
+ * or procedural-link sentence kinds. The alternation order follows
+ * Dori 2002's R1 alternation. *)
+
+sentence
+  = object-declaration
+  | process-declaration
+  | state-declaration
+  | aggregation-sentence
+  | exhibition-sentence
+  | generalization-sentence
+  | classification-sentence
+  | tagged-unidirectional-sentence
+  | tagged-bidirectional-sentence
+  | consumption-sentence
+  | result-sentence
+  | effect-sentence
+  | input-output-sentence
+  | agent-sentence
+  | instrument-sentence
+  | invocation-sentence
+  ;
+
+
+(* ----------------------------------------------------------------------
+ * Whitespace
+ * ----------------------------------------------------------------------
+ *
+ * OPL uses ASCII spaces and newlines between tokens. The grammar admits
+ * one or more whitespace characters wherever `ws` appears.
+ *)
+
+ws = ws-char , { ws-char } ;
+
+ws-char = " " | "\t" | "\n" | "\r" ;
+
+
+(* ----------------------------------------------------------------------
+ * Entity-name productions
+ * ----------------------------------------------------------------------
+ *
+ * OPL entity names (objects, processes, states) appear in OPL text as
+ * identifier strings. ISO 19450 specifies a typesetting convention
+ * (bold face for objects and processes, with capitalisation of each
+ * word) but the convention is presentational; the grammar treats
+ * names as identifier strings.
+ *
+ * Each entity-name production is a distinct grammar rule so that V7's
+ * coherence extractor can target the rule for entity collection per
+ * tools/iso-19450-opd-coherence.txt's mappings.
+ *
+ * Source: [A] (Clause 3 vocabulary, terms 3.39 object, 3.58 process,
+ * 3.68 state); [G] (formatting convention).
+ *)
+
+object-name  = identifier ;
+process-name = identifier ;
+state-name   = identifier ;
+
+(* Identifier: one or more identifier-words joined by single spaces.
+ * Each word starts with an uppercase letter (per ISO 19450's
+ * capitalisation convention) and continues with lowercase letters,
+ * digits, or hyphens. Numbers may also begin a word (allowing
+ * identifiers like "3D Camera").
+ *
+ * Source: [B-R5] (object-statement names); [D] (worked examples
+ * "OnStar System", "Driver Rescuing", "Capturing Medium").
+ *)
+
+identifier = identifier-word , { " " , identifier-word } ;
+
+identifier-word = identifier-start , { identifier-rest } ;
+
+identifier-start = uppercase-letter | digit ;
+
+identifier-rest = letter | digit | "-" ;
+
+uppercase-letter
+  = "A" | "B" | "C" | "D" | "E" | "F" | "G" | "H" | "I" | "J"
+  | "K" | "L" | "M" | "N" | "O" | "P" | "Q" | "R" | "S" | "T"
+  | "U" | "V" | "W" | "X" | "Y" | "Z" ;
+
+lowercase-letter
+  = "a" | "b" | "c" | "d" | "e" | "f" | "g" | "h" | "i" | "j"
+  | "k" | "l" | "m" | "n" | "o" | "p" | "q" | "r" | "s" | "t"
+  | "u" | "v" | "w" | "x" | "y" | "z" ;
+
+letter = uppercase-letter | lowercase-letter ;
+
+digit
+  = "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" ;
+
+
+(* ----------------------------------------------------------------------
+ * Entity declarations: object, process, state
+ * ----------------------------------------------------------------------
+ *
+ * The three OPM "thing" kinds plus state. Each has a dedicated
+ * declaration sentence used to introduce the entity into the model.
+ *
+ * Source: [B-R2..R6] (object and process declarations); [D] sections
+ * 3-4 (worked OPCAT examples); [E] section 2.4 (objects and processes).
+ *)
+
+(* Object declaration:
+ *
+ *   <Object> is physical.
+ *   <Object> is informatical.
+ *   <Object> is environmental and physical.
+ *   <Object> is environmental.
+ *
+ * The "physical" / "informatical" axis names the essence; the
+ * "environmental" / (default) axis names the affiliation. ISO 19450
+ * Clause 3.55 ("primary essence"), Clause 7.3 ("OPM thing generic
+ * properties"), and term 3.6 ("beneficiary") together define the
+ * vocabulary of this sentence.
+ *)
+
+object-declaration
+  = object-name , ws , "is" , ws , object-modifiers , "." ;
+
+object-modifiers
+  = "environmental" , ws , "and" , ws , essence
+  | "environmental"
+  | essence ;
+
+essence = "physical" | "informatical" ;
+
+
+(* Process declaration:
+ *
+ *   <Process> is physical.
+ *   <Process> is informatical.
+ *
+ * Source: [B-R7..R8]; [D] worked example "Driver Rescuing is physical."
+ *)
+
+process-declaration
+  = process-name , ws , "is" , ws , essence , "." ;
+
+
+(* State declaration:
+ *
+ *   <Object> can be <state-1>, <state-2>, ..., or <state-n>.
+ *
+ * Lists the possible states of a stateful object. The "or" introduces
+ * the final alternative. State names are written in lowercase
+ * conventionally per ISO 19450 Clause 7.3.5, but the grammar admits
+ * them as identifiers.
+ *
+ * Source: [B-R9..R10]; [E] Figure 2-2 worked example "Person can be
+ * single or married."
+ *)
+
+state-declaration
+  = object-name , ws , "can" , ws , "be" , ws , state-list , "." ;
+
+state-list
+  = state-name , "," , ws , state-list-tail
+  | state-name , ws , "or" , ws , state-name
+  | state-name ;
+
+state-list-tail
+  = state-name , "," , ws , state-list-tail
+  | state-name , "," , ws , "or" , ws , state-name ;
+
+
+(* ----------------------------------------------------------------------
+ * Fundamental structural relations
+ * ----------------------------------------------------------------------
+ *
+ * Source: [B-R12..R16]; [E] section 2.7 (the four fundamental
+ * structural relations); [F] linkTypeSelection.ts (sentence templates
+ * verified across two independent implementations).
+ *)
+
+(* Aggregation-Participation: <whole> consists of <part-list>.
+ * The whole and parts are things (objects or processes); OPM admits
+ * aggregation across both kinds.
+ * Source: [E] Figure 2-11 "Airplane consists of Body, 2 Wings, and 1
+ * to 6 Engines." (multiplicity productions deferred to a later cycle.)
+ *)
+
+aggregation-sentence
+  = thing-name , ws , "consists" , ws , "of" , ws , entity-list , "." ;
+
+
+(* Exhibition-Characterization: <thing> exhibits <feature-list>.
+ * Source: [E] Figure 2-12 "Person exhibits Name and Address."
+ *)
+
+exhibition-sentence
+  = thing-name , ws , "exhibits" , ws , entity-list , "." ;
+
+
+(* Generalization-Specialization: <special> is a <general>.
+ * Equivalent transitive form: "is a kind of" -- not specified here
+ * because it is a stylistic alternation not used in the canonical
+ * grammar; "is a" suffices.
+ * Source: [E] section 2.7.3 "Dog is an Animal."
+ *)
+
+generalization-sentence
+  = thing-name , ws , "is" , ws , article , ws , thing-name , "." ;
+
+
+(* Classification-Instantiation: <instance> is an instance of <class>.
+ * Source: [E] Figure 2-18 "The Godfather is an instance of Movie."
+ *)
+
+classification-sentence
+  = thing-name , ws , "is" , ws , "an" , ws , "instance" , ws , "of" , ws , thing-name , "." ;
+
+
+(* Article handling for "is a" / "is an": the grammar admits both;
+ * downstream presentation logic chooses the article matching the
+ * following identifier's first letter.
+ *)
+
+article = "a" | "an" ;
+
+
+(* A thing-name is either an object name or a process name. This
+ * unification is necessary because OPM's structural relations apply
+ * across both object and process kinds (per ISO 19450 Clause 10.3).
+ *)
+
+thing-name = object-name | process-name ;
+
+
+(* Comma-and "or"-separated list of entity names, used in aggregation
+ * and exhibition sentences.
+ *)
+
+(* Note: alternatives are ordered longest-first because the V6 translator
+ * emits PEG ordered choice (treetop's `/`), which commits to the first
+ * matching alternative without backtracking across the alternation. The
+ * shorter forms appear last so the parser tries the multi-element list
+ * first.
+ *)
+
+entity-list
+  = thing-name , "," , ws , entity-list-tail
+  | thing-name , ws , "and" , ws , thing-name
+  | thing-name ;
+
+entity-list-tail
+  = thing-name , "," , ws , entity-list-tail
+  | thing-name , "," , ws , "and" , ws , thing-name ;
+
+
+(* ----------------------------------------------------------------------
+ * Tagged structural links
+ * ----------------------------------------------------------------------
+ *
+ * Tagged structural links carry a user-defined relation phrase as the
+ * link tag. The grammar admits a free-form relation-phrase for the
+ * tag; presentation logic typesets the phrase as the structural-link
+ * label.
+ *
+ * Source: [B-R17]; [E] Figures 2-8, 2-9 "Highway surrounds City",
+ * "Wife and Husband are in love"; [F] template "<src> relates to
+ * <dst>." (default null-tag form).
+ *)
+
+(* Unidirectional tagged: <thing-A> <relation-phrase> <thing-B>.
+ *
+ * The default null-tag form ("relates to") is admitted as a degenerate
+ * case of relation-phrase.
+ *)
+
+tagged-unidirectional-sentence
+  = thing-name , ws , relation-phrase , ws , thing-name , "." ;
+
+
+(* Bidirectional tagged: <thing-A> and <thing-B> <relation-phrase>.
+ *
+ * The default null-tag form ("are equivalent") is admitted as a
+ * degenerate case of bidirectional-phrase.
+ *)
+
+tagged-bidirectional-sentence
+  = thing-name , ws , "and" , ws , thing-name , ws , bidirectional-phrase , "." ;
+
+
+(* Relation phrases: a sequence of one or more lowercase words. This is
+ * deliberately permissive; the OPM convention is that the relation
+ * phrase is meaningful English when read with the connected entities,
+ * but the grammar does not (and cannot) enforce semantic suitability.
+ *)
+
+relation-phrase = relation-word , { ws , relation-word } ;
+
+bidirectional-phrase = relation-word , { ws , relation-word } ;
+
+relation-word = lowercase-letter , { letter | digit | "-" } ;
+
+
+(* ----------------------------------------------------------------------
+ * Procedural links: transformation
+ * ----------------------------------------------------------------------
+ *
+ * Transformation links express how a process changes objects:
+ * consumption (the process destroys the object), result (the process
+ * creates the object), effect (the process changes the object's
+ * state without specifying initial/final).
+ *
+ * Source: [B-R18..R20]; [D] worked example "Driver Rescuing affects
+ * Driver."; [E] section 2.8.2 (transformation links); [F]
+ * linkTypeSelection.ts templates.
+ *)
+
+(* Consumption: <process> consumes <object>. *)
+
+consumption-sentence
+  = process-name , ws , "consumes" , ws , object-name , "." ;
+
+
+(* Result: <process> yields <object>. *)
+
+result-sentence
+  = process-name , ws , "yields" , ws , object-name , "." ;
+
+
+(* Effect: <process> affects <object>. *)
+
+effect-sentence
+  = process-name , ws , "affects" , ws , object-name , "." ;
+
+
+(* Input-output (state-change): <process> changes <object> from
+ * <input-state> to <output-state>.
+ *
+ * Source: [F] linkTypeSelection.ts In-out_Link_Pair template "<P>
+ * changes <O> from <s1> to <s2>."; [E] section 2.5 worked example.
+ *)
+
+input-output-sentence
+  = process-name , ws , "changes" , ws , object-name , ws , "from" , ws ,
+    state-name , ws , "to" , ws , state-name , "." ;
+
+
+(* ----------------------------------------------------------------------
+ * Procedural links: enabling
+ * ----------------------------------------------------------------------
+ *
+ * Enabling links express that an object must be present for a process
+ * to occur, without the process transforming the object.
+ *
+ * Source: [E] section 2.8.1 (enabling links); [F] linkTypeSelection.ts
+ * templates.
+ *)
+
+(* Agent (intelligent enabler): <object> handles <process>.
+ * Source: [E] Figure 2-19 "Constructor handles Building."
+ *)
+
+agent-sentence
+  = object-name , ws , "handles" , ws , process-name , "." ;
+
+
+(* Instrument (non-human enabler): <process> requires <object>.
+ * Source: [E] Figure 2-19 "Building requires Plan, Crane, and
+ * Concrete Mixer." (multi-instrument list deferred; single-instrument
+ * form admitted here.)
+ *)
+
+instrument-sentence
+  = process-name , ws , "requires" , ws , object-name , "." ;
+
+
+(* ----------------------------------------------------------------------
+ * Invocation
+ * ----------------------------------------------------------------------
+ *
+ * Invocation: <process-A> invokes <process-B>.
+ * Source: [E] Figure 2-21 "Process A invokes Process B."; [F]
+ * linkTypeSelection.ts Invocation template.
+ *)
+
+invocation-sentence
+  = process-name , ws , "invokes" , ws , process-name , "." ;

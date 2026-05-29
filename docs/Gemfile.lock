@@ -1,0 +1,24 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    asciidoctor (2.0.26)
+    commonmarker (0.23.12)
+    github-markup (5.0.1)
+    polyglot (0.3.5)
+    rexml (3.4.4)
+    treetop (1.6.18)
+      polyglot (~> 0.3)
+
+PLATFORMS
+  ruby
+  x86_64-linux
+
+DEPENDENCIES
+  asciidoctor (~> 2.0)
+  commonmarker (~> 0.23)
+  github-markup (~> 5.0)
+  rexml (~> 3.2)
+  treetop (~> 1.6)
+
+BUNDLED WITH
+   2.6.9
