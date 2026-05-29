@@ -152,7 +152,11 @@ info "rewrote image references"
 
 ad_page1="$DEST/09-Architecture-Decisions.md"
 ad_page2="$DEST/09-Architecture-Decisions-Continued.md"
-if [ -f "$ad_page1" ]; then
+# Only split when the page would exceed GitHub's ~512 KiB render limit. A small
+# Architecture Decisions chapter (e.g. holospaces' handful of ADRs) is left
+# whole; the ADR-038 split point is a wiki convention for its 60+-ADR corpus.
+ad_split_threshold=524288
+if [ -f "$ad_page1" ] && [ "$(wc -c < "$ad_page1")" -ge "$ad_split_threshold" ]; then
     split_line=$(grep -nE '^## ADR-038 ' "$ad_page1" | head -1 | cut -d: -f1)
     if [ -n "$split_line" ]; then
         {
@@ -170,7 +174,7 @@ if [ -f "$ad_page1" ]; then
         mv "$ad_page1.tmp" "$ad_page1"
         info "split Architecture Decisions at ADR-038 → 09-Architecture-Decisions-Continued.md"
     else
-        err "Architecture Decisions split point (## ADR-038) not found; page not split"
+        err "Architecture Decisions page exceeds the GitHub render limit but has no '## ADR-038 ' split boundary"
         exit 2
     fi
 fi
