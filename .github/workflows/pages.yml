@@ -5,8 +5,8 @@ name: pages
 # (arc42 ch.3 / ch.5 / ch.6: "served from GitHub Pages", an untrusted gateway;
 # every byte is verified by re-derivation on load, Law L5).
 #
-# Requires the same hologram access secrets as ci.yml (HOLOGRAM_APP_ID,
-# HOLOGRAM_APP_PRIVATE_KEY) to build the wasm bundle, plus Pages enabled for the
+# Requires the same hologram access secrets as ci.yml (the org-level GitHub App
+# APP_ID, APP_PRIVATE_KEY) to build the wasm bundle, plus Pages enabled for the
 # repository (Settings → Pages → Source: GitHub Actions).
 
 on:
@@ -38,8 +38,8 @@ jobs:
         uses: actions/create-github-app-token@v1
         id: hologram-token
         with:
-          app-id: ${{ secrets.HOLOGRAM_APP_ID }}
-          private-key: ${{ secrets.HOLOGRAM_APP_PRIVATE_KEY }}
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
           owner: Hologram-Technologies
           repositories: hologram
       - name: Configure git for the hologram substrate dependency

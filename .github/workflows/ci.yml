@@ -5,11 +5,12 @@ name: ci
 # conformance) alongside the Rust quality gates and the test tiers.
 #
 # holospaces consumes the private hologram substrate as a pinned git dependency
-# (ADR-006). Both jobs mint a GitHub App token scoped to
-# Hologram-Technologies/hologram and configure git so Cargo's git-fetch-with-cli
-# (.cargo/config.toml) can fetch it. Required repository secrets:
-#   HOLOGRAM_APP_ID, HOLOGRAM_APP_PRIVATE_KEY
-# (a GitHub App installed on the hologram repo with Contents: read).
+# (ADR-006). Each job mints a GitHub App token scoped to
+# Hologram-Technologies/hologram and configures git so Cargo's git-fetch-with-cli
+# (.cargo/config.toml) can fetch it. Uses the org-level GitHub App secrets
+#   APP_ID, APP_PRIVATE_KEY
+# (the same App and secret names hologram-ai uses; installed org-wide so every
+# Hologram-Technologies repo inherits them — no per-repo setup).
 
 on:
   push:
@@ -28,8 +29,8 @@ jobs:
         uses: actions/create-github-app-token@v1
         id: hologram-token
         with:
-          app-id: ${{ secrets.HOLOGRAM_APP_ID }}
-          private-key: ${{ secrets.HOLOGRAM_APP_PRIVATE_KEY }}
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
           owner: Hologram-Technologies
           repositories: hologram
       - name: Configure git for the hologram substrate dependency
@@ -74,8 +75,8 @@ jobs:
         uses: actions/create-github-app-token@v1
         id: hologram-token
         with:
-          app-id: ${{ secrets.HOLOGRAM_APP_ID }}
-          private-key: ${{ secrets.HOLOGRAM_APP_PRIVATE_KEY }}
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
           owner: Hologram-Technologies
           repositories: hologram
       - name: Configure git for the hologram substrate dependency
@@ -113,8 +114,8 @@ jobs:
         uses: actions/create-github-app-token@v1
         id: hologram-token
         with:
-          app-id: ${{ secrets.HOLOGRAM_APP_ID }}
-          private-key: ${{ secrets.HOLOGRAM_APP_PRIVATE_KEY }}
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
           owner: Hologram-Technologies
           repositories: hologram
       - name: Configure git for the hologram substrate dependency
