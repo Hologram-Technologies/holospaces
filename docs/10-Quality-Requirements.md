@@ -106,9 +106,11 @@ change:
 
 - **Browser** — `scripts/browser-manager-test.sh`: the Hologram Platform
   Manager (the browser peer) runs in headless Chromium (Playwright) —
-  sign in, provision, view, resolve + verify by re-derivation (Law L5).
-  It is deployed to GitHub Pages by `.github/workflows/pages.yml` (the
-  cold-start, untrusted gateway of Chapter 6).
+  sign in, provision, view, resolve + verify by re-derivation (Law L5),
+  and a live `.holo`-engine differential (the executor compiled to wasm
+  yields a κ identical to native — `CC-2`, RT2). It is deployed to
+  GitHub Pages by `.github/workflows/pages.yml` (the cold-start,
+  untrusted gateway of Chapter 6).
 
 The `CC` suites and the test tiers produce each component’s `CC` witness
 against its external authority. The gates exist and run from the first

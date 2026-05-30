@@ -14,6 +14,9 @@ if ! command -v wasm-pack >/dev/null || ! command -v node >/dev/null; then
   exit 0
 fi
 
+echo "==> generating the .holo fixture (native executor → reference output κ)"
+( cd "$ROOT" && cargo run -q -p holospaces --example holo_fixture -- "$CRATE/web" )
+
 echo "==> building the browser peer (wasm32-unknown-unknown)"
 wasm-pack build "$CRATE" --release --target web --out-dir web/pkg
 

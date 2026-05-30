@@ -31,11 +31,11 @@
     <pre id="log" class="muted">loading…</pre>
 
     <script type="module">
-      import init, { kappa, verify_kappa, Console } from "./pkg/holospaces_web.js";
+      import init, { kappa, verify_kappa, run_holo, Console } from "./pkg/holospaces_web.js";
       await init();
 
       // Expose the Manager surface for the Playwright browser test.
-      window.hs = { kappa, verify_kappa, Console };
+      window.hs = { kappa, verify_kappa, run_holo, Console };
 
       const console0 = new Console();
       const $ = (id) => document.getElementById(id);
