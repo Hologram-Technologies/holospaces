@@ -17,3 +17,14 @@ assembler, not hand-encoded:
 
 Coverage: arithmetic + immediates (sum1to10), logical/shift (bitops), RV64 word
 ops + sign extension (wordops), loads/stores LD/SD/LBU (memory).
+
+emulator.wasm
+  The system-emulator codemodule: the emulator core (crates/holospaces-emulator,
+  wrapping holospaces::emulator) compiled to a hologram Wasm container. It
+  imports only `hologram.storage_put` and exports the container ABI
+  (hg_init/hg_event/hg_suspend/hg_resume/hg_callback) + memory — so hologram's
+  engine runs it as a κ-addressed container (ADR-009; the execution surface,
+  CC-6 contract). Rebuild with scripts/build-emulator.sh:
+    cd crates/holospaces-emulator
+    cargo build --target wasm32-unknown-unknown --release
+  rustc 1.96.0 (ac68faa20 2026-05-25)

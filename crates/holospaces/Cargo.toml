@@ -55,6 +55,9 @@ wasmparser = { version = "0.221", optional = true }
 # Named directly in the CC-8 witness (a source-peer KappaSync, SyncError, Bytes,
 # address oracle) — the same substrate-core contracts the lib composes, with std.
 hologram-substrate-core = { workspace = true, features = ["std"] }
+# CC-9 — build a ContainerManifest with the guest image as initial state, to run
+# the emulator codemodule on the real runtime.
+hologram-realizations = { workspace = true, features = ["std"] }
 # CC-3 — the substrate conformance battery + the stores holospaces resolves through.
 hologram-substrate-tck = { workspace = true }
 hologram-store-mem = { workspace = true }
