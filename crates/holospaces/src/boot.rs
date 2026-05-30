@@ -347,6 +347,29 @@ pub fn ingest_devcontainer(
     Ok(Holospace::compose(source, capabilities))
 }
 
+/// Import a code module (or any content) by κ from a source peer, verified by
+/// re-derivation before it is accepted (Law L5), and cache it locally.
+///
+/// This is holospaces' *trustless-import boundary* (ADR-006, ADR-009): arbitrary
+/// code — a program, a system-emulator codemodule, an OS image — becomes
+/// runnable holospace content only after its fetched bytes re-derive to the
+/// requested κ. It composes the substrate's [`get_with_fetch`] (local store
+/// first, else fetch + verify-on-receipt + cache); holospaces adds no parallel
+/// fetch path (Law L4). Mirrors hologram's own driver-import witnesses.
+///
+/// # Errors
+///
+/// [`AccessError::VerificationFailed`] if the fetched bytes do not re-derive to
+/// `kappa` (a forged or corrupted import is refused); other [`AccessError`] on a
+/// store or sync failure.
+pub async fn import(
+    store: &dyn KappaStore,
+    source: &dyn KappaSync,
+    kappa: &Kappa,
+) -> Result<Option<Bytes>, AccessError> {
+    get_with_fetch(store, source, kappa).await
+}
+
 /// Canonicalize a provisioning source into a [`Holospace`] definition (Law L2).
 ///
 /// The resulting holospace is a canonical form; its identity is its κ. This is

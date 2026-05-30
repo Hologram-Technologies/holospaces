@@ -2,7 +2,7 @@
 
 # Conceptual Model
 
-The holospaces conceptual model in Object-Process Methodology (OPM, ISO 19450). The top-level System Diagram (SD) presents holospaces at its highest abstraction; each in-zoom diagram refines one part — **SD1** provisioning, **SD2** the lifecycle (boot · suspend · resume · migrate · terminate), **SD3** identity and sync. Each diagram is bimodal: an Object-Process Diagram (OPD) paired with equivalent Object-Process Language (OPL) sentences.
+The holospaces conceptual model in Object-Process Methodology (OPM, ISO 19450). The top-level System Diagram (SD) presents holospaces at its highest abstraction — the **Provisioning**, **Booting**, and **Projecting** processes the operator handles; each in-zoom diagram refines one part — **SD1** provisioning, **SD2** the lifecycle (boot · suspend · resume · migrate · terminate), **SD3** identity and sync, **SD4** projecting (managing holospaces and working in one through a projection). Each diagram is bimodal: an Object-Process Diagram (OPD) paired with equivalent Object-Process Language (OPL) sentences.
 
 Scope: the substrate is modeled as a single external object (`Substrate`); its internal pillars are defined by [hologram](https://github.com/Hologram-Technologies/hologram), not here. Peer deployment topology (browser / native / bare-metal) is described in the Deployment View (arc42 chapter 7), not modeled as an OPD.
 
@@ -17,12 +17,16 @@ Substrate is informatical.
 Holospace is informatical.
 Provisioning is informatical.
 Booting is informatical.
+Projecting is informatical.
 Holospaces exhibits Provisioning and Booting.
+Holospaces exhibits Projecting.
 Operator handles Provisioning.
 Operator handles Booting.
+Operator handles Projecting.
 Provisioning yields Holospace.
 Booting requires Holospace.
 Booting requires Substrate.
+Projecting requires Holospace.
 ```
 
 ## SD1 Provisioning
@@ -83,5 +87,21 @@ Sign-In requires Identity.
 Sync requires Identity.
 Sync requires Substrate.
 Sync affects Holospace.
+```
+
+## SD4 Projecting
+
+![SD4 Projecting](images/opm-SD4-Projecting.svg)
+
+```opl
+Projecting is informatical.
+Managing is informatical.
+Working is informatical.
+Projection is informatical.
+Holospace is informatical.
+Projecting consists of Managing and Working.
+Managing requires Projection.
+Working requires Projection.
+Working affects Holospace.
 ```
 

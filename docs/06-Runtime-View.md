@@ -6,24 +6,27 @@ structural conformance.)
 
 ## Provisioning a holospace from a devcontainer
 
-1.  The operator gives the Manager a link to a git repository containing
-    a valid `devcontainer.json`.
+1.  The operator gives the Manager a repository with a valid
+    `devcontainer.json`.
 
-2.  holospaces ingests the repository and the devcontainer config at the
-    boundary and **κ-addresses** them into the store; the config
-    *selects* a κ-addressed Wasm-recompiled userland for the Linux/POSIX
-    surface (ADR-008), not an OCI image by location (shared modules
-    dedupe; Laws L1/L2).
+2.  holospaces ingests the repository, the config, and the
+    operating-system image as **κ-addressed content** — fetched and
+    verified through the substrate (`get_with_fetch`), addressed by what
+    they *are*, never a located image (Laws L1/L2/L5); shared content
+    dedupes.
 
-3.  It composes a **holospace definition** — a κ over those parts; the
-    same `devcontainer.json` yields the same κ (reproducibility, Q4).
+3.  It composes a **holospace definition** — a κ over those parts (the
+    OS image, the repository, the system-emulator codemodule, the
+    capabilities); the same source yields the same κ (reproducibility,
+    Q4).
 
-4.  The Boot Layer spawns the holospace through the substrate’s runtime
-    as a hologram-native Wasm container providing the environment; the
-    userland binds only the host ABI and I/O is expressed over the
-    content-addressed graph.
+4.  The Boot Layer boots the holospace: the **system-emulator
+    codemodule** (ADR-009) computes the operating system from its
+    κ-addressed content over the substrate runtime — disk as κ-addressed
+    blocks, console / input / network as hologram channels, running
+    state as a κ snapshot.
 
-5.  The holospace appears in the Manager, ready to use.
+5.  The holospace appears in the Manager, ready to open.
 
 ## Provisioning a holospace from a holo-file
 
@@ -41,7 +44,8 @@ structural conformance.)
 3.  Management is identical to any other holospace — the same
     κ-identity, provisioning, resolution, and migration; the two compute
     forms differ only in which substrate engine executes them (the
-    executor for a `.holo`, the `ContainerRuntime` for a userland).
+    executor for a `.holo`, the `ContainerRuntime` for a Wasm code
+    module such as the system emulator).
 
 ## Suspend, resume, and migrate
 
@@ -64,20 +68,24 @@ Dev Container with no Docker daemon and no cloud VM, on a thin device.
     Pages) — the browser is now a peer that *is* the substrate (Law L1).
 
 2.  They import the devcontainer: the repository’s `devcontainer.json`
-    (validated against the Dev Container spec, `CC-4`) selects a
-    κ-addressed Wasm userland for its Linux/POSIX surface (ADR-008).
+    (validated against the Dev Container spec, `CC-4`) and its
+    operating-system image become κ-addressed content, and the holospace
+    is provisioned.
 
-3.  The Boot Layer provisions the holospace and the Spawner boots it
-    **in the browser tab** through hologram’s `ContainerRuntime` over
-    the `wasmi` interpreter `ContainerEngine` — the same lifecycle as a
-    native or remote peer (boot, suspend to a κ snapshot, resume,
-    terminate).
+3.  The operator **launches** the holospace — a **workspace projection**
+    (editor, file tree, terminal) opens in a new tab. The Boot Layer
+    boots the holospace via the system-emulator codemodule on the
+    browser’s `wasmi` `ContainerEngine` — the same lifecycle as a native
+    or remote peer (boot, suspend to a κ snapshot, resume, migrate).
 
-4.  Because state is content (a κ snapshot), the operator can suspend
-    the holospace in the browser and resume it on another instance —
-    local or remote — and the same holospace κ boots there too (Q6). The
-    browser is a first-class compute substrate; the only limits are the
-    device’s, not an account cap.
+4.  The projection reads the environment’s content by κ and publishes
+    the operator’s edits and commands as **canonical events** on the
+    holospace’s channels — editing files and running a terminal, the
+    Codespaces/Gitpod experience, entirely in the browser. Because state
+    is a κ snapshot, the operator can suspend here and resume on another
+    instance — local or remote — and the same holospace κ runs there too
+    (Q6). The browser is a first-class compute substrate; the only
+    limits are the device’s, not an account cap.
 
 ## Cold-start from GitHub Pages
 

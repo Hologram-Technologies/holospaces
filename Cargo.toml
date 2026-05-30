@@ -35,7 +35,15 @@ hologram-archive        = { git = "https://github.com/Hologram-Technologies/holo
 hologram-runtime        = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-runtime" }
 hologram-runtime-wasmtime = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-runtime-wasmtime" }
 hologram-runtime-bare   = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-runtime-bare", default-features = false }
+# The bare-metal HAL seam (BlockDevice / NetworkInterface) the κ-disk implements —
+# no_std + alloc, so the κ-disk is part of the portable peer core. Consumed by
+# reference (ADR-006).
+hologram-bare-hal       = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-bare-hal", default-features = false }
 prism                   = { version = "0.4", package = "uor-prism" }
+# The async trait emitter the HAL traits use, and a no_std spin lock for the
+# κ-disk's in-memory sector index — versions matched to hologram's own.
+async-trait             = "0.1"
+spin                    = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 
 # Quality commitments enforced from the beginning (arc42 ch.10). CI runs clippy
 # with `-D warnings`, so every workspace member upholds these.

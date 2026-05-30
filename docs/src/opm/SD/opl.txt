@@ -4,9 +4,13 @@ Substrate is informatical.
 Holospace is informatical.
 Provisioning is informatical.
 Booting is informatical.
+Projecting is informatical.
 Holospaces exhibits Provisioning and Booting.
+Holospaces exhibits Projecting.
 Operator handles Provisioning.
 Operator handles Booting.
+Operator handles Projecting.
 Provisioning yields Holospace.
 Booting requires Holospace.
 Booting requires Substrate.
+Projecting requires Holospace.

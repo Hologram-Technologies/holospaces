@@ -21,9 +21,13 @@
 //!   lifecycle through hologram's `ContainerRuntime`.
 //! - [`engine`] — the *.holo Engine*: runs a `.holo` compute artifact via the
 //!   hologram executor. Conformance: `CC-2`.
-//! - [`surface`] — the *Execution Surface*: the κ-addressed Wasm-recompiled
-//!   userland form (the second compute form) and the host-ABI contract it must
-//!   bind (ADR-008, resolving RT1). Conformance: `CC-6`.
+//! - [`surface`] — the *Execution Surface*: the κ-addressed Wasm code-module
+//!   form (the second compute form) and the host-ABI contract it must bind
+//!   (ADR-008, generalized by ADR-009). Conformance: `CC-6`.
+//! - [`disk`] — the *κ-disk*: a [`KappaStore`](substrate::KappaStore)-backed
+//!   `BlockDevice` (hologram's HAL), an operating-system image as κ-addressed
+//!   content the [execution surface](surface) reads (ADR-009). Conformance:
+//!   `CC-7`.
 //! - [`peer`] — a [`Peer`](peer::Peer) that composes the substrate for an
 //!   environment (storage · network · runtime) and supplies the boot
 //!   operations, incl. reachability-closure migration (arc42 chapter 7).
@@ -64,6 +68,7 @@
 extern crate alloc;
 
 pub mod boot;
+pub mod disk;
 /// The `.holo` Engine (the host-side execution backend; `std` only — the CPU
 /// kernels' float math needs `std`).
 #[cfg(feature = "std")]

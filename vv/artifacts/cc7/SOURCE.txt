@@ -1,0 +1,25 @@
+CC-7 — κ-disk authority artifact: a real on-disk ext4 filesystem image.
+
+rootfs.ext4
+  A real ext4 filesystem image, 1024 KiB (1024 blocks × 1024 B). It is the
+  external authority for CC-7: the κ-disk (a KappaStore-backed BlockDevice)
+  must preserve a real filesystem's bytes exactly, and a real ext4 reader must
+  read the same files back out after a round trip through the κ-disk.
+
+  Produced by e2fsprogs — the canonical Linux ext2/3/4 implementation
+  (https://www.kernel.org ext4; e2fsprogs https://e2fsprogs.sourceforge.net):
+    mke2fs 1.47.0 (5-Feb-2023)
+  Command (reproducible — fixed UUID, fixed hash seed, fixed timestamps;
+  populated from a directory tree with mke2fs -d, no mount/root required):
+    E2FSPROGS_FAKE_TIME=1700000000 \
+    mke2fs -q -t ext4 -b 1024 -m 0 -O ^has_journal \
+      -U 0d15ea5e-0000-4000-8000-0000000000c7 \
+      -E hash_seed=0d15ea5e-0000-4000-8000-0000000000c7 \
+      -d <root> rootfs.ext4 1024
+  Rebuilding with the same e2fsprogs yields a byte-identical image
+  (sha256 a22117a6eebeaffa3a23cd4cf9d6430352bbe9c6aa010c6eb59a33d131babe54).
+
+  Files in the image (content read back by debugfs in the witness):
+    /hello.txt        "hello from a real ext4 filesystem on a kappa-disk\n"
+    /fox.txt          "the quick brown fox jumps over the lazy dog\n"
+    /dir/nested.txt   "nested content preserved byte-for-byte\n"

@@ -34,6 +34,12 @@ std = [
 # no_std-capable (default features off; the `std` feature re-enables).
 hologram-substrate-core = { workspace = true }
 hologram-realizations = { workspace = true }
+# The κ-disk (CC-7) implements hologram's BlockDevice HAL trait, backed by a
+# KappaStore — a real filesystem image as κ-addressed content. no_std + alloc,
+# so it is part of the portable peer core (the execution surface on every peer).
+hologram-bare-hal = { workspace = true }
+async-trait = { workspace = true }
+spin = { workspace = true }
 # The .holo Engine building block: holospaces supplies the .holo execution
 # backend (arc42 ch.5 / ch.7), bound to hologram's executor. The CPU kernels'
 # float math needs std today, so the engine is a `std` surface (the bare-metal
@@ -46,6 +52,9 @@ serde_json = { version = "1", optional = true }
 wasmparser = { version = "0.221", optional = true }
 
 [dev-dependencies]
+# Named directly in the CC-8 witness (a source-peer KappaSync, SyncError, Bytes,
+# address oracle) — the same substrate-core contracts the lib composes, with std.
+hologram-substrate-core = { workspace = true, features = ["std"] }
 # CC-3 — the substrate conformance battery + the stores holospaces resolves through.
 hologram-substrate-tck = { workspace = true }
 hologram-store-mem = { workspace = true }
