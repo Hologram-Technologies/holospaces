@@ -81,3 +81,51 @@ warnings denied, and the unit, integration, and e2e test tiers.
 quality gates and is held to its external authority (`CC-*`); quality
 cannot silently regress. The test tiers are empty until components exist
 — the gates are not.
+
+## ADR-008: The execution surface is a κ-addressed Wasm userland over the substrate host ABI
+
+**Status:** Accepted. (Resolves the open decision RT1 of Chapter 11.)
+
+**Context:** A devcontainer holospace needs a Linux/POSIX execution
+surface, but the substrate is Wasm-only with no ambient WASI (the closed
+host surface of `CC-5`). Two surfaces were possible: (A) a
+hologram-native CPU/system *emulator-as-container* that runs arbitrary
+OCI images, or (B) a *Wasm-native* surface in which userlands are
+recompiled to κ-addressed Wasm modules that bind only the substrate’s
+host ABI. The choice is forced by the laws, not by convenience:
+
+- An OCI image is named by registry, repository, and tag — by
+  *location*. Adopting (A) would make a holospace’s code identity a
+  location, reintroducing exactly what Law L1 and ADR-001 forbid; an
+  opaque layered image is also not a canonical form holospaces could
+  operate on (Law L2).
+
+- A CPU/OCI emulator is a *second execution medium* beside hologram’s
+  runtime, which Law L4 and ADR-003 forbid ("everything through the
+  substrate; no parallel medium").
+
+**Decision:** The execution surface is (B). A holospace’s general/system
+code — the second of the two compute forms (Chapter 8) — is a
+**Wasm-recompiled userland**: one or more κ-addressed Wasm code modules
+that import only the substrate’s host ABI (the `hologram` host module —
+the syscall boundary) and present the container ABI hologram’s
+`ContainerRuntime` drives. The POSIX/libc layer is itself such a
+κ-addressed module. A devcontainer’s `devcontainer.json` therefore
+*selects and configures* a κ-addressed userland (content), it does not
+name an OCI image to emulate (location). holospaces **defines and
+enforces** this surface — the host-ABI import contract and the
+κ-addressed userland form — and boots it through the substrate unchanged
+by the lifecycle; **producing** a recompiled userland (the toolchain,
+the libc port) is upstream, exactly as compiling a model to `.holo` is
+(ADR-004, ADR-006). The surface is realized by the `surface` building
+block (Chapter 5) and witnessed by `CC-6` (Chapter 10).
+
+**Consequences:** Code identity stays content, never location (L1); a
+userland is a canonical form, deduped and verifiable like any κ (L2,
+L5); execution stays on the one substrate medium (L4); the same userland
+κ boots on any peer (Q6). The cost is that arbitrary prebuilt OCI images
+do not run as-is — they must be recompiled to the Wasm userland form;
+building that toolchain is upstream work, and a multi-module userland’s
+linking and closure are future work beyond the single-module surface
+witnessed here. Choosing the location-addressed emulator was rejected as
+a law violation, not a trade-off.

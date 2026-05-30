@@ -11,13 +11,14 @@ None of them re-implement substrate functionality; they compose it.
 alt="Level 2: Containers" />
 </figure>
 
-| Building block       | Responsibility                                                                                                                                                                                                                             |
-|----------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| **Realizations**     | holospaces' canonical-form types — chiefly the **holospace** (the κ-addressed bootable unit). Each is IRI-tagged canonical bytes, κ-addressed and verified by re-derivation, using [UOR-ADDR](https://github.com/UOR-Foundation/uor-addr). |
-| **Boot Layer**       | The environment-agnostic core: resolve a holospace κ, fetch and verify its parts, and spawn it through hologram’s ContainerRuntime with its capabilities; drive the lifecycle.                                                             |
-| **.holo Engine**     | A ContainerEngine backend that runs `.holo` compute artifacts via the [hologram](https://github.com/Hologram-Technologies/hologram) executor. Native, and compiled to Wasm for the browser peer.                                           |
-| **Identity**         | Self-sovereign sign-in key and the multi-instance sync keying (an operator’s instances discover and synchronise their holospaces over the substrate).                                                                                      |
-| **Platform Manager** | The Hologram platform: the operator console that provisions and manages holospaces. Itself a holospace.                                                                                                                                    |
+| Building block        | Responsibility                                                                                                                                                                                                                             |
+|-----------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Realizations**      | holospaces' canonical-form types — chiefly the **holospace** (the κ-addressed bootable unit). Each is IRI-tagged canonical bytes, κ-addressed and verified by re-derivation, using [UOR-ADDR](https://github.com/UOR-Foundation/uor-addr). |
+| **Boot Layer**        | The environment-agnostic core: resolve a holospace κ, fetch and verify its parts, and spawn it through hologram’s ContainerRuntime with its capabilities; drive the lifecycle.                                                             |
+| **.holo Engine**      | A ContainerEngine backend that runs `.holo` compute artifacts via the [hologram](https://github.com/Hologram-Technologies/hologram) executor. Native, and compiled to Wasm for the browser peer.                                           |
+| **Execution Surface** | The Wasm-native Linux/POSIX surface (ADR-008): the κ-addressed *Wasm-recompiled userland* form (general/system code) and the host-ABI import contract it must bind. Defines and enforces the surface; the substrate runtime executes it.   |
+| **Identity**          | Self-sovereign sign-in key and the multi-instance sync keying (an operator’s instances discover and synchronise their holospaces over the substrate).                                                                                      |
+| **Platform Manager**  | The Hologram platform: the operator console that provisions and manages holospaces. Itself a holospace.                                                                                                                                    |
 
 ## Level 2
 
@@ -48,6 +49,13 @@ hologram’s runtime (`ContainerRuntime`) drives, here bound to hologram’s
 [hologram](https://github.com/Hologram-Technologies/hologram) for the
 engine/runtime contract). In the browser peer this binding is the
 executor compiled to Wasm.
+
+**Execution Surface** — the *userland form* (a κ-addressed Wasm code
+module, the second compute form) and a *surface validator* (a userland
+imports only the `hologram` host ABI and presents the container ABI). It
+binds a devcontainer’s Linux/POSIX surface to the substrate without a
+second execution medium (ADR-008, resolving RT1); the resulting userland
+κ feeds the Boot Layer’s Spawner unchanged.
 
 **Identity** — a *Key store* (the self-sovereign sign-in key) and a
 *Sync binding* (scopes which content an operator’s instances announce

@@ -22,7 +22,9 @@
     </p>
     <p>
       <button id="signin">Sign in</button>
-      <button id="provision">Provision a holospace</button>
+      <button id="provision">Provision a .holo</button>
+      <button id="userland">Provision a userland</button>
+      <button id="runholo">Run a .holo</button>
     </p>
     <p>operator: <span id="operator" class="k muted">(signed out)</span></p>
     <p>holospaces:</p>
@@ -31,11 +33,12 @@
     <pre id="log" class="muted">loading…</pre>
 
     <script type="module">
-      import init, { kappa, verify_kappa, run_holo, Console } from "./pkg/holospaces_web.js";
+      import init, { kappa, verify_kappa, run_holo, validate_userland, Console }
+        from "./pkg/holospaces_web.js";
       await init();
 
       // Expose the Manager surface for the Playwright browser test.
-      window.hs = { kappa, verify_kappa, run_holo, Console };
+      window.hs = { kappa, verify_kappa, run_holo, validate_userland, Console };
 
       const console0 = new Console();
       const $ = (id) => document.getElementById(id);
@@ -60,12 +63,36 @@
       $("provision").onclick = () => {
         const code = new TextEncoder().encode("holospace code module #" + ++n);
         const k = console0.provision(code, 256 * 1024 * 1024);
-        log("provisioned holospace " + k);
+        log("provisioned a .holo holospace " + k);
         render();
+      };
+      // The execution surface (ADR-008): validate a recompiled userland against
+      // the host-ABI surface, then provision it as a holospace — in-browser.
+      $("userland").onclick = async () => {
+        try {
+          const res = await fetch("./fixture-userland.wasm");
+          const module = new Uint8Array(await res.arrayBuffer());
+          const k = console0.provision_userland(module, 4 * 1024 * 1024);
+          log("provisioned a userland holospace (execution surface) " + k);
+          render();
+        } catch (e) {
+          log("userland provisioning failed: " + e);
+        }
+      };
+      // The browser .holo engine (RT2, realized): run a .holo through the
+      // executor compiled to wasm; the output κ equals the native one (CC-2).
+      $("runholo").onclick = async () => {
+        try {
+          const res = await fetch("./fixture.holo");
+          const archive = new Uint8Array(await res.arrayBuffer());
+          log("browser .holo engine → output κ " + run_holo(archive));
+        } catch (e) {
+          log("running the .holo failed: " + e);
+        }
       };
 
       window.__ready = true;
-      log("ready — sign in, then provision holospaces (content-addressed, in-browser)");
+      log("ready — sign in, then provision holospaces (both compute forms, in-browser)");
     </script>
   </body>
 </html>

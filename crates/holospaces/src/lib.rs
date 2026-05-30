@@ -21,6 +21,9 @@
 //!   lifecycle through hologram's `ContainerRuntime`.
 //! - [`engine`] — the *.holo Engine*: runs a `.holo` compute artifact via the
 //!   hologram executor. Conformance: `CC-2`.
+//! - [`surface`] — the *Execution Surface*: the κ-addressed Wasm-recompiled
+//!   userland form (the second compute form) and the host-ABI contract it must
+//!   bind (ADR-008, resolving RT1). Conformance: `CC-6`.
 //! - [`peer`] — a [`Peer`](peer::Peer) that composes the substrate for an
 //!   environment (storage · network · runtime) and supplies the boot
 //!   operations, incl. reachability-closure migration (arc42 chapter 7).
@@ -69,6 +72,7 @@ pub mod identity;
 pub mod manager;
 pub mod peer;
 pub mod realizations;
+pub mod surface;
 /// Wasm module validation (the host-side provisioning surface; `std` only).
 #[cfg(feature = "std")]
 pub mod wasm;

@@ -9,16 +9,19 @@ structural conformance.)
 1.  The operator gives the Manager a link to a git repository containing
     a valid `devcontainer.json`.
 
-2.  holospaces ingests the repository, the devcontainer config, and the
-    base image at the boundary and **κ-addresses** them into the store
-    (shared layers dedupe; Law L2).
+2.  holospaces ingests the repository and the devcontainer config at the
+    boundary and **κ-addresses** them into the store; the config
+    *selects* a κ-addressed Wasm-recompiled userland for the Linux/POSIX
+    surface (ADR-008), not an OCI image by location (shared modules
+    dedupe; Laws L1/L2).
 
 3.  It composes a **holospace definition** — a κ over those parts; the
     same `devcontainer.json` yields the same κ (reproducibility, Q4).
 
 4.  The Boot Layer spawns the holospace through the substrate’s runtime
-    as a hologram-native container providing the environment; I/O is
-    expressed over the content-addressed graph.
+    as a hologram-native Wasm container providing the environment; the
+    userland binds only the host ABI and I/O is expressed over the
+    content-addressed graph.
 
 5.  The holospace appears in the Manager, ready to use.
 

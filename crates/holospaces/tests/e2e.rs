@@ -49,14 +49,16 @@ fn caps() -> Capabilities {
 }
 
 /// Provision a Wasm-container holospace into a store. The code module is a real
-/// `hologram.*` Wasm container; how a devcontainer is *built* into such a
-/// module is the open Linux-surface decision (arc42 chapter 11, RT1) — the Boot
-/// Layer and lifecycle are identical regardless of how the code κ is produced.
+/// `hologram.*` Wasm container — the *Userland* compute form (the execution
+/// surface, ADR-008): general/system code the runtime spawns over the host ABI.
+/// How a devcontainer's Linux/POSIX surface is *recompiled* into such a userland
+/// is upstream toolchain work; the Boot Layer and lifecycle here are identical
+/// regardless of how the userland κ is produced.
 fn provision_container(store: &MemKappaStore) -> Holospace {
     let code = store
         .put("blake3", &wat::parse_str(CONTAINER_WAT).unwrap())
         .unwrap();
-    provision(store, Source::HoloFile { artifact: code }, caps()).expect("provision into store")
+    provision(store, Source::Userland { entry: code }, caps()).expect("provision into store")
 }
 
 /// The full operator flow over the real runtime: sign in, provision into the
@@ -159,7 +161,7 @@ fn operator_validates_a_wasm_code_module_before_provisioning() {
 
     let store = MemKappaStore::new();
     let code = store.put("blake3", &module).unwrap();
-    let holospace = provision(&store, Source::HoloFile { artifact: code }, caps()).unwrap();
+    let holospace = provision(&store, Source::Userland { entry: code }, caps()).unwrap();
     assert!(store.contains(holospace.manifest()));
 }
 
@@ -183,7 +185,7 @@ fn operator_console_provisions_on_a_then_syncs_and_boots_on_b() {
         let peer_a = Peer::new(runtime_a.store(), &runtime_a);
         let mut manager_a = Manager::sign_in(peer_a, operator.clone());
         let holospace = manager_a
-            .provision(Source::HoloFile { artifact: code }, caps())
+            .provision(Source::Userland { entry: code }, caps())
             .expect("provision");
         assert_eq!(manager_a.view().holospaces, vec![holospace]);
 

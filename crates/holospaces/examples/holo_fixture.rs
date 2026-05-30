@@ -7,6 +7,11 @@
 //! executor compiled to wasm and asserts an identical κ — the browser `.holo`
 //! engine equals the native one.
 //!
+//! It also emits a `fixture-userland.wasm` — a real recompiled userland (the
+//! second compute form, the execution surface ADR-008; `CC-6`) — so the browser
+//! Platform Manager can validate it against the host-ABI surface and provision
+//! it as a holospace in-browser.
+//!
 //! Run by `scripts/browser-manager-test.sh`:
 //! `cargo run -p holospaces --example holo_fixture -- crates/holospaces-web/web`
 
@@ -42,6 +47,20 @@ fn compile_constant_holo(value: f32) -> Vec<u8> {
         .archive
 }
 
+/// A real recompiled userland (the execution surface, ADR-008): general/system
+/// code that presents the full container ABI and imports only the `hologram`
+/// host ABI — so `holospaces::surface::validate_userland` accepts it and the
+/// browser peer can provision it as a holospace.
+const USERLAND_WAT: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "hg_init")     (param i32 i32) (result i32) (i32.const 0))
+  (func (export "hg_event")    (param i32 i32) (result i32) (i32.const 0))
+  (func (export "hg_suspend")  (result i32) (i32.const 0))
+  (func (export "hg_resume")   (result i32) (i32.const 0))
+  (func (export "hg_callback") (param i32 i32 i32) (result i32) (i32.const 0)))
+"#;
+
 fn main() {
     let out_dir = std::env::args()
         .nth(1)
@@ -52,8 +71,18 @@ fn main() {
         .to_owned();
     std::fs::write(format!("{out_dir}/fixture.holo"), &archive).expect("write fixture.holo");
     std::fs::write(format!("{out_dir}/fixture.kappa"), &kappa).expect("write fixture.kappa");
+
+    // The execution-surface fixture: a recompiled userland, validated here so
+    // the emitted artifact is guaranteed surface-valid for the browser peer.
+    let userland = wat::parse_str(USERLAND_WAT).expect("assemble userland wasm");
+    holospaces::surface::validate_userland(&userland).expect("userland is surface-valid");
+    std::fs::write(format!("{out_dir}/fixture-userland.wasm"), &userland)
+        .expect("write fixture-userland.wasm");
+
     println!(
-        "holo_fixture: wrote fixture.holo ({} bytes); native output κ = {kappa}",
-        archive.len()
+        "holo_fixture: wrote fixture.holo ({} bytes, native output κ = {kappa}) and \
+         fixture-userland.wasm ({} bytes, surface-valid)",
+        archive.len(),
+        userland.len()
     );
 }

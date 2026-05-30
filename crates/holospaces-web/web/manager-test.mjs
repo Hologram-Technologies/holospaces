@@ -96,6 +96,41 @@ try {
     `browser .holo engine equals native (κ ${browserKappa})`,
   );
 
+  // CC-6 / ADR-008 — the execution surface in the browser: validate a real
+  // recompiled userland against the host-ABI surface, then provision it as a
+  // holospace; an ambient (WASI-style) import is refused.
+  const surface = await page.evaluate(async () => {
+    const res = await fetch("./fixture-userland.wasm");
+    const userland = new Uint8Array(await res.arrayBuffer());
+    let validated = true;
+    try {
+      window.hs.validate_userland(userland);
+    } catch {
+      validated = false;
+    }
+    const c = new window.hs.Console();
+    c.sign_in(new TextEncoder().encode("operator-self-sovereign-key"));
+    const holospace = c.provision_userland(userland, 4 * 1024 * 1024);
+    const view = JSON.parse(c.view());
+
+    // A module that reaches for an ambient `env` host is rejected by the surface.
+    const ambient = Uint8Array.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0xff]);
+    let rejected = false;
+    try {
+      window.hs.validate_userland(ambient);
+    } catch {
+      rejected = true;
+    }
+    return { validated, holospace, listed: view.holospaces, rejected };
+  });
+
+  check(surface.validated, "a recompiled userland validates against the host-ABI surface (CC-6)");
+  check(
+    surface.holospace.startsWith("blake3:") && surface.listed.includes(surface.holospace),
+    `provisioned a userland holospace on the execution surface (${surface.holospace})`,
+  );
+  check(surface.rejected, "an invalid/ambient userland module is refused (closed host surface)");
+
   console.log(failed ? "MANAGER-TEST: FAILED" : "MANAGER-TEST: PASS (browser peer + Platform Manager)");
 } finally {
   await browser.close();
