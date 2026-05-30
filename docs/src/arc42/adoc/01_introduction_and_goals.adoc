@@ -5,7 +5,7 @@ holospaces is a UOR-native _workload control plane_ over the https://github.com/
 
 === Motivating scenario
 
-Someone shares a GitHub project and asks you to try it. You want to run the code and its examples in the repo's https://containers.dev[Dev Container], on a Chromebook or Android tablet with no local Docker and no ChromeOS Linux VM. Today that means GitHub Codespaces or Gitpod — a cloud VM, with per-account caps (you can't keep more than a couple alive) and metered cost that blows past the free tier. holospaces removes the VM: the Platform Manager imports the devcontainer and boots it *as a Wasm userland in your browser tab*, through the hologram substrate runtime — same lifecycle (boot, suspend to a κ snapshot, resume, migrate), no Docker daemon, no cloud host, no server. The browser is the compute substrate; the only limits are the device's. This is the resolved execution surface of Chapter 11 (RT1) and Chapter 9 (ADR-008), witnessed live in headless Chromium (`CC-6`).
+Someone shares a GitHub project and asks you to try it. You want to run the code and its examples in the repo's https://containers.dev[Dev Container], on a Chromebook or Android tablet with no local Docker and no ChromeOS Linux VM. Today that means GitHub Codespaces or Gitpod — a cloud VM, with per-account caps (you can't keep more than a couple alive) and metered cost that blows past the free tier. holospaces removes the VM: in the Platform Manager you import the devcontainer and *launch* it — a *workspace projection* (editor, file tree, terminal) opens in a new tab over the running devcontainer. Its operating system is computed by a *κ-addressed system emulator* on the hologram substrate (ADR-009): the OS image is content, I/O is canonical events on channels, state is a κ snapshot — same lifecycle (boot, suspend, resume, migrate), no Docker daemon, no cloud host, no server. The browser is the compute substrate; the only limits are the device's. This is the execution surface of Chapter 9 (ADR-009) and Chapter 11 (RT1), witnessed against the https://www.kernel.org[Linux] and https://containers.dev[Dev Container] specifications (Chapter 10).
 
 This documentation is *authoritative for holospaces only*. Where it refers to hologram, https://github.com/UOR-Foundation/uor-addr[UOR-ADDR], or https://github.com/UOR-Foundation/prism[Prism], it *links* to those projects rather than restating their internals — their APIs and guarantees are defined there, not here.
 
@@ -22,6 +22,8 @@ holospaces must let an operator provision, boot, and manage holospaces, uniforml
 | R4 | Run holospaces across the environments hologram supports: *browser*, *native*, *bare-metal*.
 | R5 | *Sign-in* with a self-sovereign identity so an operator's instances synchronise their holospaces over the substrate.
 | R6 | Serve the *Hologram* platform (the Platform Manager) from this repository's *GitHub Pages*.
+| R7 | Run an *arbitrary operating system* in a holospace — a real https://www.kernel.org[Linux] dev environment and its real binaries (the devcontainer's image), computed over the substrate.
+| R8 | Open a *workspace projection* — a browser editor, file tree, and terminal over a running holospace — the https://github.com/features/codespaces[Codespaces] / https://www.gitpod.io[Gitpod] experience, launched from the Platform Manager.
 |===
 
 === Quality Goals

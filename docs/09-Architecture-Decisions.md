@@ -25,16 +25,17 @@ is a cache (Laws L2, L3). **Consequences:** A holospace far larger than
 RAM remains bootable (demand-paged by κ-resolve); identical content is
 stored once; no serialize/deserialize seam.
 
-## ADR-003: Run `.holo` behind hologram’s runtime; everything through the substrate
+## ADR-003: Everything through the substrate — compose hologram’s executor and runtime
 
 **Status:** Accepted. **Context:** Compute is the
 [hologram](https://github.com/Hologram-Technologies/hologram) `.holo`
 executor; deployment is hologram’s ContainerRuntime. Bypassing the
 substrate would create a parallel medium. **Decision:** holospaces runs
-`.holo` via a ContainerEngine backend behind hologram’s runtime, with
-all state in the store as κ (Law L4). **Consequences:** holospaces stays
-a thin layer; storage/network/runtime/compute are reused, never
-re-implemented.
+a tensor `.holo` via hologram’s executor and a Wasm code module through
+hologram’s `ContainerRuntime` — two distinct substrate paths, never a
+parallel medium — with all state in the store as κ (Law L4).
+**Consequences:** holospaces stays a thin layer;
+storage/network/runtime/compute are reused, never re-implemented.
 
 ## ADR-004: The holospace is the unit; two provisioning paths
 
@@ -84,7 +85,12 @@ cannot silently regress. The test tiers are empty until components exist
 
 ## ADR-008: The execution surface is a κ-addressed Wasm userland over the substrate host ABI
 
-**Status:** Accepted. (Resolves the open decision RT1 of Chapter 11.)
+**Status:** Superseded by ADR-009. (Originally resolved RT1 of Chapter
+11. Its κ-addressed-Wasm-over-the-host-ABI surface stands and is reused;
+but its choice of **recompiled userlands only** runs only what was
+recompiled, not an arbitrary operating system — so it cannot host an
+arbitrary devcontainer. ADR-009 generalizes the surface to arbitrary OS
+images via emulation.)
 
 **Context:** A devcontainer holospace needs a Linux/POSIX execution
 surface, but the substrate is Wasm-only with no ambient WASI (the closed
@@ -123,8 +129,8 @@ interpreter in the browser and on bare-metal, where a JIT cannot run). A
 userland is κ-addressed **content** the platform hosts; authoring it
 (compiling C, building a model) is writing a program, not a platform
 feature — exactly as a `.holo` is authored by a compiler (ADR-004). The
-surface is realized by the `surface` building block (Chapter 5) and
-witnessed by `CC-6` (Chapter 10) on both the native and interpreter
+surface is realized by the Execution Surface building block (Chapter 5)
+and witnessed by `CC-6` (Chapter 10) on both the native and interpreter
 engines.
 
 **Consequences:** Code identity stays content, never location (L1); a
@@ -135,3 +141,55 @@ arbitrary prebuilt OCI images do not run as-is — a workload must be a
 Wasm userland (compiled for the substrate’s host ABI), which is the
 price of content-addressed identity. Choosing the location-addressed
 emulator was rejected as a law violation, not a trade-off.
+
+## ADR-009: Run arbitrary operating systems via a κ-addressed system-emulator codemodule
+
+**Status:** Accepted. (Supersedes ADR-008; revisits RT1 of Chapter 11.)
+
+**Context:** holospaces must host **arbitrary** devcontainers with full
+[Codespaces](https://github.com/features/codespaces) /
+[Gitpod](https://www.gitpod.io) parity — any repository’s environment,
+running real binaries (`apt`, shells, language toolchains), not only
+software recompiled for the substrate. ADR-008 chose a Wasm-native
+**recompiled userland** and rejected the emulator-as-container,
+reasoning that an OCI image is named by location (Law L1). That
+reasoning conflated the **image** with its **reference**: a recompiled
+userland runs only what was recompiled — it cannot run an arbitrary OS —
+whereas an emulator can, and an emulator over κ-addressed content
+reintroduces no location. The
+[hologram](https://github.com/Hologram-Technologies/hologram) substrate
+already provides the mechanism (ADR-006): **code is κ-addressed, and
+arbitrary code is imported by κ, verified by re-derivation, and
+instantiated** (hologram’s driver-import witnesses — real Wasm drivers
+perform real block/NIC I/O over the κ-store); workloads are arbitrary
+Wasm over the `hologram` host ABI.
+
+**Decision:** A holospace’s execution is a **κ-addressed system-emulator
+codemodule** — a real system emulator compiled to Wasm and bound to the
+`hologram` host ABI — that boots an arbitrary operating-system image.
+Its disk is the OS image + repository as **κ-addressed content** (a
+`KappaStore`-backed block device); its console,
+`stdin`/`stdout`/`stderr`, and network are **hologram channels**
+(`publish`/`subscribe`); its running state is a **κ snapshot** (suspend
+/ resume / migrate). The emulator and the OS image are imported and
+verified trustlessly like any κ. holospaces **starts with Linux** and
+generalizes to any OS the emulator boots. This **extends** the execution
+surface of ADR-008 (a κ-addressed Wasm code module over the host ABI —
+the Execution Surface building block, `CC-6` — which still stands) from
+"recompiled userlands only" to "arbitrary OS images via emulation"; the
+emulator is itself such a κ-addressed code module. The emulator is an
+existing Wasm system emulator adapted to the host ABI (reuse over
+reimplementation), not written from scratch.
+
+**Consequences:** Identity stays content, never location — the OS image
+is a κ, not a registry reference (L1); the image dedupes and verifies
+like any κ (L2, L5); execution stays on the one substrate medium — the
+emulator is Wasm over the host ABI, no parallel runtime (L4); the same
+holospace κ boots on any peer (Q6). holospaces runs **arbitrary**
+devcontainers — the Codespaces/Gitpod goal — at the cost of emulation
+overhead and one substantial component, the emulator codemodule. The
+management GUI (served from GitHub Pages) and the VS Code **projection**
+that connects to a running holospace are a distinct surface (Chapter 5,
+**Projections**; Chapter 7) — the operator manages holospaces in the GUI
+and launches one into a Codespaces/Gitpod-like editor + terminal bound
+to the running devcontainer.

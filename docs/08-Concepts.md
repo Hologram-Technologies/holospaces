@@ -36,19 +36,27 @@ uniformly.
 
 ## The execution surface
 
-A devcontainer holospace’s Linux/POSIX surface maps onto the Wasm
-code-module form: its userland is a **Wasm-recompiled userland** — a
-κ-addressed Wasm module that imports only the substrate’s host ABI (the
-`hologram` host module, the syscall boundary) and presents the container
-ABI hologram’s runtime drives (ADR-008, resolving RT1). A
-`devcontainer.json` *selects* a κ-addressed userland (content) rather
-than naming an OCI image (location, forbidden by Law L1). This keeps
-code identity content, dedup and verification uniform, and execution on
-the one substrate medium (Laws L1/L2/L4). holospaces ingests, validates,
-binds, and **boots** this surface on every peer — through hologram’s
-`ContainerRuntime` over a per-environment `ContainerEngine` (Wasmtime
-natively; the `wasmi` interpreter in the browser and on bare-metal). A
-userland is κ-addressed content the platform hosts. Conformance: `CC-6`.
+A holospace’s environment — an operating system and a repository — is
+**canonical content**: κ-labels for what the bytes *are*, never where
+they live (Law L1). **Booting** realizes the holospace as a
+**computation over that content**: a κ-addressed **execution
+codemodule** reads the environment by κ, runs it, and writes new
+canonical state. For a general operating system the codemodule is a
+**system emulator** compiled to Wasm and bound to the `hologram`
+operations (ADR-009): the OS image is its content-addressed store of
+blocks, the console / input / network are **canonical events on hologram
+channels** (`publish` / `subscribe`), and the running state is a **κ
+snapshot** (suspend / resume / migrate). The emulator and the image are
+imported and verified trustlessly like any κ (the substrate’s
+content-addressed read, `get_with_fetch`). Nothing is named by location
+— the image is a κ, a "file" is content, state is a κ — so an
+**arbitrary** operating system (Linux first, then any the emulator
+boots) runs the uor-native way: content in, computation through the
+substrate, canonical state out. The same holospace κ runs on any peer
+(Q6) and re-derives to verify (L5). This rests on the κ-addressed Wasm
+code-module surface (the Execution Surface building block, ADR-008’s
+contract — still in force; the emulator is itself such a code module).
+Conformance: `CC-6` through `CC-11` (Chapter 10).
 
 ## The holospace
 
@@ -84,6 +92,24 @@ account. That identity links the operator’s instances so their
 holospaces and state synchronise over the substrate; because state is
 content (a snapshot is a κ), a holospace can be suspended on one
 instance and resumed on another.
+
+## Projection (a surface over a holospace)
+
+The operator’s interfaces are **projections** — surfaces that render and
+drive a holospace’s canonical content, never a second source of truth
+and never a server (Law L1, L3). The **Platform Manager** is the
+management projection: an operator signs in and sees, provisions, and
+acts on their holospaces. A **workspace projection** — an editor, a file
+tree, and a terminal — gives the
+[Codespaces](https://github.com/features/codespaces) /
+[Gitpod](https://www.gitpod.io) experience over a **running** holospace:
+it reads the environment’s content by κ and publishes the operator’s
+input as canonical events on the holospace’s channels, so editing a file
+or running a command is content in, computation through the substrate,
+canonical state out. A projection holds no state of its own — it is a
+view and an intent surface over content (Law L3, the store is the
+memory). Delivered from the cold-start gateway (GitHub Pages), a
+projection makes the browser a peer that **is** the substrate.
 
 ## Verify by re-derivation
 

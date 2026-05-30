@@ -8,15 +8,17 @@ same holospace κ boots on any peer.
 
 Each peer composes, for its environment, hologram’s storage and
 content-addressed networking backends, a `ContainerEngine` that boots
-Wasm userlands (the execution surface, ADR-008), and hologram’s `.holo`
-executor for tensor compute. The two execution forms (Chapter 8) run on
-these two engines; the `ContainerEngine` is environment-specific:
+Wasm code modules — including the **system-emulator codemodule** that
+computes an arbitrary OS (the execution surface, ADR-009) — and
+hologram’s `.holo` executor for tensor compute. The two execution forms
+(Chapter 8) run on these two engines; the `ContainerEngine` is
+environment-specific:
 
-| Peer           | Container engine (Wasm userlands)                                                                                                   | `.holo` executor                       | Notes                                                                                                                                                              |
-|----------------|-------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| **Browser**    | hologram’s `wasmi` interpreter engine, compiled to Wasm (`wasm-pack`) — a JIT cannot run in the browser sandbox, an interpreter can | the hologram executor compiled to Wasm | Cold-started from GitHub Pages (untrusted gateway, verified on receipt). Hosts the Hologram Platform Manager, which boots userland containers in-browser (`CC-6`). |
-| **Native**     | hologram’s Wasmtime engine (JIT)                                                                                                    | the hologram executor, native          | A full peer; can both serve and route content.                                                                                                                     |
-| **Bare-metal** | hologram’s `wasmi` interpreter engine (`no_std`, no OS)                                                                             | the hologram executor                  | Boots from firmware; the leanest peer. The same interpreter engine as the browser.                                                                                 |
+| Peer           | Container engine (Wasm code modules)                                                                                                | `.holo` executor                       | Notes                                                                                                                                                                                                  |
+|----------------|-------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Browser**    | hologram’s `wasmi` interpreter engine, compiled to Wasm (`wasm-pack`) — a JIT cannot run in the browser sandbox, an interpreter can | the hologram executor compiled to Wasm | Cold-started from GitHub Pages (untrusted gateway, verified on receipt). Delivers the Platform Manager and workspace projections; boots holospaces in-browser, including the system emulator (`CC-6`). |
+| **Native**     | hologram’s Wasmtime engine (JIT)                                                                                                    | the hologram executor, native          | A full peer; can both serve and route content.                                                                                                                                                         |
+| **Bare-metal** | hologram’s `wasmi` interpreter engine (`no_std`, no OS)                                                                             | the hologram executor                  | Boots from firmware; the leanest peer. The same interpreter engine as the browser.                                                                                                                     |
 
 All backends — storage, network, both container engines
 (`hologram-runtime-wasmtime`, `hologram-runtime-bare`), and the `.holo`
@@ -40,11 +42,18 @@ mechanisms:
   naming, Law L1); the rendezvous/routing mechanism is hologram’s (see
   [hologram](https://github.com/Hologram-Technologies/hologram)).
 
-- **Execution** — two engines: a `ContainerEngine` boots Wasm userlands
-  (a devcontainer holospace’s Linux/POSIX surface, ADR-008) through
-  hologram’s `ContainerRuntime`; the `.holo` executor runs tensor
-  compute artifacts. The `ContainerEngine` is Wasmtime natively and the
-  `wasmi` interpreter in the browser and on bare-metal.
+- **Execution** — two engines: a `ContainerEngine` boots Wasm code
+  modules — including the system-emulator codemodule that computes an
+  arbitrary OS (ADR-009) — through hologram’s `ContainerRuntime`; the
+  `.holo` executor runs tensor compute artifacts. The `ContainerEngine`
+  is Wasmtime natively and the `wasmi` interpreter in the browser and on
+  bare-metal.
+
+- **Projection** — the operator’s surfaces (the Platform Manager GUI; a
+  workspace editor/terminal over a running holospace, Chapter 8) are
+  delivered from the cold-start gateway (GitHub Pages) and run **on the
+  peer**; they render and drive content, holding no state of their own
+  (Law L3). Launching a holospace opens its workspace projection.
 
 A single online peer is simply the one-participant case of the
 content-addressed mesh; signing in with the same identity links an
