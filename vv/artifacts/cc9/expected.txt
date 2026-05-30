@@ -1,0 +1,8 @@
+# CC-9 emulator ISA conformance — real RV64I programs and their ISA-defined
+# exit codes (the program computes the value; the emulator must reproduce the
+# RISC-V ISA semantics to yield it). exit convention: ecall with a7=93, a0=code.
+# <name> <expected exit code (decimal)>
+sum1to10 55
+bitops 85
+wordops 100
+memory 239
