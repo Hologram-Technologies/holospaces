@@ -9,12 +9,15 @@
 //!   spec-valid and binds only the substrate host ABI (`surface::validate_userland`);
 //! * the [hologram](https://github.com/Hologram-Technologies/hologram)
 //!   `ContainerRuntime` contract — the userland boots, suspends to a κ snapshot,
-//!   resumes, and migrates on a real `Runtime` + `WasmtimeEngine`.
+//!   resumes, and migrates on a real `Runtime`, over **both** the native
+//!   `WasmtimeEngine` (JIT) and the `wasmi` `BareMetalEngine` interpreter (the
+//!   browser + bare-metal `ContainerEngine`), yielding the same κ on each (Q6).
 //!
 //! This is the resolved RT1 surface: a κ-addressed userland over the host ABI,
 //! not a located OCI image (Laws L1/L2/L4).
 
 use hologram_runtime::Runtime;
+use hologram_runtime_bare::BareMetalEngine;
 use hologram_runtime_wasmtime::WasmtimeEngine;
 use hologram_store_mem::MemKappaStore;
 use holospaces::boot::{provision, Phase, Session};
@@ -155,6 +158,44 @@ fn a_recompiled_userland_runs_on_the_real_substrate() {
         b.resume().await.expect("resume the migrated userland on B");
         assert_eq!(b.phase(), Phase::Running);
         b.terminate().await.expect("terminate");
+    });
+}
+
+/// The **same** userland κ boots on a *different* environment engine: the
+/// `wasmi` interpreter `ContainerEngine` (`hologram-runtime-bare`) — the engine
+/// the browser and bare-metal peers run (it is `no_std` + pure-Rust, so it
+/// compiles to wasm32 and to bare-metal where a JIT cannot). This witnesses Q6
+/// (the same holospace κ boots on any peer) across heterogeneous engines, not
+/// just the native Wasmtime one. (CC-6, cross-environment execution surface.)
+#[test]
+fn a_userland_boots_on_the_interpreter_engine() {
+    pollster::block_on(async {
+        let module = wat::parse_str(USERLAND_WAT).unwrap();
+        surface::validate_userland(&module).expect("surface-valid");
+
+        let store = MemKappaStore::new();
+        let code = store.put("blake3", &module).unwrap();
+        let holospace =
+            provision(&store, Source::Userland { entry: code }, caps()).expect("provision");
+
+        // The κ is identical to the one a native Wasmtime peer computes — the
+        // holospace is the engine-agnostic content; only the peer's engine differs.
+        let native_store = MemKappaStore::new();
+        native_store.put("blake3", &module).unwrap();
+        let native = provision(&native_store, Source::Userland { entry: code }, caps()).unwrap();
+        assert_eq!(holospace.kappa(), native.kappa(), "same κ on any peer (Q6)");
+
+        // Boot, suspend, resume, terminate on the interpreter engine — the real
+        // browser/bare-metal execution surface, no JIT, no host.
+        let runtime = Runtime::new(BareMetalEngine::new(), store);
+        let mut s = Session::provision(&runtime, holospace);
+        s.boot().await.expect("interpreter spawn of the userland");
+        assert_eq!(s.phase(), Phase::Running);
+        let snapshot = s.suspend().await.expect("interpreter suspend");
+        assert!(snapshot.as_str().starts_with("blake3:"));
+        s.resume().await.expect("interpreter resume");
+        assert_eq!(s.phase(), Phase::Running);
+        s.terminate().await.expect("terminate");
     });
 }
 

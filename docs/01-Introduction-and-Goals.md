@@ -1,16 +1,37 @@
 # Introduction and Goals
 
-holospaces is a UOR-native *boot layer* over the
+holospaces is a UOR-native *workload control plane* over the
 [hologram](https://github.com/Hologram-Technologies/hologram) substrate.
-It provisions and runs *holospaces* — bootable, content-addressed
-environments that range from a single compute artifact to a full Linux
-development environment — across every environment hologram supports
-(browser, native, bare-metal), holding all state as content. Its
-first-party holospace, *Hologram*, is the *Platform Manager*: the
-operator console that provisions and manages the others. For the
-development-environment use case it is, in effect, a UOR-native,
-serverless [Gitpod](https://www.gitpod.io) /
-[Codespaces](https://github.com/features/codespaces).
+It provisions, places, and runs *holospaces* — bootable,
+content-addressed **workloads** that range from a single compute
+artifact to a full Linux development environment — across every compute
+substrate hologram supports, and it treats the **browser as a
+first-class compute substrate, alongside local (native) and remote
+infrastructure**. A workload that boots in the browser is not a degraded
+preview: it runs the same κ, through the same substrate runtime, as on a
+native or remote peer (Q6). The control plane is **not a server**: it is
+realized as a peer-local console — the first-party holospace *Hologram*,
+the *Platform Manager* — and every participant is a content-addressed
+peer (Law L1). For the development-environment use case it is, in
+effect, a UOR-native, serverless [Gitpod](https://www.gitpod.io) /
+[Codespaces](https://github.com/features/codespaces) that can run the
+environment **in the browser itself**.
+
+## Motivating scenario
+
+Someone shares a GitHub project and asks you to try it. You want to run
+the code and its examples in the repo’s [Dev
+Container](https://containers.dev), on a Chromebook or Android tablet
+with no local Docker and no ChromeOS Linux VM. Today that means GitHub
+Codespaces or Gitpod — a cloud VM, with per-account caps (you can’t keep
+more than a couple alive) and metered cost that blows past the free
+tier. holospaces removes the VM: the Platform Manager imports the
+devcontainer and boots it **as a Wasm userland in your browser tab**,
+through the hologram substrate runtime — same lifecycle (boot, suspend
+to a κ snapshot, resume, migrate), no Docker daemon, no cloud host, no
+server. The browser is the compute substrate; the only limits are the
+device’s. This is the resolved execution surface of Chapter 11 (RT1) and
+Chapter 9 (ADR-008), witnessed live in headless Chromium (`CC-6`).
 
 This documentation is **authoritative for holospaces only**. Where it
 refers to hologram,

@@ -113,6 +113,22 @@ try {
     const holospace = c.provision_userland(userland, 4 * 1024 * 1024);
     const view = JSON.parse(c.view());
 
+    // Boot the userland container IN THE BROWSER via the wasmi interpreter
+    // engine — spawn, suspend to a κ snapshot, resume, terminate (ADR-008/CC-6).
+    const snapshot = c.boot_userland(userland, 4 * 1024 * 1024);
+
+    // The Codespaces scenario (arc42 ch.1): import a devcontainer and run it in
+    // the browser tab — its config selects the κ-addressed Wasm userland.
+    const config = new TextEncoder().encode('{"name":"app","image":"debian:12"}');
+    const devcontainerSnapshot = c.run_devcontainer(
+      "https://github.com/example/cool-project.git",
+      "main",
+      ".devcontainer/devcontainer.json",
+      config,
+      userland,
+      64 * 1024 * 1024,
+    );
+
     // A module that reaches for an ambient `env` host is rejected by the surface.
     const ambient = Uint8Array.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0xff]);
     let rejected = false;
@@ -121,13 +137,29 @@ try {
     } catch {
       rejected = true;
     }
-    return { validated, holospace, listed: view.holospaces, rejected };
+    return {
+      validated,
+      holospace,
+      listed: view.holospaces,
+      snapshot,
+      devcontainerSnapshot,
+      rejected,
+    };
   });
 
   check(surface.validated, "a recompiled userland validates against the host-ABI surface (CC-6)");
   check(
     surface.holospace.startsWith("blake3:") && surface.listed.includes(surface.holospace),
     `provisioned a userland holospace on the execution surface (${surface.holospace})`,
+  );
+  check(
+    typeof surface.snapshot === "string" && surface.snapshot.startsWith("blake3:"),
+    `booted a userland container in-browser (interpreter engine) → snapshot κ ${surface.snapshot}`,
+  );
+  check(
+    typeof surface.devcontainerSnapshot === "string" &&
+      surface.devcontainerSnapshot.startsWith("blake3:"),
+    `imported + ran a devcontainer in-browser, no Docker/VM (κ ${surface.devcontainerSnapshot})`,
   );
   check(surface.rejected, "an invalid/ambient userland module is refused (closed host surface)");
 

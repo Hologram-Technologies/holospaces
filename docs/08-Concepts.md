@@ -37,17 +37,18 @@ uniformly.
 ## The execution surface
 
 A devcontainer holospace’s Linux/POSIX surface maps onto the Wasm
-code-module form: its userland is a **Wasm-recompiled userland** —
-κ-addressed Wasm modules that import only the substrate’s host ABI (the
-`hologram` host module, the syscall boundary) and present the container
-ABI hologram’s runtime drives (ADR-008, resolving RT1). The POSIX/libc
-layer is itself such a κ-addressed module, and a `devcontainer.json`
-*selects* a κ-addressed userland (content) rather than naming an OCI
-image (location, forbidden by Law L1). This keeps code identity content,
-dedup and verification uniform, and execution on the one substrate
-medium (Laws L1/L2/L4). holospaces defines and enforces the surface (the
-host-ABI import contract); producing a recompiled userland is upstream
-toolchain work (ADR-004/006). Conformance: `CC-6`.
+code-module form: its userland is a **Wasm-recompiled userland** — a
+κ-addressed Wasm module that imports only the substrate’s host ABI (the
+`hologram` host module, the syscall boundary) and presents the container
+ABI hologram’s runtime drives (ADR-008, resolving RT1). A
+`devcontainer.json` *selects* a κ-addressed userland (content) rather
+than naming an OCI image (location, forbidden by Law L1). This keeps
+code identity content, dedup and verification uniform, and execution on
+the one substrate medium (Laws L1/L2/L4). holospaces ingests, validates,
+binds, and **boots** this surface on every peer — through hologram’s
+`ContainerRuntime` over a per-environment `ContainerEngine` (Wasmtime
+natively; the `wasmi` interpreter in the browser and on bare-metal). A
+userland is κ-addressed content the platform hosts. Conformance: `CC-6`.
 
 ## The holospace
 
