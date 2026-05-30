@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "config": {
+    "mediaType": "application/vnd.oci.image.config.v1+json",
+    "digest": "sha256:efff58ccf46cfb6e4f6375c02ed87dbbae36114eca68f0ee7b7f8922bc9dc0d8",
+    "size": 673
+  },
+  "layers": [
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:6eabe91cff8e565f7cbcb44a150066205c7b2f6f1ef93bf18d3825ef89cadeae",
+      "size": 142,
+      "annotations": {
+        "buildkit/rewritten-timestamp": "1700000000"
+      }
+    }
+  ]
+}
