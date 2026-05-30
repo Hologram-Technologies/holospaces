@@ -24,6 +24,8 @@
       <button id="signin">Sign in</button>
       <button id="provision">Provision a .holo</button>
       <button id="userland">Provision a userland</button>
+      <button id="boot">Boot a userland</button>
+      <button id="devcontainer">Run a devcontainer</button>
       <button id="runholo">Run a .holo</button>
     </p>
     <p>operator: <span id="operator" class="k muted">(signed out)</span></p>
@@ -77,6 +79,42 @@
           render();
         } catch (e) {
           log("userland provisioning failed: " + e);
+        }
+      };
+      // Boot a userland container in the browser (ADR-008; RT2; CC-6): spawn it
+      // through the substrate runtime over the wasmi interpreter engine, capture
+      // a κ snapshot of its state, resume, terminate — all in the browser peer.
+      $("boot").onclick = async () => {
+        try {
+          const res = await fetch("./fixture-userland.wasm");
+          const module = new Uint8Array(await res.arrayBuffer());
+          const snapshot = console0.boot_userland(module, 4 * 1024 * 1024);
+          log("booted a userland in-browser → state snapshot κ " + snapshot);
+          render();
+        } catch (e) {
+          log("booting the userland failed: " + e);
+        }
+      };
+      // The Codespaces scenario (arc42 ch.1): import a devcontainer and run it
+      // in the browser tab — no Docker daemon, no cloud VM. The config selects a
+      // κ-addressed Wasm userland (here the fixture), booted on the wasmi engine.
+      $("devcontainer").onclick = async () => {
+        try {
+          const res = await fetch("./fixture-userland.wasm");
+          const userland = new Uint8Array(await res.arrayBuffer());
+          const config = new TextEncoder().encode('{"name":"app","image":"debian:12"}');
+          const snapshot = console0.run_devcontainer(
+            "https://github.com/example/cool-project.git",
+            "main",
+            ".devcontainer/devcontainer.json",
+            config,
+            userland,
+            64 * 1024 * 1024,
+          );
+          log("ran a devcontainer in-browser → state snapshot κ " + snapshot);
+          render();
+        } catch (e) {
+          log("running the devcontainer failed: " + e);
         }
       };
       // The browser .holo engine (RT2, realized): run a .holo through the

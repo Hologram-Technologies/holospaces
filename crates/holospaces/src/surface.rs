@@ -10,17 +10,18 @@
 //! a *Wasm-recompiled userland*: a κ-addressed Wasm code module that imports
 //! only the substrate's host ABI (the `hologram` host module — the syscall
 //! boundary) and presents the container ABI hologram's `ContainerRuntime`
-//! drives. holospaces *defines and enforces* this surface (the host-ABI import
-//! contract, [`validate_userland`]) and composes a userland into a bootable
-//! [`Holospace`] ([`compose`]); the substrate runtime executes it unchanged by
-//! the lifecycle (arc42 chapter 5, *Boot Layer*). *Producing* a recompiled
-//! userland (the libc/toolchain) is upstream, exactly as compiling a model to
-//! `.holo` is (ADR-004, ADR-006).
+//! drives. holospaces *defines, enforces, and boots* this surface: it validates
+//! a userland against the host-ABI contract ([`validate_userland`]), composes a
+//! bootable [`Holospace`] ([`compose`]), and the substrate runtime spawns it
+//! over the peer's `ContainerEngine` — Wasmtime natively, hologram's `wasmi`
+//! interpreter (`hologram-runtime-bare`) in the browser and on bare-metal, where
+//! a JIT cannot run. A userland is κ-addressed *content* the platform hosts.
 //!
 //! Because a userland is content (a κ), not a located OCI image, code identity
 //! stays content (Law L1), dedups and verifies like any κ (Laws L2, L5), and
 //! the same userland κ boots on any peer (Q6) — all without a second execution
-//! medium (Law L4). Conformance: `CC-6` (arc42 chapter 10).
+//! medium (Law L4). Conformance: `CC-6` (arc42 chapter 10), witnessed on both
+//! the native and interpreter engines.
 
 use hologram_substrate_core::Capabilities;
 

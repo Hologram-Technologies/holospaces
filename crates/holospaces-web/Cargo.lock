@@ -280,6 +280,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "hologram-runtime"
+version = "0.6.0"
+source = "git+https://github.com/Hologram-Technologies/hologram?rev=18f553d8578997ce32e7b653786a0bcf9b09a2c0#18f553d8578997ce32e7b653786a0bcf9b09a2c0"
+dependencies = [
+ "async-trait",
+ "hashbrown 0.15.5",
+ "hologram-realizations",
+ "hologram-substrate-core",
+ "spin",
+]
+
+[[package]]
+name = "hologram-runtime-bare"
+version = "0.6.0"
+source = "git+https://github.com/Hologram-Technologies/hologram?rev=18f553d8578997ce32e7b653786a0bcf9b09a2c0#18f553d8578997ce32e7b653786a0bcf9b09a2c0"
+dependencies = [
+ "hashbrown 0.15.5",
+ "hologram-runtime",
+ "hologram-substrate-core",
+ "spin",
+ "wasmi",
+]
+
+[[package]]
 name = "hologram-store-mem"
 version = "0.6.0"
 source = "git+https://github.com/Hologram-Technologies/hologram?rev=18f553d8578997ce32e7b653786a0bcf9b09a2c0#18f553d8578997ce32e7b653786a0bcf9b09a2c0"
@@ -319,13 +343,15 @@ dependencies = [
  "hologram-realizations",
  "hologram-substrate-core",
  "serde_json",
- "wasmparser",
+ "wasmparser 0.221.3",
 ]
 
 [[package]]
 name = "holospaces-web"
 version = "0.0.0"
 dependencies = [
+ "hologram-runtime",
+ "hologram-runtime-bare",
  "hologram-store-mem",
  "hologram-substrate-core",
  "holospaces",
@@ -509,6 +535,16 @@ name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
+
+[[package]]
+name = "string-interner"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23de088478b31c349c9ba67816fa55d9355232d63c3afea8bf513e31f0f1d2c0"
+dependencies = [
+ "hashbrown 0.15.5",
+ "serde",
+]
 
 [[package]]
 name = "syn"
@@ -695,6 +731,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasmi"
+version = "2.0.0-beta.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45c55fe72d4967863199560df94b78b255cd5da14f82948c45635cb2f404796c"
+dependencies = [
+ "spin",
+ "wasmi_collections",
+ "wasmi_core",
+ "wasmi_ir",
+ "wasmparser 0.228.0",
+]
+
+[[package]]
+name = "wasmi_collections"
+version = "2.0.0-beta.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "481e5b8f8080e86546c85a29244886579af9dc59fd28fa1f6ce5cfa1cd734221"
+dependencies = [
+ "string-interner",
+]
+
+[[package]]
+name = "wasmi_core"
+version = "2.0.0-beta.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15765bc7b07c3ca8fede7335623e8d8c156abe804979621cd28a5a7f560300eb"
+dependencies = [
+ "libm",
+]
+
+[[package]]
+name = "wasmi_ir"
+version = "2.0.0-beta.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5eb152ed4c67d8fb478464d62328c9daa7185b343039bdc44d4139beb5396f09"
+dependencies = [
+ "wasmi_core",
+]
+
+[[package]]
 name = "wasmparser"
 version = "0.221.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -705,6 +781,16 @@ dependencies = [
  "indexmap",
  "semver",
  "serde",
+]
+
+[[package]]
+name = "wasmparser"
+version = "0.228.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4abf1132c1fdf747d56bbc1bb52152400c70f336870f968b85e89ea422198ae3"
+dependencies = [
+ "bitflags",
+ "indexmap",
 ]
 
 [[package]]

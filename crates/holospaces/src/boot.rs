@@ -305,14 +305,15 @@ pub mod devcontainer {
     impl core::error::Error for DevcontainerError {}
 }
 
-/// Ingest a devcontainer holospace from a git source + its `devcontainer.json`
-/// (ADR-004; Conformance `CC-4`).
+/// Ingest a devcontainer holospace from a git source + its `devcontainer.json`,
+/// binding the κ-addressed Wasm `userland` its config selects for the
+/// Linux/POSIX surface (ADR-008; Conformance `CC-4`, `CC-6`).
 ///
 /// The config is validated against the Dev Container spec
-/// ([`devcontainer::parse`]) and its content is content-addressed, so the
-/// holospace identity is a function of the actual configuration — the
-/// holospace *matches its source*, and the same source yields the same κ
-/// (reproducibility, QS1 / Q4).
+/// ([`devcontainer::parse`]) and its content is content-addressed; the
+/// `userland` entry module is the code the runtime boots. The holospace
+/// identity is a function of both — the holospace *matches its source* and is
+/// bootable, and the same source yields the same κ (reproducibility, QS1 / Q4).
 ///
 /// # Errors
 ///
@@ -324,6 +325,7 @@ pub fn ingest_devcontainer(
     reference: impl Into<String>,
     config_path: impl Into<String>,
     config_json: &[u8],
+    userland: Kappa,
     capabilities: hologram_substrate_core::Capabilities,
 ) -> Result<Holospace, IngestError> {
     let repo = repo.into();
@@ -340,6 +342,7 @@ pub fn ingest_devcontainer(
         reference: reference.into(),
         config_path,
         config: address(config_json),
+        userland,
     };
     Ok(Holospace::compose(source, capabilities))
 }
@@ -657,11 +660,13 @@ mod tests {
     #[test]
     fn ingest_devcontainer_validates_and_is_reproducible() {
         let cfg = br#"{"name":"app","image":"debian:12"}"#;
+        let userland = address(b"the userland this devcontainer selects");
         let a = ingest_devcontainer(
             "https://example.invalid/app.git",
             "main",
             ".devcontainer/devcontainer.json",
             cfg,
+            userland,
             caps(),
         )
         .unwrap();
@@ -670,10 +675,13 @@ mod tests {
             "main",
             ".devcontainer/devcontainer.json",
             cfg,
+            userland,
             caps(),
         )
         .unwrap();
         assert_eq!(a.kappa(), b.kappa(), "same source ⇒ same κ (QS1)");
+        // The devcontainer boots the userland its config selects (ADR-008).
+        assert_eq!(a.container_manifest().code, userland);
 
         // A config declaring two image sources is rejected (Dev Container spec).
         let err = ingest_devcontainer(
@@ -681,6 +689,7 @@ mod tests {
             "main",
             ".devcontainer/devcontainer.json",
             br#"{"image":"debian:12","build":{"dockerfile":"Dockerfile"}}"#,
+            userland,
             caps(),
         )
         .unwrap_err();
@@ -698,6 +707,7 @@ mod tests {
                 reference: "main".to_owned(),
                 config_path: ".devcontainer/devcontainer.json".to_owned(),
                 config: address(br#"{"image":"debian:12"}"#),
+                userland: address(b"userland"),
             },
             caps(),
         )

@@ -34,6 +34,7 @@ hologram-graph          = { git = "https://github.com/Hologram-Technologies/holo
 hologram-archive        = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-archive" }
 hologram-runtime        = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-runtime" }
 hologram-runtime-wasmtime = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-runtime-wasmtime" }
+hologram-runtime-bare   = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-runtime-bare", default-features = false }
 prism                   = { version = "0.4", package = "uor-prism" }
 
 # Quality commitments enforced from the beginning (arc42 ch.10). CI runs clippy

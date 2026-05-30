@@ -268,6 +268,12 @@ pub enum Source {
     /// A git repository plus a `devcontainer.json`, per the
     /// [Dev Container](https://containers.dev) specification — "just like
     /// gitpod/codespaces". (Conformance: `CC-4`.)
+    ///
+    /// The config *selects* a κ-addressed [`Source::Userland`] for its
+    /// Linux/POSIX surface (ADR-008): `userland` is the entry module the
+    /// runtime boots. Identity covers both the config (the holospace *matches
+    /// its source*, `CC-4`) and the userland (so the holospace is bootable and
+    /// reproducible). See [`crate::boot::ingest_devcontainer`].
     Devcontainer {
         /// The git repository URL.
         repo: String,
@@ -275,11 +281,11 @@ pub enum Source {
         reference: String,
         /// Path to the dev container configuration within the repository.
         config_path: String,
-        /// The κ-label of the validated `devcontainer.json` content. The
-        /// holospace identity is a function of it, so the holospace *matches
-        /// its source* (Conformance `CC-4`); see
-        /// [`crate::boot::ingest_devcontainer`].
+        /// The κ-label of the validated `devcontainer.json` content.
         config: Kappa,
+        /// The κ-label of the Wasm userland the config selects — the entry
+        /// module the runtime boots (the execution surface, ADR-008).
+        userland: Kappa,
     },
 }
 
@@ -301,9 +307,11 @@ impl Source {
                 reference,
                 config_path,
                 config,
+                userland,
             } => {
                 p.push(1u8);
                 p.extend_from_slice(config.as_array());
+                p.extend_from_slice(userland.as_array());
                 for s in [repo, reference, config_path] {
                     p.extend_from_slice(&(s.len() as u32).to_le_bytes());
                     p.extend_from_slice(s.as_bytes());
@@ -327,6 +335,7 @@ impl Source {
             }),
             1 => {
                 let config = read_kappa(payload, &mut cur)?;
+                let userland = read_kappa(payload, &mut cur)?;
                 let repo = read_str(payload, &mut cur)?;
                 let reference = read_str(payload, &mut cur)?;
                 let config_path = read_str(payload, &mut cur)?;
@@ -335,26 +344,25 @@ impl Source {
                     reference,
                     config_path,
                     config,
+                    userland,
                 })
             }
             _ => Err(RealizationError::Malformed),
         }
     }
 
-    /// The code-module κ-label this source contributes to the manifest. For a
-    /// holo-file it is the `.holo` artifact κ; for a userland it is the entry
-    /// Wasm module κ (the execution surface, ADR-008); for a devcontainer it is
-    /// the reproducible κ of the validated config, which selects a recompiled
-    /// userland produced upstream (ADR-008, resolving arc42 chapter 11 RT1).
+    /// The code-module κ-label this source contributes to the manifest — the
+    /// module the runtime boots. For a holo-file it is the `.holo` artifact κ;
+    /// for a userland and a devcontainer it is the entry Wasm userland module κ
+    /// (the execution surface, ADR-008), so every form is bootable.
     fn code_kappa(&self) -> Kappa {
         match self {
             Source::HoloFile { artifact } => *artifact,
             // A Wasm-recompiled userland: the entry module *is* the code the
             // runtime spawns (the execution surface, ADR-008).
             Source::Userland { entry } => *entry,
-            // The validated `devcontainer.json` content is the code identity;
-            // the recompiled userland it selects is produced upstream (ADR-008).
-            Source::Devcontainer { config, .. } => *config,
+            // The devcontainer boots the userland its config selects.
+            Source::Devcontainer { userland, .. } => *userland,
         }
     }
 }
@@ -506,6 +514,7 @@ mod tests {
             reference: "main".to_owned(),
             config_path: ".devcontainer/devcontainer.json".to_owned(),
             config: address(br#"{"image":"debian:12"}"#),
+            userland: address(b"the recompiled userland the config selects"),
         }
     }
 

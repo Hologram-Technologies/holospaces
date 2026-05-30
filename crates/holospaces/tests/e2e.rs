@@ -50,10 +50,9 @@ fn caps() -> Capabilities {
 
 /// Provision a Wasm-container holospace into a store. The code module is a real
 /// `hologram.*` Wasm container — the *Userland* compute form (the execution
-/// surface, ADR-008): general/system code the runtime spawns over the host ABI.
-/// How a devcontainer's Linux/POSIX surface is *recompiled* into such a userland
-/// is upstream toolchain work; the Boot Layer and lifecycle here are identical
-/// regardless of how the userland κ is produced.
+/// surface, ADR-008): general/system code the runtime boots over the host ABI.
+/// A userland is κ-addressed content; the Boot Layer and lifecycle are identical
+/// however it was authored.
 fn provision_container(store: &MemKappaStore) -> Holospace {
     let code = store
         .put("blake3", &wat::parse_str(CONTAINER_WAT).unwrap())
@@ -136,10 +135,7 @@ fn invalid_transitions_are_rejected_against_the_real_runtime() {
 fn operator_provisions_a_holo_file_holospace() {
     let store = MemKappaStore::new();
     let artifact = store
-        .put(
-            "blake3",
-            b"a .holo tensor-graph artifact (compiled upstream)",
-        )
+        .put("blake3", b"a .holo tensor-graph artifact")
         .unwrap();
     let holospace = provision(&store, Source::HoloFile { artifact }, caps()).expect("provision");
     let identity = holospace.kappa();
@@ -219,6 +215,47 @@ fn operator_console_provisions_on_a_then_syncs_and_boots_on_b() {
             .expect("boot on B (migrated content)");
         assert_eq!(session_b.phase(), Phase::Running);
         session_b.terminate().await.unwrap();
+    });
+}
+
+/// A devcontainer holospace boots (ADR-008; `CC-4` + `CC-6`): its config selects
+/// a κ-addressed Wasm userland, which the runtime spawns. This is the resolved
+/// RT1 surface end-to-end — the devcontainer path produces a *bootable*
+/// holospace, not a config hash.
+#[test]
+fn operator_boots_a_devcontainer_holospace() {
+    pollster::block_on(async {
+        let store = MemKappaStore::new();
+        // The recompiled userland the devcontainer's config selects.
+        let userland = store
+            .put("blake3", &wat::parse_str(CONTAINER_WAT).unwrap())
+            .unwrap();
+        let config = holospaces::address(br#"{"name":"app","image":"debian:12"}"#);
+        let holospace = provision(
+            &store,
+            Source::Devcontainer {
+                repo: "https://example.invalid/app.git".to_string(),
+                reference: "main".to_string(),
+                config_path: ".devcontainer/devcontainer.json".to_string(),
+                config,
+                userland,
+            },
+            caps(),
+        )
+        .expect("provision the devcontainer holospace");
+        // Its Container ID's code is the userland — bootable, not the config hash.
+        assert_eq!(holospace.container_manifest().code, userland);
+
+        let runtime = Runtime::new(WasmtimeEngine::new(), store);
+        let mut session = Session::provision(&runtime, holospace);
+        session
+            .boot()
+            .await
+            .expect("boot the devcontainer userland");
+        assert_eq!(session.phase(), Phase::Running);
+        session.suspend().await.expect("suspend");
+        session.resume().await.expect("resume");
+        session.terminate().await.expect("terminate");
     });
 }
 

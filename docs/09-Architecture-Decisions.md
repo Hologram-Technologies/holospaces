@@ -106,26 +106,32 @@ host ABI. The choice is forced by the laws, not by convenience:
 
 **Decision:** The execution surface is (B). A holospace’s general/system
 code — the second of the two compute forms (Chapter 8) — is a
-**Wasm-recompiled userland**: one or more κ-addressed Wasm code modules
-that import only the substrate’s host ABI (the `hologram` host module —
-the syscall boundary) and present the container ABI hologram’s
-`ContainerRuntime` drives. The POSIX/libc layer is itself such a
-κ-addressed module. A devcontainer’s `devcontainer.json` therefore
-*selects and configures* a κ-addressed userland (content), it does not
-name an OCI image to emulate (location). holospaces **defines and
-enforces** this surface — the host-ABI import contract and the
-κ-addressed userland form — and boots it through the substrate unchanged
-by the lifecycle; **producing** a recompiled userland (the toolchain,
-the libc port) is upstream, exactly as compiling a model to `.holo` is
-(ADR-004, ADR-006). The surface is realized by the `surface` building
-block (Chapter 5) and witnessed by `CC-6` (Chapter 10).
+**Wasm-recompiled userland**: a κ-addressed Wasm code module that
+imports only the substrate’s host ABI (the `hologram` host module — the
+syscall boundary) and presents the container ABI hologram’s
+`ContainerRuntime` drives. The POSIX/libc layer compiles to such a
+module (its libraries linked in, as Wasm linking does — the entry module
+is what the runtime boots); a workload’s data is paged in by κ-resolve
+at runtime (Law L3), not baked into the image. A devcontainer’s
+`devcontainer.json` *selects* a κ-addressed userland (content), it does
+not name an OCI image to emulate (location). holospaces **defines,
+enforces, and boots** this surface on every peer — it ingests the
+source, validates the userland against the host-ABI contract, composes a
+bootable holospace, and spawns it through hologram’s `ContainerRuntime`
+over the peer’s `ContainerEngine` (Wasmtime natively; the `wasmi`
+interpreter in the browser and on bare-metal, where a JIT cannot run). A
+userland is κ-addressed **content** the platform hosts; authoring it
+(compiling C, building a model) is writing a program, not a platform
+feature — exactly as a `.holo` is authored by a compiler (ADR-004). The
+surface is realized by the `surface` building block (Chapter 5) and
+witnessed by `CC-6` (Chapter 10) on both the native and interpreter
+engines.
 
 **Consequences:** Code identity stays content, never location (L1); a
 userland is a canonical form, deduped and verifiable like any κ (L2,
 L5); execution stays on the one substrate medium (L4); the same userland
-κ boots on any peer (Q6). The cost is that arbitrary prebuilt OCI images
-do not run as-is — they must be recompiled to the Wasm userland form;
-building that toolchain is upstream work, and a multi-module userland’s
-linking and closure are future work beyond the single-module surface
-witnessed here. Choosing the location-addressed emulator was rejected as
-a law violation, not a trade-off.
+κ boots on any peer (Q6), native or browser/bare-metal. The cost is that
+arbitrary prebuilt OCI images do not run as-is — a workload must be a
+Wasm userland (compiled for the substrate’s host ABI), which is the
+price of content-addressed identity. Choosing the location-addressed
+emulator was rejected as a law violation, not a trade-off.

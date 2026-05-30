@@ -54,6 +54,10 @@ hologram-store-native = { workspace = true }
 # through hologram's runtime (no mocks).
 hologram-runtime = { workspace = true }
 hologram-runtime-wasmtime = { workspace = true }
+# The interpreter ContainerEngine (wasmi, no_std) — the browser + bare-metal
+# peers' engine. Witnessed natively (CC-6) so the same engine that boots a
+# userland in Chromium and on bare-metal is validated against the real runtime.
+hologram-runtime-bare = { workspace = true, features = ["std"] }
 # CC-2 — the compiler to build a .holo for the differential oracle.
 hologram-compiler = { workspace = true }
 hologram-graph = { workspace = true }

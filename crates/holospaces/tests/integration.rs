@@ -13,6 +13,10 @@ use holospaces::Capabilities;
 
 const CONFIG: &[u8] = br#"{"name":"app","image":"debian:12"}"#;
 
+fn userland() -> holospaces::Kappa {
+    holospaces::address(b"the recompiled userland this devcontainer selects")
+}
+
 fn caps() -> Capabilities {
     Capabilities {
         storage_roots: Vec::new(),
@@ -33,6 +37,7 @@ fn provision() -> holospaces::Holospace {
         "main",
         ".devcontainer/devcontainer.json",
         CONFIG,
+        userland(),
         caps(),
     )
     .expect("ingest")
@@ -79,6 +84,7 @@ fn capability_change_changes_identity_end_to_end() {
         "main",
         ".devcontainer/devcontainer.json",
         CONFIG,
+        userland(),
         scoped_caps,
     )
     .unwrap();

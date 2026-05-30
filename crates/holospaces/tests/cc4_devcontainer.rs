@@ -123,12 +123,14 @@ fn devcontainer_holospace_is_reproducible_from_its_source() {
     let configs = template_configs();
     let cfg = &configs.iter().find(|(n, _)| n == "rust").unwrap().1;
     let other = &configs.iter().find(|(n, _)| n == "python").unwrap().1;
+    let userland = holospaces::address(b"the userland these devcontainers select");
     let mk = |c: &[u8]| {
         ingest_devcontainer(
             "https://x.invalid/r.git",
             "main",
             ".devcontainer/devcontainer.json",
             c,
+            userland,
             caps(),
         )
         .unwrap()

@@ -35,9 +35,13 @@ structural conformance.)
 2.  The Boot Layer resolves the κ (locally, else fetched and verified,
     Law L5) and runs it via the **.holo Engine** over the
     [hologram](https://github.com/Hologram-Technologies/hologram)
-    executor.
+    executor (a tensor-compute run, distinct from the Wasm
+    `ContainerEngine`).
 
-3.  Lifecycle is identical to any other holospace.
+3.  Management is identical to any other holospace — the same
+    κ-identity, provisioning, resolution, and migration; the two compute
+    forms differ only in which substrate engine executes them (the
+    executor for a `.holo`, the `ContainerRuntime` for a userland).
 
 ## Suspend, resume, and migrate
 
@@ -50,6 +54,30 @@ structural conformance.)
 
 3.  This makes migration a content operation: suspend on one peer,
     resume on another; unchanged state dedupes in the store.
+
+## Running a devcontainer in the browser (the Codespaces scenario)
+
+This is the motivating scenario of Chapter 1: run a shared repository’s
+Dev Container with no Docker daemon and no cloud VM, on a thin device.
+
+1.  The operator opens the Platform Manager (cold-started from GitHub
+    Pages) — the browser is now a peer that *is* the substrate (Law L1).
+
+2.  They import the devcontainer: the repository’s `devcontainer.json`
+    (validated against the Dev Container spec, `CC-4`) selects a
+    κ-addressed Wasm userland for its Linux/POSIX surface (ADR-008).
+
+3.  The Boot Layer provisions the holospace and the Spawner boots it
+    **in the browser tab** through hologram’s `ContainerRuntime` over
+    the `wasmi` interpreter `ContainerEngine` — the same lifecycle as a
+    native or remote peer (boot, suspend to a κ snapshot, resume,
+    terminate).
+
+4.  Because state is content (a κ snapshot), the operator can suspend
+    the holospace in the browser and resume it on another instance —
+    local or remote — and the same holospace κ boots there too (Q6). The
+    browser is a first-class compute substrate; the only limits are the
+    device’s, not an account cap.
 
 ## Cold-start from GitHub Pages
 
