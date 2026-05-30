@@ -1,0 +1,25 @@
+[package]
+name = "holospaces-emulator"
+description = "The holospaces system-emulator codemodule — the RISC-V emulator core compiled to a hologram Wasm container (the κ-addressed execution surface of ADR-009)"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Hologram-Technologies/holospaces"
+publish = false
+
+# A hologram container codemodule: a Wasm module that exports the container ABI
+# (hg_*) and imports only the `hologram` host ABI, run by hologram's engine. It
+# wraps the no_std emulator core (holospaces::emulator). Built for wasm32 by
+# scripts/build-emulator.sh; not part of the host workspace build.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+holospaces = { path = "../holospaces", default-features = false }
+# A no_std allocator for the container (the emulator's RAM lives on the heap).
+dlmalloc = { version = "0.2", features = ["global"] }
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = true

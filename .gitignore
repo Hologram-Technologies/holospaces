@@ -8,3 +8,6 @@
 /crates/holospaces-web/web/fixture.holo
 /crates/holospaces-web/web/fixture.kappa
 /crates/holospaces-web/web/fixture-userland.wasm
+
+# Excluded wasm codemodule crate build output (artifact is staged under vv/)
+crates/holospaces-emulator/target/

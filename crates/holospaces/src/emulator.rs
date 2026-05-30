@@ -367,7 +367,7 @@ impl Emulator {
                     ((a as i64).wrapping_div(b as i64)) as u64
                 }
             } // DIV
-            5 => a.checked_div(b).unwrap_or(u64::MAX), // DIVU (÷0 ⇒ all ones)
+            5 => a.checked_div(b).unwrap_or(u64::MAX),                      // DIVU (÷0 ⇒ all ones)
             6 => {
                 if b == 0 {
                     a

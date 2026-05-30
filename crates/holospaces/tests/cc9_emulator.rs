@@ -17,11 +17,15 @@
 
 use std::path::{Path, PathBuf};
 
+use hologram_realizations::{CapabilitySet, ContainerManifest};
+use hologram_runtime::Runtime;
+use hologram_runtime_wasmtime::WasmtimeEngine;
 use hologram_store_mem::MemKappaStore;
 use holospaces::disk::{BlockDevice, KappaDisk};
 use holospaces::emulator::{Emulator, Halt};
-use holospaces::substrate::KappaStore;
-use holospaces::{address, verify};
+use holospaces::realizations::empty_kappa;
+use holospaces::substrate::{Capabilities, ContainerRuntime, KappaStore, Realization};
+use holospaces::{address, surface, verify};
 
 fn artifact_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vv/artifacts/cc9")
@@ -113,6 +117,81 @@ fn the_emulator_writes_console_output_and_snapshots_reproducibly() {
         snapshot, snapshot2,
         "identical runs ⇒ identical κ snapshot (L1)"
     );
+}
+
+/// The emulator runs **as a real hologram container codemodule on the engine**:
+/// the `holospaces-emulator` Wasm module (imports only `hologram.storage_put`,
+/// exports the container ABI) is validated against the execution-surface
+/// contract, then spawned on the **real Wasmtime runtime** with a guest image as
+/// its initial state. It runs the RISC-V program and emits the ISA-defined result
+/// back into the substrate via the host ABI — content-addressed, so the result κ
+/// is the guest's deterministic output. The container κ snapshot is the runtime's
+/// own and is reproducible. This is ADR-009's claim realized: the emulator is
+/// κ-addressed Wasm over the host ABI, not a parallel medium (Law L4). (CC-9,
+/// the emulator on the substrate.)
+#[test]
+fn the_emulator_codemodule_runs_on_the_real_hologram_runtime() {
+    pollster::block_on(async {
+        let wasm = std::fs::read(artifact_dir().join("emulator.wasm"))
+            .expect("the emulator codemodule (run scripts/build-emulator.sh)");
+
+        // It is a valid execution-surface codemodule: spec-valid, host-ABI-only
+        // imports, full container ABI (the CC-6 contract the emulator binds).
+        surface::validate_userland(&wasm).expect("emulator is a valid codemodule");
+
+        // sum1to10 computes 55; the container emits [exit_code u64 LE][console].
+        let image = std::fs::read(artifact_dir().join("sum1to10.bin")).unwrap();
+        let expected_record = 55u64.to_le_bytes(); // console empty
+        let expected_k = address(&expected_record);
+
+        let snapshot = |()| async {
+            let store = MemKappaStore::new();
+            let code = store.put("blake3", &wasm).unwrap();
+            let init = store.put("blake3", &image).unwrap();
+            let manifest = ContainerManifest {
+                code,
+                initial_state: init,
+                parameters: empty_kappa(),
+            };
+            let cid = store.put("blake3", &manifest.canonicalize()).unwrap();
+            let caps = Capabilities {
+                storage_roots: Vec::new(),
+                storage_quota_bytes: 0,
+                network_fetch: false,
+                network_announce: false,
+                publish_channels: Vec::new(),
+                subscribe_channels: Vec::new(),
+                memory_max_bytes: 0,
+                cpu_time_per_event_ms: 1_000_000,
+                priority_weight: 0,
+            };
+            let ck = store
+                .put("blake3", &CapabilitySet::new(caps).canonicalize())
+                .unwrap();
+
+            let rt = Runtime::new(WasmtimeEngine::new(), store);
+            // Spawn runs hg_init(image) → the emulator runs → storage_put(result).
+            let handle = rt
+                .spawn(&cid, &ck)
+                .await
+                .expect("spawn the emulator container");
+            let present = rt.store().contains(&expected_k);
+            let snap = rt.suspend(handle).await.expect("suspend → κ snapshot");
+            (present, snap)
+        };
+
+        let (present, snap_a) = snapshot(()).await;
+        assert!(
+            present,
+            "the emulator-on-hologram emitted the ISA-correct result (55) via the host ABI"
+        );
+        assert!(snap_a.as_str().starts_with("blake3:"), "real κ snapshot");
+
+        // Reproducible: an identical run yields the identical container snapshot κ
+        // (deterministic emulation ⇒ content-addressed state, Law L1).
+        let (_, snap_b) = snapshot(()).await;
+        assert_eq!(snap_a, snap_b, "same run ⇒ same container κ snapshot (L1)");
+    });
 }
 
 /// The emulator's disk and state are substrate primitives: the guest image is
