@@ -1,0 +1,19 @@
+CC-9 — RISC-V emulator ISA-conformance authority artifacts.
+
+The external authority is the RISC-V Unprivileged ISA (RV64I), per
+https://riscv.org/technical/specifications/ . Each *.s is a real RV64I program
+that computes an ISA-defined result and exits with it (ecall a7=93, a0=code),
+in the self-checking style of riscv-tests
+(https://github.com/riscv-software-src/riscv-tests). The emulator
+(holospaces::emulator) must reproduce the ISA semantics exactly to yield the
+expected exit code (expected.txt).
+
+The *.bin are flat binaries (the .text section, loaded at guest address 0 and
+the reset PC), assembled from *.s by LLVM's real RISC-V backend — the external
+assembler, not hand-encoded:
+  Ubuntu LLVM version 18.1.3
+  llvm-mc --triple=riscv64 --mattr=+m --filetype=obj <f>.s -o <f>.o
+  llvm-objcopy -O binary --only-section=.text <f>.o <f>.bin
+
+Coverage: arithmetic + immediates (sum1to10), logical/shift (bitops), RV64 word
+ops + sign extension (wordops), loads/stores LD/SD/LBU (memory).
