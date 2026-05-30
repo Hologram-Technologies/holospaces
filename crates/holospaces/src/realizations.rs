@@ -255,6 +255,16 @@ pub enum Source {
         /// The κ-label of the `.holo` artifact.
         artifact: Kappa,
     },
+    /// A *Wasm-recompiled userland* — general/system code (the second compute
+    /// form, arc42 chapter 8), run by the substrate's `ContainerRuntime` over
+    /// its host ABI. This is the *execution surface* a devcontainer's
+    /// Linux/POSIX environment recompiles to (ADR-008, resolving RT1); see
+    /// [`crate::surface`]. Its identity is content, never an OCI image location
+    /// (Law L1).
+    Userland {
+        /// The κ-label of the entry Wasm code module (the Container ID's code).
+        entry: Kappa,
+    },
     /// A git repository plus a `devcontainer.json`, per the
     /// [Dev Container](https://containers.dev) specification — "just like
     /// gitpod/codespaces". (Conformance: `CC-4`.)
@@ -282,6 +292,10 @@ impl Source {
                 p.push(0u8);
                 p.extend_from_slice(artifact.as_array());
             }
+            Source::Userland { entry } => {
+                p.push(2u8);
+                p.extend_from_slice(entry.as_array());
+            }
             Source::Devcontainer {
                 repo,
                 reference,
@@ -308,6 +322,9 @@ impl Source {
             0 => Ok(Source::HoloFile {
                 artifact: read_kappa(payload, &mut cur)?,
             }),
+            2 => Ok(Source::Userland {
+                entry: read_kappa(payload, &mut cur)?,
+            }),
             1 => {
                 let config = read_kappa(payload, &mut cur)?;
                 let repo = read_str(payload, &mut cur)?;
@@ -325,14 +342,18 @@ impl Source {
     }
 
     /// The code-module κ-label this source contributes to the manifest. For a
-    /// holo-file it is the artifact κ; for a devcontainer it is the
-    /// reproducible κ of the source descriptor (the built image κ is produced
-    /// by the substrate's build, an engine concern — arc42 chapter 11, RT1).
+    /// holo-file it is the `.holo` artifact κ; for a userland it is the entry
+    /// Wasm module κ (the execution surface, ADR-008); for a devcontainer it is
+    /// the reproducible κ of the validated config, which selects a recompiled
+    /// userland produced upstream (ADR-008, resolving arc42 chapter 11 RT1).
     fn code_kappa(&self) -> Kappa {
         match self {
             Source::HoloFile { artifact } => *artifact,
+            // A Wasm-recompiled userland: the entry module *is* the code the
+            // runtime spawns (the execution surface, ADR-008).
+            Source::Userland { entry } => *entry,
             // The validated `devcontainer.json` content is the code identity;
-            // the built image is produced by the substrate's build (RT1).
+            // the recompiled userland it selects is produced upstream (ADR-008).
             Source::Devcontainer { config, .. } => *config,
         }
     }
@@ -538,6 +559,12 @@ mod tests {
                 },
                 caps(),
             ),
+            Holospace::compose(
+                Source::Userland {
+                    entry: address(b"a recompiled userland module"),
+                },
+                caps(),
+            ),
         ] {
             let back = Holospace::from_canonical(&hs.canonicalize()).expect("decode");
             assert_eq!(back, hs);
@@ -557,5 +584,28 @@ mod tests {
         .kappa();
         let devc = Holospace::compose(devcontainer(), caps()).kappa();
         assert_ne!(holofile, devc);
+    }
+
+    #[test]
+    fn the_two_compute_forms_are_distinct_at_the_same_code_kappa() {
+        // The second compute form (a Wasm userland, ADR-008) is a different
+        // holospace from a tensor `.holo` even when both reference the same code
+        // κ — the form is part of identity, so the runtime never confuses them.
+        let code = address(b"some code module bytes");
+        let holofile = Holospace::compose(Source::HoloFile { artifact: code }, caps());
+        let userland = Holospace::compose(Source::Userland { entry: code }, caps());
+        assert_eq!(
+            holofile.manifest(),
+            userland.manifest(),
+            "same Container ID"
+        );
+        assert_ne!(
+            holofile.kappa(),
+            userland.kappa(),
+            "but distinct holospace identity (the compute form differs)"
+        );
+        // The userland source round-trips through the canonical form.
+        let back = Holospace::from_canonical(&userland.canonicalize()).unwrap();
+        assert_eq!(back.source(), &Source::Userland { entry: code });
     }
 }

@@ -51,12 +51,16 @@ jobs:
         with:
           workspaces: crates/holospaces-web
       - uses: jetli/wasm-pack-action@v0.4.0
+      - name: Generate the in-browser fixtures (.holo + recompiled userland)
+        run: cargo run -q -p holospaces --example holo_fixture -- crates/holospaces-web/web
       - name: Build the Platform Manager (wasm32)
         run: wasm-pack build crates/holospaces-web --release --target web --out-dir web/pkg
       - name: Assemble the site
         run: |
           mkdir -p _site
           cp crates/holospaces-web/web/index.html _site/
+          cp crates/holospaces-web/web/fixture.holo _site/
+          cp crates/holospaces-web/web/fixture-userland.wasm _site/
           cp -r crates/holospaces-web/web/pkg _site/pkg
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
