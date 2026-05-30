@@ -40,6 +40,10 @@
 //!   presentation over this model.
 //! - [`wasm`] — WebAssembly module validation + the substrate's closed host
 //!   surface. Conformance: `CC-5`.
+//! - [`oci`] — OCI image ingestion: a devcontainer's operating-system image is
+//!   ingested at the boundary into κ-addressed content, each blob verified by
+//!   re-derivation against its OCI `sha256` digest (an OCI digest is a κ-label;
+//!   Law L5). Conformance: `CC-10`.
 //!
 //! The substrate seams holospaces drives — `KappaStore`, `KappaSync`,
 //! `ContainerRuntime`, the `.holo` executor — are defined in hologram and
@@ -75,6 +79,10 @@ pub mod disk;
 pub mod engine;
 pub mod identity;
 pub mod manager;
+/// OCI image ingestion (the host-side provisioning surface for a devcontainer's
+/// operating-system image; `std` only). Conformance: `CC-10`.
+#[cfg(feature = "std")]
+pub mod oci;
 pub mod peer;
 pub mod realizations;
 pub mod surface;

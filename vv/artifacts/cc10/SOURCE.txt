@@ -1,0 +1,21 @@
+CC-10 — devcontainer ingestion authority artifacts.
+
+image/   A real OCI image-layout (https://github.com/opencontainers/image-spec),
+         produced by BuildKit — a conforming OCI implementation:
+           docker 29.4.3-1 ; github.com/docker/buildx v0.34.0 3e73561e39785683b31b05eeab1ef645be44ca42
+         Reproducibly (SOURCE_DATE_EPOCH=1700000000, rewrite-timestamp), from:
+           FROM scratch
+           COPY payload.txt /payload.txt
+           LABEL org.holospaces.cc10="real OCI image-layout authority artifact"
+           build: docker buildx build --output type=oci,rewrite-timestamp=true
+         Layout (every blob is named by its sha256 digest — the OCI content
+         address, which IS verify-by-re-derivation, Law L5):
+           oci-layout                          {"imageLayoutVersion":"1.0.0"}
+           index.json    → manifest sha256:aecbccb0…
+           blobs/sha256/aecbccb0…  image manifest (application/vnd.oci.image.manifest.v1+json)
+           blobs/sha256/efff58cc…  image config   (application/vnd.oci.image.config.v1+json)
+           blobs/sha256/6eabe91c…  layer tar+gzip  (application/vnd.oci.image.layer.v1.tar+gzip)
+
+devcontainer.json   A real Dev Container config (https://containers.dev), the
+         repository half of the source — imported from devcontainers/templates
+         (see vv/artifacts/cc4/SOURCE.txt for the pin).
