@@ -5,3 +5,5 @@
 /crates/holospaces-web/target
 /crates/holospaces-web/web/pkg
 /crates/holospaces-web/web/node_modules
+/crates/holospaces-web/web/fixture.holo
+/crates/holospaces-web/web/fixture.kappa

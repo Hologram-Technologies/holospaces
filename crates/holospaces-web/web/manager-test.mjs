@@ -82,6 +82,20 @@ try {
   check(r.absent, "an unknown κ is absent (no forging — L1/L5)");
   check(r.roster1 && r.roster1 === r.roster2, `operator roster κ is stable (${r.roster1})`);
 
+  // CC-2 / RT2 — the browser `.holo` engine equals the native one: run the
+  // fixture `.holo` (compiled + executed natively) through the executor
+  // compiled to wasm, and assert an identical output κ.
+  const nativeKappa = (await readFile(path.join(ROOT, "fixture.kappa"), "utf8")).trim();
+  const browserKappa = await page.evaluate(async () => {
+    const res = await fetch("./fixture.holo");
+    const archive = new Uint8Array(await res.arrayBuffer());
+    return window.hs.run_holo(archive);
+  });
+  check(
+    browserKappa === nativeKappa,
+    `browser .holo engine equals native (κ ${browserKappa})`,
+  );
+
   console.log(failed ? "MANAGER-TEST: FAILED" : "MANAGER-TEST: PASS (browser peer + Platform Manager)");
 } finally {
   await browser.close();

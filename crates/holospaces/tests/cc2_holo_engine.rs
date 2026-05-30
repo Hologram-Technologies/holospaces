@@ -22,9 +22,11 @@
 //!    the address-boundary surface (`execute_addressed`, the path a pipeline /
 //!    the browser FFI drives) yield the same output κ.
 //!
-//! The live browser-vs-native cross-host run is carried by the browser peer's
-//! Playwright harness (hologram's `store-opfs` pattern), which shares this
-//! `address_bytes` σ-axis; see `vv/PROVENANCE.md`.
+//! The **live** browser-vs-native differential is `scripts/browser-manager-test.sh`
+//! (the CI `browser` job): it runs this same `.holo`, compiled and executed
+//! natively here, through the executor compiled to wasm in headless Chromium,
+//! and asserts an identical output κ — the browser `.holo` engine equals the
+//! native one (arc42 chapter 11, RT2). See `vv/PROVENANCE.md`.
 //!
 //! Run by `vv/run.sh`; also `cargo test -p holospaces --test cc2_holo_engine`.
 

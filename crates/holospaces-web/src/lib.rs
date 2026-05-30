@@ -43,6 +43,21 @@ pub fn verify_kappa(bytes: &[u8], kappa: &str) -> Result<bool, JsValue> {
     verify(bytes, &parse_kappa(kappa)?).map_err(js_err)
 }
 
+/// Run a `.holo` compute artifact in the browser via the hologram executor
+/// compiled to wasm — the *browser `.holo` engine* (arc42 chapter 11, RT2;
+/// conformance `CC-2`). Returns the κ-label of the first output. Because the
+/// executor is deterministic and content-addressed, this κ equals the one the
+/// native executor produces for the same `.holo` (the browser engine equals the
+/// native one).
+#[wasm_bindgen]
+pub fn run_holo(archive: &[u8]) -> Result<String, JsValue> {
+    let outputs = holospaces::engine::HoloEngine::run(archive, &[]).map_err(js_err)?;
+    let first = outputs
+        .first()
+        .ok_or_else(|| JsValue::from_str("the .holo produced no outputs"))?;
+    Ok(first.as_str().to_owned())
+}
+
 /// The Platform Manager console, running as a browser peer.
 #[wasm_bindgen]
 pub struct Console {
