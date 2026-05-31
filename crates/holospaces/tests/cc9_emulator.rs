@@ -167,6 +167,37 @@ fn the_emulator_passes_the_official_riscv_tests() {
     eprintln!("cc9: passed all {} official riscv-tests", tests.len());
 }
 
+/// The emulator takes a **CLINT timer interrupt** — the periodic tick a kernel's
+/// scheduler relies on. A real program (assembled by the RISC-V toolchain,
+/// `vv/artifacts/cc9/tint.S`/`.bin`) arms `mtimecmp` via the memory-mapped CLINT,
+/// enables the machine timer interrupt (`mie.MTIE` + `mstatus.MIE`), and spins;
+/// when `mtime` reaches the compare the emulator raises the timer interrupt
+/// (cause = interrupt | 7) into the handler, which confirms `mcause` and signals
+/// success over HTIF. (CC-9, the interrupt/timer authority — the RISC-V
+/// Privileged ISA + the CLINT memory map.)
+#[test]
+fn the_emulator_takes_a_clint_timer_interrupt() {
+    let manifest = std::fs::read_to_string(artifact_dir().join("tint.manifest")).expect("manifest");
+    let tohost = u64::from_str_radix(
+        manifest
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .trim_start_matches("0x"),
+        16,
+    )
+    .unwrap();
+    let image = std::fs::read(artifact_dir().join("tint.bin")).expect("tint.bin");
+    let mut emu = Emulator::new(0x8000_0000, 16 * 1024 * 1024);
+    emu.load_flat(&image).unwrap();
+    emu.set_htif(tohost);
+    assert_eq!(
+        emu.run(10_000_000),
+        Halt::Exit(0),
+        "the machine timer interrupt fires and the handler confirms mcause"
+    );
+}
+
 /// The emulator runs **as a real hologram container codemodule on the engine**:
 /// the `holospaces-emulator` Wasm module (imports only `hologram.storage_put`,
 /// exports the container ABI) is validated against the execution-surface

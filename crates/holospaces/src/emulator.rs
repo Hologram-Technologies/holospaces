@@ -20,8 +20,10 @@
 //! trap handling across privilege levels — machine and supervisor mode with
 //! delegation (`ecall`/`ebreak` exceptions → `mtvec`/`stvec`, `mcause`/`scause`,
 //! `mret`/`sret`), and **Sv39 paging** (the page-table walk with accessed/dirty
-//! bits and U/SUM/MXR permissions) — so the official machine- and
-//! supervisor-mode tests (including supervisor paging) run unmodified. A flat
+//! bits and U/SUM/MXR permissions), and **interrupts** (the CLINT memory-mapped
+//! timer, `mip`/`mie` with `mideleg`, vectored `mtvec`) — so the official
+//! machine- and supervisor-mode tests (including supervisor paging) run
+//! unmodified, and a kernel receives its scheduler tick. A flat
 //! program may instead use the `ecall` host boundary (console `write` / `exit`)
 //! when it installs no trap vector.
 
@@ -53,12 +55,22 @@ mod csr {
     // Machine.
     pub const MSTATUS: u32 = 0x300;
     pub const MEDELEG: u32 = 0x302;
-    pub const MTVEC: u32 = 0x305;
+    pub const MIDELEG: u32 = 0x303;
     pub const MIE: u32 = 0x304;
+    pub const MTVEC: u32 = 0x305;
     pub const MEPC: u32 = 0x341;
     pub const MCAUSE: u32 = 0x342;
     pub const MTVAL: u32 = 0x343;
     pub const MIP: u32 = 0x344;
+
+    /// Interrupt-pending/enable bit positions (RISC-V Privileged ISA §3.1.9):
+    /// supervisor/machine software (1/3), timer (5/7), external (9/11).
+    pub const SSIP: u32 = 1;
+    pub const MSIP: u32 = 3;
+    pub const STIP: u32 = 5;
+    pub const MTIP: u32 = 7;
+    pub const SEIP: u32 = 9;
+    pub const MEIP: u32 = 11;
 
     /// The `sstatus` view of `mstatus` (the S-mode-visible bits): SIE, SPIE, SPP,
     /// FS, SUM, MXR (RISC-V Privileged ISA §4.1.1).
@@ -71,6 +83,17 @@ mod csr {
 /// Privilege levels (RISC-V Privileged ISA): machine, supervisor, user.
 const PRIV_M: u8 = 3;
 const PRIV_S: u8 = 1;
+
+/// The trap entry PC for a trap vector (`mtvec`/`stvec`): the base, or — in
+/// vectored mode (low bit 1), for an interrupt — `base + 4*code`.
+fn trap_vector(tvec: u64, is_interrupt: bool, code: u64) -> u64 {
+    let base = tvec & !3;
+    if is_interrupt && tvec & 1 == 1 {
+        base + 4 * code
+    } else {
+        base
+    }
+}
 
 /// Why the machine stopped stepping.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -143,7 +166,18 @@ pub struct Emulator {
     /// The HTIF `tohost` address, if set — a store there signals exit (the
     /// riscv-tests / SBI console channel); otherwise `None` (flat programs).
     htif: Option<u64>,
+    /// The CLINT timer (`mtime`) and its per-hart compare (`mtimecmp`) and
+    /// software-interrupt latch (`msip`) — a memory-mapped timer the guest reads
+    /// and arms to receive timer/software interrupts (RISC-V CLINT).
+    mtime: u64,
+    mtimecmp: u64,
+    msip: bool,
 }
+
+/// The CLINT memory-mapped region (one hart): `msip` at +0, `mtimecmp` at
+/// +0x4000, `mtime` at +0xBFF8.
+const CLINT_BASE: u64 = 0x0200_0000;
+const CLINT_END: u64 = 0x0201_0000;
 
 impl Emulator {
     /// Create a machine with `ram_bytes` of RAM mapped at `base`, the reset PC.
@@ -161,6 +195,9 @@ impl Emulator {
             reservation: None,
             priv_level: PRIV_M,
             htif: None,
+            mtime: 0,
+            mtimecmp: 0,
+            msip: false,
         }
     }
 
@@ -212,7 +249,14 @@ impl Emulator {
     /// is handled in machine mode (`mtvec`/`mepc`/`mcause`/`mtval`, `mstatus`
     /// MPP/MPIE).
     fn trap(&mut self, cause: u64, tval: u64, epc: u64) {
-        let delegated = self.priv_level <= PRIV_S && (self.raw_csr(csr::MEDELEG) >> cause) & 1 != 0;
+        let is_int = cause >> 63 != 0;
+        let code = cause & 0xfff;
+        let deleg = if is_int {
+            self.raw_csr(csr::MIDELEG)
+        } else {
+            self.raw_csr(csr::MEDELEG)
+        };
+        let delegated = self.priv_level <= PRIV_S && (deleg >> code) & 1 != 0;
         let mut st = self.raw_csr(csr::MSTATUS);
         if delegated {
             self.csr_write(csr::SEPC, epc);
@@ -224,7 +268,7 @@ impl Emulator {
             st = (st & !(1 << 8)) | ((u64::from(self.priv_level) & 1) << 8); // SPP
             self.csrs.insert(csr::MSTATUS, st);
             self.priv_level = PRIV_S;
-            self.hart.pc = self.csr_read(csr::STVEC) & !3;
+            self.hart.pc = trap_vector(self.csr_read(csr::STVEC), is_int, code);
         } else {
             self.csr_write(csr::MEPC, epc);
             self.csr_write(csr::MCAUSE, cause);
@@ -235,7 +279,7 @@ impl Emulator {
             st = (st & !(3 << 11)) | (u64::from(self.priv_level) << 11); // MPP
             self.csrs.insert(csr::MSTATUS, st);
             self.priv_level = PRIV_M;
-            self.hart.pc = self.csr_read(csr::MTVEC) & !3;
+            self.hart.pc = trap_vector(self.csr_read(csr::MTVEC), is_int, code);
         }
     }
 
@@ -292,11 +336,6 @@ impl Emulator {
         self.hart.pc
     }
 
-    #[doc(hidden)]
-    pub fn step_one(&mut self) -> Result<(), Halt> {
-        self.step()
-    }
-
     /// A reproducible snapshot of machine state — registers, PC, and RAM — the
     /// canonical bytes the substrate κ-addresses on suspend (`CC-9`). Identical
     /// runs produce identical snapshots (Law L1).
@@ -321,6 +360,13 @@ impl Emulator {
     /// Run until the guest exits, traps, or `max_steps` is reached.
     pub fn run(&mut self, max_steps: u64) -> Halt {
         for _ in 0..max_steps {
+            // At each instruction boundary: advance the timer, reconcile the
+            // CLINT interrupt latches into `mip`, and take a pending interrupt
+            // (which redirects the PC) before the next instruction.
+            self.tick();
+            if self.take_interrupt() {
+                continue;
+            }
             match self.step() {
                 Ok(()) => {}
                 Err(halt) => return halt,
@@ -343,6 +389,9 @@ impl Emulator {
     }
 
     fn load_phys(&self, addr: u64, width: usize) -> Result<u64, Trap> {
+        if (CLINT_BASE..CLINT_END).contains(&addr) {
+            return Ok(self.clint_read(addr));
+        }
         let o = self.offset(addr, width)?;
         let mut v = 0u64;
         for i in 0..width {
@@ -352,11 +401,93 @@ impl Emulator {
     }
 
     fn store_phys(&mut self, addr: u64, width: usize, value: u64) -> Result<(), Trap> {
+        if (CLINT_BASE..CLINT_END).contains(&addr) {
+            self.clint_write(addr, value);
+            return Ok(());
+        }
         let o = self.offset(addr, width)?;
         for i in 0..width {
             self.ram[o + i] = (value >> (8 * i)) as u8;
         }
         Ok(())
+    }
+
+    /// Read the CLINT timer registers (RISC-V CLINT memory map).
+    fn clint_read(&self, addr: u64) -> u64 {
+        match addr - CLINT_BASE {
+            0x0 => u64::from(self.msip),
+            0x4000 => self.mtimecmp,
+            0xbff8 => self.mtime,
+            _ => 0,
+        }
+    }
+
+    fn clint_write(&mut self, addr: u64, value: u64) {
+        match addr - CLINT_BASE {
+            0x0 => self.msip = value & 1 != 0,
+            0x4000 => self.mtimecmp = value,
+            0xbff8 => self.mtime = value,
+            _ => {}
+        }
+    }
+
+    /// Advance the timer and reconcile the memory-mapped interrupt latches into
+    /// `mip` (CLINT → MTIP/MSIP), called once per executed instruction.
+    fn tick(&mut self) {
+        self.mtime = self.mtime.wrapping_add(1);
+        let mut mip = self.raw_csr(csr::MIP);
+        // Machine timer interrupt: pending while mtime >= mtimecmp (armed).
+        if self.mtimecmp != 0 && self.mtime >= self.mtimecmp {
+            mip |= 1 << csr::MTIP;
+        } else {
+            mip &= !(1 << csr::MTIP);
+        }
+        // Machine software interrupt latch.
+        if self.msip {
+            mip |= 1 << csr::MSIP;
+        } else {
+            mip &= !(1 << csr::MSIP);
+        }
+        self.csrs.insert(csr::MIP, mip);
+    }
+
+    /// Take the highest-priority enabled+pending interrupt, if any (RISC-V
+    /// Privileged ISA §3.1.9): machine interrupts unless delegated (`mideleg`)
+    /// to supervisor, each gated by the global enable for the current privilege.
+    /// Returns `true` if an interrupt was taken.
+    fn take_interrupt(&mut self) -> bool {
+        let pending = self.raw_csr(csr::MIP) & self.raw_csr(csr::MIE);
+        if pending == 0 {
+            return false;
+        }
+        let mstatus = self.raw_csr(csr::MSTATUS);
+        let mideleg = self.raw_csr(csr::MIDELEG);
+        // Priority order (high → low): MEI, MSI, MTI, SEI, SSI, STI.
+        const ORDER: [u32; 6] = [
+            csr::MEIP,
+            csr::MSIP,
+            csr::MTIP,
+            csr::SEIP,
+            csr::SSIP,
+            csr::STIP,
+        ];
+        for bit in ORDER {
+            if pending & (1 << bit) == 0 {
+                continue;
+            }
+            let to_s = (mideleg >> bit) & 1 != 0;
+            let enabled = if to_s {
+                self.priv_level < PRIV_S || (self.priv_level == PRIV_S && (mstatus >> 1) & 1 == 1)
+            } else {
+                self.priv_level < PRIV_M || (mstatus >> 3) & 1 == 1
+            };
+            if enabled {
+                let cause = (1u64 << 63) | u64::from(bit);
+                self.trap(cause, 0, self.hart.pc);
+                return true;
+            }
+        }
+        false
     }
 
     /// A guest virtual load (translate then read).
