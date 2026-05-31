@@ -177,6 +177,11 @@ pub struct Emulator {
     ram: Vec<u8>,
     base: u64,
     console: Vec<u8>,
+    /// Pending console *input* (the bytes a driver fed to the machine's terminal,
+    /// delivered to the guest through the SBI console; `in_cursor` is the next
+    /// unread byte). The terminal-input channel of a workspace projection (CC-11).
+    console_in: Vec<u8>,
+    in_cursor: usize,
     /// Control and status registers (Zicsr) — a flat file; the privileged
     /// semantics (WARL fields, read-only CSRs) are a later conformance step.
     csrs: BTreeMap<u32, u64>,
@@ -223,6 +228,8 @@ impl Emulator {
             ram: vec![0; ram_bytes],
             base,
             console: Vec::new(),
+            console_in: Vec::new(),
+            in_cursor: 0,
             csrs,
             reservation: None,
             priv_level: PRIV_M,
@@ -492,6 +499,23 @@ impl Emulator {
         &self.console
     }
 
+    /// Feed bytes to the machine's console *input* — the operator's keystrokes /
+    /// terminal commands. The guest reads them through the SBI console (legacy
+    /// `console_getchar` or the DBCN `console_read`). This is the terminal-input
+    /// intent of a workspace projection (CC-11): driving a running holospace.
+    pub fn feed_console(&mut self, bytes: &[u8]) {
+        self.console_in.extend_from_slice(bytes);
+    }
+
+    /// Take one pending console input byte (SBI `console_getchar`), or `None`.
+    fn console_getchar(&mut self) -> Option<u8> {
+        let b = self.console_in.get(self.in_cursor).copied();
+        if b.is_some() {
+            self.in_cursor += 1;
+        }
+        b
+    }
+
     /// The current program counter (diagnostics / single-stepping).
     #[must_use]
     pub fn pc(&self) -> u64 {
@@ -571,6 +595,11 @@ impl Emulator {
         out.extend_from_slice(&self.reservation.unwrap_or(u64::MAX).to_le_bytes());
         out.extend_from_slice(&self.mtime.to_le_bytes());
         out.extend_from_slice(&self.mtimecmp.to_le_bytes());
+        // The pending console input + read cursor (the terminal-input channel), so
+        // a suspended interactive machine resumes identically (CC-11).
+        out.extend_from_slice(&(self.console_in.len() as u64).to_le_bytes());
+        out.extend_from_slice(&self.console_in);
+        out.extend_from_slice(&(self.in_cursor as u64).to_le_bytes());
         out.extend_from_slice(&self.ram);
         out
     }
@@ -1280,9 +1309,15 @@ impl Emulator {
         match eid {
             // ── Legacy extensions (return only in a0) ──
             0x01 => self.console.push(a0 as u8), // console_putchar
-            0x02 => err = u64::MAX,              // console_getchar — no input
-            0x00 => self.set_timer(a0),          // set_timer
-            0x08 => return Err(Halt::Exit(0)),   // shutdown
+            0x02 => {
+                // console_getchar — return the next input byte (in a0) or -1.
+                err = match self.console_getchar() {
+                    Some(b) => u64::from(b),
+                    None => u64::MAX,
+                };
+            }
+            0x00 => self.set_timer(a0),        // set_timer
+            0x08 => return Err(Halt::Exit(0)), // shutdown
             // ── Base extension (probe / identity) ──
             0x10 => match fid {
                 0 => val = 0x0200_0000,                       // spec version 2.0
@@ -1306,6 +1341,25 @@ impl Emulator {
                         }
                     }
                     val = a0;
+                }
+                1 => {
+                    // console_read(num_bytes=a0, base_lo=a1, base_hi=a2) — fill
+                    // guest memory with pending input, return the count read.
+                    let base = a1 | (a2 << 32);
+                    let mut read = 0u64;
+                    while read < a0 {
+                        let Some(b) = self.console_getchar() else {
+                            break;
+                        };
+                        if self
+                            .store(base.wrapping_add(read), 1, u64::from(b))
+                            .is_err()
+                        {
+                            break;
+                        }
+                        read += 1;
+                    }
+                    val = read;
                 }
                 2 => self.console.push(a0 as u8), // console_write_byte
                 _ => {}

@@ -43,6 +43,12 @@
 //!   the operator's holospaces and the Intent surface (provision · open a
 //!   lifecycle session · synchronise). A rendered console is a thin
 //!   presentation over this model.
+//! - [`projection`] — the *Workspace Projection* model: a view + intent over a
+//!   *running* holospace — an Editor/FS view that reads the environment's
+//!   content by κ, and a [`Terminal`](projection::Workspace) that publishes the
+//!   operator's input as canonical events ([`Intent`](projection::Intent))
+//!   advancing the holospace's κ snapshot. The Codespaces/Gitpod experience
+//!   (ADR-009). Conformance: `CC-11`.
 //! - [`wasm`] — WebAssembly module validation + the substrate's closed host
 //!   surface. Conformance: `CC-5`.
 //! - [`oci`] — OCI image ingestion: a devcontainer's operating-system image is
@@ -90,6 +96,7 @@ pub mod manager;
 #[cfg(feature = "std")]
 pub mod oci;
 pub mod peer;
+pub mod projection;
 pub mod realizations;
 pub mod surface;
 /// Wasm module validation (the host-side provisioning surface; `std` only).

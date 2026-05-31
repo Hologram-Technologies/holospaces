@@ -1,0 +1,5 @@
+HOLOSPACES-WORKSPACE-READY
+$ hello-workspace
+$ Linux version 6.6.0 (holospaces@cc11) (riscv64-linux-gnu-gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, GNU ld (GNU Binutils for Ubuntu) 2.42) #2 SMP Fri 31 May 2026 00:00:00 UTC
+$ sh: foo: not found
+$ HOLOSPACES-WORKSPACE-DONE

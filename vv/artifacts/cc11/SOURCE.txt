@@ -1,0 +1,36 @@
+CC-11 workspace-projection witness — an interactive Linux terminal
+==================================================================
+
+The workspace projection (holospaces::projection) drives a running holospace.
+Its Terminal surface is witnessed against a real, running Linux terminal: the
+same RV64GC Linux 6.6 kernel as CC-9 (vv/artifacts/cc9/linux/SOURCE.txt — the
+identical trimmed config and reproducible build flags), but with an *interactive*
+init — a tiny real shell (shell.c) as PID 1 that reads the console and answers
+'echo <text>', 'version' (prints /proc/version), and 'exit' (powers off). It puts
+the console tty in non-echoing mode so its output is deterministic given the
+input, and is therefore a differential oracle.
+
+Linux kernel
+------------
+  Upstream : https://github.com/torvalds/linux   Tag: v6.6   Commit: ffc253263a1375a65fa6c9f62a893e9767fbebfa
+  Config   : identical to CC-9 (vv/artifacts/cc9/linux/kernel.config), with
+             CONFIG_INITRAMFS_SOURCE = this directory's initramfs.list.
+  Built reproducibly: KBUILD_BUILD_TIMESTAMP="Fri 31 May 2026 00:00:00 UTC",
+             KBUILD_BUILD_USER=holospaces, KBUILD_BUILD_HOST=cc11, .version=0.
+  Toolchain: gcc-riscv64-linux-gnu 13.3.0, GNU ld 2.42 (Ubuntu 24.04 cross).
+  Artifact : Image.gz (gzip -9 of arch/riscv/boot/Image).
+
+initramfs (initramfs.list -> the kernel's gen_init_cpio): a single freestanding
+static PID-1 (shell.c, raw RISC-V Linux syscalls, no libc) + /dev/console, /dev/null,
+/proc.
+
+Device tree: the same machine as CC-9 — vv/artifacts/cc9/linux/holospaces.dtb
+(rv64imafdc, Sv39, 128 MiB at 0x80000000, CLINT, 10 MHz).
+
+input.txt: the operator's command lines (typed after the ready banner).
+expected-session.txt: the deterministic terminal session (ready banner through
+the done banner), captured from qemu-system-riscv64 booting this exact Image and
+fed input.txt after boot (echo disabled, so no interleaving). The emulator must
+reproduce it byte-for-byte (the differential oracle).
+
+To reproduce: build.sh rebuilds the init + initramfs + kernel from the pins.
