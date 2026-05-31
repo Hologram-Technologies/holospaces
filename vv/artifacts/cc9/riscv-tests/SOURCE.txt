@@ -35,5 +35,3 @@ exceptions). NOT yet included, with what each needs (in progress):
   rv64mi-p-ma_fetch              — misaligned instruction-fetch trap
   rv64mi-p-illegal               — vectored interrupts + S-mode + paging (composite)
   rv64si-p-csr                   — S-mode CSR conformance
-  rv64si-p-dirty, -icache-alias  — Sv39 paging (A/D bits)
-  rv64si-p-wfi                   — timer interrupts + WFI wake
