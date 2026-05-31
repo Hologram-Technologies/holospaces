@@ -28,10 +28,11 @@
 //!   `BlockDevice` (hologram's HAL), an operating-system image as κ-addressed
 //!   content the [execution surface](surface) reads (ADR-009). Conformance:
 //!   `CC-7`.
-//! - [`emulator`] — the *system emulator* core: a real RISC-V (RV64IM) machine
-//!   grown conformance-first against the RISC-V ISA, which the emulator
-//!   codemodule wraps to boot an arbitrary OS image (ADR-009). Conformance:
-//!   `CC-9`.
+//! - [`emulator`] — the *system emulator* core: a real RISC-V machine
+//!   (RV64IMAC + Zicsr, machine/supervisor traps, Sv39 paging, CLINT interrupts,
+//!   SBI) verified against the official RISC-V conformance suite, which the
+//!   emulator codemodule wraps to boot an arbitrary OS image (ADR-009).
+//!   Conformance: `CC-9`.
 //! - [`peer`] — a [`Peer`](peer::Peer) that composes the substrate for an
 //!   environment (storage · network · runtime) and supplies the boot
 //!   operations, incl. reachability-closure migration (arc42 chapter 7).

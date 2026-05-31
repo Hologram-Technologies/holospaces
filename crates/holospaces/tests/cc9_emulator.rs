@@ -198,6 +198,27 @@ fn the_emulator_takes_a_clint_timer_interrupt() {
     );
 }
 
+/// The emulator provides the **SBI firmware interface** an S-mode kernel boots
+/// under. A real program (assembled by the RISC-V toolchain,
+/// `vv/artifacts/cc9/sbi.S`/`.bin`) drops to supervisor mode via `mret`, then
+/// uses SBI `ecall`s — console `putchar` to print, then system reset to halt.
+/// The emulator-as-SEE services them: the console receives the bytes and the
+/// reset ends the run. (CC-9, the SBI authority — the RISC-V SBI specification.)
+#[test]
+fn the_emulator_services_sbi_console_and_shutdown() {
+    let image = std::fs::read(artifact_dir().join("sbi.bin")).expect("sbi.bin");
+    let mut emu = Emulator::new(0x8000_0000, 16 * 1024 * 1024);
+    emu.load_flat(&image).unwrap();
+    emu.enable_sbi(); // run as the M-mode firmware (SEE)
+    let halt = emu.run(1_000_000);
+    assert_eq!(halt, Halt::Exit(0), "SBI system reset halts the machine");
+    assert_eq!(
+        emu.console(),
+        b"OK\n",
+        "the S-mode kernel's SBI console output reaches the emulator console"
+    );
+}
+
 /// The emulator runs **as a real hologram container codemodule on the engine**:
 /// the `holospaces-emulator` Wasm module (imports only `hologram.storage_put`,
 /// exports the container ABI) is validated against the execution-surface
