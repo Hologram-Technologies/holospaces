@@ -1,0 +1,27 @@
+CC-9 — the official RISC-V conformance suite (the canonical ISA authority).
+
+The external authority is riscv-tests — the RISC-V Software project's official
+ISA conformance suite, the same suite real hardware and QEMU are validated
+against (https://github.com/riscv-software-src/riscv-tests). Each test runs in a
+real machine-mode environment (installs mtvec, drops to U-mode via mret, runs
+self-checking cases, and signals pass/fail through the HTIF tohost channel).
+
+Pins:
+  riscv-tests   1eb47d946c55f55cab8653c224c2993acc0276bd
+  env submodule 6de71edb142be36319e380ce782c3d1830c65d68
+  toolchain     riscv64-unknown-elf-gcc (13.2.0-11ubuntu1+12) 13.2.0
+
+Build (the *.bin are flat images of the machine-mode '-p' tests, base
+0x80000000; manifest.txt pins each test's tohost address since it depends on the
+test size):
+  FLAGS="-march=rv64g -mabi=lp64 -static -mcmodel=medany -fvisibility=hidden \
+         -nostdlib -nostartfiles -I env/p -I isa/macros/scalar -T env/p/link.ld"
+  for s in isa/rv64u{i,m,a}/*.S; do
+    riscv64-unknown-elf-gcc $FLAGS $s -o <name>
+    riscv64-unknown-elf-objcopy -O binary <name> <name>.bin
+    # tohost = nm <name> | awk '$3=="tohost"'  -> manifest.txt
+  done
+
+Coverage: rv64ui (base integer), rv64um (multiply/divide), rv64ua (atomics) —
+86 tests. Witness: tests/cc9_emulator.rs
+(the_emulator_passes_the_official_riscv_tests).

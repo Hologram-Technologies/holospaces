@@ -1,19 +1,16 @@
-//! `CC-9` (in progress) — the system-emulator core conforms to the RISC-V ISA
-//! (arc42 chapter 10, Conformance catalog; ADR-009).
+//! `CC-9` — the system emulator (arc42 chapter 10, Conformance catalog; ADR-009).
 //!
-//! CC-9's end state is "a real operating system boots and runs on the emulator."
-//! That is reached conformance-first: the emulator is grown against the
-//! https://riscv.org/technical/specifications/[RISC-V] ISA as its external
-//! authority, exactly as `CC-5` is grown against the WebAssembly spec suite. This
-//! witness is the foundation step — the [emulator](holospaces::emulator) core
-//! executes **real RISC-V machine code** (assembled by LLVM's RISC-V backend,
-//! `vv/artifacts/cc9/`, in the self-checking style of riscv-tests) and reproduces
-//! the ISA-defined result exactly.
+//! The [emulator](holospaces::emulator) is verified against external authorities:
 //!
-//! The full-OS boot, the κ-disk-as-disk and console-over-channels integration,
-//! and the QEMU differential are the subsequent CC-9 steps; until a real OS
-//! boots, `vv/run.sh` reports CC-9 *pending* (this is the cargo-tier ISA witness,
-//! not yet the CC-9 suite).
+//! * it **passes the official RISC-V `riscv-tests` conformance suite** (rv64ui +
+//!   rv64um + rv64ua, machine-mode `-p`) — the canonical authority real hardware
+//!   and QEMU are validated against, exercising the base ISA, M/A extensions, and
+//!   the machine-mode trap architecture;
+//! * it runs **as a real hologram Wasm container codemodule** on the substrate
+//!   runtime, with its disk as a `CC-7` κ-disk and a reproducible κ snapshot.
+//!
+//! CC-9's end state is "a real operating system boots and runs"; until a real OS
+//! boots, `vv/run.sh` reports CC-9 *pending* — these are cargo-tier witnesses.
 
 use std::path::{Path, PathBuf};
 
@@ -117,6 +114,53 @@ fn the_emulator_writes_console_output_and_snapshots_reproducibly() {
         snapshot, snapshot2,
         "identical runs ⇒ identical κ snapshot (L1)"
     );
+}
+
+/// The emulator passes the **official RISC-V `riscv-tests` conformance suite**
+/// (rv64ui base + rv64um multiply/divide + rv64ua atomics, machine-mode `-p`
+/// variants) — the canonical external authority for the RISC-V ISA, the same
+/// suite hardware and QEMU are validated against. Each test runs in a real
+/// machine-mode environment (it installs `mtvec`, drops to U-mode via `mret`,
+/// runs its cases, and signals pass/fail through the HTIF `tohost` channel), so
+/// passing them exercises the privileged trap architecture as well as the base
+/// ISA. (CC-9, the canonical ISA-conformance authority.)
+#[test]
+fn the_emulator_passes_the_official_riscv_tests() {
+    let dir = artifact_dir().join("riscv-tests");
+    // The manifest pins each test's HTIF `tohost` address (it depends on the
+    // test's size, so it is not a fixed constant).
+    let manifest = std::fs::read_to_string(dir.join("manifest.txt"))
+        .expect("riscv-tests manifest (built per vv/artifacts/cc9/riscv-tests/SOURCE.txt)");
+    let tests: Vec<(&str, u64)> = manifest
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let mut it = l.split_whitespace();
+            let name = it.next().unwrap();
+            let tohost = it.next().unwrap().trim_start_matches("0x");
+            (name, u64::from_str_radix(tohost, 16).unwrap())
+        })
+        .collect();
+    assert!(
+        tests.len() >= 80,
+        "the official suite is present ({})",
+        tests.len()
+    );
+
+    let mut failures = Vec::new();
+    for (name, tohost) in &tests {
+        let image = std::fs::read(dir.join(format!("{name}.bin"))).expect("test image");
+        // The -p tests link at 0x8000_0000; HTIF tohost per the manifest.
+        let mut emu = Emulator::new(0x8000_0000, 16 * 1024 * 1024);
+        emu.load_flat(&image).expect("image fits");
+        emu.set_htif(*tohost);
+        let halt = emu.run(50_000_000);
+        if halt != Halt::Exit(0) {
+            failures.push(format!("{name}: {halt:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "riscv-tests failures: {failures:#?}");
+    eprintln!("cc9: passed all {} official riscv-tests", tests.len());
 }
 
 /// The emulator runs **as a real hologram container codemodule on the engine**:

@@ -10,18 +10,17 @@
 //! container that runs on hologram's `wasmi`/Wasmtime engine (the same engine
 //! that boots a userland, `CC-6`).
 //!
-//! The core is grown conformance-first against the
+//! The core is verified conformance-first against the
 //! https://riscv.org/technical/specifications/[RISC-V] ISA as its external
-//! authority (`CC-9`, arc42 chapter 10): it executes real RISC-V machine code —
-//! assembled by LLVM's RISC-V backend, in the self-checking style of
-//! https://github.com/riscv-software-src/riscv-tests[riscv-tests] — and must
-//! reproduce the ISA semantics exactly. This is the base integer set, integer
-//! multiply/divide (M), atomics (A), and the control/status registers (Zicsr) —
-//! RV64IMA + Zicsr — plus the `ecall` boundary a guest uses for console output
-//! and exit. The remaining privileged architecture (traps, Sv39 paging,
-//! CLINT/PLIC, SBI) and the compressed (C) and floating-point (FD) extensions
-//! that a full Linux boot needs are layered on top of this same core in
-//! subsequent conformance steps.
+//! authority (`CC-9`, arc42 chapter 10): it passes the **official
+//! https://github.com/riscv-software-src/riscv-tests[riscv-tests] conformance
+//! suite** — the same suite real hardware and QEMU are validated against. It
+//! implements the base integer set, integer multiply/divide (M), atomics (A),
+//! the control/status registers (Zicsr), and machine-mode trap handling
+//! (`ecall`→`mtvec`, `mcause`/`mepc`/`mstatus`, `mret`) — so the official tests'
+//! own machine-mode environment runs unmodified. A flat program may instead use
+//! the `ecall` host boundary (console `write` / `exit`) when it installs no trap
+//! vector.
 
 use alloc::collections::BTreeMap;
 #[cfg(not(feature = "std"))]
@@ -37,6 +36,17 @@ mod syscall {
     pub const EXIT: u64 = 93;
     pub const EXIT_GROUP: u64 = 94;
 }
+
+/// The machine-mode CSR numbers the trap architecture reads and writes.
+mod csr {
+    pub const MSTATUS: u32 = 0x300;
+    pub const MTVEC: u32 = 0x305;
+    pub const MEPC: u32 = 0x341;
+    pub const MCAUSE: u32 = 0x342;
+}
+
+/// Privilege levels (RISC-V Privileged ISA): machine, supervisor, user.
+const PRIV_M: u8 = 3;
 
 /// Why the machine stopped stepping.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,6 +97,11 @@ pub struct Emulator {
     csrs: BTreeMap<u32, u64>,
     /// The LR/SC reservation address (A extension, single hart).
     reservation: Option<u64>,
+    /// The current privilege level (M/S/U) — starts in machine mode.
+    priv_level: u8,
+    /// The HTIF `tohost` address, if set — a store there signals exit (the
+    /// riscv-tests / SBI console channel); otherwise `None` (flat programs).
+    htif: Option<u64>,
 }
 
 impl Emulator {
@@ -103,7 +118,16 @@ impl Emulator {
             console: Vec::new(),
             csrs: BTreeMap::new(),
             reservation: None,
+            priv_level: PRIV_M,
+            htif: None,
         }
+    }
+
+    /// Set the HTIF `tohost` address — a store there ends the run with an exit
+    /// code (the riscv-tests / SBI signalling channel). Configured from the
+    /// guest image's `tohost` symbol.
+    pub fn set_htif(&mut self, tohost: u64) {
+        self.htif = Some(tohost);
     }
 
     fn csr_read(&self, csr: u32) -> u64 {
@@ -112,6 +136,36 @@ impl Emulator {
 
     fn csr_write(&mut self, csr: u32, value: u64) {
         self.csrs.insert(csr, value);
+    }
+
+    /// Take a trap to machine mode (RISC-V Privileged ISA §3.1.6): record the
+    /// faulting PC and cause, save the interrupt-enable and privilege into
+    /// `mstatus` (MPIE/MPP), and jump to `mtvec` in machine mode.
+    fn trap(&mut self, cause: u64, epc: u64) {
+        self.csr_write(csr::MEPC, epc);
+        self.csr_write(csr::MCAUSE, cause);
+        let mut st = self.csr_read(csr::MSTATUS);
+        let mie = (st >> 3) & 1;
+        st = (st & !(1 << 7)) | (mie << 7); // MPIE = MIE
+        st &= !(1 << 3); // MIE = 0
+        st = (st & !(3 << 11)) | (u64::from(self.priv_level) << 11); // MPP = priv
+        self.csr_write(csr::MSTATUS, st);
+        self.priv_level = PRIV_M;
+        self.hart.pc = self.csr_read(csr::MTVEC) & !3; // direct mode
+    }
+
+    /// Return from a machine-mode trap (`mret`): restore PC, interrupt-enable,
+    /// and privilege from `mstatus`/`mepc`.
+    fn mret(&mut self) {
+        let mut st = self.csr_read(csr::MSTATUS);
+        let mpie = (st >> 7) & 1;
+        let mpp = (st >> 11) & 3;
+        st = (st & !(1 << 3)) | (mpie << 3); // MIE = MPIE
+        st |= 1 << 7; // MPIE = 1
+        st &= !(3 << 11); // MPP = U
+        self.csr_write(csr::MSTATUS, st);
+        self.priv_level = mpp as u8;
+        self.hart.pc = self.csr_read(csr::MEPC);
     }
 
     /// Load a flat guest image at `base` and set the reset PC there.
@@ -133,6 +187,12 @@ impl Emulator {
     #[must_use]
     pub fn console(&self) -> &[u8] {
         &self.console
+    }
+
+    /// The current program counter (diagnostics).
+    #[must_use]
+    pub fn pc(&self) -> u64 {
+        self.hart.pc
     }
 
     /// A reproducible snapshot of machine state — registers, PC, and RAM — the
@@ -271,6 +331,15 @@ impl Emulator {
                 // STORE
                 let addr = self.rd(rs1).wrapping_add(s_imm(inst));
                 let v = self.rd(rs2);
+                // HTIF tohost (the riscv-tests / Linux SBI console channel): a
+                // store to the configured address signals exit (bit0=1 ⇒ exit
+                // code = value>>1; a console putchar otherwise).
+                if self.htif == Some(addr) {
+                    if v & 1 != 0 {
+                        return Err(Halt::Exit(v >> 1));
+                    }
+                    return Ok(());
+                }
                 let width = match funct3 {
                     0 => 1, // SB
                     1 => 2, // SH
@@ -291,7 +360,7 @@ impl Emulator {
                     4 => a ^ imm,                            // XORI
                     6 => a | imm,                            // ORI
                     7 => a & imm,                            // ANDI
-                    1 => a << (rs2 & 0x3f),                  // SLLI (shamt 6b)
+                    1 => a << ((inst >> 20) & 0x3f),         // SLLI (6-bit shamt, RV64)
                     5 => {
                         let shamt = (inst >> 20) & 0x3f;
                         if funct7 & 0x20 != 0 {
@@ -397,12 +466,18 @@ impl Emulator {
             }
             0x0f => { /* FENCE / FENCE.I — ordering no-op on this model */ }
             0x73 if funct3 == 0 => {
-                // SYSTEM — ECALL / EBREAK.
-                match inst >> 7 {
-                    0x0000_0000 => return self.ecall(), // ECALL (imm=0, rd/rs1=0)
-                    0x0010_0000 => return Err(Halt::Trap(Trap::Breakpoint)), // EBREAK (imm=1)
-                    _ => return Err(Halt::Trap(Trap::IllegalInstruction(inst))),
-                }
+                // SYSTEM — ECALL / EBREAK / xRET / WFI / SFENCE.VMA.
+                return match inst {
+                    0x0000_0073 => self.ecall(),                      // ECALL
+                    0x0010_0073 => Err(Halt::Trap(Trap::Breakpoint)), // EBREAK
+                    0x3020_0073 => {
+                        self.mret();
+                        Ok(())
+                    } // MRET
+                    0x1050_0073 => Ok(()),                            // WFI — nop on this model
+                    _ if (inst >> 25) == 0x09 => Ok(()),              // SFENCE.VMA — nop (no TLB)
+                    _ => Err(Halt::Trap(Trap::IllegalInstruction(inst))),
+                };
             }
             0x73 => {
                 // SYSTEM — Zicsr: CSRRW/S/C and their immediate forms. The source
@@ -495,6 +570,19 @@ impl Emulator {
 
     /// The `ecall` boundary: a tiny Linux syscall surface (write / exit).
     fn ecall(&mut self) -> Result<(), Halt> {
+        // If the guest installed a machine-mode trap vector, `ecall` is a real
+        // trap into its handler (a kernel / the riscv-tests environment): cause
+        // 8/9/11 by the originating privilege. Otherwise it is the host syscall
+        // boundary a flat program uses (write / exit).
+        if self.csr_read(csr::MTVEC) != 0 {
+            let cause = match self.priv_level {
+                3 => 11, // ECALL from M
+                1 => 9,  // ECALL from S
+                _ => 8,  // ECALL from U
+            };
+            self.trap(cause, self.hart.pc);
+            return Ok(());
+        }
         let num = self.rd(17); // a7
         match num {
             syscall::EXIT | syscall::EXIT_GROUP => Err(Halt::Exit(self.rd(10))),
