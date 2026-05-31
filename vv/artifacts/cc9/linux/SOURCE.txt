@@ -31,7 +31,7 @@ HOLOSPACES-LINUX-USERSPACE-OK, mounts procfs, echoes /proc/version, and powers
 the machine off via the reboot(2) syscall (-> SBI SRST -> the emulator halts).
 
 Device tree (holospaces.dts -> holospaces.dtb, dtc 1.7.0): one rv64imafdc hart
-with riscv,sv39, 128 MiB RAM at 0x80000000, a SiFive CLINT at 0x02000000, and a
+with riscv,sv57, 128 MiB RAM at 0x80000000, a SiFive CLINT at 0x02000000, and a
 10 MHz timebase — the machine the emulator presents.
 
 expected-userspace.txt: the two deterministic userspace lines (the marker + the

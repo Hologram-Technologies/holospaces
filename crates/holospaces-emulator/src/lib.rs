@@ -51,23 +51,12 @@ extern "C" {
     fn storage_get(kappa_ptr: *const u8, out_ptr: *mut u8, out_cap: usize) -> i32;
 }
 
-/// Batch-profile guest RAM (the ISA-conformance guests are tiny).
-const RAM_BYTES: usize = 256 * 1024;
-/// Liveness bound on a batch run (the host's fuel budget bounds it too).
-const MAX_STEPS: u64 = 5_000_000;
-
-/// The boot-descriptor magic that selects the operating-system profile.
+/// The boot-descriptor magic that selects the operating-system profile. The
+/// descriptor is `OS_MAGIC` + four little-endian `u64` machine fields
+/// (`ram_bytes`, `base`, `dtb_addr`, `max_steps`) + the kernel-image κ + the
+/// device-tree κ — so the host specifies the machine, nothing is baked in.
 const OS_MAGIC: &[u8; 4] = b"HGOS";
-/// OS-profile machine: 128 MiB of RAM at the standard RISC-V base, the device
-/// tree high and clear of the kernel (matching `holospaces.dts` / `boot_kernel`).
-const OS_BASE: u64 = 0x8000_0000;
-const OS_RAM_BYTES: usize = 128 * 1024 * 1024;
-const OS_DTB_ADDR: u64 = OS_BASE + 0x0700_0000;
-/// Liveness bound on an OS boot (a full Linux boot to userspace is ~10⁸ steps).
-const OS_MAX_STEPS: u64 = 3_000_000_000;
-/// Upper bound on the kernel image read out of the substrate (the buffer cap).
-const KERNEL_CAP: usize = 64 * 1024 * 1024;
-const DTB_CAP: usize = 64 * 1024;
+const OS_DESC_LEN: usize = 4 + 8 * 4 + 71 + 71;
 
 /// Read κ-addressed content (the 71-byte label at `kappa`) out of the substrate
 /// into a fresh buffer of at most `cap` bytes; `None` if the host refused it.
@@ -79,6 +68,11 @@ fn get_kappa(kappa: &[u8], cap: usize) -> Option<Vec<u8>> {
     }
     buf.truncate(n as usize);
     Some(buf)
+}
+
+/// A little-endian `u64` read from a descriptor field.
+fn rd_u64(b: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes(<[u8; 8]>::try_from(&b[off..off + 8]).unwrap_or([0; 8]))
 }
 
 /// Emit the run record `[exit_code u64 LE][console]` into the substrate via
@@ -104,33 +98,45 @@ fn emit(code: u64, console: &[u8]) -> i32 {
 pub extern "C" fn hg_init(ptr: *const u8, len: i32) -> i32 {
     let state = unsafe { core::slice::from_raw_parts(ptr, len as usize) };
 
-    // Operating-system profile: a boot descriptor (magic + kernel κ + DTB κ).
-    if state.len() == OS_MAGIC.len() + 71 + 71 && &state[..4] == OS_MAGIC {
-        let kernel_kappa = &state[4..4 + 71];
-        let dtb_kappa = &state[4 + 71..4 + 71 + 71];
-        let Some(kernel) = get_kappa(kernel_kappa, KERNEL_CAP) else {
+    // Operating-system profile: a boot descriptor naming the machine + the
+    // kernel/DTB content κ. The host owns the machine spec — no sizes are baked
+    // into the codemodule, so it boots an OS of any size the host provisions.
+    if state.len() == OS_DESC_LEN && &state[..4] == OS_MAGIC {
+        let ram_bytes = rd_u64(state, 4) as usize;
+        let base = rd_u64(state, 12);
+        let dtb_addr = rd_u64(state, 20);
+        let max_steps = rd_u64(state, 28);
+        let kernel_kappa = &state[36..36 + 71];
+        let dtb_kappa = &state[36 + 71..36 + 71 + 71];
+        // The kernel must fit in RAM; the DTB sits at `dtb_addr` and runs to the
+        // top of RAM — the caps follow the machine, they are not fixed numbers.
+        let Some(kernel) = get_kappa(kernel_kappa, ram_bytes) else {
             return 3;
         };
-        let Some(dtb) = get_kappa(dtb_kappa, DTB_CAP) else {
+        let dtb_cap = ram_bytes.saturating_sub(dtb_addr.wrapping_sub(base) as usize);
+        let Some(dtb) = get_kappa(dtb_kappa, dtb_cap) else {
             return 4;
         };
-        let mut emu = Emulator::new(OS_BASE, OS_RAM_BYTES);
-        if emu.boot_kernel(&kernel, &dtb, OS_DTB_ADDR).is_err() {
+        let mut emu = Emulator::new(base, ram_bytes);
+        if emu.boot_kernel(&kernel, &dtb, dtb_addr).is_err() {
             return 5;
         }
-        let code = match emu.run(OS_MAX_STEPS) {
+        let code = match emu.run(max_steps) {
             Halt::Exit(c) => c,
             _ => u64::MAX,
         };
         return emit(code, emu.console());
     }
 
-    // Batch profile: a flat RISC-V image run to completion.
-    let mut emu = Emulator::new(0, RAM_BYTES);
+    // Batch profile: a flat RISC-V image run to completion. RAM is sized to the
+    // image (plus a working margin); the step budget is the host's fuel-backed
+    // liveness guard (a non-halting guest is bounded by the runtime's fuel).
+    let ram = (state.len() * 2).max(256 * 1024);
+    let mut emu = Emulator::new(0, ram);
     if emu.load_flat(state).is_err() {
         return 1;
     }
-    let code = match emu.run(MAX_STEPS) {
+    let code = match emu.run(u64::MAX) {
         Halt::Exit(c) => c,
         _ => u64::MAX,
     };
