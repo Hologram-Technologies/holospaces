@@ -5,46 +5,119 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Hologram Platform Manager</title>
     <style>
-      body { font: 14px/1.5 system-ui, sans-serif; max-width: 52rem; margin: 2rem auto; padding: 0 1rem; }
-      h1 { font-size: 1.3rem; }
-      button { font: inherit; padding: 0.3rem 0.7rem; margin-right: 0.4rem; }
-      code, pre { font-family: ui-monospace, monospace; }
-      .k { color: #555; word-break: break-all; }
-      #holospaces li { margin: 0.2rem 0; }
-      .muted { color: #777; }
+      :root { color-scheme: dark; }
+      body {
+        font: 14px/1.5 system-ui, sans-serif; margin: 0; background: #0d1117; color: #c9d1d9;
+      }
+      header { padding: 1rem 1.5rem; border-bottom: 1px solid #21262d; }
+      h1 { font-size: 1.2rem; margin: 0; }
+      h2 { font-size: 0.95rem; margin: 0 0 0.5rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; }
+      .muted { color: #8b949e; }
+      .k { color: #58a6ff; font-family: ui-monospace, monospace; word-break: break-all; font-size: 0.85em; }
+      main { padding: 1.5rem; max-width: 70rem; margin: 0 auto; }
+      section { margin-bottom: 1.5rem; }
+      button {
+        font: inherit; padding: 0.35rem 0.8rem; margin: 0 0.4rem 0.4rem 0; cursor: pointer;
+        background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px;
+      }
+      button:hover { background: #30363d; }
+      button.primary { background: #238636; border-color: #2ea043; color: #fff; }
+      button:disabled { opacity: 0.5; cursor: default; }
+      #holospaces { list-style: none; padding: 0; margin: 0.5rem 0; }
+      #holospaces li { padding: 0.3rem 0; border-bottom: 1px solid #21262d; }
+      .workspace { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+      .panel { border: 1px solid #21262d; border-radius: 8px; overflow: hidden; }
+      .panel-head { background: #161b22; padding: 0.4rem 0.8rem; border-bottom: 1px solid #21262d; font-size: 0.85em; color: #8b949e; }
+      #terminal {
+        font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.45;
+        background: #010409; color: #c9d1d9; padding: 0.8rem; height: 22rem; overflow-y: auto;
+        white-space: pre-wrap; word-break: break-word; margin: 0;
+      }
+      .prompt { display: flex; border-top: 1px solid #21262d; }
+      .prompt span { padding: 0.5rem 0 0.5rem 0.8rem; color: #2ea043; font-family: ui-monospace, monospace; }
+      #cmd { flex: 1; background: #010409; color: #c9d1d9; border: 0; padding: 0.5rem 0.8rem; font-family: ui-monospace, monospace; outline: none; }
+      #editor { width: 100%; height: 16rem; box-sizing: border-box; background: #010409; color: #c9d1d9; border: 0; padding: 0.8rem; font-family: ui-monospace, monospace; font-size: 12px; resize: none; outline: none; }
+      .editor-foot { padding: 0.5rem 0.8rem; border-top: 1px solid #21262d; display: flex; align-items: center; gap: 0.5rem; }
+      .editor-foot input { background: #010409; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 0.3rem 0.5rem; font-family: ui-monospace, monospace; }
+      #status { font-size: 0.85em; }
+      .hidden { display: none; }
+      a { color: #58a6ff; }
     </style>
   </head>
   <body>
-    <h1>Hologram Platform Manager</h1>
-    <p class="muted">
-      The browser is a peer that <em>is</em> the substrate — no server (Law L1).
-      Identity is content; every byte is verified by re-derivation (Law L5).
-    </p>
-    <p>
-      <button id="signin">Sign in</button>
-      <button id="provision">Provision a .holo</button>
-      <button id="userland">Provision a userland</button>
-      <button id="boot">Boot a userland</button>
-      <button id="devcontainer">Run a devcontainer</button>
-      <button id="runholo">Run a .holo</button>
-    </p>
-    <p>operator: <span id="operator" class="k muted">(signed out)</span></p>
-    <p>holospaces:</p>
-    <ul id="holospaces"><li class="muted">none yet</li></ul>
-    <p>roster κ: <span id="roster" class="k muted">—</span></p>
-    <pre id="log" class="muted">loading…</pre>
+    <header>
+      <h1>Hologram Platform Manager</h1>
+      <p class="muted" style="margin:0.3rem 0 0">
+        The browser is a peer that <em>is</em> the substrate — no server (Law L1).
+        Identity is content; every byte is verified by re-derivation (Law L5).
+      </p>
+    </header>
+    <main>
+      <section>
+        <h2>Operator</h2>
+        <button id="signin" class="primary">Sign in</button>
+        <span id="operator" class="k">(signed out)</span>
+        <span class="muted"> · roster κ </span><span id="roster" class="k">—</span>
+      </section>
+
+      <section>
+        <h2>Holospaces</h2>
+        <button id="provision">Provision a .holo</button>
+        <button id="userland">Provision a userland</button>
+        <button id="runholo">Run a .holo (CC-2)</button>
+        <button id="boot">Boot a userland (CC-6)</button>
+        <ul id="holospaces"><li class="muted">none yet</li></ul>
+      </section>
+
+      <section>
+        <h2>Launch a workspace — a real OS in your tab (CC-9 · CC-11)</h2>
+        <p class="muted" style="margin:0 0 0.6rem">
+          Launch boots a real, unmodified <strong>Linux kernel</strong> on the
+          κ-addressed system emulator — <em>in this tab</em>, no Docker daemon and
+          no cloud VM (ADR-009). Then drive it: the <strong>terminal</strong>
+          publishes your commands as canonical events that advance the holospace's
+          κ snapshot, and the <strong>editor</strong> reads and edits content by κ.
+        </p>
+        <button id="launch" class="primary" disabled>Launch workspace</button>
+        <span id="status" class="muted">loading…</span>
+
+        <div id="workspace" class="workspace hidden" style="margin-top:1rem">
+          <div class="panel">
+            <div class="panel-head">Terminal — the running holospace</div>
+            <pre id="terminal"></pre>
+            <div class="prompt">
+              <span>$</span>
+              <input id="cmd" placeholder="try: echo hello · version · exit" disabled autocomplete="off" />
+            </div>
+          </div>
+          <div class="panel">
+            <div class="panel-head">Editor — environment content, addressed by κ</div>
+            <textarea id="editor" spellcheck="false">edit me, then Save — my κ is my identity (Law L1)
+</textarea>
+            <div class="editor-foot">
+              <input id="path" value="/work/readme.txt" />
+              <button id="save">Save</button>
+              <span class="muted">κ</span> <span id="filekappa" class="k">—</span>
+            </div>
+          </div>
+        </div>
+        <p style="margin-top:0.6rem">
+          holospace state κ: <span id="statekappa" class="k">—</span>
+        </p>
+      </section>
+    </main>
 
     <script type="module">
-      import init, { kappa, verify_kappa, run_holo, validate_userland, Console }
+      import init, { kappa, verify_kappa, run_holo, validate_userland, Console, Workspace }
         from "./pkg/holospaces_web.js";
       await init();
 
-      // Expose the Manager surface for the Playwright browser test.
-      window.hs = { kappa, verify_kappa, run_holo, validate_userland, Console };
+      // Expose the surface for the Playwright browser test.
+      window.hs = { kappa, verify_kappa, run_holo, validate_userland, Console, Workspace };
 
       const console0 = new Console();
       const $ = (id) => document.getElementById(id);
-      const log = (m) => ($("log").textContent = m);
+      const status = (m) => ($("status").textContent = m);
       let n = 0;
 
       function render() {
@@ -58,79 +131,114 @@
       }
 
       $("signin").onclick = () => {
-        const id = console0.sign_in(new TextEncoder().encode("operator-self-sovereign-key"));
-        log("signed in — identity " + id);
+        console0.sign_in(new TextEncoder().encode("operator-self-sovereign-key"));
         render();
       };
       $("provision").onclick = () => {
-        const code = new TextEncoder().encode("holospace code module #" + ++n);
-        const k = console0.provision(code, 256 * 1024 * 1024);
-        log("provisioned a .holo holospace " + k);
+        console0.provision(new TextEncoder().encode("holospace code #" + ++n), 256 * 1024 * 1024);
         render();
       };
-      // The execution surface (ADR-008): validate a recompiled userland against
-      // the host-ABI surface, then provision it as a holospace — in-browser.
       $("userland").onclick = async () => {
-        try {
-          const res = await fetch("./fixture-userland.wasm");
-          const module = new Uint8Array(await res.arrayBuffer());
-          const k = console0.provision_userland(module, 4 * 1024 * 1024);
-          log("provisioned a userland holospace (execution surface) " + k);
-          render();
-        } catch (e) {
-          log("userland provisioning failed: " + e);
-        }
+        const m = new Uint8Array(await (await fetch("./fixture-userland.wasm")).arrayBuffer());
+        console0.provision_userland(m, 4 * 1024 * 1024);
+        render();
       };
-      // Boot a userland container in the browser (ADR-008; RT2; CC-6): spawn it
-      // through the substrate runtime over the wasmi interpreter engine, capture
-      // a κ snapshot of its state, resume, terminate — all in the browser peer.
       $("boot").onclick = async () => {
-        try {
-          const res = await fetch("./fixture-userland.wasm");
-          const module = new Uint8Array(await res.arrayBuffer());
-          const snapshot = console0.boot_userland(module, 4 * 1024 * 1024);
-          log("booted a userland in-browser → state snapshot κ " + snapshot);
-          render();
-        } catch (e) {
-          log("booting the userland failed: " + e);
-        }
+        const m = new Uint8Array(await (await fetch("./fixture-userland.wasm")).arrayBuffer());
+        const snap = console0.boot_userland(m, 4 * 1024 * 1024);
+        render();
+        status("booted a userland in-browser → snapshot κ " + snap);
       };
-      // The Codespaces scenario (arc42 ch.1): import a devcontainer and run it
-      // in the browser tab — no Docker daemon, no cloud VM. The config selects a
-      // κ-addressed Wasm userland (here the fixture), booted on the wasmi engine.
-      $("devcontainer").onclick = async () => {
-        try {
-          const res = await fetch("./fixture-userland.wasm");
-          const userland = new Uint8Array(await res.arrayBuffer());
-          const config = new TextEncoder().encode('{"name":"app","image":"debian:12"}');
-          const snapshot = console0.run_devcontainer(
-            "https://github.com/example/cool-project.git",
-            "main",
-            ".devcontainer/devcontainer.json",
-            config,
-            userland,
-            64 * 1024 * 1024,
-          );
-          log("ran a devcontainer in-browser → state snapshot κ " + snapshot);
-          render();
-        } catch (e) {
-          log("running the devcontainer failed: " + e);
-        }
-      };
-      // The browser .holo engine (RT2, realized): run a .holo through the
-      // executor compiled to wasm; the output κ equals the native one (CC-2).
       $("runholo").onclick = async () => {
+        const a = new Uint8Array(await (await fetch("./fixture.holo")).arrayBuffer());
+        status("browser .holo engine → output κ " + run_holo(a));
+      };
+
+      // ── The workspace: boot a real OS and drive it (CC-9 · CC-11) ──
+      let ws = null;
+
+      async function gunzip(url) {
+        const res = await fetch(url);
+        const stream = res.body.pipeThrough(new DecompressionStream("gzip"));
+        return new Uint8Array(await new Response(stream).arrayBuffer());
+      }
+
+      const BASE = 0x80000000, RAM = 128 * 1024 * 1024, DTB_ADDR = 0x87000000;
+      const READY = "HOLOSPACES-WORKSPACE-READY";
+
+      function renderTerminal() {
+        const t = $("terminal");
+        t.textContent = ws.terminal();
+        t.scrollTop = t.scrollHeight;
+        $("statekappa").textContent = ws.state_kappa();
+      }
+
+      $("launch").onclick = async () => {
+        $("launch").disabled = true;
         try {
-          const res = await fetch("./fixture.holo");
-          const archive = new Uint8Array(await res.arrayBuffer());
-          log("browser .holo engine → output κ " + run_holo(archive));
+          status("fetching the kernel image…");
+          const [kernel, dtb] = await Promise.all([
+            gunzip("./workspace-kernel.gz"),
+            fetch("./workspace.dtb").then((r) => r.arrayBuffer()).then((b) => new Uint8Array(b)),
+          ]);
+          status(`booting a real Linux kernel (${(kernel.length / 1048576).toFixed(1)} MiB) on the emulator…`);
+          ws = Workspace.boot(kernel, dtb, RAM, BASE, DTB_ADDR);
+          $("workspace").classList.remove("hidden");
+
+          // Boot in instruction chunks so the tab stays live and streams the console.
+          let steps = 0;
+          await new Promise((resolve) => {
+            const tick = () => {
+              const halted = ws.run(5_000_000);
+              steps += 5_000_000;
+              renderTerminal();
+              if (ws.shows(READY) || halted) return resolve();
+              status(`booting… (${(steps / 1e6).toFixed(0)}M instructions)`);
+              setTimeout(tick, 0);
+            };
+            tick();
+          });
+
+          status("workspace ready — type a command, or edit a file");
+          $("cmd").disabled = false;
+          $("cmd").focus();
         } catch (e) {
-          log("running the .holo failed: " + e);
+          status("launch failed: " + e);
+          $("launch").disabled = false;
         }
       };
 
+      // Terminal input: each line is a canonical event that drives the holospace.
+      $("cmd").addEventListener("keydown", (e) => {
+        if (e.key !== "Enter" || !ws) return;
+        const line = $("cmd").value;
+        $("cmd").value = "";
+        const eventKappa = ws.type_line(line);
+        renderTerminal();
+        status("event published on the channel → κ " + eventKappa);
+        if (ws.halted) {
+          $("cmd").disabled = true;
+          status("the workspace powered off (the OS halted)");
+        }
+      });
+
+      // Editor: an edit content-addresses the file — its κ is its identity (L1).
+      function rehash() {
+        if (!ws) return;
+        $("filekappa").textContent = kappa(new TextEncoder().encode($("editor").value));
+      }
+      $("editor").addEventListener("input", rehash);
+      $("save").onclick = () => {
+        if (!ws) return;
+        const k = ws.save_file($("path").value, new TextEncoder().encode($("editor").value));
+        $("filekappa").textContent = k;
+        status("saved — content addressed to κ " + k);
+      };
+
+      render();
+      $("launch").disabled = false;
       window.__ready = true;
-      log("ready — sign in, then provision holospaces (both compute forms, in-browser)");
+      status("ready — sign in, provision holospaces, or launch a workspace");
     </script>
   </body>
 </html>

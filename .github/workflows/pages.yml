@@ -14,6 +14,8 @@ on:
     branches: [main]
     paths:
       - 'crates/holospaces-web/**'
+      - 'vv/artifacts/cc11/**'
+      - 'vv/artifacts/cc9/linux/**'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 
@@ -56,6 +58,11 @@ jobs:
           cp crates/holospaces-web/web/fixture.holo _site/
           cp crates/holospaces-web/web/fixture-userland.wasm _site/
           cp -r crates/holospaces-web/web/pkg _site/pkg
+          # The workspace fixture: a real RISC-V Linux kernel + its device tree
+          # (the pinned CC-11 interactive image; provenance in vv/artifacts/cc11).
+          # The browser peer boots it on the system emulator — CC-9 / CC-11.
+          cp vv/artifacts/cc11/Image.gz _site/workspace-kernel.gz
+          cp vv/artifacts/cc9/linux/holospaces.dtb _site/workspace.dtb
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

@@ -15,17 +15,27 @@
 //! view, resolve (verify by re-derivation, Law L5), the operator roster (R5),
 //! the browser `.holo` engine (RT2, `CC-2`), booting a userland container
 //! in-browser through the substrate runtime (the execution surface, ADR-008;
-//! `CC-6`), **and importing and running a devcontainer in the browser** — the
+//! `CC-6`), and importing and running a devcontainer in the browser — the
 //! Codespaces/Gitpod scenario with no Docker daemon and no cloud VM (arc42
 //! chapter 1, the motivating scenario). The same holospace κ boots on this
 //! browser peer as on a native or remote one (Q6).
+//!
+//! It also exposes the **[`Workspace`]** — launching a holospace whose code is
+//! the [system emulator](holospaces::emulator) **boots a real operating system
+//! in the tab** (`CC-9`) and drives it through the [workspace
+//! projection](holospaces::projection) (`CC-11`): a live terminal whose commands
+//! are canonical events advancing the holospace's κ snapshot, and an editor that
+//! reads and edits environment content by κ — the documented launch experience,
+//! realized on the browser peer.
 
 use hologram_runtime::Runtime;
 use hologram_runtime_bare::BareMetalEngine;
 use hologram_store_mem::MemKappaStore;
 use hologram_substrate_core::{Capabilities, KappaStore, Realization};
 use holospaces::boot::{devcontainer, provision, LifecycleError, Resolver, Session};
+use holospaces::emulator::{Emulator, Halt};
 use holospaces::identity::{Operator, Roster};
+use holospaces::projection::{Intent, Workspace as Projection};
 use holospaces::realizations::{address, verify, Holospace, Kappa, Source};
 use holospaces::surface;
 use wasm_bindgen::prelude::*;
@@ -300,5 +310,143 @@ impl Console {
                 .map_err(js_err)?;
         }
         Ok(())
+    }
+}
+
+/// A **workspace** over a running holospace, in the browser tab — the
+/// Codespaces/Gitpod experience (ADR-009; `CC-9` + `CC-11`). The operator
+/// launches a holospace whose code is the system emulator; it **boots a real
+/// operating system** (the [system emulator](holospaces::emulator) running in
+/// the browser's own wasm engine), and the [workspace
+/// projection](holospaces::projection) drives it: a live **terminal**
+/// (keystrokes published as canonical events that advance the holospace's κ
+/// snapshot) and an **editor** that reads and edits environment content *by κ*.
+///
+/// The boot runs in instruction *chunks* ([`run`](Workspace::run)) so the UI
+/// stays responsive and can stream the console as the kernel boots — there is no
+/// server doing the work; the browser peer *is* the machine (Law L1).
+#[wasm_bindgen]
+pub struct Workspace {
+    machine: Emulator,
+    store: MemKappaStore,
+    channel: Vec<Kappa>,
+    halted: bool,
+}
+
+#[wasm_bindgen]
+impl Workspace {
+    /// Launch a workspace: place the OS `kernel` image and `dtb` in a machine
+    /// with `ram_bytes` of RAM at `base`, the device tree at `dtb_addr`, and hand
+    /// off as the SBI firmware. The machine is now booting (drive it with
+    /// [`run`](Workspace::run)).
+    pub fn boot(
+        kernel: &[u8],
+        dtb: &[u8],
+        ram_bytes: f64,
+        base: f64,
+        dtb_addr: f64,
+    ) -> Result<Workspace, JsValue> {
+        let mut machine = Emulator::new(base as u64, ram_bytes as usize);
+        machine
+            .boot_kernel(kernel, dtb, dtb_addr as u64)
+            .map_err(js_err)?;
+        Ok(Workspace {
+            machine,
+            store: MemKappaStore::new(),
+            channel: Vec::new(),
+            halted: false,
+        })
+    }
+
+    /// Advance the running holospace by `budget` instructions (one chunk of the
+    /// boot or of servicing input). Returns `true` once the machine has halted
+    /// (powered off). Call repeatedly from a UI loop, rendering
+    /// [`terminal`](Workspace::terminal) between chunks.
+    pub fn run(&mut self, budget: f64) -> bool {
+        if self.halted {
+            return true;
+        }
+        if !matches!(self.machine.run(budget as u64), Halt::OutOfBudget) {
+            self.halted = true;
+        }
+        self.halted
+    }
+
+    /// Whether the machine has powered off.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn halted(&self) -> bool {
+        self.halted
+    }
+
+    /// The rendered terminal — the console the running holospace has produced.
+    #[must_use]
+    pub fn terminal(&self) -> String {
+        String::from_utf8_lossy(self.machine.console()).into_owned()
+    }
+
+    /// Whether the terminal has rendered `marker` yet (e.g. the ready banner).
+    #[must_use]
+    pub fn shows(&self, marker: &str) -> bool {
+        self.machine
+            .console()
+            .windows(marker.len())
+            .any(|w| w == marker.as_bytes())
+    }
+
+    /// Type a line into the terminal: publish it as a canonical event on the
+    /// holospace's channel (Law L1/L2), feed the keystrokes to the running
+    /// machine, and run until the response settles. The holospace's κ snapshot
+    /// advances. Returns the event's κ.
+    pub fn type_line(&mut self, line: &str) -> String {
+        let event = {
+            let mut projection = Projection::attach(&mut self.machine);
+            projection.type_line(line, 400_000_000)
+        };
+        self.channel.push(event);
+        // The `exit` line powers the machine off; reflect that in the workspace.
+        if self.shows("WORKSPACE-DONE") {
+            self.halted = true;
+        }
+        event.as_str().to_owned()
+    }
+
+    /// The running holospace's κ snapshot — its canonical state (Law L1/L3/L5).
+    #[must_use]
+    pub fn state_kappa(&self) -> String {
+        address(&self.machine.snapshot()).as_str().to_owned()
+    }
+
+    /// The κ of every operator event published on the terminal channel so far.
+    #[must_use]
+    pub fn channel(&self) -> Vec<JsValue> {
+        self.channel
+            .iter()
+            .map(|k| JsValue::from_str(k.as_str()))
+            .collect()
+    }
+
+    /// The **editor** surface: save a file's content (the operator's edit). The
+    /// content is κ-addressed into the substrate (Law L2), so the returned κ is
+    /// the file's new identity — an edit advances it (Law L1). The canonical edit
+    /// event for `path` is published on the channel.
+    pub fn save_file(&mut self, path: &str, content: &[u8]) -> Result<String, JsValue> {
+        let intent = Intent::Edit {
+            path: path.to_owned(),
+            content: content.to_vec(),
+        };
+        self.channel.push(intent.kappa());
+        let stored = self.store.put("blake3", content).map_err(js_err)?;
+        Ok(stored.as_str().to_owned())
+    }
+
+    /// The editor's read: fetch a file's content *by κ*, verifying it by
+    /// re-derivation (Law L5). `undefined` if it is not in the workspace store.
+    pub fn open_file(&self, kappa: &str) -> Result<Option<Vec<u8>>, JsValue> {
+        let kappa = parse_kappa(kappa)?;
+        self.store
+            .get(&kappa)
+            .map(|opt| opt.map(|b| b.to_vec()))
+            .map_err(js_err)
     }
 }
