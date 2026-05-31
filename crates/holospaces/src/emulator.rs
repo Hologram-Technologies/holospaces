@@ -11,9 +11,9 @@
 //! that boots a userland, `CC-6`).
 //!
 //! The core is verified conformance-first against the
-//! https://riscv.org/technical/specifications/[RISC-V] ISA as its external
+//! [RISC-V](https://riscv.org/technical/specifications/) ISA as its external
 //! authority (`CC-9`, arc42 chapter 10): it passes the **official
-//! https://github.com/riscv-software-src/riscv-tests[riscv-tests] conformance
+//! [riscv-tests](https://github.com/riscv-software-src/riscv-tests) conformance
 //! suite** — the same suite real hardware and QEMU are validated against. It
 //! implements the base integer set, integer multiply/divide (M), atomics (A),
 //! single/double floating point (F/D — correctly rounded with the IEEE-754 flags
@@ -186,10 +186,10 @@ struct Hart {
 /// A single-hart RV64GC RISC-V machine over a flat little-endian RAM, with an
 /// `ecall` console (the `write` syscall appends to [`Emulator::console`]).
 ///
-/// RAM is mapped at [`Emulator::base`]; a flat guest image is loaded there and
-/// the reset PC is `base`. The machine is deterministic — identical image +
-/// identical input yield identical console output and identical final state,
-/// so its κ snapshot is reproducible (Law L1/L5; `CC-9`).
+/// RAM is mapped at the machine's `base` address; a flat guest image is loaded
+/// there and the reset PC is `base`. The machine is deterministic — identical
+/// image + identical input yield identical console output and identical final
+/// state, so its κ snapshot is reproducible (Law L1/L5; `CC-9`).
 pub struct Emulator {
     hart: Hart,
     ram: Vec<u8>,
