@@ -23,18 +23,17 @@ test size):
   done
 
 Coverage: rv64ui (base integer), rv64um (multiply/divide), rv64ua (atomics), rv64uc (compressed) —
-86 tests. Witness: tests/cc9_emulator.rs
+86 tests (+ the full rv64mi/rv64si privileged suites). Witness: tests/cc9_emulator.rs
 (the_emulator_passes_the_official_riscv_tests).
 
-Privileged suites (rv64mi, rv64si) — PARTIAL coverage (explicitly recorded; no
-silent caps). The manifest includes the machine-/supervisor-mode tests the
-emulator currently passes (M-mode + S-mode traps, delegation, sret, ecall/ebreak
-exceptions). NOT yet included, with what each needs (in progress):
-  rv64mi-p-csr, rv64mi-p-mcsr   — CSR WARL/read-only conformance (misa, counters)
-  rv64mi-p-breakpoint            — debug-trigger CSRs
-  rv64mi-p-ma_fetch              — misaligned instruction-fetch trap
-  rv64mi-p-illegal               — vectored interrupts + S-mode + paging (composite)
-  rv64si-p-csr                   — S-mode CSR conformance
+Privileged suites (rv64mi, rv64si) — FULL coverage. The emulator passes ALL of
+the machine-mode (rv64mi) and supervisor-mode (rv64si) tests: traps + delegation,
+mret/sret, ecall/ebreak, the WARL/read-only CSR semantics (rv64mi/si-csr,
+rv64mi-mcsr — mstatus.UXL/SXL fixed at 2, misa read-only), the debug-trigger
+absence (rv64mi-breakpoint — a no-trigger hart), misaligned load/store/fetch
+(rv64mi/si-ma_*), the FP-disabled trap (mstatus.FS=0 -> illegal), and the
+composite vectored-interrupt / S-mode / paging test (rv64mi-illegal — incl. the
+mstatus.TVM/TSR trap semantics for sfence.vma/satp/sret). No exclusions.
 
 Floating point (F/D): rv64uf (single) + rv64ud (double) — built with
 -mabi=lp64d. The emulator's F/D extension computes correctly-rounded results,

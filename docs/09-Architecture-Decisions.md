@@ -178,9 +178,9 @@ surface of ADR-008 (a κ-addressed Wasm code module over the host ABI —
 the Execution Surface building block, `CC-6` — which still stands) from
 "recompiled userlands only" to "arbitrary OS images via emulation"; the
 emulator is itself such a κ-addressed code module. The emulator core is
-a real RISC-V machine (RV64IMAC + Zicsr, machine/supervisor traps, Sv39
-paging, CLINT interrupts, SBI) bound directly to the `hologram` host ABI
-and **verified against the official
+a real RISC-V machine (RV64GC (= IMAFDC) + Zicsr, machine/supervisor
+traps, Sv39 paging, CLINT interrupts, SBI) bound directly to the
+`hologram` host ABI and **verified against the official
 [riscv-tests](https://github.com/riscv-software-src/riscv-tests)
 conformance suite** — the same authority real hardware and QEMU are
 validated against. It is a clean-room core rather than an adapted

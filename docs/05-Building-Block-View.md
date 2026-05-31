@@ -69,7 +69,7 @@ which boots it through hologram’s `ContainerRuntime` over the peer’s
 browser and on bare-metal.
 
 **System Emulator** — for a general operating system, the execution
-codemodule (ADR-009): a real RISC-V machine (RV64IMAC + Zicsr,
+codemodule (ADR-009): a real RISC-V machine (RV64GC (= IMAFDC) + Zicsr,
 machine/supervisor traps, Sv39 paging, CLINT interrupts, SBI) bound to
 the host ABI and verified against the official riscv-tests conformance
 suite (`CC-9`). A *κ-disk* (a `KappaStore`-backed block device — the OS

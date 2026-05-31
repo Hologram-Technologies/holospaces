@@ -21,7 +21,7 @@ if ! command -v cargo >/dev/null 2>&1; then
     exit 127
 fi
 
-# The fast cargo-tier witnesses: ISA conformance (128 official riscv-tests),
+# The fast cargo-tier witnesses: ISA conformance (134 official riscv-tests),
 # the CLINT timer, SBI, the codemodule on the real runtime, and the κ-disk.
 cargo test --manifest-path "$ROOT/Cargo.toml" -p holospaces \
     --test cc9_emulator -- --nocapture || exit 1
