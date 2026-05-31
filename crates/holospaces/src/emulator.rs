@@ -21,7 +21,7 @@
 //! compressed encoding (C), the control/status registers (Zicsr), and
 //! trap handling across privilege levels — machine and supervisor mode with
 //! delegation (`ecall`/`ebreak` exceptions → `mtvec`/`stvec`, `mcause`/`scause`,
-//! `mret`/`sret`), and **Sv39 paging** (the page-table walk with accessed/dirty
+//! `mret`/`sret`), and **Sv39/Sv48/Sv57 paging** (the page-table walk with accessed/dirty
 //! bits and U/SUM/MXR permissions), and **interrupts** (the CLINT memory-mapped
 //! timer, `mip`/`mie` with `mideleg`, vectored `mtvec`) — so the official
 //! machine- and supervisor-mode tests (including supervisor paging) run
@@ -154,7 +154,7 @@ pub enum Trap {
     UnknownSyscall(u64),
     /// `ebreak`.
     Breakpoint,
-    /// An Sv39 page fault: `cause` is the RISC-V exception code (12 fetch / 13
+    /// A page fault (Sv39/Sv48/Sv57): `cause` is the RISC-V exception code (12 fetch / 13
     /// load / 15 store), `addr` the faulting virtual address.
     PageFault {
         /// The RISC-V page-fault exception code (12/13/15).
@@ -338,14 +338,13 @@ impl Emulator {
             | csr::TINFO
             | csr::TCONTROL => {}
             0x180 => {
-                // `satp`. This hart implements Sv39 (the DTB `mmu-type`), so a
-                // write selecting a deeper mode (Sv48/Sv57) does not take — its
-                // mode field reads back as bare. A modern kernel probes the
-                // deepest mode by writing `satp` and reading it back, so this is
-                // how an Sv39-only hart makes it fall back to Sv39 (RISC-V
-                // Privileged ISA §4.1.11: an unsupported MODE leaves `satp`
-                // unchanged / WARL).
-                let v = if matches!(value >> 60, 0 | 8) {
+                // `satp` MODE is WARL (RISC-V Privileged ISA §4.1.11). This hart
+                // implements bare + the full Sv39/Sv48/Sv57 set (the `translate`
+                // walker handles all three), so a write selecting any of those
+                // takes; a reserved MODE leaves the field bare. A modern kernel
+                // probes for the deepest mode by writing `satp` and reading it
+                // back — and gets whatever it asks for, up to Sv57.
+                let v = if matches!(value >> 60, 0 | 8 | 9 | 10) {
                     value
                 } else {
                     value & !(0xfu64 << 60)
@@ -509,13 +508,23 @@ impl Emulator {
         Ok(())
     }
 
-    /// Boot a flat RISC-V Linux `Image` as the supervisor OS: place the kernel at
-    /// its 2 MiB text offset, the flattened device tree (`dtb`) at `dtb_addr`,
+    /// Boot a RISC-V supervisor OS `Image`: place the kernel at the load offset
+    /// its own header declares, the flattened device tree (`dtb`) at `dtb_addr`,
     /// and hand off the way the SBI firmware does — drop to S-mode at the kernel
     /// entry with `a0` = hart id (0) and `a1` = the DTB pointer (RISC-V boot
     /// protocol). The emulator services the kernel's SBI calls (`enable_sbi`).
+    ///
+    /// The load offset is read from the RISC-V Image header (`text_offset` at
+    /// byte 8, identified by the `RSC\x05` magic at byte 56), so the boot adapts
+    /// to whatever the image asks for rather than assuming one layout.
+    ///
+    /// # Errors
+    ///
+    /// [`Trap::AccessFault`] if `image` is not a RISC-V `Image` (no header) or it
+    /// and the device tree do not fit at their addresses in RAM.
     pub fn boot_kernel(&mut self, image: &[u8], dtb: &[u8], dtb_addr: u64) -> Result<(), Trap> {
-        let entry = self.base + 0x20_0000; // the RISC-V kernel Image `text_offset`
+        let text_offset = image_text_offset(image).ok_or(Trap::AccessFault(self.base))?;
+        let entry = self.base + text_offset;
         let koff = self.offset(entry, image.len())?;
         self.ram[koff..koff + image.len()].copy_from_slice(image);
         let doff = self.offset(dtb_addr, dtb.len())?;
@@ -795,8 +804,8 @@ impl Emulator {
         self.store_phys(pa, width, value)
     }
 
-    /// Translate a virtual address through Sv39 paging (RISC-V Privileged ISA
-    /// §4.3-4.4) when `satp.MODE == Sv39` and the effective privilege is below
+    /// Translate a virtual address through Sv39/Sv48/Sv57 paging (RISC-V Privileged ISA
+    /// §4.3-4.6) when `satp.MODE` selects Sv39/Sv48/Sv57 and the effective privilege is below
     /// machine; otherwise the address is physical (bare mode). Sets the
     /// accessed/dirty bits and enforces the page permissions and U/SUM/MXR.
     fn translate(&mut self, vaddr: u64, access: Access) -> Result<u64, Trap> {
@@ -1759,6 +1768,21 @@ fn j_(imm: i32, rd: u32, op: u32) -> u32 {
 
 /// Expand a compressed (RVC) parcel to its 32-bit equivalent, or `None` if it is
 /// reserved / a float form this core does not implement.
+/// The RISC-V kernel `Image` load offset, read from the image's own header
+/// (`Documentation/riscv/boot-image-header.rst`): `text_offset` is the
+/// little-endian `u64` at byte 8, and the header carries the magic `RSC\x05` at
+/// byte 56. Returns `None` when the bytes are not a RISC-V `Image` (so the boot
+/// fails cleanly rather than loading at a guessed address).
+fn image_text_offset(image: &[u8]) -> Option<u64> {
+    let header = image.get(..64)?;
+    if &header[56..60] != b"RSC\x05" {
+        return None;
+    }
+    Some(u64::from_le_bytes(
+        <[u8; 8]>::try_from(&header[8..16]).ok()?,
+    ))
+}
+
 fn expand_rvc(half: u16) -> Option<u32> {
     let h = u32::from(half);
     let funct3 = (h >> 13) & 7;

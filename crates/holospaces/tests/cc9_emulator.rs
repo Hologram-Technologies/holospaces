@@ -367,9 +367,16 @@ fn the_codemodule_boots_real_linux_on_the_substrate() {
             let kernel_k = store.put("blake3", &kernel).unwrap();
             let dtb_k = store.put("blake3", &dtb).unwrap();
 
-            // The boot descriptor delivered as the container's initial state.
-            let mut desc = Vec::with_capacity(4 + 71 + 71);
+            // The boot descriptor delivered as the container's initial state: the
+            // magic, the machine the host provisions (RAM, base, DTB address, the
+            // instruction budget — the codemodule bakes in none of these), then
+            // the kernel-image κ and the device-tree κ the codemodule reads back.
+            let mut desc = Vec::with_capacity(4 + 8 * 4 + 71 + 71);
             desc.extend_from_slice(b"HGOS");
+            desc.extend_from_slice(&(128u64 * 1024 * 1024).to_le_bytes()); // ram_bytes
+            desc.extend_from_slice(&base.to_le_bytes()); // base
+            desc.extend_from_slice(&dtb_addr.to_le_bytes()); // dtb_addr
+            desc.extend_from_slice(&3_000_000_000u64.to_le_bytes()); // max_steps
             desc.extend_from_slice(kernel_k.as_bytes());
             desc.extend_from_slice(dtb_k.as_bytes());
             let init = store.put("blake3", &desc).unwrap();
