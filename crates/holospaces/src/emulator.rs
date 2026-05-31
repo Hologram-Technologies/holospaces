@@ -1,4 +1,4 @@
-//! **System emulator** — a real RISC-V (RV64IMAC + Zicsr) machine, the core of
+//! **System emulator** — a real RISC-V (RV64GC: IMAFDC + Zicsr) machine, the core of
 //! the arbitrary-OS execution surface (ADR-009, arc42 chapter 9).
 //!
 //! holospaces hosts *arbitrary* operating systems by running a real system
@@ -16,7 +16,9 @@
 //! https://github.com/riscv-software-src/riscv-tests[riscv-tests] conformance
 //! suite** — the same suite real hardware and QEMU are validated against. It
 //! implements the base integer set, integer multiply/divide (M), atomics (A),
-//! the compressed encoding (C), the control/status registers (Zicsr), and
+//! single/double floating point (F/D — correctly rounded with the IEEE-754 flags
+//! and rounding modes, on the libm foundation hologram's float kernels use), the
+//! compressed encoding (C), the control/status registers (Zicsr), and
 //! trap handling across privilege levels — machine and supervisor mode with
 //! delegation (`ecall`/`ebreak` exceptions → `mtvec`/`stvec`, `mcause`/`scause`,
 //! `mret`/`sret`), and **Sv39 paging** (the page-table walk with accessed/dirty
@@ -47,6 +49,11 @@ mod syscall {
 
 /// The CSR numbers the trap architecture and supervisor mode read and write.
 mod csr {
+    // Floating point (F/D): the accrued exception flags, rounding mode, and the
+    // combined control/status register (RISC-V Unprivileged ISA §11.2).
+    pub const FFLAGS: u32 = 0x001;
+    pub const FRM: u32 = 0x002;
+    pub const FCSR: u32 = 0x003;
     // Supervisor.
     pub const SSTATUS: u32 = 0x100;
     pub const SIE: u32 = 0x104;
@@ -141,10 +148,13 @@ enum Access {
     Store,
 }
 
-/// A RISC-V hart (hardware thread): 32 integer registers and a program counter.
+/// A RISC-V hart (hardware thread): 32 integer registers, 32 floating-point
+/// registers (the F/D extension, stored as raw bits — `f32` values are
+/// NaN-boxed in the high half), and a program counter.
 #[derive(Clone)]
 struct Hart {
     x: [u64; 32],
+    f: [u64; 32],
     pc: u64,
 }
 
@@ -194,11 +204,13 @@ impl Emulator {
         let mut csrs = BTreeMap::new();
         // `misa` reports the ISA: RV64 (MXL=2) with the I, M, A, C extensions a
         // kernel checks for. mhartid defaults to 0 (single hart).
-        let misa = (2u64 << 62) | (1 << 0) | (1 << 2) | (1 << 8) | (1 << 12);
+        // RV64 (MXL=2) with A, C, D, F, I, M.
+        let misa = (2u64 << 62) | (1 << 0) | (1 << 2) | (1 << 3) | (1 << 5) | (1 << 8) | (1 << 12);
         csrs.insert(csr::MISA, misa);
         Self {
             hart: Hart {
                 x: [0; 32],
+                f: [0; 32],
                 pc: base,
             },
             ram: vec![0; ram_bytes],
@@ -235,6 +247,8 @@ impl Emulator {
             csr::SSTATUS => self.raw_csr(csr::MSTATUS) & csr::SSTATUS_MASK,
             csr::SIE => self.raw_csr(csr::MIE) & csr::S_INT_MASK,
             csr::SIP => self.raw_csr(csr::MIP) & csr::S_INT_MASK,
+            csr::FFLAGS => self.raw_csr(csr::FCSR) & 0x1f,
+            csr::FRM => (self.raw_csr(csr::FCSR) >> 5) & 0x7,
             _ => self.raw_csr(csr),
         }
     }
@@ -258,9 +272,85 @@ impl Emulator {
                 let m = (self.raw_csr(csr::MIP) & !csr::S_INT_MASK) | (value & csr::S_INT_MASK);
                 self.csrs.insert(csr::MIP, m);
             }
+            csr::FFLAGS => {
+                let f = (self.raw_csr(csr::FCSR) & !0x1f) | (value & 0x1f);
+                self.csrs.insert(csr::FCSR, f);
+            }
+            csr::FRM => {
+                let f = (self.raw_csr(csr::FCSR) & !0xe0) | ((value & 0x7) << 5);
+                self.csrs.insert(csr::FCSR, f);
+            }
+            csr::FCSR => {
+                // Only frm (7:5) + fflags (4:0) are writable; the rest is 0.
+                self.csrs.insert(csr::FCSR, value & 0xff);
+            }
             _ => {
                 self.csrs.insert(csr, value);
             }
+        }
+    }
+
+    // ── floating-point register file (F/D) — raw bits; `f32` values are
+    //    NaN-boxed in the high half (RISC-V Unprivileged ISA §11.3) ──
+
+    fn frd(&self, i: u32) -> u64 {
+        self.hart.f[i as usize]
+    }
+
+    fn fwr(&mut self, i: u32, bits: u64) {
+        self.hart.f[i as usize] = bits;
+        self.mark_fs_dirty();
+    }
+
+    /// Read FP register `i` as an `f32` (the low half if properly NaN-boxed,
+    /// else the canonical NaN per the ISA).
+    fn frd32(&self, i: u32) -> f32 {
+        let bits = self.hart.f[i as usize];
+        if bits >> 32 == 0xffff_ffff {
+            f32::from_bits(bits as u32)
+        } else {
+            f32::from_bits(0x7fc0_0000) // canonical NaN
+        }
+    }
+
+    fn fwr32(&mut self, i: u32, x: f32) {
+        self.hart.f[i as usize] = 0xffff_ffff_0000_0000 | u64::from(x.to_bits());
+        self.mark_fs_dirty();
+    }
+
+    fn frd64(&self, i: u32) -> f64 {
+        f64::from_bits(self.hart.f[i as usize])
+    }
+
+    fn fwr64(&mut self, i: u32, x: f64) {
+        self.hart.f[i as usize] = x.to_bits();
+        self.mark_fs_dirty();
+    }
+
+    /// Mark the FP state dirty (`mstatus.FS = 3`) — a context switch saves the
+    /// F registers (RISC-V Privileged ISA §3.1.6).
+    fn mark_fs_dirty(&mut self) {
+        let st = self.raw_csr(csr::MSTATUS) | (3 << 13);
+        self.csrs.insert(csr::MSTATUS, st);
+    }
+
+    /// Accrue floating-point exception flags into `fcsr.fflags`
+    /// (NV=0x10 / DZ=0x08 / OF=0x04 / UF=0x02 / NX=0x01).
+    fn set_fflags(&mut self, flags: u8) {
+        if flags != 0 {
+            let f = self.raw_csr(csr::FCSR) | u64::from(flags);
+            self.csrs.insert(csr::FCSR, f);
+        }
+    }
+
+    /// The effective rounding mode for an FP instruction: its `rm` field, or —
+    /// when that is "dynamic" (7) — the `fcsr.frm` field.
+    fn rounding_mode(&self, inst: u32) -> u32 {
+        let rm = (inst >> 12) & 0x7;
+        if rm == 7 {
+            ((self.raw_csr(csr::FCSR) >> 5) & 0x7) as u32
+        } else {
+            rm
         }
     }
 
@@ -375,6 +465,9 @@ impl Emulator {
         let mut out = Vec::with_capacity(8 * 33 + self.ram.len());
         out.extend_from_slice(&self.hart.pc.to_le_bytes());
         for r in &self.hart.x {
+            out.extend_from_slice(&r.to_le_bytes());
+        }
+        for r in &self.hart.f {
             out.extend_from_slice(&r.to_le_bytes());
         }
         // The CSR file (Zicsr), in canonical (sorted) order — deterministic, so
@@ -890,6 +983,34 @@ impl Emulator {
                     }
                 }
             }
+            0x07 => {
+                // LOAD-FP: FLW (32) / FLD (64)
+                let addr = self.rd(rs1).wrapping_add(i_imm(inst));
+                match funct3 {
+                    2 => {
+                        let bits = self.load(addr, 4, Access::Load).map_err(Halt::Trap)?;
+                        self.fwr(rd, 0xffff_ffff_0000_0000 | (bits & 0xffff_ffff));
+                    }
+                    3 => {
+                        let bits = self.load(addr, 8, Access::Load).map_err(Halt::Trap)?;
+                        self.fwr(rd, bits);
+                    }
+                    _ => return Err(Halt::Trap(Trap::IllegalInstruction(inst))),
+                }
+            }
+            0x27 => {
+                // STORE-FP: FSW (32) / FSD (64)
+                let addr = self.rd(rs1).wrapping_add(s_imm(inst));
+                match funct3 {
+                    2 => self
+                        .store(addr, 4, self.frd(rs2) & 0xffff_ffff)
+                        .map_err(Halt::Trap)?,
+                    3 => self.store(addr, 8, self.frd(rs2)).map_err(Halt::Trap)?,
+                    _ => return Err(Halt::Trap(Trap::IllegalInstruction(inst))),
+                }
+            }
+            0x53 => return self.fp_op(inst),
+            0x43 | 0x47 | 0x4b | 0x4f => return self.fp_madd(inst, opcode),
             0x0f => { /* FENCE / FENCE.I — ordering no-op on this model */ }
             0x73 if funct3 == 0 => {
                 // SYSTEM — ECALL / EBREAK / xRET set their own PC and return;
@@ -1108,6 +1229,255 @@ impl Emulator {
             eid,
             0x00 | 0x01 | 0x02 | 0x08 | 0x10 | 0x5449_4d45 | 0x4442_434e | 0x5352_5354
         )
+    }
+
+    /// Execute an OP-FP instruction (RISC-V F/D extension). The single-precision
+    /// (`fmt`=0) and double-precision (`fmt`=1) forms share the structure; the
+    /// arithmetic uses the native IEEE-754 ops and libm (the no_std float
+    /// foundation hologram's `mathf` is built on) — deterministic across peers.
+    fn fp_op(&mut self, inst: u32) -> Result<(), Halt> {
+        let rd = (inst >> 7) & 0x1f;
+        let rs1 = (inst >> 15) & 0x1f;
+        let rs2 = (inst >> 20) & 0x1f;
+        let funct3 = (inst >> 12) & 0x7;
+        let funct7 = inst >> 25;
+        let fmt = funct7 & 3; // 0 = single, 1 = double
+        let funct5 = funct7 >> 2;
+        let rm = self.rounding_mode(inst);
+        let illegal = || Err(Halt::Trap(Trap::IllegalInstruction(inst)));
+        match funct5 {
+            0x00..=0x03 => {
+                if fmt == 0 {
+                    let (a, b) = (self.frd32(rs1), self.frd32(rs2));
+                    let (r, f) = f32_binop(funct5, a, b, rm);
+                    self.fwr32(rd, r);
+                    self.set_fflags(f);
+                } else {
+                    let (a, b) = (self.frd64(rs1), self.frd64(rs2));
+                    let (r, f) = f64_binop(funct5, a, b, rm);
+                    self.fwr64(rd, r);
+                    self.set_fflags(f);
+                }
+            }
+            0x0b => {
+                // FSQRT
+                if fmt == 0 {
+                    let (r, f) = f32_sqrt(self.frd32(rs1), rm);
+                    self.fwr32(rd, r);
+                    self.set_fflags(f);
+                } else {
+                    let (r, f) = f64_sqrt(self.frd64(rs1), rm);
+                    self.fwr64(rd, r);
+                    self.set_fflags(f);
+                }
+            }
+            0x04 => {
+                // FSGNJ / FSGNJN / FSGNJX — on the NaN-box-aware value (a
+                // non-NaN-boxed single input reads as the canonical NaN).
+                let sign = if fmt == 0 { 1u64 << 31 } else { 1u64 << 63 };
+                let (a, b) = if fmt == 0 {
+                    (
+                        u64::from(self.frd32(rs1).to_bits()),
+                        u64::from(self.frd32(rs2).to_bits()),
+                    )
+                } else {
+                    (self.frd(rs1), self.frd(rs2))
+                };
+                let res = match funct3 {
+                    0 => (a & !sign) | (b & sign),
+                    1 => (a & !sign) | ((b & sign) ^ sign),
+                    2 => a ^ (b & sign),
+                    _ => return illegal(),
+                };
+                if fmt == 0 {
+                    self.fwr(rd, 0xffff_ffff_0000_0000 | (res & 0xffff_ffff));
+                } else {
+                    self.fwr(rd, res);
+                }
+            }
+            0x05 => {
+                // FMIN / FMAX — a signaling NaN operand sets the invalid flag.
+                if fmt == 0 {
+                    let (a, b) = (self.frd32(rs1), self.frd32(rs2));
+                    self.fwr32(rd, fp_minmax32(funct3 == 1, a, b));
+                    self.set_fflags(if is_snan32(a) || is_snan32(b) {
+                        fflag::NV
+                    } else {
+                        0
+                    });
+                } else {
+                    let (a, b) = (self.frd64(rs1), self.frd64(rs2));
+                    self.fwr64(rd, fp_minmax64(funct3 == 1, a, b));
+                    self.set_fflags(if is_snan64(a) || is_snan64(b) {
+                        fflag::NV
+                    } else {
+                        0
+                    });
+                }
+            }
+            0x14 => {
+                // FLE / FLT / FEQ → integer register
+                let (r, nv) = if fmt == 0 {
+                    let (a, b) = (self.frd32(rs1), self.frd32(rs2));
+                    let nv = cmp_nv(
+                        funct3 == 2,
+                        a.is_nan(),
+                        b.is_nan(),
+                        is_snan32(a),
+                        is_snan32(b),
+                    );
+                    let r = match funct3 {
+                        0 => a <= b,
+                        1 => a < b,
+                        2 => a == b,
+                        _ => return illegal(),
+                    };
+                    (r, nv)
+                } else {
+                    let (a, b) = (self.frd64(rs1), self.frd64(rs2));
+                    let nv = cmp_nv(
+                        funct3 == 2,
+                        a.is_nan(),
+                        b.is_nan(),
+                        is_snan64(a),
+                        is_snan64(b),
+                    );
+                    let r = match funct3 {
+                        0 => a <= b,
+                        1 => a < b,
+                        2 => a == b,
+                        _ => return illegal(),
+                    };
+                    (r, nv)
+                };
+                self.wr(rd, u64::from(r));
+                self.set_fflags(nv);
+            }
+            0x18 => {
+                // FCVT integer ← float (rs2: 0 W, 1 WU, 2 L, 3 LU)
+                let (x, nan) = if fmt == 0 {
+                    let v = self.frd32(rs1);
+                    (f64::from(v), v.is_nan())
+                } else {
+                    let v = self.frd64(rs1);
+                    (v, v.is_nan())
+                };
+                let (v, f) = fp_to_int(x, rs2, rm, nan);
+                self.wr(rd, v);
+                self.set_fflags(f);
+            }
+            0x1a => {
+                // FCVT float ← integer (rs2: 0 W, 1 WU, 2 L, 3 LU)
+                let src = self.rd(rs1);
+                if fmt == 0 {
+                    let (r, f) = int_to_f32(src, rs2);
+                    self.fwr32(rd, r);
+                    self.set_fflags(f);
+                } else {
+                    let (r, f) = int_to_f64_flags(src, rs2, rm);
+                    self.fwr64(rd, r);
+                    self.set_fflags(f);
+                }
+            }
+            0x08 => {
+                // FCVT.S.D (fmt=0) / FCVT.D.S (fmt=1)
+                if fmt == 0 {
+                    let a = self.frd64(rs1);
+                    if a.is_nan() {
+                        self.fwr32(rd, canonical_nan32());
+                        self.set_fflags(if is_snan64(a) { fflag::NV } else { 0 });
+                    } else {
+                        let (r, f) = round_to_f32(a, rm);
+                        self.fwr32(rd, r);
+                        self.set_fflags(f);
+                    }
+                } else {
+                    // widening S→D is always exact (only NV on a signaling NaN).
+                    let a = self.frd32(rs1);
+                    if a.is_nan() {
+                        self.fwr64(rd, canonical_nan64());
+                        self.set_fflags(if is_snan32(a) { fflag::NV } else { 0 });
+                    } else {
+                        self.fwr64(rd, f64::from(a));
+                    }
+                }
+            }
+            0x1c => {
+                // FMV.X.W/D (funct3=0) or FCLASS (funct3=1) → integer register
+                if funct3 == 0 {
+                    let v = if fmt == 0 {
+                        sext(self.frd(rs1) & 0xffff_ffff, 32)
+                    } else {
+                        self.frd(rs1)
+                    };
+                    self.wr(rd, v);
+                } else {
+                    let v = if fmt == 0 {
+                        fclass32(self.frd32(rs1))
+                    } else {
+                        fclass64(self.frd64(rs1))
+                    };
+                    self.wr(rd, v);
+                }
+            }
+            0x1e => {
+                // FMV.W.X / FMV.D.X : float register ← integer bits
+                if fmt == 0 {
+                    self.fwr(rd, 0xffff_ffff_0000_0000 | (self.rd(rs1) & 0xffff_ffff));
+                } else {
+                    self.fwr(rd, self.rd(rs1));
+                }
+            }
+            _ => return illegal(),
+        }
+        self.hart.pc = self.hart.pc.wrapping_add(4);
+        Ok(())
+    }
+
+    /// Execute a fused multiply-add (FMADD/FMSUB/FNMSUB/FNMADD) — the fused
+    /// `a*b±c` a kernel and libc rely on, via libm's `fma` (correctly rounded,
+    /// deterministic).
+    fn fp_madd(&mut self, inst: u32, opcode: u32) -> Result<(), Halt> {
+        let rd = (inst >> 7) & 0x1f;
+        let rs1 = (inst >> 15) & 0x1f;
+        let rs2 = (inst >> 20) & 0x1f;
+        let funct7 = inst >> 25;
+        let fmt = funct7 & 3;
+        let rs3 = funct7 >> 2;
+        let rm = self.rounding_mode(inst);
+        // The two sign flips per form: FMADD a*b+c, FMSUB a*b−c, FNMSUB −(a*b)+c,
+        // FNMADD −(a*b)−c.
+        let (neg_ab, neg_c) = match opcode {
+            0x43 => (false, false),
+            0x47 => (false, true),
+            0x4b => (true, false),
+            _ => (true, true),
+        };
+        if fmt == 0 {
+            let (mut a, b, mut c) = (self.frd32(rs1), self.frd32(rs2), self.frd32(rs3));
+            if neg_ab {
+                a = -a;
+            }
+            if neg_c {
+                c = -c;
+            }
+            let (r, f) = f32_fma(a, b, c, rm);
+            self.fwr32(rd, r);
+            self.set_fflags(f);
+        } else {
+            let (mut a, b, mut c) = (self.frd64(rs1), self.frd64(rs2), self.frd64(rs3));
+            if neg_ab {
+                a = -a;
+            }
+            if neg_c {
+                c = -c;
+            }
+            let (r, f) = f64_fma(a, b, c, rm);
+            self.fwr64(rd, r);
+            self.set_fflags(f);
+        }
+        self.hart.pc = self.hart.pc.wrapping_add(4);
+        Ok(())
     }
 }
 
@@ -1329,6 +1699,560 @@ fn expand_rvc(half: u16) -> Option<u32> {
         }
         _ => None,
     }
+}
+
+// ── floating-point helpers (F/D extension) ──
+//
+// The arithmetic computes correctly-rounded results and the IEEE-754 accrued
+// exception flags on the libm foundation hologram's float kernels use: single
+// precision is computed exactly in `f64` (`f32` add/sub/mul/fma are exact there)
+// then rounded to `f32` with the instruction's rounding mode; double precision
+// computes the round-to-nearest result natively and recovers the exact rounding
+// residual via an error-free transformation (`fma`), giving the inexact flag and
+// the direction for the directed rounding modes. Deterministic across peers.
+
+/// Exception-flag bits (RISC-V Unprivileged ISA §11.2).
+mod fflag {
+    pub const NX: u8 = 0x01; // inexact
+    pub const UF: u8 = 0x02; // underflow
+    pub const OF: u8 = 0x04; // overflow
+    pub const DZ: u8 = 0x08; // divide by zero
+    pub const NV: u8 = 0x10; // invalid operation
+}
+
+const RNE: u32 = 0;
+const RTZ: u32 = 1;
+const RDN: u32 = 2;
+const RUP: u32 = 3;
+const RMM: u32 = 4;
+
+fn canonical_nan32() -> f32 {
+    f32::from_bits(0x7fc0_0000)
+}
+fn canonical_nan64() -> f64 {
+    f64::from_bits(0x7ff8_0000_0000_0000)
+}
+fn is_snan32(x: f32) -> bool {
+    let b = x.to_bits();
+    b & 0x7f80_0000 == 0x7f80_0000 && b & 0x007f_ffff != 0 && b & 0x0040_0000 == 0
+}
+fn is_snan64(x: f64) -> bool {
+    let b = x.to_bits();
+    b & 0x7ff0_0000_0000_0000 == 0x7ff0_0000_0000_0000
+        && b & 0x000f_ffff_ffff_ffff != 0
+        && b & 0x0008_0000_0000_0000 == 0
+}
+
+/// Round an *exact* real value (held in an `f64`) to `f32` with rounding mode
+/// `rm`, returning the value and the accrued flags (NX/OF/UF).
+fn round_to_f32(exact: f64, rm: u32) -> (f32, u8) {
+    if exact == 0.0 {
+        return (exact as f32, 0);
+    }
+    let rne = exact as f32; // native round-to-nearest-even
+    if exact.is_infinite() {
+        return (rne, 0);
+    }
+    if f64::from(rne) == exact {
+        return (rne, 0); // exact
+    }
+    let toward = if exact > f64::from(rne) {
+        libm::nextafterf(rne, f32::INFINITY)
+    } else {
+        libm::nextafterf(rne, f32::NEG_INFINITY)
+    };
+    let res = pick_directed(
+        f64::from(rne),
+        rne,
+        f64::from(toward),
+        toward,
+        exact,
+        exact > 0.0,
+        rm,
+    );
+    (res, round_flags_f32(res, exact))
+}
+
+fn round_flags_f32(res: f32, exact: f64) -> u8 {
+    let mut f = fflag::NX;
+    if res.is_infinite() {
+        f |= fflag::OF;
+    } else if (res == 0.0 && exact != 0.0) || (res != 0.0 && res.abs() < f32::MIN_POSITIVE) {
+        f |= fflag::UF;
+    }
+    f
+}
+
+/// Pick the directed-rounding result from the two `f32` candidates bracketing
+/// the exact value (`r` = round-to-nearest, `toward` = the adjacent value toward
+/// the exact value).
+fn pick_directed(
+    rv: f64,
+    r: f32,
+    tv: f64,
+    toward: f32,
+    exact: f64,
+    positive: bool,
+    rm: u32,
+) -> f32 {
+    let (lo, hi) = if rv < tv { (r, toward) } else { (toward, r) };
+    match rm {
+        RTZ => {
+            if positive {
+                lo
+            } else {
+                hi
+            }
+        }
+        RDN => lo,
+        RUP => hi,
+        RMM => {
+            // ties-to-max-magnitude: only differs from RNE on an exact tie.
+            let (elo, ehi) = (f64::from(lo), f64::from(hi));
+            if exact - elo == ehi - exact {
+                if lo.abs() > hi.abs() {
+                    lo
+                } else {
+                    hi
+                }
+            } else {
+                r
+            }
+        }
+        _ => r, // RNE
+    }
+}
+
+/// Single-precision add/sub/mul/div with flags (computed exactly in `f64`).
+fn f32_binop(funct5: u32, a: f32, b: f32, rm: u32) -> (f32, u8) {
+    if a.is_nan() || b.is_nan() {
+        let nv = if is_snan32(a) || is_snan32(b) {
+            fflag::NV
+        } else {
+            0
+        };
+        return (canonical_nan32(), nv);
+    }
+    let (af, bf) = (f64::from(a), f64::from(b));
+    match funct5 {
+        3 => {
+            if b == 0.0 {
+                return if a == 0.0 {
+                    (canonical_nan32(), fflag::NV) // 0/0
+                } else {
+                    let s = (a.is_sign_negative() ^ b.is_sign_negative()) as u32;
+                    (f32::from_bits((s << 31) | 0x7f80_0000), fflag::DZ) // x/0 = ±inf
+                };
+            }
+            round_to_f32(af / bf, rm)
+        }
+        2 if (a == 0.0 && b.is_infinite()) || (a.is_infinite() && b == 0.0) => {
+            (canonical_nan32(), fflag::NV) // 0*inf
+        }
+        1 | 0 if a.is_infinite() && b.is_infinite() && ((funct5 == 1) == (a == b)) => {
+            (canonical_nan32(), fflag::NV) // inf-inf / (-inf)+inf
+        }
+        _ => {
+            let exact = match funct5 {
+                0 => af + bf,
+                1 => af - bf,
+                _ => af * bf,
+            };
+            round_to_f32(exact, rm)
+        }
+    }
+}
+
+/// Double-precision add/sub/mul/div with flags. The round-to-nearest result is
+/// native; the exact rounding residual (for inexact + directed rounding) comes
+/// from an error-free transformation.
+fn f64_binop(funct5: u32, a: f64, b: f64, rm: u32) -> (f64, u8) {
+    if a.is_nan() || b.is_nan() {
+        let nv = if is_snan64(a) || is_snan64(b) {
+            fflag::NV
+        } else {
+            0
+        };
+        return (canonical_nan64(), nv);
+    }
+    match funct5 {
+        3 => {
+            if b == 0.0 {
+                return if a == 0.0 {
+                    (canonical_nan64(), fflag::NV)
+                } else {
+                    let s = (a.is_sign_negative() ^ b.is_sign_negative()) as u64;
+                    (f64::from_bits((s << 63) | 0x7ff0_0000_0000_0000), fflag::DZ)
+                };
+            }
+            let r = a / b;
+            let residual = libm::fma(-r, b, a); // a - r*b (the rounding direction)
+            finalize_f64(r, residual, rm)
+        }
+        2 if (a == 0.0 && b.is_infinite()) || (a.is_infinite() && b == 0.0) => {
+            (canonical_nan64(), fflag::NV)
+        }
+        1 | 0 if a.is_infinite() && b.is_infinite() && ((funct5 == 1) == (a == b)) => {
+            (canonical_nan64(), fflag::NV)
+        }
+        0 => {
+            let r = a + b;
+            let residual = two_sum_err(a, b, r);
+            finalize_f64(r, residual, rm)
+        }
+        1 => {
+            let r = a - b;
+            let residual = two_sum_err(a, -b, r);
+            finalize_f64(r, residual, rm)
+        }
+        _ => {
+            let r = a * b;
+            let residual = if r.is_finite() {
+                libm::fma(a, b, -r)
+            } else {
+                0.0
+            };
+            finalize_f64(r, residual, rm)
+        }
+    }
+}
+
+/// The exact rounding error of `a+b` (Knuth's TwoSum): `(a+b) = r + err`.
+fn two_sum_err(a: f64, b: f64, r: f64) -> f64 {
+    if !r.is_finite() {
+        return 0.0;
+    }
+    let bv = r - a;
+    let av = r - bv;
+    (a - av) + (b - bv)
+}
+
+/// Finalize a double-precision result from its round-to-nearest value `r` and
+/// the (sign of the) exact residual, applying the rounding mode and flags.
+fn finalize_f64(r: f64, residual: f64, rm: u32) -> (f64, u8) {
+    if residual == 0.0 || !r.is_finite() {
+        let f = if r.is_infinite() && residual != 0.0 {
+            fflag::OF | fflag::NX
+        } else {
+            0
+        };
+        return (r, f);
+    }
+    let toward = if residual > 0.0 {
+        libm::nextafter(r, f64::INFINITY)
+    } else {
+        libm::nextafter(r, f64::NEG_INFINITY)
+    };
+    let positive = r > 0.0 || (r == 0.0 && residual > 0.0);
+    let (lo, hi) = if r < toward { (r, toward) } else { (toward, r) };
+    let res = match rm {
+        RTZ => {
+            if positive {
+                lo
+            } else {
+                hi
+            }
+        }
+        RDN => lo,
+        RUP => hi,
+        RMM => {
+            // tie (residual is exactly half an ulp) → max magnitude.
+            if libm::fabs(residual) * 2.0 == libm::fabs(toward - r) {
+                if libm::fabs(lo) > libm::fabs(hi) {
+                    lo
+                } else {
+                    hi
+                }
+            } else {
+                r
+            }
+        }
+        _ => r,
+    };
+    let mut f = fflag::NX;
+    if res.is_infinite() {
+        f |= fflag::OF;
+    } else if res != 0.0 && libm::fabs(res) < f64::MIN_POSITIVE {
+        f |= fflag::UF;
+    }
+    (res, f)
+}
+
+fn f32_sqrt(a: f32, rm: u32) -> (f32, u8) {
+    if a.is_nan() {
+        return (canonical_nan32(), if is_snan32(a) { fflag::NV } else { 0 });
+    }
+    if a < 0.0 {
+        return (canonical_nan32(), fflag::NV);
+    }
+    if a == 0.0 {
+        return (a, 0);
+    }
+    round_to_f32(libm::sqrt(f64::from(a)), rm)
+}
+
+fn f64_sqrt(a: f64, rm: u32) -> (f64, u8) {
+    if a.is_nan() {
+        return (canonical_nan64(), if is_snan64(a) { fflag::NV } else { 0 });
+    }
+    if a < 0.0 {
+        return (canonical_nan64(), fflag::NV);
+    }
+    if a == 0.0 {
+        return (a, 0);
+    }
+    let r = libm::sqrt(a);
+    finalize_f64(r, libm::fma(-r, r, a), rm)
+}
+
+fn f32_fma(a: f32, b: f32, c: f32, rm: u32) -> (f32, u8) {
+    if a.is_nan() || b.is_nan() || c.is_nan() {
+        let nv = if is_snan32(a) || is_snan32(b) || is_snan32(c) {
+            fflag::NV
+        } else {
+            0
+        };
+        return (canonical_nan32(), nv);
+    }
+    if (a == 0.0 && b.is_infinite()) || (a.is_infinite() && b == 0.0) {
+        return (canonical_nan32(), fflag::NV); // 0 * inf
+    }
+    round_to_f32(f64::from(a) * f64::from(b) + f64::from(c), rm)
+}
+
+fn f64_fma(a: f64, b: f64, c: f64, rm: u32) -> (f64, u8) {
+    if a.is_nan() || b.is_nan() || c.is_nan() {
+        let nv = if is_snan64(a) || is_snan64(b) || is_snan64(c) {
+            fflag::NV
+        } else {
+            0
+        };
+        return (canonical_nan64(), nv);
+    }
+    if (a == 0.0 && b.is_infinite()) || (a.is_infinite() && b == 0.0) {
+        return (canonical_nan64(), fflag::NV);
+    }
+    let r = libm::fma(a, b, c);
+    if !r.is_finite() {
+        return (r, 0);
+    }
+    // a*b+c exactly = (p + pe) + c via error-free transformations; the residual
+    // gives inexact and the directed-rounding direction.
+    let p = a * b;
+    let pe = if p.is_finite() {
+        libm::fma(a, b, -p)
+    } else {
+        0.0
+    };
+    let s = p + c;
+    let se = two_sum_err(p, c, s);
+    finalize_f64(r, ((s - r) + se) + pe, rm)
+}
+
+/// Round a float to an integral-valued float by the rounding mode.
+fn round_to_integer(v: f64, rm: u32) -> f64 {
+    match rm {
+        RTZ => libm::trunc(v),
+        RDN => libm::floor(v),
+        RUP => libm::ceil(v),
+        RMM => libm::round(v), // ties away from zero
+        _ => libm::rint(v),    // RNE: ties to even
+    }
+}
+
+/// Float → integer convert with the rounding mode and flags (NX inexact, NV
+/// out-of-range / NaN). `sel`: 0=W, 1=WU, 2=L, 3=LU.
+fn fp_to_int(x: f64, sel: u32, rm: u32, nan: bool) -> (u64, u8) {
+    if nan {
+        let v = match sel {
+            0 => sext(u64::from(i32::MAX as u32), 32),
+            1 => sext(u64::from(u32::MAX), 32),
+            2 => i64::MAX as u64,
+            _ => u64::MAX,
+        };
+        return (v, fflag::NV);
+    }
+    let r = round_to_integer(x, rm);
+    let inexact = if r == x { 0 } else { fflag::NX };
+    let (lo, hi, vmin, vmax): (f64, f64, u64, u64) = match sel {
+        0 => (
+            i32::MIN as f64,
+            i32::MAX as f64,
+            sext(u64::from(i32::MIN as u32), 32),
+            sext(u64::from(i32::MAX as u32), 32),
+        ),
+        1 => (0.0, u32::MAX as f64, 0, sext(u64::from(u32::MAX), 32)),
+        2 => (
+            i64::MIN as f64,
+            i64::MAX as f64,
+            i64::MIN as u64,
+            i64::MAX as u64,
+        ),
+        _ => (0.0, u64::MAX as f64, 0, u64::MAX),
+    };
+    if r < lo {
+        return (vmin, fflag::NV);
+    }
+    if r > hi {
+        return (vmax, fflag::NV);
+    }
+    let v = match sel {
+        0 => sext((r as i32) as u32 as u64, 32),
+        1 => sext(u64::from(r as u32), 32),
+        2 => r as i64 as u64,
+        _ => r as u64,
+    };
+    (v, inexact)
+}
+
+/// Integer → float convert; sets inexact when the integer is not exactly
+/// representable. `sel`: 0=W, 1=WU, 2=L, 3=LU.
+fn int_to_f32(src: u64, sel: u32) -> (f32, u8) {
+    let exact: f64 = match sel {
+        0 => f64::from(src as i32),
+        1 => f64::from(src as u32),
+        2 => src as i64 as f64,
+        _ => src as f64,
+    };
+    round_to_f32(exact, RNE)
+}
+
+fn int_to_f64_flags(src: u64, sel: u32, rm: u32) -> (f64, u8) {
+    match sel {
+        0 => (f64::from(src as i32), 0),
+        1 => (f64::from(src as u32), 0),
+        2 => {
+            let i = src as i64;
+            let r = i as f64;
+            (r, if r as i64 == i { 0 } else { fflag::NX })
+        }
+        _ => {
+            let r = src as f64;
+            let residual = if r as u64 >= src {
+                f64::from(u8::from(r as u64 != src))
+            } else {
+                -1.0
+            };
+            finalize_f64(r, residual, rm)
+        }
+    }
+}
+
+/// Comparison invalid flag: `feq` signals only on a signaling NaN; `flt`/`fle`
+/// signal on any NaN.
+fn cmp_nv(quiet: bool, a_nan: bool, b_nan: bool, a_snan: bool, b_snan: bool) -> u8 {
+    let signal = if quiet {
+        a_snan || b_snan
+    } else {
+        a_nan || b_nan
+    };
+    if signal {
+        fflag::NV
+    } else {
+        0
+    }
+}
+
+/// RISC-V `fmin`/`fmax`: a NaN operand is ignored (the other is returned), both
+/// NaN gives the canonical NaN, and −0.0 is ordered below +0.0.
+fn fp_minmax32(is_max: bool, a: f32, b: f32) -> f32 {
+    if a.is_nan() && b.is_nan() {
+        return f32::from_bits(0x7fc0_0000);
+    }
+    if a.is_nan() {
+        return b;
+    }
+    if b.is_nan() {
+        return a;
+    }
+    if a == 0.0 && b == 0.0 {
+        let a_neg = a.is_sign_negative();
+        return if is_max == a_neg { b } else { a };
+    }
+    if is_max == (a > b) {
+        a
+    } else {
+        b
+    }
+}
+
+fn fp_minmax64(is_max: bool, a: f64, b: f64) -> f64 {
+    if a.is_nan() && b.is_nan() {
+        return f64::from_bits(0x7ff8_0000_0000_0000);
+    }
+    if a.is_nan() {
+        return b;
+    }
+    if b.is_nan() {
+        return a;
+    }
+    if a == 0.0 && b == 0.0 {
+        let a_neg = a.is_sign_negative();
+        return if is_max == a_neg { b } else { a };
+    }
+    if is_max == (a > b) {
+        a
+    } else {
+        b
+    }
+}
+
+/// `fclass` — the 10-bit classification mask (RISC-V Unprivileged ISA §11.9).
+fn fclass32(x: f32) -> u64 {
+    let bits = x.to_bits();
+    let (sign, exp, frac) = (bits >> 31, (bits >> 23) & 0xff, bits & 0x7f_ffff);
+    fclass_bits(
+        sign != 0,
+        exp == 0xff,
+        exp == 0,
+        frac == 0,
+        frac & 0x40_0000 != 0,
+    )
+}
+
+fn fclass64(x: f64) -> u64 {
+    let bits = x.to_bits();
+    let (sign, exp, frac) = (bits >> 63, (bits >> 52) & 0x7ff, bits & 0xf_ffff_ffff_ffff);
+    fclass_bits(
+        sign != 0,
+        exp == 0x7ff,
+        exp == 0,
+        frac == 0,
+        frac & 0x8_0000_0000_0000 != 0,
+    )
+}
+
+fn fclass_bits(neg: bool, max_exp: bool, zero_exp: bool, zero_frac: bool, quiet: bool) -> u64 {
+    let idx = if max_exp && !zero_frac {
+        if quiet {
+            9
+        } else {
+            8
+        } // qNaN / sNaN
+    } else if max_exp {
+        if neg {
+            0
+        } else {
+            7
+        } // ±inf
+    } else if zero_exp && zero_frac {
+        if neg {
+            3
+        } else {
+            4
+        } // ±0
+    } else if zero_exp {
+        if neg {
+            2
+        } else {
+            5
+        } // ±subnormal
+    } else if neg {
+        1
+    } else {
+        6
+    }; // ±normal
+    1 << idx
 }
 
 // ── immediate decoders (RISC-V Unprivileged ISA §2.3) ──

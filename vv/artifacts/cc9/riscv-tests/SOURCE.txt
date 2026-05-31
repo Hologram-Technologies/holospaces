@@ -35,3 +35,10 @@ exceptions). NOT yet included, with what each needs (in progress):
   rv64mi-p-ma_fetch              — misaligned instruction-fetch trap
   rv64mi-p-illegal               — vectored interrupts + S-mode + paging (composite)
   rv64si-p-csr                   — S-mode CSR conformance
+
+Floating point (F/D): rv64uf (single) + rv64ud (double) — built with
+-mabi=lp64d. The emulator's F/D extension computes correctly-rounded results,
+the IEEE-754 accrued exception flags, and all rounding modes on the libm
+foundation hologram's float kernels (mathf) are built on (error-free
+transformations recover the exact residual for inexact + directed rounding).
+All 23 FP tests pass.
