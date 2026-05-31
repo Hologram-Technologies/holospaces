@@ -70,9 +70,12 @@ fn get_kappa(kappa: &[u8], cap: usize) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-/// A little-endian `u64` read from a descriptor field.
+/// A little-endian `u64` read from a descriptor field. The caller has already
+/// checked the descriptor length, so the 8-byte window is always in range.
 fn rd_u64(b: &[u8], off: usize) -> u64 {
-    u64::from_le_bytes(<[u8; 8]>::try_from(&b[off..off + 8]).unwrap_or([0; 8]))
+    let mut field = [0u8; 8];
+    field.copy_from_slice(&b[off..off + 8]);
+    u64::from_le_bytes(field)
 }
 
 /// Emit the run record `[exit_code u64 LE][console]` into the substrate via
