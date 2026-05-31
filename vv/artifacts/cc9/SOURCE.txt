@@ -32,3 +32,10 @@ emulator.wasm
 Zicsr + A extension coverage (assembled with --mattr=+m,+a,+zicsr):
   csr   CSRRW/CSRRWI/CSRRS round-trip through mscratch (587 = 0x123+0x123+5)
   amo   AMOADD.W + AMOSWAP.W on memory (223 = 100 + 123)
+
+tint.S / tint.bin — a CLINT timer-interrupt test (RISC-V Privileged ISA + the
+CLINT memory map as the authority), assembled by riscv64-unknown-elf-gcc
+(-march=rv64imac_zicsr, -Ttext=0x80000000). Arms mtimecmp via the CLINT, enables
+the machine timer interrupt, spins; the emulator raises the timer interrupt
+(cause = interrupt|7) into the handler, which verifies mcause and signals pass
+over HTIF. tohost in tint.manifest. Witness: tests/cc9_emulator.rs.
