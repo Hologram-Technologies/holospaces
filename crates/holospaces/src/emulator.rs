@@ -17,8 +17,9 @@
 //! suite** — the same suite real hardware and QEMU are validated against. It
 //! implements the base integer set, integer multiply/divide (M), atomics (A),
 //! the compressed encoding (C), the control/status registers (Zicsr), and
-//! machine-mode trap handling (`ecall`→`mtvec`, `mcause`/`mepc`/`mstatus`,
-//! `mret`) — so the official tests' own machine-mode environment runs
+//! trap handling across privilege levels — machine and supervisor mode with
+//! delegation (`ecall`/`ebreak` exceptions → `mtvec`/`stvec`, `mcause`/`scause`,
+//! `mret`/`sret`) — so the official machine- and supervisor-mode tests run
 //! unmodified. A flat program may instead use the `ecall` host boundary (console
 //! `write` / `exit`) when it installs no trap vector.
 
@@ -37,16 +38,37 @@ mod syscall {
     pub const EXIT_GROUP: u64 = 94;
 }
 
-/// The machine-mode CSR numbers the trap architecture reads and writes.
+/// The CSR numbers the trap architecture and supervisor mode read and write.
 mod csr {
+    // Supervisor.
+    pub const SSTATUS: u32 = 0x100;
+    pub const SIE: u32 = 0x104;
+    pub const STVEC: u32 = 0x105;
+    pub const SEPC: u32 = 0x141;
+    pub const SCAUSE: u32 = 0x142;
+    pub const STVAL: u32 = 0x143;
+    pub const SIP: u32 = 0x144;
+    // Machine.
     pub const MSTATUS: u32 = 0x300;
+    pub const MEDELEG: u32 = 0x302;
     pub const MTVEC: u32 = 0x305;
+    pub const MIE: u32 = 0x304;
     pub const MEPC: u32 = 0x341;
     pub const MCAUSE: u32 = 0x342;
+    pub const MTVAL: u32 = 0x343;
+    pub const MIP: u32 = 0x344;
+
+    /// The `sstatus` view of `mstatus` (the S-mode-visible bits): SIE, SPIE, SPP,
+    /// FS, SUM, MXR (RISC-V Privileged ISA §4.1.1).
+    pub const SSTATUS_MASK: u64 =
+        (1 << 1) | (1 << 5) | (1 << 8) | (3 << 13) | (1 << 18) | (1 << 19);
+    /// The `sie`/`sip` view of `mie`/`mip`: the S-mode interrupt bits.
+    pub const S_INT_MASK: u64 = (1 << 1) | (1 << 5) | (1 << 9);
 }
 
 /// Privilege levels (RISC-V Privileged ISA): machine, supervisor, user.
 const PRIV_M: u8 = 3;
+const PRIV_S: u8 = 1;
 
 /// Why the machine stopped stepping.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,41 +153,97 @@ impl Emulator {
     }
 
     fn csr_read(&self, csr: u32) -> u64 {
+        // `sstatus`/`sie`/`sip` are restricted views of `mstatus`/`mie`/`mip`.
+        match csr {
+            csr::SSTATUS => self.raw_csr(csr::MSTATUS) & csr::SSTATUS_MASK,
+            csr::SIE => self.raw_csr(csr::MIE) & csr::S_INT_MASK,
+            csr::SIP => self.raw_csr(csr::MIP) & csr::S_INT_MASK,
+            _ => self.raw_csr(csr),
+        }
+    }
+
+    fn raw_csr(&self, csr: u32) -> u64 {
         self.csrs.get(&csr).copied().unwrap_or(0)
     }
 
     fn csr_write(&mut self, csr: u32, value: u64) {
-        self.csrs.insert(csr, value);
+        match csr {
+            csr::SSTATUS => {
+                let m =
+                    (self.raw_csr(csr::MSTATUS) & !csr::SSTATUS_MASK) | (value & csr::SSTATUS_MASK);
+                self.csrs.insert(csr::MSTATUS, m);
+            }
+            csr::SIE => {
+                let m = (self.raw_csr(csr::MIE) & !csr::S_INT_MASK) | (value & csr::S_INT_MASK);
+                self.csrs.insert(csr::MIE, m);
+            }
+            csr::SIP => {
+                let m = (self.raw_csr(csr::MIP) & !csr::S_INT_MASK) | (value & csr::S_INT_MASK);
+                self.csrs.insert(csr::MIP, m);
+            }
+            _ => {
+                self.csrs.insert(csr, value);
+            }
+        }
     }
 
-    /// Take a trap to machine mode (RISC-V Privileged ISA §3.1.6): record the
-    /// faulting PC and cause, save the interrupt-enable and privilege into
-    /// `mstatus` (MPIE/MPP), and jump to `mtvec` in machine mode.
-    fn trap(&mut self, cause: u64, epc: u64) {
-        self.csr_write(csr::MEPC, epc);
-        self.csr_write(csr::MCAUSE, cause);
-        let mut st = self.csr_read(csr::MSTATUS);
-        let mie = (st >> 3) & 1;
-        st = (st & !(1 << 7)) | (mie << 7); // MPIE = MIE
-        st &= !(1 << 3); // MIE = 0
-        st = (st & !(3 << 11)) | (u64::from(self.priv_level) << 11); // MPP = priv
-        self.csr_write(csr::MSTATUS, st);
-        self.priv_level = PRIV_M;
-        self.hart.pc = self.csr_read(csr::MTVEC) & !3; // direct mode
+    /// Take a trap (RISC-V Privileged ISA §3.1.6/§4.1.1). An exception taken in
+    /// S/U mode whose cause is delegated (`medeleg`) is handled in supervisor
+    /// mode (`stvec`/`sepc`/`scause`/`stval`, `sstatus` SPP/SPIE); otherwise it
+    /// is handled in machine mode (`mtvec`/`mepc`/`mcause`/`mtval`, `mstatus`
+    /// MPP/MPIE).
+    fn trap(&mut self, cause: u64, tval: u64, epc: u64) {
+        let delegated = self.priv_level <= PRIV_S && (self.raw_csr(csr::MEDELEG) >> cause) & 1 != 0;
+        let mut st = self.raw_csr(csr::MSTATUS);
+        if delegated {
+            self.csr_write(csr::SEPC, epc);
+            self.csr_write(csr::SCAUSE, cause);
+            self.csr_write(csr::STVAL, tval);
+            let sie = (st >> 1) & 1;
+            st = (st & !(1 << 5)) | (sie << 5); // SPIE = SIE
+            st &= !(1 << 1); // SIE = 0
+            st = (st & !(1 << 8)) | ((u64::from(self.priv_level) & 1) << 8); // SPP
+            self.csrs.insert(csr::MSTATUS, st);
+            self.priv_level = PRIV_S;
+            self.hart.pc = self.csr_read(csr::STVEC) & !3;
+        } else {
+            self.csr_write(csr::MEPC, epc);
+            self.csr_write(csr::MCAUSE, cause);
+            self.csr_write(csr::MTVAL, tval);
+            let mie = (st >> 3) & 1;
+            st = (st & !(1 << 7)) | (mie << 7); // MPIE = MIE
+            st &= !(1 << 3); // MIE = 0
+            st = (st & !(3 << 11)) | (u64::from(self.priv_level) << 11); // MPP
+            self.csrs.insert(csr::MSTATUS, st);
+            self.priv_level = PRIV_M;
+            self.hart.pc = self.csr_read(csr::MTVEC) & !3;
+        }
     }
 
-    /// Return from a machine-mode trap (`mret`): restore PC, interrupt-enable,
-    /// and privilege from `mstatus`/`mepc`.
+    /// Return from a machine-mode trap (`mret`).
     fn mret(&mut self) {
-        let mut st = self.csr_read(csr::MSTATUS);
+        let mut st = self.raw_csr(csr::MSTATUS);
         let mpie = (st >> 7) & 1;
         let mpp = (st >> 11) & 3;
         st = (st & !(1 << 3)) | (mpie << 3); // MIE = MPIE
         st |= 1 << 7; // MPIE = 1
         st &= !(3 << 11); // MPP = U
-        self.csr_write(csr::MSTATUS, st);
+        self.csrs.insert(csr::MSTATUS, st);
         self.priv_level = mpp as u8;
         self.hart.pc = self.csr_read(csr::MEPC);
+    }
+
+    /// Return from a supervisor-mode trap (`sret`).
+    fn sret(&mut self) {
+        let mut st = self.raw_csr(csr::MSTATUS);
+        let spie = (st >> 5) & 1;
+        let spp = (st >> 8) & 1;
+        st = (st & !(1 << 1)) | (spie << 1); // SIE = SPIE
+        st |= 1 << 5; // SPIE = 1
+        st &= !(1 << 8); // SPP = U
+        self.csrs.insert(csr::MSTATUS, st);
+        self.priv_level = spp as u8;
+        self.hart.pc = self.csr_read(csr::SEPC);
     }
 
     /// Load a flat guest image at `base` and set the reset PC there.
@@ -269,7 +347,11 @@ impl Emulator {
         }
     }
 
-    /// Execute one instruction. `Ok(())` advances; `Err(Halt)` stops.
+    /// Fetch, decode, and execute one instruction. A processor exception (an
+    /// illegal instruction, a breakpoint, or an access fault) is *raised* into
+    /// the guest's trap handler when one is installed (`mtvec` set) — the correct
+    /// privileged behaviour a kernel and the official `rv64mi`/`rv64si` tests
+    /// rely on; a flat program with no handler instead stops with `Halt::Trap`.
     fn step(&mut self) -> Result<(), Halt> {
         let pc = self.hart.pc;
         // Fetch: a 16-bit parcel whose low two bits are `11` is the start of a
@@ -279,12 +361,38 @@ impl Emulator {
         let (inst, ilen) = if parcel & 3 == 3 {
             (self.load(pc, 4).map_err(Halt::Trap)? as u32, 4u64)
         } else {
-            (
-                expand_rvc(parcel)
-                    .ok_or(Halt::Trap(Trap::IllegalInstruction(u32::from(parcel))))?,
-                2,
-            )
+            match expand_rvc(parcel) {
+                Some(i) => (i, 2),
+                None => return self.raise(Trap::IllegalInstruction(u32::from(parcel)), pc),
+            }
         };
+        match self.exec(inst, pc, ilen) {
+            Err(Halt::Trap(t)) => self.raise(t, pc),
+            other => other,
+        }
+    }
+
+    /// Raise a processor exception: trap into the installed handler (`mtvec`)
+    /// with the cause and `mtval`, or — for a flat program with no handler —
+    /// stop with `Halt::Trap`.
+    fn raise(&mut self, trap: Trap, epc: u64) -> Result<(), Halt> {
+        let (cause, tval) = match &trap {
+            Trap::IllegalInstruction(i) => (2, u64::from(*i)),
+            Trap::Breakpoint => (3, epc),
+            Trap::AccessFault(a) => (5, *a),
+            Trap::UnknownSyscall(_) => return Err(Halt::Trap(trap)),
+        };
+        // A flat program installs no trap vector at all → terminate.
+        if self.csr_read(csr::MTVEC) == 0 && self.csr_read(csr::STVEC) == 0 {
+            return Err(Halt::Trap(trap));
+        }
+        self.trap(cause, tval, epc);
+        Ok(())
+    }
+
+    /// Execute a decoded instruction (`Err(Halt::Trap)` signals an exception the
+    /// caller routes through [`raise`](Self::raise)).
+    fn exec(&mut self, inst: u32, pc: u64, ilen: u64) -> Result<(), Halt> {
         let opcode = inst & 0x7f;
         let rd = (inst >> 7) & 0x1f;
         let rs1 = (inst >> 15) & 0x1f;
@@ -485,6 +593,10 @@ impl Emulator {
                         self.mret();
                         Ok(())
                     } // MRET
+                    0x1020_0073 => {
+                        self.sret();
+                        Ok(())
+                    } // SRET
                     0x1050_0073 => Ok(()),                            // WFI — nop on this model
                     _ if (inst >> 25) == 0x09 => Ok(()),              // SFENCE.VMA — nop (no TLB)
                     _ => Err(Halt::Trap(Trap::IllegalInstruction(inst))),
@@ -585,13 +697,13 @@ impl Emulator {
         // trap into its handler (a kernel / the riscv-tests environment): cause
         // 8/9/11 by the originating privilege. Otherwise it is the host syscall
         // boundary a flat program uses (write / exit).
-        if self.csr_read(csr::MTVEC) != 0 {
+        if self.csr_read(csr::MTVEC) != 0 || self.csr_read(csr::STVEC) != 0 {
             let cause = match self.priv_level {
                 3 => 11, // ECALL from M
                 1 => 9,  // ECALL from S
                 _ => 8,  // ECALL from U
             };
-            self.trap(cause, self.hart.pc);
+            self.trap(cause, 0, self.hart.pc);
             return Ok(());
         }
         let num = self.rd(17); // a7

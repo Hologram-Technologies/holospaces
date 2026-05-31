@@ -116,14 +116,18 @@ fn the_emulator_writes_console_output_and_snapshots_reproducibly() {
     );
 }
 
-/// The emulator passes the **official RISC-V `riscv-tests` conformance suite**
-/// (rv64ui base + rv64um multiply/divide + rv64ua atomics, machine-mode `-p`
-/// variants) — the canonical external authority for the RISC-V ISA, the same
-/// suite hardware and QEMU are validated against. Each test runs in a real
-/// machine-mode environment (it installs `mtvec`, drops to U-mode via `mret`,
-/// runs its cases, and signals pass/fail through the HTIF `tohost` channel), so
-/// passing them exercises the privileged trap architecture as well as the base
-/// ISA. (CC-9, the canonical ISA-conformance authority.)
+/// The emulator passes the **official RISC-V `riscv-tests` conformance suite** —
+/// the canonical external authority for the RISC-V ISA, the same suite hardware
+/// and QEMU are validated against: the unprivileged `rv64ui` (base) + `rv64um`
+/// (mul/div) + `rv64ua` (atomics) + `rv64uc` (compressed) in full, plus the
+/// machine- and supervisor-mode privileged tests (`rv64mi`/`rv64si`) the emulator
+/// passes (the manifest pins exactly which; the not-yet-covered privileged tests
+/// are recorded in `riscv-tests/SOURCE.txt`). Each runs in a real machine-mode
+/// environment (installs `mtvec`, drops to a lower mode via `mret`/`sret`, runs
+/// its self-checking cases, and signals pass/fail through the HTIF `tohost`
+/// channel), so passing them exercises the privileged trap architecture
+/// (`ecall`/`ebreak` exceptions, delegation, `sret`) as well as the base ISA.
+/// (CC-9, the canonical ISA-conformance authority.)
 #[test]
 fn the_emulator_passes_the_official_riscv_tests() {
     let dir = artifact_dir().join("riscv-tests");

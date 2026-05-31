@@ -25,3 +25,15 @@ test size):
 Coverage: rv64ui (base integer), rv64um (multiply/divide), rv64ua (atomics), rv64uc (compressed) —
 86 tests. Witness: tests/cc9_emulator.rs
 (the_emulator_passes_the_official_riscv_tests).
+
+Privileged suites (rv64mi, rv64si) — PARTIAL coverage (explicitly recorded; no
+silent caps). The manifest includes the machine-/supervisor-mode tests the
+emulator currently passes (M-mode + S-mode traps, delegation, sret, ecall/ebreak
+exceptions). NOT yet included, with what each needs (in progress):
+  rv64mi-p-csr, rv64mi-p-mcsr   — CSR WARL/read-only conformance (misa, counters)
+  rv64mi-p-breakpoint            — debug-trigger CSRs
+  rv64mi-p-ma_fetch              — misaligned instruction-fetch trap
+  rv64mi-p-illegal               — vectored interrupts + S-mode + paging (composite)
+  rv64si-p-csr                   — S-mode CSR conformance
+  rv64si-p-dirty, -icache-alias  — Sv39 paging (A/D bits)
+  rv64si-p-wfi                   — timer interrupts + WFI wake
