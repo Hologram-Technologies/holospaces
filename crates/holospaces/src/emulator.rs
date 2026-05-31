@@ -90,6 +90,24 @@ mod csr {
     pub const TIME: u32 = 0xc01;
     pub const INSTRET: u32 = 0xc02;
 
+    /// The debug trigger module (Sdtrig) CSRs — optional. This hart implements no
+    /// triggers, so they read as 0 and ignore writes (RISC-V Debug spec: a
+    /// no-trigger hart hardwires `tselect`/`tdata*`; software detects the absence
+    /// and skips — the `breakpoint` conformance test does exactly that).
+    pub const TSELECT: u32 = 0x7a0;
+    pub const TDATA1: u32 = 0x7a1;
+    pub const TDATA2: u32 = 0x7a2;
+    pub const TDATA3: u32 = 0x7a3;
+    pub const TINFO: u32 = 0x7a4;
+    pub const TCONTROL: u32 = 0x7a5;
+
+    /// `mstatus.UXL`/`SXL` (bits 33:32 / 35:34) — the U-/S-mode XLEN, a WARL field
+    /// fixed at 2 (XLEN = 64) on this RV64 hart (RISC-V Privileged ISA §3.1.6.3).
+    pub const XLEN_MASK: u64 = (3 << 32) | (3 << 34);
+    pub const XLEN_64: u64 = (2 << 32) | (2 << 34);
+    /// `sstatus.UXL` (bits 33:32) — the U-mode XLEN view, fixed at 2.
+    pub const UXL_64: u64 = 2 << 32;
+
     /// The `sstatus` view of `mstatus` (the S-mode-visible bits): SIE, SPIE, SPP,
     /// FS, SUM, MXR (RISC-V Privileged ISA §4.1.1).
     pub const SSTATUS_MASK: u64 =
@@ -219,6 +237,8 @@ impl Emulator {
         // RV64 (MXL=2) with A, C, D, F, I, M.
         let misa = (2u64 << 62) | (1 << 0) | (1 << 2) | (1 << 3) | (1 << 5) | (1 << 8) | (1 << 12);
         csrs.insert(csr::MISA, misa);
+        // `mstatus.UXL`/`SXL` are fixed at 2 (XLEN 64) on this RV64 hart.
+        csrs.insert(csr::MSTATUS, csr::XLEN_64);
         Self {
             hart: Hart {
                 x: [0; 32],
@@ -258,12 +278,18 @@ impl Emulator {
     fn csr_read(&self, csr: u32) -> u64 {
         // `sstatus`/`sie`/`sip` are restricted views of `mstatus`/`mie`/`mip`.
         match csr {
-            csr::SSTATUS => self.raw_csr(csr::MSTATUS) & csr::SSTATUS_MASK,
+            // `mstatus`/`sstatus` expose the WARL XLEN fields fixed at 2 (XLEN 64).
+            csr::MSTATUS => (self.raw_csr(csr::MSTATUS) & !csr::XLEN_MASK) | csr::XLEN_64,
+            csr::SSTATUS => (self.raw_csr(csr::MSTATUS) & csr::SSTATUS_MASK) | csr::UXL_64,
             csr::SIE => self.raw_csr(csr::MIE) & csr::S_INT_MASK,
             csr::SIP => self.raw_csr(csr::MIP) & csr::S_INT_MASK,
             csr::FFLAGS => self.raw_csr(csr::FCSR) & 0x1f,
             csr::FRM => (self.raw_csr(csr::FCSR) >> 5) & 0x7,
             csr::TIME | csr::CYCLE | csr::INSTRET => self.mtime,
+            // No debug triggers implemented — the trigger CSRs read as 0.
+            csr::TSELECT | csr::TDATA1 | csr::TDATA2 | csr::TDATA3 | csr::TINFO | csr::TCONTROL => {
+                0
+            }
             _ => self.raw_csr(csr),
         }
     }
@@ -299,6 +325,17 @@ impl Emulator {
                 // Only frm (7:5) + fflags (4:0) are writable; the rest is 0.
                 self.csrs.insert(csr::FCSR, value & 0xff);
             }
+            // `misa` is read-only on this hart (a fixed ISA — the common
+            // implementation; the `ma_fetch` test detects that C cannot be
+            // disabled and skips the IALIGN cases). The debug trigger CSRs are
+            // likewise hardwired (no triggers).
+            csr::MISA
+            | csr::TSELECT
+            | csr::TDATA1
+            | csr::TDATA2
+            | csr::TDATA3
+            | csr::TINFO
+            | csr::TCONTROL => {}
             0x180 => {
                 // `satp`. This hart implements Sv39 (the DTB `mmu-type`), so a
                 // write selecting a deeper mode (Sv48/Sv57) does not take — its
@@ -362,6 +399,13 @@ impl Emulator {
     fn mark_fs_dirty(&mut self) {
         let st = self.raw_csr(csr::MSTATUS) | (3 << 13);
         self.csrs.insert(csr::MSTATUS, st);
+    }
+
+    /// Whether the floating-point unit is on (`mstatus.FS` ≠ Off). When it is
+    /// off, any FP instruction or FP-CSR access traps as illegal (RISC-V
+    /// Privileged ISA §3.1.6.6) — the kernel uses this for lazy FP context save.
+    fn fp_enabled(&self) -> bool {
+        (self.raw_csr(csr::MSTATUS) >> 13) & 3 != 0
     }
 
     /// Accrue floating-point exception flags into `fcsr.fflags`
@@ -526,12 +570,6 @@ impl Emulator {
     #[must_use]
     pub fn csr(&self, n: u32) -> u64 {
         self.csr_read(n)
-    }
-
-    /// The CLINT timer pair `(mtime, mtimecmp)` (diagnostics / OS bring-up).
-    #[must_use]
-    pub fn timer(&self) -> (u64, u64) {
-        (self.mtime, self.mtimecmp)
     }
 
     /// Read an integer register (diagnostics / OS bring-up).
@@ -1109,7 +1147,10 @@ impl Emulator {
                 }
             }
             0x07 => {
-                // LOAD-FP: FLW (32) / FLD (64)
+                // LOAD-FP: FLW (32) / FLD (64) — requires the FP unit on.
+                if !self.fp_enabled() {
+                    return Err(Halt::Trap(Trap::IllegalInstruction(inst)));
+                }
                 let addr = self.rd(rs1).wrapping_add(i_imm(inst));
                 match funct3 {
                     2 => {
@@ -1124,7 +1165,10 @@ impl Emulator {
                 }
             }
             0x27 => {
-                // STORE-FP: FSW (32) / FSD (64)
+                // STORE-FP: FSW (32) / FSD (64) — requires the FP unit on.
+                if !self.fp_enabled() {
+                    return Err(Halt::Trap(Trap::IllegalInstruction(inst)));
+                }
                 let addr = self.rd(rs1).wrapping_add(s_imm(inst));
                 match funct3 {
                     2 => self
@@ -1133,6 +1177,10 @@ impl Emulator {
                     3 => self.store(addr, 8, self.frd(rs2)).map_err(Halt::Trap)?,
                     _ => return Err(Halt::Trap(Trap::IllegalInstruction(inst))),
                 }
+            }
+            0x53 | 0x43 | 0x47 | 0x4b | 0x4f if !self.fp_enabled() => {
+                // OP-FP / FMADD family with the FP unit off → illegal.
+                return Err(Halt::Trap(Trap::IllegalInstruction(inst)));
             }
             0x53 => return self.fp_op(inst),
             0x43 | 0x47 | 0x4b | 0x4f => return self.fp_madd(inst, opcode),
@@ -1148,6 +1196,12 @@ impl Emulator {
                         return Ok(());
                     } // MRET
                     0x1020_0073 => {
+                        // SRET traps in S-mode when mstatus.TSR is set (RISC-V
+                        // Privileged ISA §3.1.6.5).
+                        if self.priv_level == PRIV_S && (self.raw_csr(csr::MSTATUS) >> 22) & 1 == 1
+                        {
+                            return Err(Halt::Trap(Trap::IllegalInstruction(inst)));
+                        }
                         self.sret();
                         return Ok(());
                     } // SRET
@@ -1163,7 +1217,14 @@ impl Emulator {
                             self.mtime = self.mtimecmp - 1;
                         }
                     }
-                    _ if (inst >> 25) == 0x09 => {} // SFENCE.VMA — nop (no TLB)
+                    _ if (inst >> 25) == 0x09 => {
+                        // SFENCE.VMA — no TLB to flush, but it traps in S-mode
+                        // when mstatus.TVM is set (RISC-V Privileged ISA §3.1.6.5).
+                        if self.priv_level == PRIV_S && (self.raw_csr(csr::MSTATUS) >> 20) & 1 == 1
+                        {
+                            return Err(Halt::Trap(Trap::IllegalInstruction(inst)));
+                        }
+                    }
                     _ => return Err(Halt::Trap(Trap::IllegalInstruction(inst))),
                 }
             }
@@ -1171,6 +1232,18 @@ impl Emulator {
                 // SYSTEM — Zicsr: CSRRW/S/C and their immediate forms. The source
                 // is a register (funct3 1-3) or a 5-bit zimm (funct3 5-7).
                 let csr = (inst >> 20) & 0xfff;
+                // The FP CSRs are accessible only when the FP unit is on.
+                if matches!(csr, csr::FFLAGS | csr::FRM | csr::FCSR) && !self.fp_enabled() {
+                    return Err(Halt::Trap(Trap::IllegalInstruction(inst)));
+                }
+                // `satp` access traps in S-mode when mstatus.TVM is set (RISC-V
+                // Privileged ISA §3.1.6.5).
+                if csr == 0x180
+                    && self.priv_level == PRIV_S
+                    && (self.raw_csr(csr::MSTATUS) >> 20) & 1 == 1
+                {
+                    return Err(Halt::Trap(Trap::IllegalInstruction(inst)));
+                }
                 let old = self.csr_read(csr);
                 let src = if funct3 & 0x4 != 0 {
                     u64::from(rs1) // zimm (the rs1 field)
