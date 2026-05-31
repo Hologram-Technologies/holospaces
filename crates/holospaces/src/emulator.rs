@@ -183,7 +183,7 @@ struct Hart {
     pc: u64,
 }
 
-/// A minimal RISC-V machine: one hart over a flat little-endian RAM, with an
+/// A single-hart RV64GC RISC-V machine over a flat little-endian RAM, with an
 /// `ecall` console (the `write` syscall appends to [`Emulator::console`]).
 ///
 /// RAM is mapped at [`Emulator::base`]; a flat guest image is loaded there and
