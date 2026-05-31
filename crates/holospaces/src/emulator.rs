@@ -83,6 +83,13 @@ mod csr {
     pub const SEIP: u32 = 9;
     pub const MEIP: u32 = 11;
 
+    /// User-mode read-only shadow counters (RISC-V Unprivileged ISA §10.1):
+    /// `time` mirrors the CLINT `mtime` (the kernel's `rdtime` clocksource);
+    /// `cycle`/`instret` mirror it too (a monotonic free-running counter).
+    pub const CYCLE: u32 = 0xc00;
+    pub const TIME: u32 = 0xc01;
+    pub const INSTRET: u32 = 0xc02;
+
     /// The `sstatus` view of `mstatus` (the S-mode-visible bits): SIE, SPIE, SPP,
     /// FS, SUM, MXR (RISC-V Privileged ISA §4.1.1).
     pub const SSTATUS_MASK: u64 =
@@ -249,6 +256,7 @@ impl Emulator {
             csr::SIP => self.raw_csr(csr::MIP) & csr::S_INT_MASK,
             csr::FFLAGS => self.raw_csr(csr::FCSR) & 0x1f,
             csr::FRM => (self.raw_csr(csr::FCSR) >> 5) & 0x7,
+            csr::TIME | csr::CYCLE | csr::INSTRET => self.mtime,
             _ => self.raw_csr(csr),
         }
     }
@@ -283,6 +291,21 @@ impl Emulator {
             csr::FCSR => {
                 // Only frm (7:5) + fflags (4:0) are writable; the rest is 0.
                 self.csrs.insert(csr::FCSR, value & 0xff);
+            }
+            0x180 => {
+                // `satp`. This hart implements Sv39 (the DTB `mmu-type`), so a
+                // write selecting a deeper mode (Sv48/Sv57) does not take — its
+                // mode field reads back as bare. A modern kernel probes the
+                // deepest mode by writing `satp` and reading it back, so this is
+                // how an Sv39-only hart makes it fall back to Sv39 (RISC-V
+                // Privileged ISA §4.1.11: an unsupported MODE leaves `satp`
+                // unchanged / WARL).
+                let v = if matches!(value >> 60, 0 | 8) {
+                    value
+                } else {
+                    value & !(0xfu64 << 60)
+                };
+                self.csrs.insert(0x180, v);
             }
             _ => {
                 self.csrs.insert(csr, value);
@@ -434,6 +457,34 @@ impl Emulator {
         Ok(())
     }
 
+    /// Boot a flat RISC-V Linux `Image` as the supervisor OS: place the kernel at
+    /// its 2 MiB text offset, the flattened device tree (`dtb`) at `dtb_addr`,
+    /// and hand off the way the SBI firmware does — drop to S-mode at the kernel
+    /// entry with `a0` = hart id (0) and `a1` = the DTB pointer (RISC-V boot
+    /// protocol). The emulator services the kernel's SBI calls (`enable_sbi`).
+    pub fn boot_kernel(&mut self, image: &[u8], dtb: &[u8], dtb_addr: u64) -> Result<(), Trap> {
+        let entry = self.base + 0x20_0000; // the RISC-V kernel Image `text_offset`
+        let koff = self.offset(entry, image.len())?;
+        self.ram[koff..koff + image.len()].copy_from_slice(image);
+        let doff = self.offset(dtb_addr, dtb.len())?;
+        self.ram[doff..doff + dtb.len()].copy_from_slice(dtb);
+        self.hart.pc = entry;
+        self.priv_level = PRIV_S;
+        self.hart.x[10] = 0; // a0 = boot hart id
+        self.hart.x[11] = dtb_addr; // a1 = device-tree blob
+        self.provide_sbi = true; // the emulator is the SEE / SBI firmware
+                                 // Delegate the standard exceptions and S-mode interrupts to supervisor
+                                 // mode, the way the SBI firmware (OpenSBI) does — so the kernel's own
+                                 // `stvec` handler services its page faults, syscalls, and timer/software
+                                 // interrupts (RISC-V Privileged ISA §3.1.8; OpenSBI `medeleg`/`mideleg`).
+                                 // medeleg: misaligned/access/illegal/breakpoint/ecall-from-U + the three
+                                 // page faults (causes 0-8, 12, 13, 15). mideleg: S software/timer/external.
+        self.csrs.insert(csr::MEDELEG, 0xb1ff);
+        self.csrs
+            .insert(csr::MIDELEG, (1 << 1) | (1 << 5) | (1 << 9));
+        Ok(())
+    }
+
     /// The bytes the guest has written to fd 1/2 via the `write` syscall — its
     /// console output (the channel the emulator codemodule publishes).
     #[must_use]
@@ -445,6 +496,40 @@ impl Emulator {
     #[must_use]
     pub fn pc(&self) -> u64 {
         self.hart.pc
+    }
+
+    /// Read a CSR (diagnostics / OS bring-up).
+    #[must_use]
+    pub fn csr(&self, n: u32) -> u64 {
+        self.csr_read(n)
+    }
+
+    /// The CLINT timer pair `(mtime, mtimecmp)` (diagnostics / OS bring-up).
+    #[must_use]
+    pub fn timer(&self) -> (u64, u64) {
+        (self.mtime, self.mtimecmp)
+    }
+
+    /// Read an integer register (diagnostics / OS bring-up).
+    #[must_use]
+    pub fn xreg(&self, i: usize) -> u64 {
+        self.hart.x[i]
+    }
+
+    /// Read `width` bytes of physical RAM, little-endian (diagnostics — page
+    /// table inspection during OS bring-up). Out-of-range reads return 0.
+    #[must_use]
+    pub fn peek(&self, addr: u64, width: usize) -> u64 {
+        match self.offset(addr, width) {
+            Ok(o) => {
+                let mut v = 0u64;
+                for i in 0..width {
+                    v |= (self.ram[o + i] as u64) << (8 * i);
+                }
+                v
+            }
+            Err(_) => 0,
+        }
     }
 
     /// Advance the timer, take any pending interrupt, and execute one
@@ -648,9 +733,15 @@ impl Emulator {
     /// accessed/dirty bits and enforces the page permissions and U/SUM/MXR.
     fn translate(&mut self, vaddr: u64, access: Access) -> Result<u64, Trap> {
         let satp = self.raw_csr(0x180);
-        if satp >> 60 != 8 {
-            return Ok(vaddr); // bare (no paging)
-        }
+        // Sv39/Sv48/Sv57 differ only in the page-table depth (3/4/5 levels); a
+        // modern kernel probes for the deepest the hart accepts, so all three are
+        // implemented (RISC-V Privileged ISA §4.4-4.6).
+        let levels: i32 = match satp >> 60 {
+            8 => 3,
+            9 => 4,
+            10 => 5,
+            _ => return Ok(vaddr), // bare (no paging)
+        };
         let mstatus = self.raw_csr(csr::MSTATUS);
         // MPRV makes loads/stores use the previous privilege (MPP); fetches don't.
         let eff = if access != Access::Fetch && (mstatus >> 17) & 1 == 1 {
@@ -671,15 +762,14 @@ impl Emulator {
             },
             addr: vaddr,
         };
-        let vpn = [
-            (vaddr >> 12) & 0x1ff,
-            (vaddr >> 21) & 0x1ff,
-            (vaddr >> 30) & 0x1ff,
-        ];
-        let mut a = (satp & 0xf_ffff_ffff_ffff) << 12;
-        let mut level = 2i32;
+        // The root page-table PPN is `satp` bits 43:0 (44 bits); bits 59:44 are
+        // the ASID and must be masked off (RISC-V Privileged ISA §4.1.11) — a
+        // kernel that uses a nonzero ASID would otherwise corrupt the root.
+        let mut a = (satp & 0xfff_ffff_ffff) << 12;
+        let mut level = levels - 1;
         loop {
-            let pte_addr = a + vpn[level as usize] * 8;
+            let vpn_l = (vaddr >> (12 + 9 * level)) & 0x1ff;
+            let pte_addr = a + vpn_l * 8;
             let pte = self.load_phys(pte_addr, 8)?;
             let (v, r, w, x, u) = (
                 pte & 1,
@@ -707,7 +797,7 @@ impl Emulator {
                 if eff == PRIV_S && u == 1 && (access == Access::Fetch || sum == 0) {
                     return Err(pf(access)); // S-mode into a user page without SUM
                 }
-                let ppn = pte >> 10;
+                let ppn = (pte >> 10) & 0xfff_ffff_ffff; // 44-bit PPN (bits 53:10)
                 if level > 0 && ppn & ((1 << (9 * level)) - 1) != 0 {
                     return Err(pf(access)); // misaligned superpage
                 }
@@ -722,7 +812,7 @@ impl Emulator {
                 let mask = (1u64 << (12 + 9 * level)) - 1;
                 return Ok(((ppn << 12) & !mask) | (vaddr & mask));
             }
-            a = (pte >> 10) << 12;
+            a = ((pte >> 10) & 0xfff_ffff_ffff) << 12;
             level -= 1;
             if level < 0 {
                 return Err(pf(access));
@@ -751,13 +841,19 @@ impl Emulator {
         let pc = self.hart.pc;
         // Fetch: a 16-bit parcel whose low two bits are `11` is the start of a
         // 32-bit instruction; otherwise it is a compressed (C extension)
-        // instruction, expanded to its 32-bit equivalent (RISC-V ISA §16).
-        let parcel = self.load(pc, 2, Access::Fetch).map_err(Halt::Trap)? as u16;
+        // instruction, expanded to its 32-bit equivalent (RISC-V ISA §16). A
+        // fetch fault (e.g. an unmapped page) is delivered to the trap handler
+        // like any other exception — the kernel relies on a deliberate fetch
+        // page fault to switch into its virtual mapping (head.S trampoline).
+        let parcel = match self.load(pc, 2, Access::Fetch) {
+            Ok(v) => v as u16,
+            Err(t) => return self.raise(t, pc),
+        };
         let (inst, ilen) = if parcel & 3 == 3 {
-            (
-                self.load(pc, 4, Access::Fetch).map_err(Halt::Trap)? as u32,
-                4u64,
-            )
+            match self.load(pc, 4, Access::Fetch) {
+                Ok(v) => (v as u32, 4u64),
+                Err(t) => return self.raise(t, pc),
+            }
         } else {
             match expand_rvc(parcel) {
                 Some(i) => (i, 2),
@@ -1541,6 +1637,11 @@ fn expand_rvc(half: u16) -> Option<u32> {
                 | (((h >> 6) & 1) << 2);
             (imm != 0).then(|| i_(imm as i32, 2, 0, rs2p, 0x13))
         }
+        (0, 1) => {
+            // C.FLD → fld rd', off(rs1') (RV64GC compressed double load)
+            let off = (((h >> 10) & 7) << 3) | (((h >> 5) & 3) << 6);
+            Some(i_(off as i32, rdp, 3, rs2p, 0x07))
+        }
         (0, 2) => {
             // C.LW → lw rd', off(rs1')
             let off = (((h >> 10) & 7) << 3) | (((h >> 6) & 1) << 2) | (((h >> 5) & 1) << 6);
@@ -1550,6 +1651,11 @@ fn expand_rvc(half: u16) -> Option<u32> {
             // C.LD → ld rd', off(rs1')
             let off = (((h >> 10) & 7) << 3) | (((h >> 5) & 3) << 6);
             Some(i_(off as i32, rdp, 3, rs2p, 0x03))
+        }
+        (0, 5) => {
+            // C.FSD → fsd rs2', off(rs1') (RV64GC compressed double store)
+            let off = (((h >> 10) & 7) << 3) | (((h >> 5) & 3) << 6);
+            Some(s_(off as i32, rs2p, rdp, 3, 0x27))
         }
         (0, 6) => {
             // C.SW → sw rs2', off(rs1')
@@ -1662,6 +1768,11 @@ fn expand_rvc(half: u16) -> Option<u32> {
             let shamt = (((h >> 12) & 1) << 5) | ((h >> 2) & 0x1f);
             Some(i_(shamt as i32, rd, 1, rd, 0x13))
         }
+        (2, 1) => {
+            // C.FLDSP → fld rd, off(x2) (RV64GC compressed double load from SP)
+            let off = (((h >> 12) & 1) << 5) | (((h >> 5) & 3) << 3) | (((h >> 2) & 7) << 6);
+            Some(i_(off as i32, 2, 3, rd, 0x07))
+        }
         (2, 2) => {
             // C.LWSP → lw rd, off(x2)
             let off = (((h >> 12) & 1) << 5) | (((h >> 4) & 7) << 2) | (((h >> 2) & 3) << 6);
@@ -1686,6 +1797,11 @@ fn expand_rvc(half: u16) -> Option<u32> {
             } else {
                 Some(r_(0, rs2, rd, 0, rd, 0x33)) // C.ADD
             }
+        }
+        (2, 5) => {
+            // C.FSDSP → fsd rs2, off(x2) (RV64GC compressed double store to SP)
+            let off = (((h >> 10) & 7) << 3) | (((h >> 7) & 7) << 6);
+            Some(s_(off as i32, rs2, 2, 3, 0x27))
         }
         (2, 6) => {
             // C.SWSP → sw rs2, off(x2)
