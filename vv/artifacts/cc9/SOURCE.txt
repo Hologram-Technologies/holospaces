@@ -28,3 +28,7 @@ emulator.wasm
     cd crates/holospaces-emulator
     cargo build --target wasm32-unknown-unknown --release
   rustc 1.96.0 (ac68faa20 2026-05-25)
+
+Zicsr + A extension coverage (assembled with --mattr=+m,+a,+zicsr):
+  csr   CSRRW/CSRRWI/CSRRS round-trip through mscratch (587 = 0x123+0x123+5)
+  amo   AMOADD.W + AMOSWAP.W on memory (223 = 100 + 123)

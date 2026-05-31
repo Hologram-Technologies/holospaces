@@ -6,3 +6,5 @@ sum1to10 55
 bitops 85
 wordops 100
 memory 239
+csr 587
+amo 223
