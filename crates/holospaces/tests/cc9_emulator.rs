@@ -3,14 +3,14 @@
 //! The [emulator](holospaces::emulator) is verified against external authorities:
 //!
 //! * it **passes the official RISC-V `riscv-tests` conformance suite** (rv64ui +
-//!   rv64um + rv64ua, machine-mode `-p`) — the canonical authority real hardware
-//!   and QEMU are validated against, exercising the base ISA, M/A extensions, and
-//!   the machine-mode trap architecture;
+//!   um + ua + uc + uf + ud + mi/si) — the canonical authority real hardware and
+//!   QEMU are validated against, exercising the base ISA, the M/A/F/D/C
+//!   extensions, and the machine/supervisor trap architecture;
+//! * **a real, unmodified Linux 6.6 kernel boots to userspace on it**, and PID 1
+//!   produces console output byte-identical to `qemu-system-riscv64` on the same
+//!   image — the differential oracle (CC-9's end state);
 //! * it runs **as a real hologram Wasm container codemodule** on the substrate
 //!   runtime, with its disk as a `CC-7` κ-disk and a reproducible κ snapshot.
-//!
-//! CC-9's end state is "a real operating system boots and runs"; until a real OS
-//! boots, `vv/run.sh` reports CC-9 *pending* — these are cargo-tier witnesses.
 
 use std::path::{Path, PathBuf};
 
@@ -359,4 +359,81 @@ fn the_emulator_runs_a_guest_off_a_kappa_disk_and_snapshots_to_the_store() {
             "same image ⇒ same snapshot κ on any peer (L1)"
         );
     });
+}
+
+/// **A real, unmodified Linux kernel boots to userspace on the emulator core.**
+///
+/// This is CC-9's end state and the strongest external authority of all: the
+/// pinned RISC-V Linux 6.6 kernel (`vv/artifacts/cc9/linux/`, provenance in its
+/// `SOURCE.txt`) is loaded as the supervisor OS — the emulator is the SBI
+/// firmware — and run until PID 1 executes. A real OS boot exercises the base
+/// ISA, the M/A/F/D/C extensions, Sv39 paging, the machine/supervisor trap
+/// architecture, the CLINT timer, and the SBI far more stringently than any unit
+/// test; if the emulator were not a faithful RISC-V machine the kernel would
+/// fault, not reach userspace. PID 1 (a real static ELF) prints its marker and
+/// the real `/proc/version`, which must match — byte-for-byte — the output the
+/// reference RISC-V implementation (`qemu-system-riscv64`) produces from the same
+/// image (`expected-userspace.txt`, the differential oracle; ADR-009).
+///
+/// Ignored by default (a full boot is ~15 s and must run in release); the CC-9
+/// V&V suite runs it. Run directly with:
+/// `cargo test --release -p holospaces --test cc9_emulator -- --ignored --nocapture`.
+#[test]
+#[ignore = "boots a real Linux kernel (~15s; release only) — run by the CC-9 vv suite"]
+fn the_emulator_boots_real_linux_to_userspace() {
+    use std::io::Read;
+
+    let dir = artifact_dir().join("linux");
+    // The pinned kernel Image is committed gzip-compressed; decompress it.
+    let gz = std::fs::read(dir.join("Image.gz")).expect("Image.gz (see linux/SOURCE.txt)");
+    let mut image = Vec::new();
+    flate2::read::GzDecoder::new(&gz[..])
+        .read_to_end(&mut image)
+        .expect("gunzip the kernel Image");
+    let dtb = std::fs::read(dir.join("holospaces.dtb")).expect("holospaces.dtb");
+    let expected = std::fs::read_to_string(dir.join("expected-userspace.txt")).expect("expected");
+
+    // 128 MiB at the standard RISC-V RAM base; the DTB sits high, clear of the
+    // kernel — exactly what the boot_kernel hand-off and the device tree describe.
+    let base = 0x8000_0000u64;
+    let mut emu = Emulator::new(base, 128 * 1024 * 1024);
+    emu.boot_kernel(&image, &dtb, base + 0x0700_0000)
+        .expect("load the kernel Image + device tree");
+
+    // Run until PID 1 powers the machine off (reboot(2) -> SBI SRST -> Halt::Exit),
+    // bounded by a generous instruction budget.
+    let mut steps = 0u64;
+    let halt = loop {
+        match emu.run(10_000_000) {
+            Halt::OutOfBudget => {
+                steps += 10_000_000;
+                assert!(
+                    steps < 3_000_000_000,
+                    "the kernel did not reach userspace within the budget (pc={:#x})",
+                    emu.pc()
+                );
+            }
+            other => break other,
+        }
+    };
+    assert_eq!(
+        halt,
+        Halt::Exit(0),
+        "PID 1 powers the machine off cleanly via the SBI system-reset call"
+    );
+
+    let console = String::from_utf8_lossy(emu.console());
+    // The real kernel reached userspace and ran a real ELF as PID 1.
+    assert!(
+        console.contains("Run /init as init process"),
+        "the kernel hands control to the userspace init"
+    );
+    // The userspace output matches the reference implementation byte-for-byte
+    // (the marker PID 1 prints, then the real `Linux version 6.6.0 …` banner).
+    for line in expected.lines().filter(|l| !l.trim().is_empty()) {
+        assert!(
+            console.contains(line),
+            "userspace output must match the qemu-system-riscv64 oracle; missing:\n  {line}"
+        );
+    }
 }

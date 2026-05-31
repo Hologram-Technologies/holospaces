@@ -1,0 +1,43 @@
+CC-9 OS-boot witness — a real RISC-V Linux kernel booted on the holospaces emulator
+===================================================================================
+
+These artifacts let the CC-9 witness boot a real, unmodified Linux kernel to
+userspace on the holospaces system-emulator core and check the result against
+the reference RISC-V implementation (qemu-system-riscv64). The emulator is the
+implementation under test; the *kernel* is the external authority — a real OS
+boot exercises the ISA, Sv39 paging, M/S traps, the CLINT timer, SBI, atomics,
+and F/D far more stringently than any unit test, and it must produce output
+byte-identical to QEMU on the same image.
+
+Linux kernel
+------------
+  Upstream : https://github.com/torvalds/linux  (Linus Torvalds' tree)
+  Tag      : v6.6
+  Commit   : ffc253263a1375a65fa6c9f62a893e9767fbebfa
+  Arch     : riscv (RV64GC), defconfig trimmed by kernel.config (NET/DEBUG_VM/
+             PCI/USB/SOUND/DRM/modules off; SBI console + initramfs + ELF + FPU on)
+  Built reproducibly with:
+    KBUILD_BUILD_TIMESTAMP="Fri 31 May 2026 00:00:00 UTC"
+    KBUILD_BUILD_USER=holospaces  KBUILD_BUILD_HOST=cc9   (.version = 0 -> "#1")
+    make ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- Image
+  Artifact : Image.gz  (gzip -9 of arch/riscv/boot/Image)
+
+Toolchain (Ubuntu 24.04 cross): gcc-riscv64-linux-gnu 13.3.0, GNU ld 2.42.
+
+initramfs (initramfs.cpio.gz, built from initramfs.list by the kernel's
+gen_init_cpio): a single freestanding static PID-1 (init.c -> /init, raw RISC-V
+Linux syscalls, no libc), plus /dev/console and /proc. PID 1 prints the marker
+HOLOSPACES-LINUX-USERSPACE-OK, mounts procfs, echoes /proc/version, and powers
+the machine off via the reboot(2) syscall (-> SBI SRST -> the emulator halts).
+
+Device tree (holospaces.dts -> holospaces.dtb, dtc 1.7.0): one rv64imafdc hart
+with riscv,sv39, 128 MiB RAM at 0x80000000, a SiFive CLINT at 0x02000000, and a
+10 MHz timebase — the machine the emulator presents.
+
+expected-userspace.txt: the two deterministic userspace lines (the marker + the
+reproducible "Linux version 6.6.0 …" banner /proc/version reports). Captured
+from qemu-system-riscv64 booting this exact Image; the emulator must reproduce
+them byte-for-byte (the differential oracle).
+
+To reproduce: see build.sh (clones the pin, applies kernel.config, builds the
+init + initramfs + dtb, builds the kernel) — every byte here is regenerated.

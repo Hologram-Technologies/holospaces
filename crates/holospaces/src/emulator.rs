@@ -1122,7 +1122,18 @@ impl Emulator {
                         self.sret();
                         return Ok(());
                     } // SRET
-                    0x1050_0073 => {}               // WFI — nop on this model
+                    0x1050_0073 => {
+                        // WFI: wait until an interrupt is pending. Rather than
+                        // spin the idle loop (which would burn millions of host
+                        // cycles advancing `mtime` one tick at a time), skip
+                        // straight to the next armed timer compare when nothing
+                        // else is pending — the next `tick` then latches the
+                        // timer interrupt. A standard emulator idle optimization.
+                        let pending = self.raw_csr(csr::MIP) & self.raw_csr(csr::MIE);
+                        if pending == 0 && self.mtimecmp > self.mtime {
+                            self.mtime = self.mtimecmp - 1;
+                        }
+                    }
                     _ if (inst >> 25) == 0x09 => {} // SFENCE.VMA — nop (no TLB)
                     _ => return Err(Halt::Trap(Trap::IllegalInstruction(inst))),
                 }
