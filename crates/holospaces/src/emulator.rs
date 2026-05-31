@@ -19,9 +19,11 @@
 //! the compressed encoding (C), the control/status registers (Zicsr), and
 //! trap handling across privilege levels — machine and supervisor mode with
 //! delegation (`ecall`/`ebreak` exceptions → `mtvec`/`stvec`, `mcause`/`scause`,
-//! `mret`/`sret`) — so the official machine- and supervisor-mode tests run
-//! unmodified. A flat program may instead use the `ecall` host boundary (console
-//! `write` / `exit`) when it installs no trap vector.
+//! `mret`/`sret`), and **Sv39 paging** (the page-table walk with accessed/dirty
+//! bits and U/SUM/MXR permissions) — so the official machine- and
+//! supervisor-mode tests (including supervisor paging) run unmodified. A flat
+//! program may instead use the `ecall` host boundary (console `write` / `exit`)
+//! when it installs no trap vector.
 
 use alloc::collections::BTreeMap;
 #[cfg(not(feature = "std"))]
@@ -93,6 +95,23 @@ pub enum Trap {
     UnknownSyscall(u64),
     /// `ebreak`.
     Breakpoint,
+    /// An Sv39 page fault: `cause` is the RISC-V exception code (12 fetch / 13
+    /// load / 15 store), `addr` the faulting virtual address.
+    PageFault {
+        /// The RISC-V page-fault exception code (12/13/15).
+        cause: u64,
+        /// The faulting virtual address.
+        addr: u64,
+    },
+}
+
+/// The kind of guest memory access (selects the page-table permission bit and
+/// the page-fault cause).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Access {
+    Fetch,
+    Load,
+    Store,
 }
 
 /// A RISC-V hart (hardware thread): 32 integer registers and a program counter.
@@ -273,6 +292,11 @@ impl Emulator {
         self.hart.pc
     }
 
+    #[doc(hidden)]
+    pub fn step_one(&mut self) -> Result<(), Halt> {
+        self.step()
+    }
+
     /// A reproducible snapshot of machine state — registers, PC, and RAM — the
     /// canonical bytes the substrate κ-addresses on suspend (`CC-9`). Identical
     /// runs produce identical snapshots (Law L1).
@@ -318,7 +342,7 @@ impl Emulator {
         Ok(off as usize)
     }
 
-    fn load(&self, addr: u64, width: usize) -> Result<u64, Trap> {
+    fn load_phys(&self, addr: u64, width: usize) -> Result<u64, Trap> {
         let o = self.offset(addr, width)?;
         let mut v = 0u64;
         for i in 0..width {
@@ -327,12 +351,112 @@ impl Emulator {
         Ok(v)
     }
 
-    fn store(&mut self, addr: u64, width: usize, value: u64) -> Result<(), Trap> {
+    fn store_phys(&mut self, addr: u64, width: usize, value: u64) -> Result<(), Trap> {
         let o = self.offset(addr, width)?;
         for i in 0..width {
             self.ram[o + i] = (value >> (8 * i)) as u8;
         }
         Ok(())
+    }
+
+    /// A guest virtual load (translate then read).
+    fn load(&mut self, addr: u64, width: usize, access: Access) -> Result<u64, Trap> {
+        let pa = self.translate(addr, access)?;
+        self.load_phys(pa, width)
+    }
+
+    /// A guest virtual store (translate then write).
+    fn store(&mut self, addr: u64, width: usize, value: u64) -> Result<(), Trap> {
+        let pa = self.translate(addr, Access::Store)?;
+        self.store_phys(pa, width, value)
+    }
+
+    /// Translate a virtual address through Sv39 paging (RISC-V Privileged ISA
+    /// §4.3-4.4) when `satp.MODE == Sv39` and the effective privilege is below
+    /// machine; otherwise the address is physical (bare mode). Sets the
+    /// accessed/dirty bits and enforces the page permissions and U/SUM/MXR.
+    fn translate(&mut self, vaddr: u64, access: Access) -> Result<u64, Trap> {
+        let satp = self.raw_csr(0x180);
+        if satp >> 60 != 8 {
+            return Ok(vaddr); // bare (no paging)
+        }
+        let mstatus = self.raw_csr(csr::MSTATUS);
+        // MPRV makes loads/stores use the previous privilege (MPP); fetches don't.
+        let eff = if access != Access::Fetch && (mstatus >> 17) & 1 == 1 {
+            ((mstatus >> 11) & 3) as u8
+        } else {
+            self.priv_level
+        };
+        if eff == PRIV_M {
+            return Ok(vaddr);
+        }
+        let sum = (mstatus >> 18) & 1;
+        let mxr = (mstatus >> 19) & 1;
+        let pf = |a: Access| Trap::PageFault {
+            cause: match a {
+                Access::Fetch => 12,
+                Access::Load => 13,
+                Access::Store => 15,
+            },
+            addr: vaddr,
+        };
+        let vpn = [
+            (vaddr >> 12) & 0x1ff,
+            (vaddr >> 21) & 0x1ff,
+            (vaddr >> 30) & 0x1ff,
+        ];
+        let mut a = (satp & 0xf_ffff_ffff_ffff) << 12;
+        let mut level = 2i32;
+        loop {
+            let pte_addr = a + vpn[level as usize] * 8;
+            let pte = self.load_phys(pte_addr, 8)?;
+            let (v, r, w, x, u) = (
+                pte & 1,
+                (pte >> 1) & 1,
+                (pte >> 2) & 1,
+                (pte >> 3) & 1,
+                (pte >> 4) & 1,
+            );
+            if v == 0 || (r == 0 && w == 1) {
+                return Err(pf(access));
+            }
+            if r == 1 || x == 1 {
+                // Leaf PTE: check permissions, U/SUM/MXR, and alignment.
+                let perm = match access {
+                    Access::Fetch => x == 1,
+                    Access::Load => r == 1 || (mxr == 1 && x == 1),
+                    Access::Store => w == 1,
+                };
+                if !perm {
+                    return Err(pf(access));
+                }
+                if eff == 0 && u == 0 {
+                    return Err(pf(access)); // U-mode needs a user page
+                }
+                if eff == PRIV_S && u == 1 && (access == Access::Fetch || sum == 0) {
+                    return Err(pf(access)); // S-mode into a user page without SUM
+                }
+                let ppn = pte >> 10;
+                if level > 0 && ppn & ((1 << (9 * level)) - 1) != 0 {
+                    return Err(pf(access)); // misaligned superpage
+                }
+                // Set Accessed (and Dirty on store).
+                let mut npte = pte | (1 << 6);
+                if access == Access::Store {
+                    npte |= 1 << 7;
+                }
+                if npte != pte {
+                    self.store_phys(pte_addr, 8, npte)?;
+                }
+                let mask = (1u64 << (12 + 9 * level)) - 1;
+                return Ok(((ppn << 12) & !mask) | (vaddr & mask));
+            }
+            a = (pte >> 10) << 12;
+            level -= 1;
+            if level < 0 {
+                return Err(pf(access));
+            }
+        }
     }
 
     // ── registers (x0 is hard-wired zero) ──
@@ -357,9 +481,12 @@ impl Emulator {
         // Fetch: a 16-bit parcel whose low two bits are `11` is the start of a
         // 32-bit instruction; otherwise it is a compressed (C extension)
         // instruction, expanded to its 32-bit equivalent (RISC-V ISA §16).
-        let parcel = self.load(pc, 2).map_err(Halt::Trap)? as u16;
+        let parcel = self.load(pc, 2, Access::Fetch).map_err(Halt::Trap)? as u16;
         let (inst, ilen) = if parcel & 3 == 3 {
-            (self.load(pc, 4).map_err(Halt::Trap)? as u32, 4u64)
+            (
+                self.load(pc, 4, Access::Fetch).map_err(Halt::Trap)? as u32,
+                4u64,
+            )
         } else {
             match expand_rvc(parcel) {
                 Some(i) => (i, 2),
@@ -380,6 +507,7 @@ impl Emulator {
             Trap::IllegalInstruction(i) => (2, u64::from(*i)),
             Trap::Breakpoint => (3, epc),
             Trap::AccessFault(a) => (5, *a),
+            Trap::PageFault { cause, addr } => (*cause, *addr),
             Trap::UnknownSyscall(_) => return Err(Halt::Trap(trap)),
         };
         // A flat program installs no trap vector at all → terminate.
@@ -434,14 +562,15 @@ impl Emulator {
             0x03 => {
                 // LOAD
                 let addr = self.rd(rs1).wrapping_add(i_imm(inst));
+                let ld = |s: &mut Self, w| s.load(addr, w, Access::Load).map_err(Halt::Trap);
                 let v = match funct3 {
-                    0 => sext(self.load(addr, 1).map_err(Halt::Trap)?, 8), // LB
-                    1 => sext(self.load(addr, 2).map_err(Halt::Trap)?, 16), // LH
-                    2 => sext(self.load(addr, 4).map_err(Halt::Trap)?, 32), // LW
-                    3 => self.load(addr, 8).map_err(Halt::Trap)?,          // LD
-                    4 => self.load(addr, 1).map_err(Halt::Trap)?,          // LBU
-                    5 => self.load(addr, 2).map_err(Halt::Trap)?,          // LHU
-                    6 => self.load(addr, 4).map_err(Halt::Trap)?,          // LWU
+                    0 => sext(ld(self, 1)?, 8),  // LB
+                    1 => sext(ld(self, 2)?, 16), // LH
+                    2 => sext(ld(self, 4)?, 32), // LW
+                    3 => ld(self, 8)?,           // LD
+                    4 => ld(self, 1)?,           // LBU
+                    5 => ld(self, 2)?,           // LHU
+                    6 => ld(self, 4)?,           // LWU
                     _ => return Err(Halt::Trap(Trap::IllegalInstruction(inst))),
                 };
                 self.wr(rd, v);
@@ -561,7 +690,7 @@ impl Emulator {
                 match funct5 {
                     0x02 => {
                         // LR: load + set the reservation.
-                        let v = self.load(addr, width).map_err(Halt::Trap)?;
+                        let v = self.load(addr, width, Access::Load).map_err(Halt::Trap)?;
                         self.reservation = Some(addr);
                         self.wr(rd, amo_extend(v, width));
                     }
@@ -576,7 +705,7 @@ impl Emulator {
                         self.reservation = None;
                     }
                     _ => {
-                        let old = self.load(addr, width).map_err(Halt::Trap)?;
+                        let old = self.load(addr, width, Access::Store).map_err(Halt::Trap)?;
                         let res = amo_op(funct5, old, self.rd(rs2), width);
                         self.store(addr, width, res).map_err(Halt::Trap)?;
                         self.wr(rd, amo_extend(old, width));
@@ -585,22 +714,23 @@ impl Emulator {
             }
             0x0f => { /* FENCE / FENCE.I — ordering no-op on this model */ }
             0x73 if funct3 == 0 => {
-                // SYSTEM — ECALL / EBREAK / xRET / WFI / SFENCE.VMA.
-                return match inst {
-                    0x0000_0073 => self.ecall(),                      // ECALL
-                    0x0010_0073 => Err(Halt::Trap(Trap::Breakpoint)), // EBREAK
+                // SYSTEM — ECALL / EBREAK / xRET set their own PC and return;
+                // WFI / SFENCE.VMA are no-ops here and fall through to advance.
+                match inst {
+                    0x0000_0073 => return self.ecall(),                      // ECALL
+                    0x0010_0073 => return Err(Halt::Trap(Trap::Breakpoint)), // EBREAK
                     0x3020_0073 => {
                         self.mret();
-                        Ok(())
+                        return Ok(());
                     } // MRET
                     0x1020_0073 => {
                         self.sret();
-                        Ok(())
+                        return Ok(());
                     } // SRET
-                    0x1050_0073 => Ok(()),                            // WFI — nop on this model
-                    _ if (inst >> 25) == 0x09 => Ok(()),              // SFENCE.VMA — nop (no TLB)
-                    _ => Err(Halt::Trap(Trap::IllegalInstruction(inst))),
-                };
+                    0x1050_0073 => {}               // WFI — nop on this model
+                    _ if (inst >> 25) == 0x09 => {} // SFENCE.VMA — nop (no TLB)
+                    _ => return Err(Halt::Trap(Trap::IllegalInstruction(inst))),
+                }
             }
             0x73 => {
                 // SYSTEM — Zicsr: CSRRW/S/C and their immediate forms. The source
@@ -713,7 +843,9 @@ impl Emulator {
                 // write(fd=a0, buf=a1, len=a2) — fd 1/2 go to the console.
                 let (_fd, buf, len) = (self.rd(10), self.rd(11), self.rd(12));
                 for i in 0..len {
-                    let byte = self.load(buf.wrapping_add(i), 1).map_err(Halt::Trap)? as u8;
+                    let byte = self
+                        .load(buf.wrapping_add(i), 1, Access::Load)
+                        .map_err(Halt::Trap)? as u8;
                     self.console.push(byte);
                 }
                 self.wr(10, len); // return bytes written
