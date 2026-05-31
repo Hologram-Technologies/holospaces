@@ -1,5 +1,5 @@
-//! **System emulator** — a real RISC-V (RV64IM) machine, the core of the
-//! arbitrary-OS execution surface (ADR-009, arc42 chapter 9).
+//! **System emulator** — a real RISC-V (RV64IMA + Zicsr) machine, the core of
+//! the arbitrary-OS execution surface (ADR-009, arc42 chapter 9).
 //!
 //! holospaces hosts *arbitrary* operating systems by running a real system
 //! emulator as a κ-addressed Wasm codemodule over the substrate host ABI: the
@@ -15,12 +15,15 @@
 //! authority (`CC-9`, arc42 chapter 10): it executes real RISC-V machine code —
 //! assembled by LLVM's RISC-V backend, in the self-checking style of
 //! https://github.com/riscv-software-src/riscv-tests[riscv-tests] — and must
-//! reproduce the ISA semantics exactly. This is the base integer set plus
-//! multiply/divide (RV64IM) and the `ecall` boundary a guest uses for console
-//! output and exit; the privileged architecture (CSRs, traps, Sv39 paging,
-//! CLINT/PLIC) that a full Linux boot needs is layered on top of this same core
-//! in subsequent conformance steps.
+//! reproduce the ISA semantics exactly. This is the base integer set, integer
+//! multiply/divide (M), atomics (A), and the control/status registers (Zicsr) —
+//! RV64IMA + Zicsr — plus the `ecall` boundary a guest uses for console output
+//! and exit. The remaining privileged architecture (traps, Sv39 paging,
+//! CLINT/PLIC, SBI) and the compressed (C) and floating-point (FD) extensions
+//! that a full Linux boot needs are layered on top of this same core in
+//! subsequent conformance steps.
 
+use alloc::collections::BTreeMap;
 #[cfg(not(feature = "std"))]
 #[allow(unused_imports)]
 use alloc::{vec, vec::Vec};
@@ -79,6 +82,11 @@ pub struct Emulator {
     ram: Vec<u8>,
     base: u64,
     console: Vec<u8>,
+    /// Control and status registers (Zicsr) — a flat file; the privileged
+    /// semantics (WARL fields, read-only CSRs) are a later conformance step.
+    csrs: BTreeMap<u32, u64>,
+    /// The LR/SC reservation address (A extension, single hart).
+    reservation: Option<u64>,
 }
 
 impl Emulator {
@@ -93,7 +101,17 @@ impl Emulator {
             ram: vec![0; ram_bytes],
             base,
             console: Vec::new(),
+            csrs: BTreeMap::new(),
+            reservation: None,
         }
+    }
+
+    fn csr_read(&self, csr: u32) -> u64 {
+        self.csrs.get(&csr).copied().unwrap_or(0)
+    }
+
+    fn csr_write(&mut self, csr: u32, value: u64) {
+        self.csrs.insert(csr, value);
     }
 
     /// Load a flat guest image at `base` and set the reset PC there.
@@ -126,6 +144,13 @@ impl Emulator {
         out.extend_from_slice(&self.hart.pc.to_le_bytes());
         for r in &self.hart.x {
             out.extend_from_slice(&r.to_le_bytes());
+        }
+        // The CSR file (Zicsr), in canonical (sorted) order — deterministic, so
+        // the snapshot κ is reproducible (BTreeMap iterates in key order).
+        out.extend_from_slice(&(self.csrs.len() as u32).to_le_bytes());
+        for (csr, value) in &self.csrs {
+            out.extend_from_slice(&csr.to_le_bytes());
+            out.extend_from_slice(&value.to_le_bytes());
         }
         out.extend_from_slice(&self.ram);
         out
@@ -336,14 +361,69 @@ impl Emulator {
                 };
                 self.wr(rd, v);
             }
+            0x2f => {
+                // AMO (A extension): LR / SC / atomic read-modify-write.
+                let width = match funct3 {
+                    2 => 4,
+                    3 => 8,
+                    _ => return Err(Halt::Trap(Trap::IllegalInstruction(inst))),
+                };
+                let funct5 = funct7 >> 2;
+                let addr = self.rd(rs1);
+                match funct5 {
+                    0x02 => {
+                        // LR: load + set the reservation.
+                        let v = self.load(addr, width).map_err(Halt::Trap)?;
+                        self.reservation = Some(addr);
+                        self.wr(rd, amo_extend(v, width));
+                    }
+                    0x03 => {
+                        // SC: store iff the reservation holds; rd = 0 (ok) / 1 (fail).
+                        if self.reservation == Some(addr) {
+                            self.store(addr, width, self.rd(rs2)).map_err(Halt::Trap)?;
+                            self.wr(rd, 0);
+                        } else {
+                            self.wr(rd, 1);
+                        }
+                        self.reservation = None;
+                    }
+                    _ => {
+                        let old = self.load(addr, width).map_err(Halt::Trap)?;
+                        let res = amo_op(funct5, old, self.rd(rs2), width);
+                        self.store(addr, width, res).map_err(Halt::Trap)?;
+                        self.wr(rd, amo_extend(old, width));
+                    }
+                }
+            }
             0x0f => { /* FENCE / FENCE.I — ordering no-op on this model */ }
-            0x73 => {
-                // SYSTEM — ECALL / EBREAK (CSRs are a later conformance step)
+            0x73 if funct3 == 0 => {
+                // SYSTEM — ECALL / EBREAK.
                 match inst >> 7 {
                     0x0000_0000 => return self.ecall(), // ECALL (imm=0, rd/rs1=0)
                     0x0010_0000 => return Err(Halt::Trap(Trap::Breakpoint)), // EBREAK (imm=1)
                     _ => return Err(Halt::Trap(Trap::IllegalInstruction(inst))),
                 }
+            }
+            0x73 => {
+                // SYSTEM — Zicsr: CSRRW/S/C and their immediate forms. The source
+                // is a register (funct3 1-3) or a 5-bit zimm (funct3 5-7).
+                let csr = (inst >> 20) & 0xfff;
+                let old = self.csr_read(csr);
+                let src = if funct3 & 0x4 != 0 {
+                    u64::from(rs1) // zimm (the rs1 field)
+                } else {
+                    self.rd(rs1)
+                };
+                let write = match funct3 & 0x3 {
+                    1 => Some(src),                    // CSRRW(I)
+                    2 if rs1 != 0 => Some(old | src),  // CSRRS(I)
+                    3 if rs1 != 0 => Some(old & !src), // CSRRC(I)
+                    _ => None, // CSRRS/C with a zero source: no write (no side effects)
+                };
+                if let Some(v) = write {
+                    self.csr_write(csr, v);
+                }
+                self.wr(rd, old);
             }
             _ => return Err(Halt::Trap(Trap::IllegalInstruction(inst))),
         }
@@ -440,6 +520,49 @@ impl Emulator {
 fn sext(v: u64, bits: u32) -> u64 {
     let shift = 64 - bits;
     (((v << shift) as i64) >> shift) as u64
+}
+
+/// The destination value of an AMO/LR (the loaded old value), sign-extended from
+/// the access width per the A extension (`amo.w` returns a sign-extended word).
+fn amo_extend(v: u64, width: usize) -> u64 {
+    if width == 4 {
+        sext(v, 32)
+    } else {
+        v
+    }
+}
+
+/// Apply an atomic memory operation, returning the value to store (truncated to
+/// the access width by `store`). RISC-V "A" extension, `funct5` from bits 31..27.
+fn amo_op(funct5: u32, old: u64, val: u64, width: usize) -> u64 {
+    if width == 4 {
+        let (o, v) = (old as u32, val as u32);
+        u64::from(match funct5 {
+            0x00 => o.wrapping_add(v),                         // AMOADD.W
+            0x01 => v,                                         // AMOSWAP.W
+            0x04 => o ^ v,                                     // AMOXOR.W
+            0x08 => o | v,                                     // AMOOR.W
+            0x0c => o & v,                                     // AMOAND.W
+            0x10 => core::cmp::min(o as i32, v as i32) as u32, // AMOMIN.W
+            0x14 => core::cmp::max(o as i32, v as i32) as u32, // AMOMAX.W
+            0x18 => core::cmp::min(o, v),                      // AMOMINU.W
+            0x1c => core::cmp::max(o, v),                      // AMOMAXU.W
+            _ => o,
+        })
+    } else {
+        match funct5 {
+            0x00 => old.wrapping_add(val),
+            0x01 => val,
+            0x04 => old ^ val,
+            0x08 => old | val,
+            0x0c => old & val,
+            0x10 => core::cmp::min(old as i64, val as i64) as u64,
+            0x14 => core::cmp::max(old as i64, val as i64) as u64,
+            0x18 => core::cmp::min(old, val),
+            0x1c => core::cmp::max(old, val),
+            _ => old,
+        }
+    }
 }
 
 fn i_imm(inst: u32) -> u64 {
