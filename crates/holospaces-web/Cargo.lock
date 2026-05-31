@@ -220,6 +220,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hologram-bare-hal"
+version = "0.6.0"
+source = "git+https://github.com/Hologram-Technologies/hologram?rev=18f553d8578997ce32e7b653786a0bcf9b09a2c0#18f553d8578997ce32e7b653786a0bcf9b09a2c0"
+dependencies = [
+ "async-trait",
+ "spin",
+]
+
+[[package]]
 name = "hologram-exec"
 version = "0.6.0"
 source = "git+https://github.com/Hologram-Technologies/hologram?rev=18f553d8578997ce32e7b653786a0bcf9b09a2c0#18f553d8578997ce32e7b653786a0bcf9b09a2c0"
@@ -338,11 +347,15 @@ dependencies = [
 name = "holospaces"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "hologram-backend",
+ "hologram-bare-hal",
  "hologram-exec",
  "hologram-realizations",
  "hologram-substrate-core",
+ "libm",
  "serde_json",
+ "spin",
  "wasmparser 0.221.3",
 ]
 
