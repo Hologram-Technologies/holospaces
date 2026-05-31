@@ -57,6 +57,7 @@ mod csr {
     pub const SIP: u32 = 0x144;
     // Machine.
     pub const MSTATUS: u32 = 0x300;
+    pub const MISA: u32 = 0x301;
     pub const MEDELEG: u32 = 0x302;
     pub const MIDELEG: u32 = 0x303;
     pub const MIE: u32 = 0x304;
@@ -190,6 +191,11 @@ impl Emulator {
     /// Create a machine with `ram_bytes` of RAM mapped at `base`, the reset PC.
     #[must_use]
     pub fn new(base: u64, ram_bytes: usize) -> Self {
+        let mut csrs = BTreeMap::new();
+        // `misa` reports the ISA: RV64 (MXL=2) with the I, M, A, C extensions a
+        // kernel checks for. mhartid defaults to 0 (single hart).
+        let misa = (2u64 << 62) | (1 << 0) | (1 << 2) | (1 << 8) | (1 << 12);
+        csrs.insert(csr::MISA, misa);
         Self {
             hart: Hart {
                 x: [0; 32],
@@ -198,7 +204,7 @@ impl Emulator {
             ram: vec![0; ram_bytes],
             base,
             console: Vec::new(),
-            csrs: BTreeMap::new(),
+            csrs,
             reservation: None,
             priv_level: PRIV_M,
             htif: None,
@@ -345,10 +351,20 @@ impl Emulator {
         &self.console
     }
 
-    /// The current program counter (diagnostics).
+    /// The current program counter (diagnostics / single-stepping).
     #[must_use]
     pub fn pc(&self) -> u64 {
         self.hart.pc
+    }
+
+    /// Advance the timer, take any pending interrupt, and execute one
+    /// instruction (diagnostics / single-stepping during OS bring-up).
+    pub fn step_once(&mut self) -> Result<(), Halt> {
+        self.tick();
+        if self.take_interrupt() {
+            return Ok(());
+        }
+        self.step()
     }
 
     /// A reproducible snapshot of machine state — registers, PC, and RAM — the
@@ -368,6 +384,15 @@ impl Emulator {
             out.extend_from_slice(&csr.to_le_bytes());
             out.extend_from_slice(&value.to_le_bytes());
         }
+        // The remaining machine state: privilege, the LR/SC reservation, the
+        // CLINT timer, and the firmware mode — so a suspended *running* machine
+        // resumes identically (a complete, reproducible κ snapshot; `CC-9`).
+        out.push(self.priv_level);
+        out.push(u8::from(self.provide_sbi));
+        out.push(u8::from(self.msip));
+        out.extend_from_slice(&self.reservation.unwrap_or(u64::MAX).to_le_bytes());
+        out.extend_from_slice(&self.mtime.to_le_bytes());
+        out.extend_from_slice(&self.mtimecmp.to_le_bytes());
         out.extend_from_slice(&self.ram);
         out
     }
