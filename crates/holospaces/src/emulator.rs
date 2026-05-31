@@ -200,8 +200,9 @@ pub struct Emulator {
     /// unread byte). The terminal-input channel of a workspace projection (CC-11).
     console_in: Vec<u8>,
     in_cursor: usize,
-    /// Control and status registers (Zicsr) — a flat file; the privileged
-    /// semantics (WARL fields, read-only CSRs) are a later conformance step.
+    /// Control and status registers (Zicsr) — a flat backing store; the WARL and
+    /// read-only semantics (`mstatus.UXL`/`SXL`, `misa`, the debug triggers, …)
+    /// are enforced at the `csr_read`/`csr_write` boundary.
     csrs: BTreeMap<u32, u64>,
     /// The LR/SC reservation address (A extension, single hart).
     reservation: Option<u64>,
