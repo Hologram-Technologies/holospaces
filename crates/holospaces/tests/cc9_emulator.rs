@@ -10,7 +10,9 @@
 //!   produces console output byte-identical to `qemu-system-riscv64` on the same
 //!   image — the differential oracle (CC-9's end state);
 //! * it runs **as a real hologram Wasm container codemodule** on the substrate
-//!   runtime, with its disk as a `CC-7` κ-disk and a reproducible κ snapshot.
+//!   runtime, with its disk as a `CC-7` κ-disk and a reproducible κ snapshot —
+//!   and a real Linux kernel boots **through that codemodule** on the runtime,
+//!   its image delivered as κ content (ADR-009 fully realized).
 
 use std::path::{Path, PathBuf};
 
@@ -291,6 +293,128 @@ fn the_emulator_codemodule_runs_on_the_real_hologram_runtime() {
         // (deterministic emulation ⇒ content-addressed state, Law L1).
         let (_, snap_b) = snapshot(()).await;
         assert_eq!(snap_a, snap_b, "same run ⇒ same container κ snapshot (L1)");
+    });
+}
+
+/// **A real Linux kernel boots *through the codemodule* on the substrate.** This
+/// is ADR-009 fully realized: the emulator runs as a κ-addressed Wasm container
+/// on the real hologram runtime, and an arbitrary operating system boots over it
+/// — the kernel image delivered as *content* (read back by κ with `storage_get`,
+/// Laws L1/L4), not as a located file.
+///
+/// The host hands the container a small **boot descriptor** as its initial state
+/// (`b"HGOS"` + the kernel-image κ + the device-tree κ); the codemodule reads the
+/// kernel and DTB out of the substrate, becomes the SBI firmware, and boots Linux
+/// to userspace, emitting `[exit_code][console]` via `storage_put`. That record
+/// must be **byte-identical to the one the emulator core produces** (computed
+/// here as the oracle — and the core's output already matches `qemu-system-riscv64`,
+/// the `the_emulator_boots_real_linux_to_userspace` witness), so the container κ
+/// of the result is the same content address. A second run yields the same
+/// snapshot κ — the OS boot on the substrate is deterministic (Law L1).
+///
+/// Ignored by default (boots Linux twice, ~40 s, release only); the CC-9 suite
+/// runs it. `cargo test --release -p holospaces --test cc9_emulator
+/// the_codemodule_boots_real_linux -- --ignored --nocapture`.
+#[test]
+#[ignore = "boots a real Linux kernel through the wasm codemodule on the runtime (~40s; release) — run by the CC-9 vv suite"]
+fn the_codemodule_boots_real_linux_on_the_substrate() {
+    use std::io::Read;
+
+    let dir = artifact_dir().join("linux");
+    let gz = std::fs::read(dir.join("Image.gz")).expect("Image.gz");
+    let mut kernel = Vec::new();
+    flate2::read::GzDecoder::new(&gz[..])
+        .read_to_end(&mut kernel)
+        .expect("gunzip the kernel Image");
+    let dtb = std::fs::read(dir.join("holospaces.dtb")).expect("holospaces.dtb");
+
+    let base = 0x8000_0000u64;
+    let dtb_addr = base + 0x0700_0000;
+
+    // The oracle: boot the emulator core directly to get the canonical run record.
+    let mut core = Emulator::new(base, 128 * 1024 * 1024);
+    core.boot_kernel(&kernel, &dtb, dtb_addr)
+        .expect("core boot");
+    let halt = loop {
+        match core.run(10_000_000) {
+            Halt::OutOfBudget => {}
+            other => break other,
+        }
+    };
+    assert_eq!(
+        halt,
+        Halt::Exit(0),
+        "the core boots Linux to a clean poweroff"
+    );
+    let mut expected_record = match halt {
+        Halt::Exit(c) => c,
+        _ => u64::MAX,
+    }
+    .to_le_bytes()
+    .to_vec();
+    expected_record.extend_from_slice(core.console());
+    let expected_k = address(&expected_record);
+
+    pollster::block_on(async {
+        let wasm = std::fs::read(artifact_dir().join("emulator.wasm"))
+            .expect("emulator codemodule (run scripts/build-emulator.sh)");
+        surface::validate_userland(&wasm).expect("emulator is a valid codemodule");
+
+        let boot = || async {
+            let store = MemKappaStore::new();
+            let code = store.put("blake3", &wasm).unwrap();
+            let kernel_k = store.put("blake3", &kernel).unwrap();
+            let dtb_k = store.put("blake3", &dtb).unwrap();
+
+            // The boot descriptor delivered as the container's initial state.
+            let mut desc = Vec::with_capacity(4 + 71 + 71);
+            desc.extend_from_slice(b"HGOS");
+            desc.extend_from_slice(kernel_k.as_bytes());
+            desc.extend_from_slice(dtb_k.as_bytes());
+            let init = store.put("blake3", &desc).unwrap();
+
+            let manifest = ContainerManifest {
+                code,
+                initial_state: init,
+                parameters: empty_kappa(),
+            };
+            let cid = store.put("blake3", &manifest.canonicalize()).unwrap();
+            // The container reads the kernel + DTB by κ — they are its read-closure
+            // roots; CPU + memory unbounded for a full boot (a real devcontainer's
+            // budget). The emitted record is within a small storage quota.
+            let caps = Capabilities {
+                storage_roots: vec![kernel_k, dtb_k],
+                storage_quota_bytes: 1 << 20,
+                network_fetch: false,
+                network_announce: false,
+                publish_channels: Vec::new(),
+                subscribe_channels: Vec::new(),
+                memory_max_bytes: 0,
+                cpu_time_per_event_ms: 0,
+                priority_weight: 0,
+            };
+            let ck = store
+                .put("blake3", &CapabilitySet::new(caps).canonicalize())
+                .unwrap();
+
+            let rt = Runtime::new(WasmtimeEngine::new(), store);
+            let handle = rt.spawn(&cid, &ck).await.expect("spawn the OS container");
+            let present = rt.store().contains(&expected_k);
+            let snap = rt.suspend(handle).await.expect("suspend → κ snapshot");
+            (present, snap)
+        };
+
+        let (present, snap_a) = boot().await;
+        assert!(
+            present,
+            "the codemodule booted Linux on the substrate and emitted the same \
+             record the core produces (which matches qemu-system-riscv64)"
+        );
+        let (_, snap_b) = boot().await;
+        assert_eq!(
+            snap_a, snap_b,
+            "deterministic OS boot on the substrate ⇒ reproducible container κ (L1)"
+        );
     });
 }
 
