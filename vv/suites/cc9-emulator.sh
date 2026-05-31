@@ -33,6 +33,14 @@ cargo test --release --manifest-path "$ROOT/Cargo.toml" -p holospaces \
     --test cc9_emulator the_emulator_boots_real_linux_to_userspace \
     -- --ignored --nocapture || exit 1
 
+# The substrate witness: the same Linux kernel boots *through* the emulator
+# codemodule on the real hologram runtime (image delivered as κ content via
+# storage_get), emitting a record byte-identical to the core. Boots Linux twice
+# (~90 s); the flagship CC-9 witness — ADR-009 fully realized.
+cargo test --release --manifest-path "$ROOT/Cargo.toml" -p holospaces \
+    --test cc9_emulator the_codemodule_boots_real_linux_on_the_substrate \
+    -- --ignored --nocapture || exit 1
+
 # The differential oracle, when the reference implementation is available: the
 # same pinned Image must boot identically on qemu-system-riscv64. The emulator
 # witness already asserts the userspace output equals expected-userspace.txt
