@@ -23,9 +23,12 @@
 //! bits and U/SUM/MXR permissions), and **interrupts** (the CLINT memory-mapped
 //! timer, `mip`/`mie` with `mideleg`, vectored `mtvec`) — so the official
 //! machine- and supervisor-mode tests (including supervisor paging) run
-//! unmodified, and a kernel receives its scheduler tick. A flat
-//! program may instead use the `ecall` host boundary (console `write` / `exit`)
-//! when it installs no trap vector.
+//! unmodified, and a kernel receives its scheduler tick. In firmware mode
+//! ([`Emulator::enable_sbi`]) the emulator is the M-mode SEE: it services a
+//! supervisor's **SBI** calls (the RISC-V SBI specification — console, timer,
+//! system reset) so a real S-mode OS kernel boots over it. A flat program may
+//! instead use the `ecall` host boundary (console `write` / `exit`) when it
+//! installs no trap vector.
 
 use alloc::collections::BTreeMap;
 #[cfg(not(feature = "std"))]
@@ -172,6 +175,10 @@ pub struct Emulator {
     mtime: u64,
     mtimecmp: u64,
     msip: bool,
+    /// When set, the emulator acts as the M-mode firmware (SEE): a supervisor
+    /// `ecall` is serviced as an SBI call (console / timer / shutdown) rather
+    /// than trapping — the boot mode a real S-mode kernel runs under.
+    provide_sbi: bool,
 }
 
 /// The CLINT memory-mapped region (one hart): `msip` at +0, `mtimecmp` at
@@ -198,7 +205,15 @@ impl Emulator {
             mtime: 0,
             mtimecmp: 0,
             msip: false,
+            provide_sbi: false,
         }
+    }
+
+    /// Run the emulator as the M-mode firmware (SEE), servicing supervisor SBI
+    /// calls (console / timer / shutdown) — the mode a real S-mode OS kernel
+    /// boots under (the conformance tests run with this off).
+    pub fn enable_sbi(&mut self) {
+        self.provide_sbi = true;
     }
 
     /// Set the HTIF `tohost` address — a store there ends the run with an exit
@@ -436,11 +451,18 @@ impl Emulator {
     fn tick(&mut self) {
         self.mtime = self.mtime.wrapping_add(1);
         let mut mip = self.raw_csr(csr::MIP);
-        // Machine timer interrupt: pending while mtime >= mtimecmp (armed).
-        if self.mtimecmp != 0 && self.mtime >= self.mtimecmp {
-            mip |= 1 << csr::MTIP;
+        // The timer interrupt: in firmware (SBI) mode the SEE delivers it to the
+        // supervisor (STIP) — what an S-mode kernel handles; otherwise it is the
+        // machine timer (MTIP), as the conformance tests expect.
+        let timer_bit = if self.provide_sbi {
+            csr::STIP
         } else {
-            mip &= !(1 << csr::MTIP);
+            csr::MTIP
+        };
+        if self.mtimecmp != 0 && self.mtime >= self.mtimecmp {
+            mip |= 1 << timer_bit;
+        } else {
+            mip &= !(1 << timer_bit);
         }
         // Machine software interrupt latch.
         if self.msip {
@@ -954,6 +976,11 @@ impl Emulator {
 
     /// The `ecall` boundary: a tiny Linux syscall surface (write / exit).
     fn ecall(&mut self) -> Result<(), Halt> {
+        // In firmware (SBI) mode, a supervisor `ecall` is an SBI call serviced by
+        // the emulator-as-SEE and returns to S-mode (the kernel boot path).
+        if self.provide_sbi && self.priv_level == PRIV_S {
+            return self.sbi_call();
+        }
         // If the guest installed a machine-mode trap vector, `ecall` is a real
         // trap into its handler (a kernel / the riscv-tests environment): cause
         // 8/9/11 by the originating privilege. Otherwise it is the host syscall
@@ -985,6 +1012,77 @@ impl Emulator {
             }
             other => Err(Halt::Trap(Trap::UnknownSyscall(other))),
         }
+    }
+
+    /// Service a Supervisor Binary Interface (SBI) call from the S-mode kernel
+    /// (the RISC-V SBI specification). `a7` is the extension ID, `a6` the
+    /// function ID, `a0..a5` the arguments; the call returns in `a0` (error) and
+    /// `a1` (value), and execution resumes after the `ecall` in S-mode. The
+    /// console, timer, and shutdown services a minimal kernel needs are provided.
+    fn sbi_call(&mut self) -> Result<(), Halt> {
+        let (eid, fid) = (self.rd(17), self.rd(16));
+        let (a0, a1, a2) = (self.rd(10), self.rd(11), self.rd(12));
+        let mut err: u64 = 0; // SBI_SUCCESS
+        let mut val: u64 = 0;
+        match eid {
+            // ── Legacy extensions (return only in a0) ──
+            0x01 => self.console.push(a0 as u8), // console_putchar
+            0x02 => err = u64::MAX,              // console_getchar — no input
+            0x00 => self.set_timer(a0),          // set_timer
+            0x08 => return Err(Halt::Exit(0)),   // shutdown
+            // ── Base extension (probe / identity) ──
+            0x10 => match fid {
+                0 => val = 0x0200_0000,                       // spec version 2.0
+                3 => val = u64::from(self.sbi_supported(a0)), // probe_extension
+                _ => {}                                       // impl id / mvendorid / … → 0
+            },
+            // ── TIME extension ──
+            0x5449_4d45 => {
+                if fid == 0 {
+                    self.set_timer(a0);
+                }
+            }
+            // ── Debug console (DBCN) ──
+            0x4442_434e => match fid {
+                0 => {
+                    // console_write(num_bytes=a0, base_lo=a1, base_hi=a2)
+                    let base = a1 | (a2 << 32);
+                    for i in 0..a0 {
+                        if let Ok(b) = self.load(base.wrapping_add(i), 1, Access::Load) {
+                            self.console.push(b as u8);
+                        }
+                    }
+                    val = a0;
+                }
+                2 => self.console.push(a0 as u8), // console_write_byte
+                _ => {}
+            },
+            // ── System reset ──
+            0x5352_5354 => return Err(Halt::Exit(0)),
+            // ── IPI / RFENCE / HSM (single hart): acknowledge success ──
+            0x0073_5049 | 0x5246_4e43 | 0x4853_4d00..=0x4853_4dff => {}
+            _ => err = (-2_i64) as u64, // ERR_NOT_SUPPORTED
+        }
+        self.wr(10, err);
+        self.wr(11, val);
+        self.hart.pc = self.hart.pc.wrapping_add(4);
+        Ok(())
+    }
+
+    /// SBI timer: program `mtimecmp` and clear the pending supervisor timer
+    /// interrupt (the kernel re-arms it each tick).
+    fn set_timer(&mut self, when: u64) {
+        self.mtimecmp = when;
+        let mip = self.raw_csr(csr::MIP) & !(1 << csr::STIP);
+        self.csrs.insert(csr::MIP, mip);
+    }
+
+    /// Whether an SBI extension ID is provided (for `probe_extension`).
+    fn sbi_supported(&self, eid: u64) -> bool {
+        matches!(
+            eid,
+            0x00 | 0x01 | 0x02 | 0x08 | 0x10 | 0x5449_4d45 | 0x4442_434e | 0x5352_5354
+        )
     }
 }
 

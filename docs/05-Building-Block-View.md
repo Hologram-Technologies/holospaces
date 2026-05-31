@@ -69,14 +69,16 @@ which boots it through hologram’s `ContainerRuntime` over the peer’s
 browser and on bare-metal.
 
 **System Emulator** — for a general operating system, the execution
-codemodule (ADR-009): an existing system emulator adapted to the host
-ABI (reuse over reimplementation). A *κ-disk* (a `KappaStore`-backed
-block device — the OS image and repository as κ-addressed blocks) is its
-storage; its console / input / network are bound to hologram channels;
-its running state is a κ snapshot. It is itself a κ-addressed code
-module satisfying the Execution Surface — imported and verified
-trustlessly (`get_with_fetch`). It computes an arbitrary OS image;
-holospaces starts with Linux.
+codemodule (ADR-009): a real RISC-V machine (RV64IMAC + Zicsr,
+machine/supervisor traps, Sv39 paging, CLINT interrupts, SBI) bound to
+the host ABI and verified against the official riscv-tests conformance
+suite (`CC-9`). A *κ-disk* (a `KappaStore`-backed block device — the OS
+image and repository as κ-addressed blocks) is its storage; its console
+/ input / network are bound to hologram channels; its running state is a
+κ snapshot. It is itself a κ-addressed code module satisfying the
+Execution Surface — imported and verified trustlessly
+(`get_with_fetch`). It computes an arbitrary OS image; holospaces starts
+with Linux.
 
 **Identity** — a *Key store* (the self-sovereign sign-in key) and a
 *Sync binding* (scopes which content an operator’s instances announce

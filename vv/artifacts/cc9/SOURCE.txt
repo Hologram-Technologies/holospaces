@@ -39,3 +39,9 @@ CLINT memory map as the authority), assembled by riscv64-unknown-elf-gcc
 the machine timer interrupt, spins; the emulator raises the timer interrupt
 (cause = interrupt|7) into the handler, which verifies mcause and signals pass
 over HTIF. tohost in tint.manifest. Witness: tests/cc9_emulator.rs.
+
+sbi.S / sbi.bin — an SBI firmware-interface test (the RISC-V SBI specification as
+the authority), assembled by riscv64-unknown-elf-gcc (-march=rv64imac_zicsr).
+Drops to supervisor mode via mret, then uses SBI ecalls — console putchar
+("OK\n") and system reset — which the emulator-as-SEE (enable_sbi) services.
+Witness: tests/cc9_emulator.rs::the_emulator_services_sbi_console_and_shutdown.

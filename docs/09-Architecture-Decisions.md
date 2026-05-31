@@ -177,9 +177,18 @@ generalizes to any OS the emulator boots. This **extends** the execution
 surface of ADR-008 (a κ-addressed Wasm code module over the host ABI —
 the Execution Surface building block, `CC-6` — which still stands) from
 "recompiled userlands only" to "arbitrary OS images via emulation"; the
-emulator is itself such a κ-addressed code module. The emulator is an
-existing Wasm system emulator adapted to the host ABI (reuse over
-reimplementation), not written from scratch.
+emulator is itself such a κ-addressed code module. The emulator core is
+a real RISC-V machine (RV64IMAC + Zicsr, machine/supervisor traps, Sv39
+paging, CLINT interrupts, SBI) bound directly to the `hologram` host ABI
+and **verified against the official
+[riscv-tests](https://github.com/riscv-software-src/riscv-tests)
+conformance suite** — the same authority real hardware and QEMU are
+validated against. It is a clean-room core rather than an adapted
+off-the-shelf emulator because existing Wasm system emulators bind WASI
+or a browser host surface, which the substrate’s closed host ABI refuses
+(`CC-5`, Law L1); binding the ISA emulator directly to `hologram` is the
+uor-native realization, with the official ISA suite as its external
+oracle (`CC-9`).
 
 **Consequences:** Identity stays content, never location — the OS image
 is a κ, not a registry reference (L1); the image dedupes and verifies
