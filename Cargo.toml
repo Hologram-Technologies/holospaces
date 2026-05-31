@@ -44,6 +44,10 @@ prism                   = { version = "0.4", package = "uor-prism" }
 # κ-disk's in-memory sector index — versions matched to hologram's own.
 async-trait             = "0.1"
 spin                    = { version = "0.9", default-features = false, features = ["spin_mutex"] }
+# The no_std IEEE-754 float foundation hologram's CPU float kernels (mathf) are
+# built on — used by the emulator's F/D extension for deterministic, reproducible
+# floating point across peers. Same version hologram uses.
+libm                    = "0.2"
 
 # Quality commitments enforced from the beginning (arc42 ch.10). CI runs clippy
 # with `-D warnings`, so every workspace member upholds these.

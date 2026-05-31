@@ -200,6 +200,7 @@ dependencies = [
  "hologram-bare-hal",
  "hologram-realizations",
  "hologram-substrate-core",
+ "libm",
  "spin",
 ]
 

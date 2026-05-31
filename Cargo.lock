@@ -998,6 +998,7 @@ dependencies = [
  "hologram-substrate-core",
  "hologram-substrate-tck",
  "jsonschema",
+ "libm",
  "pollster",
  "serde_json",
  "sha2",
