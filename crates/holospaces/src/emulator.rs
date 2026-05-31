@@ -1,4 +1,4 @@
-//! **System emulator** — a real RISC-V (RV64IMA + Zicsr) machine, the core of
+//! **System emulator** — a real RISC-V (RV64IMAC + Zicsr) machine, the core of
 //! the arbitrary-OS execution surface (ADR-009, arc42 chapter 9).
 //!
 //! holospaces hosts *arbitrary* operating systems by running a real system
@@ -16,11 +16,11 @@
 //! https://github.com/riscv-software-src/riscv-tests[riscv-tests] conformance
 //! suite** — the same suite real hardware and QEMU are validated against. It
 //! implements the base integer set, integer multiply/divide (M), atomics (A),
-//! the control/status registers (Zicsr), and machine-mode trap handling
-//! (`ecall`→`mtvec`, `mcause`/`mepc`/`mstatus`, `mret`) — so the official tests'
-//! own machine-mode environment runs unmodified. A flat program may instead use
-//! the `ecall` host boundary (console `write` / `exit`) when it installs no trap
-//! vector.
+//! the compressed encoding (C), the control/status registers (Zicsr), and
+//! machine-mode trap handling (`ecall`→`mtvec`, `mcause`/`mepc`/`mstatus`,
+//! `mret`) — so the official tests' own machine-mode environment runs
+//! unmodified. A flat program may instead use the `ecall` host boundary (console
+//! `write` / `exit`) when it installs no trap vector.
 
 use alloc::collections::BTreeMap;
 #[cfg(not(feature = "std"))]
@@ -272,15 +272,26 @@ impl Emulator {
     /// Execute one instruction. `Ok(())` advances; `Err(Halt)` stops.
     fn step(&mut self) -> Result<(), Halt> {
         let pc = self.hart.pc;
-        let inst = self.load(pc, 4).map_err(Halt::Trap)? as u32;
-        // (RV64I is fixed 32-bit; the C extension is a later conformance step.)
+        // Fetch: a 16-bit parcel whose low two bits are `11` is the start of a
+        // 32-bit instruction; otherwise it is a compressed (C extension)
+        // instruction, expanded to its 32-bit equivalent (RISC-V ISA §16).
+        let parcel = self.load(pc, 2).map_err(Halt::Trap)? as u16;
+        let (inst, ilen) = if parcel & 3 == 3 {
+            (self.load(pc, 4).map_err(Halt::Trap)? as u32, 4u64)
+        } else {
+            (
+                expand_rvc(parcel)
+                    .ok_or(Halt::Trap(Trap::IllegalInstruction(u32::from(parcel))))?,
+                2,
+            )
+        };
         let opcode = inst & 0x7f;
         let rd = (inst >> 7) & 0x1f;
         let rs1 = (inst >> 15) & 0x1f;
         let rs2 = (inst >> 20) & 0x1f;
         let funct3 = (inst >> 12) & 0x7;
         let funct7 = (inst >> 25) & 0x7f;
-        let mut next = pc.wrapping_add(4);
+        let mut next = pc.wrapping_add(ilen);
 
         match opcode {
             0x37 => self.wr(rd, sext(u_imm(inst), 32)), // LUI
@@ -599,6 +610,226 @@ impl Emulator {
             }
             other => Err(Halt::Trap(Trap::UnknownSyscall(other))),
         }
+    }
+}
+
+// ── compressed instructions (RISC-V ISA §16) — expand a 16-bit parcel to its
+//    32-bit equivalent, which the base decoder then executes ──
+
+/// Sign-extend the low `bits` of `v` to a 32-bit value.
+fn se(v: u32, bits: u32) -> i32 {
+    let shift = 32 - bits;
+    ((v << shift) as i32) >> shift
+}
+
+// 32-bit instruction-word builders (the base encodings the decoder reads back).
+fn i_(imm: i32, rs1: u32, f3: u32, rd: u32, op: u32) -> u32 {
+    ((imm as u32 & 0xfff) << 20) | (rs1 << 15) | (f3 << 12) | (rd << 7) | op
+}
+fn r_(f7: u32, rs2: u32, rs1: u32, f3: u32, rd: u32, op: u32) -> u32 {
+    (f7 << 25) | (rs2 << 20) | (rs1 << 15) | (f3 << 12) | (rd << 7) | op
+}
+fn s_(imm: i32, rs2: u32, rs1: u32, f3: u32, op: u32) -> u32 {
+    let i = imm as u32 & 0xfff;
+    ((i >> 5) << 25) | (rs2 << 20) | (rs1 << 15) | (f3 << 12) | ((i & 0x1f) << 7) | op
+}
+fn b_(imm: i32, rs2: u32, rs1: u32, f3: u32, op: u32) -> u32 {
+    let i = imm as u32;
+    (((i >> 12) & 1) << 31)
+        | (((i >> 5) & 0x3f) << 25)
+        | (rs2 << 20)
+        | (rs1 << 15)
+        | (f3 << 12)
+        | (((i >> 1) & 0xf) << 8)
+        | (((i >> 11) & 1) << 7)
+        | op
+}
+fn j_(imm: i32, rd: u32, op: u32) -> u32 {
+    let i = imm as u32;
+    (((i >> 20) & 1) << 31)
+        | (((i >> 1) & 0x3ff) << 21)
+        | (((i >> 11) & 1) << 20)
+        | (((i >> 12) & 0xff) << 12)
+        | (rd << 7)
+        | op
+}
+
+/// Expand a compressed (RVC) parcel to its 32-bit equivalent, or `None` if it is
+/// reserved / a float form this core does not implement.
+fn expand_rvc(half: u16) -> Option<u32> {
+    let h = u32::from(half);
+    let funct3 = (h >> 13) & 7;
+    let rd = (h >> 7) & 0x1f; // also rs1 (CR/CI)
+    let rs2 = (h >> 2) & 0x1f; // CR/CSS
+    let rdp = ((h >> 7) & 7) + 8; // rd'/rs1'
+    let rs2p = ((h >> 2) & 7) + 8; // rs2'
+    match (h & 3, funct3) {
+        // ── Quadrant 0 ──
+        (0, 0) => {
+            // C.ADDI4SPN → addi rd', x2, nzuimm
+            let imm = (((h >> 7) & 0xf) << 6)
+                | (((h >> 11) & 3) << 4)
+                | (((h >> 5) & 1) << 3)
+                | (((h >> 6) & 1) << 2);
+            (imm != 0).then(|| i_(imm as i32, 2, 0, rs2p, 0x13))
+        }
+        (0, 2) => {
+            // C.LW → lw rd', off(rs1')
+            let off = (((h >> 10) & 7) << 3) | (((h >> 6) & 1) << 2) | (((h >> 5) & 1) << 6);
+            Some(i_(off as i32, rdp, 2, rs2p, 0x03))
+        }
+        (0, 3) => {
+            // C.LD → ld rd', off(rs1')
+            let off = (((h >> 10) & 7) << 3) | (((h >> 5) & 3) << 6);
+            Some(i_(off as i32, rdp, 3, rs2p, 0x03))
+        }
+        (0, 6) => {
+            // C.SW → sw rs2', off(rs1')
+            let off = (((h >> 10) & 7) << 3) | (((h >> 6) & 1) << 2) | (((h >> 5) & 1) << 6);
+            Some(s_(off as i32, rs2p, rdp, 2, 0x23))
+        }
+        (0, 7) => {
+            // C.SD → sd rs2', off(rs1')
+            let off = (((h >> 10) & 7) << 3) | (((h >> 5) & 3) << 6);
+            Some(s_(off as i32, rs2p, rdp, 3, 0x23))
+        }
+        // ── Quadrant 1 ──
+        (1, 0) => {
+            // C.ADDI (rd==0 ⇒ C.NOP) → addi rd, rd, imm
+            let imm = se((((h >> 12) & 1) << 5) | ((h >> 2) & 0x1f), 6);
+            Some(i_(imm, rd, 0, rd, 0x13))
+        }
+        (1, 1) => {
+            // C.ADDIW → addiw rd, rd, imm (rd != 0)
+            let imm = se((((h >> 12) & 1) << 5) | ((h >> 2) & 0x1f), 6);
+            (rd != 0).then(|| i_(imm, rd, 0, rd, 0x1b))
+        }
+        (1, 2) => {
+            // C.LI → addi rd, x0, imm
+            let imm = se((((h >> 12) & 1) << 5) | ((h >> 2) & 0x1f), 6);
+            Some(i_(imm, 0, 0, rd, 0x13))
+        }
+        (1, 3) if rd == 2 => {
+            // C.ADDI16SP → addi x2, x2, nzimm
+            let imm = se(
+                (((h >> 12) & 1) << 9)
+                    | (((h >> 3) & 3) << 7)
+                    | (((h >> 5) & 1) << 6)
+                    | (((h >> 2) & 1) << 5)
+                    | (((h >> 6) & 1) << 4),
+                10,
+            );
+            (imm != 0).then(|| i_(imm, 2, 0, 2, 0x13))
+        }
+        (1, 3) => {
+            // C.LUI → lui rd, nzimm
+            let imm = se((((h >> 12) & 1) << 17) | (((h >> 2) & 0x1f) << 12), 18);
+            (imm != 0 && rd != 0).then_some((imm as u32 & 0xffff_f000) | (rd << 7) | 0x37)
+        }
+        (1, 4) => {
+            // MISC-ALU on rd'
+            let funct2 = (h >> 10) & 3;
+            match funct2 {
+                0 => {
+                    // C.SRLI
+                    let shamt = (((h >> 12) & 1) << 5) | ((h >> 2) & 0x1f);
+                    Some(i_(shamt as i32, rdp, 5, rdp, 0x13))
+                }
+                1 => {
+                    // C.SRAI (funct7 0x20)
+                    let shamt = (((h >> 12) & 1) << 5) | ((h >> 2) & 0x1f);
+                    Some(i_((0x400 | shamt) as i32, rdp, 5, rdp, 0x13))
+                }
+                2 => {
+                    // C.ANDI
+                    let imm = se((((h >> 12) & 1) << 5) | ((h >> 2) & 0x1f), 6);
+                    Some(i_(imm, rdp, 7, rdp, 0x13))
+                }
+                _ => {
+                    // register-register
+                    let bit12 = (h >> 12) & 1;
+                    match (bit12, (h >> 5) & 3) {
+                        (0, 0) => Some(r_(0x20, rs2p, rdp, 0, rdp, 0x33)), // C.SUB
+                        (0, 1) => Some(r_(0, rs2p, rdp, 4, rdp, 0x33)),    // C.XOR
+                        (0, 2) => Some(r_(0, rs2p, rdp, 6, rdp, 0x33)),    // C.OR
+                        (0, 3) => Some(r_(0, rs2p, rdp, 7, rdp, 0x33)),    // C.AND
+                        (1, 0) => Some(r_(0x20, rs2p, rdp, 0, rdp, 0x3b)), // C.SUBW
+                        (1, 1) => Some(r_(0, rs2p, rdp, 0, rdp, 0x3b)),    // C.ADDW
+                        _ => None,
+                    }
+                }
+            }
+        }
+        (1, 5) => {
+            // C.J → jal x0, off
+            let off = se(
+                (((h >> 12) & 1) << 11)
+                    | (((h >> 11) & 1) << 4)
+                    | (((h >> 9) & 3) << 8)
+                    | (((h >> 8) & 1) << 10)
+                    | (((h >> 7) & 1) << 6)
+                    | (((h >> 6) & 1) << 7)
+                    | (((h >> 3) & 7) << 1)
+                    | (((h >> 2) & 1) << 5),
+                12,
+            );
+            Some(j_(off, 0, 0x6f))
+        }
+        (1, 6) | (1, 7) => {
+            // C.BEQZ / C.BNEZ → beq/bne rs1', x0, off
+            let off = se(
+                (((h >> 12) & 1) << 8)
+                    | (((h >> 10) & 3) << 3)
+                    | (((h >> 5) & 3) << 6)
+                    | (((h >> 3) & 3) << 1)
+                    | (((h >> 2) & 1) << 5),
+                9,
+            );
+            let f3 = if funct3 == 6 { 0 } else { 1 };
+            Some(b_(off, 0, rdp, f3, 0x63))
+        }
+        // ── Quadrant 2 ──
+        (2, 0) => {
+            // C.SLLI → slli rd, rd, shamt
+            let shamt = (((h >> 12) & 1) << 5) | ((h >> 2) & 0x1f);
+            Some(i_(shamt as i32, rd, 1, rd, 0x13))
+        }
+        (2, 2) => {
+            // C.LWSP → lw rd, off(x2)
+            let off = (((h >> 12) & 1) << 5) | (((h >> 4) & 7) << 2) | (((h >> 2) & 3) << 6);
+            (rd != 0).then(|| i_(off as i32, 2, 2, rd, 0x03))
+        }
+        (2, 3) => {
+            // C.LDSP → ld rd, off(x2)
+            let off = (((h >> 12) & 1) << 5) | (((h >> 5) & 3) << 3) | (((h >> 2) & 7) << 6);
+            (rd != 0).then(|| i_(off as i32, 2, 3, rd, 0x03))
+        }
+        (2, 4) => {
+            if (h >> 12) & 1 == 0 {
+                if rs2 == 0 {
+                    (rd != 0).then(|| i_(0, rd, 0, 0, 0x67)) // C.JR
+                } else {
+                    Some(r_(0, rs2, 0, 0, rd, 0x33)) // C.MV
+                }
+            } else if rd == 0 && rs2 == 0 {
+                Some(0x0010_0073) // C.EBREAK
+            } else if rs2 == 0 {
+                Some(i_(0, rd, 0, 1, 0x67)) // C.JALR
+            } else {
+                Some(r_(0, rs2, rd, 0, rd, 0x33)) // C.ADD
+            }
+        }
+        (2, 6) => {
+            // C.SWSP → sw rs2, off(x2)
+            let off = (((h >> 9) & 0xf) << 2) | (((h >> 7) & 3) << 6);
+            Some(s_(off as i32, rs2, 2, 2, 0x23))
+        }
+        (2, 7) => {
+            // C.SDSP → sd rs2, off(x2)
+            let off = (((h >> 10) & 7) << 3) | (((h >> 7) & 7) << 6);
+            Some(s_(off as i32, rs2, 2, 3, 0x23))
+        }
+        _ => None,
     }
 }
 

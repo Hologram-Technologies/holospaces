@@ -22,6 +22,6 @@ test size):
     # tohost = nm <name> | awk '$3=="tohost"'  -> manifest.txt
   done
 
-Coverage: rv64ui (base integer), rv64um (multiply/divide), rv64ua (atomics) —
+Coverage: rv64ui (base integer), rv64um (multiply/divide), rv64ua (atomics), rv64uc (compressed) —
 86 tests. Witness: tests/cc9_emulator.rs
 (the_emulator_passes_the_official_riscv_tests).
