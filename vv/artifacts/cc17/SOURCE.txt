@@ -29,8 +29,15 @@ Witness — crates/holospaces-web/web/vscode-workbench-test.mjs (Chromium via
 
 Phase status (this row is staged; ADR-012/015):
   Phase 1 (DONE/witnessed) — the real workbench loads κ-verified in the tab.
-  Phase 2 — the editor's FileSystemProvider over the virtio-9p workspace (CC-15)
-    + the terminal over the console (CC-11). The extension host is per-peer
+  Phase 2 FOUNDATION (DONE/witnessed) — the editor-side filesystem over the
+    shared workspace: holospaces' list/write/read API over the virtio-9p
+    workspace (CC-15), content-addressed, with a file the editor writes read by
+    the real OS over 9p (one content, Law L1). Witness
+    crates/holospaces/tests/cc17_workspace_fs.rs; exposed on the wasm peer as
+    Workspace.ws_list/ws_read/ws_write for the workbench's FileSystemProvider.
+  Phase 2 (remaining) — the browser wiring: a service worker bridging the
+    workbench's web-extension FileSystemProvider to those wasm-peer methods, and
+    the terminal over the console (CC-11). The extension host is per-peer
     (ADR-015 feasibility refinement): the BROWSER peer uses the vscode.dev "web"
     model (a FileSystemProvider web extension whose fetches a service worker
     serves from the wasm peer's 9p workspace), because its emulated OS does not

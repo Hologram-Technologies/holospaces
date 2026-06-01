@@ -601,4 +601,44 @@ impl Workspace {
             None => Ok(None),
         }
     }
+
+    // ── the workbench's filesystem: the shared virtio-9p workspace (CC-15/CC-17) ──
+    //
+    // The real VS Code web workbench (CC-17) edits the holospace's files through a
+    // `FileSystemProvider`. Per ADR-012/015 that provider is the running
+    // holospace's `virtio-9p` workspace — the κ-addressed content the editor and
+    // the OS *share* (Law L1), not a separate store. A service worker bridges the
+    // workbench's web-extension provider to these methods on the wasm peer, so the
+    // editor reads and writes the *same content* the devcontainer OS sees.
+
+    /// The shared workspace's directory listing — a JSON array of
+    /// `{ name, dir, size }` over the running holospace's `virtio-9p` workspace
+    /// (the workbench `FileSystemProvider.readDirectory`).
+    #[must_use]
+    pub fn ws_list(&self) -> String {
+        let entries: Vec<serde_json::Value> = self
+            .machine
+            .workspace_list()
+            .into_iter()
+            .map(|(name, dir, size)| serde_json::json!({ "name": name, "dir": dir, "size": size }))
+            .collect();
+        serde_json::Value::Array(entries).to_string()
+    }
+
+    /// Read a file from the shared workspace (the workbench
+    /// `FileSystemProvider.readFile`) — the same content the OS reads over
+    /// `virtio-9p`. `undefined` if absent.
+    #[must_use]
+    pub fn ws_read(&self, name: &str) -> Option<Vec<u8>> {
+        self.machine.workspace_file(name).map(<[u8]>::to_vec)
+    }
+
+    /// Write a file into the shared workspace (the workbench
+    /// `FileSystemProvider.writeFile`) — the editor saving the *same content* the
+    /// OS reads over `virtio-9p` (one content, Law L1). Returns the content's κ
+    /// (its identity, Law L1/L2).
+    pub fn ws_write(&mut self, name: &str, content: &[u8]) -> String {
+        self.machine.workspace_write(name, content);
+        address(content).as_str().to_owned()
+    }
 }
