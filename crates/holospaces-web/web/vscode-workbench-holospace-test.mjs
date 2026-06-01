@@ -38,7 +38,15 @@ const ROOT = path.resolve(DIR, "../../..");
 const distDir = path.join(DIR, "node_modules/vscode-web/dist");
 const extDir = path.join(DIR, "builtin-extensions/holospace-fs");
 const cc14 = path.join(ROOT, "vv/artifacts/cc14");
-const cc14Layer = "a5d38ca0c6059f07fa4cd14937697b61b93696a766dad68c1a2a7b5c54df8e01";
+// Derive the devcontainer layer digest from the OCI image (never hardcode it —
+// it would drift from the artifact). index.json → manifest → layers[0].digest.
+async function ociLayerDigest(imageDir) {
+  const blob = async (d) => JSON.parse(await readFile(path.join(imageDir, "blobs/sha256", d.split(":")[1]), "utf8"));
+  const index = JSON.parse(await readFile(path.join(imageDir, "index.json"), "utf8"));
+  const manifest = await blob(index.manifests[0].digest);
+  return manifest.layers[0].digest.split(":")[1];
+}
+const cc14Layer = await ociLayerDigest(path.join(cc14, "image"));
 
 let failed = false;
 const check = (c, m) => (c ? console.log("  ✓", m) : ((failed = true), console.error("HOLOSPACE-WORKBENCH: FAIL —", m)));
