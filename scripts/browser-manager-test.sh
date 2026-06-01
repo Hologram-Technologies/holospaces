@@ -28,6 +28,13 @@ cp "$ROOT/vv/artifacts/cc11/Image.gz" "$CRATE/web/workspace-kernel.gz"
 cp "$ROOT/vv/artifacts/cc9/linux/holospaces.dtb" "$CRATE/web/workspace.dtb"
 rm -rf "$CRATE/web/vendor"
 cp -r "$ROOT/vv/artifacts/cc13/vendor" "$CRATE/web/vendor"
+# The devcontainer (CC-14/CC-20): the virtio-mmio kernel + the OCI image's layer,
+# so the browser peer assembles the rootfs (the in-crate Layer Assembler, wasm)
+# and boots it over virtio-blk — the devcontainer flow, in the browser.
+cp "$ROOT/vv/artifacts/cc14/kernel/Image.gz" "$CRATE/web/devcontainer-kernel.gz"
+mfdig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['manifests'][0]['digest'].split(':')[1])" "$ROOT/vv/artifacts/cc14/image/index.json")
+ldig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['layers'][0]['digest'].split(':')[1])" "$ROOT/vv/artifacts/cc14/image/blobs/sha256/$mfdig")
+cp "$ROOT/vv/artifacts/cc14/image/blobs/sha256/$ldig" "$CRATE/web/devcontainer-layer.tar.gz"
 
 cd "$CRATE/web"
 [ -d node_modules/playwright ] || npm install playwright >/dev/null 2>&1
@@ -41,3 +48,6 @@ node manager-test.mjs
 
 echo "==> running the VS Code workspace test in Chromium (CC-13: κ-verified Monaco + xterm.js, real OS)"
 node workspace-test.mjs
+
+echo "==> running the devcontainer boot test in Chromium (CC-14/CC-20: assemble OCI image + virtio-blk boot in the browser)"
+node devcontainer-test.mjs

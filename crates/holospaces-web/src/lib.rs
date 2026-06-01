@@ -32,9 +32,11 @@ use hologram_runtime::Runtime;
 use hologram_runtime_bare::BareMetalEngine;
 use hologram_store_mem::MemKappaStore;
 use hologram_substrate_core::{Capabilities, KappaStore, Realization};
+use holospaces::assembly::{assemble_ext4, Layer};
 use holospaces::boot::{devcontainer, provision, LifecycleError, Resolver, Session};
 use holospaces::emulator::{Emulator, Halt};
 use holospaces::identity::{Operator, Roster};
+use holospaces::machine::MachineSpec;
 use holospaces::projection::{Intent, Workspace as Projection};
 use holospaces::realizations::{address, verify, Holospace, Kappa, Source};
 use holospaces::surface;
@@ -125,6 +127,55 @@ pub fn validate_userland(module: &[u8]) -> Result<(), JsValue> {
     surface::validate_userland(module).map_err(js_err)
 }
 
+/// A devcontainer's OCI image, assembled into a bootable root filesystem *in the
+/// browser* — the Layer Assembler (`CC-7` / the in-crate ext4 writer) running as
+/// the wasm peer. The operator's page fetches the devcontainer's image layers
+/// from the cold-start gateway (verified by re-derivation before they are added),
+/// then assembles them here; the result boots over the emulator's `virtio-blk`
+/// ([`Workspace::boot_devcontainer`], `CC-14`). The browser peer *is* the
+/// machine — no server assembles or boots the OS (Law L1/L4).
+#[wasm_bindgen]
+pub struct DevcontainerImage {
+    layers: Vec<(String, Vec<u8>)>,
+}
+
+#[wasm_bindgen]
+impl DevcontainerImage {
+    /// A new, empty image (add its layers lowest-first with [`Self::add_layer`]).
+    #[wasm_bindgen(constructor)]
+    #[must_use]
+    pub fn new() -> DevcontainerImage {
+        DevcontainerImage { layers: Vec::new() }
+    }
+
+    /// Add an OCI image layer (its media type + the verified blob bytes), in
+    /// order from the base layer up.
+    pub fn add_layer(&mut self, media_type: &str, blob: &[u8]) {
+        self.layers.push((media_type.to_string(), blob.to_vec()));
+    }
+
+    /// Assemble the layers into a bootable `ext4` root filesystem (gunzip +
+    /// untar + OCI whiteout overlay + the in-crate ext4 writer; Law L4). The
+    /// bytes back a [`Workspace::boot_devcontainer`] machine's `virtio-blk` disk.
+    pub fn assemble(&self) -> Result<Vec<u8>, JsValue> {
+        let layers: Vec<Layer> = self
+            .layers
+            .iter()
+            .map(|(mt, b)| Layer {
+                media_type: mt,
+                blob: b,
+            })
+            .collect();
+        assemble_ext4(&layers).map_err(js_err)
+    }
+}
+
+impl Default for DevcontainerImage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The Platform Manager console, running as a browser peer that composes the
 /// substrate runtime over the interpreter `ContainerEngine`.
 #[wasm_bindgen]
@@ -184,7 +235,11 @@ impl Console {
         memory_bytes: f64,
     ) -> Result<String, JsValue> {
         devcontainer::parse(config_json).map_err(js_err)?;
-        let artifact = self.runtime.store().put("blake3", config_json).map_err(js_err)?;
+        let artifact = self
+            .runtime
+            .store()
+            .put("blake3", config_json)
+            .map_err(js_err)?;
         self.provision_source(Source::HoloFile { artifact }, memory_bytes)
     }
 
@@ -211,9 +266,12 @@ impl Console {
     pub fn boot_userland(&mut self, module: &[u8], memory_bytes: f64) -> Result<String, JsValue> {
         surface::validate_userland(module).map_err(js_err)?;
         let entry = self.runtime.store().put("blake3", module).map_err(js_err)?;
-        let holospace =
-            provision(self.runtime.store(), Source::Userland { entry }, capabilities(memory_bytes))
-                .map_err(js_err)?;
+        let holospace = provision(
+            self.runtime.store(),
+            Source::Userland { entry },
+            capabilities(memory_bytes),
+        )
+        .map_err(js_err)?;
         self.record(&holospace)?;
         Ok(self.boot(holospace)?.as_str().to_owned())
     }
@@ -367,6 +425,26 @@ impl Workspace {
         let mut machine = Emulator::new(base as u64, ram_bytes as usize);
         machine
             .boot_kernel(kernel, dtb, dtb_addr as u64)
+            .map_err(js_err)?;
+        Ok(Workspace {
+            machine,
+            store: MemKappaStore::new(),
+            channel: Vec::new(),
+            files: std::collections::BTreeMap::new(),
+            halted: false,
+        })
+    }
+
+    /// Boot a **devcontainer** workspace: the Boot Orchestrator
+    /// ([`MachineSpec`](holospaces::machine::MachineSpec)) generates the device
+    /// tree and boots `kernel` on a machine whose `virtio-blk` disk is the
+    /// assembled `rootfs` (from [`DevcontainerImage::assemble`]). The guest
+    /// kernel mounts the rootfs over `/dev/vda` and runs the devcontainer's real
+    /// OS — entirely in the browser peer (`CC-14`). Drive it with
+    /// [`run`](Workspace::run), exactly like [`boot`](Workspace::boot).
+    pub fn boot_devcontainer(kernel: &[u8], rootfs: &[u8]) -> Result<Workspace, JsValue> {
+        let machine = MachineSpec::devcontainer()
+            .boot(kernel, rootfs.to_vec())
             .map_err(js_err)?;
         Ok(Workspace {
             machine,
