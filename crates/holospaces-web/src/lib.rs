@@ -445,8 +445,11 @@ impl Workspace {
     /// OS — entirely in the browser peer (`CC-14`). Drive it with
     /// [`run`](Workspace::run), exactly like [`boot`](Workspace::boot).
     pub fn boot_devcontainer(kernel: &[u8], rootfs: &[u8]) -> Result<Workspace, JsValue> {
+        // Attach the shared `virtio-9p` workspace (CC-15) so the workbench's
+        // FileSystemProvider (`ws_list`/`ws_read`/`ws_write`) and the OS share the
+        // same files — the editor edits the content the devcontainer OS sees.
         let machine = MachineSpec::devcontainer()
-            .boot(kernel, rootfs.to_vec())
+            .boot_workspace(kernel, rootfs.to_vec(), &[])
             .map_err(js_err)?;
         Ok(Workspace {
             machine,

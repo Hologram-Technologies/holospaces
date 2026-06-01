@@ -130,9 +130,11 @@
         const m = meta.get(k);
         if (act === "enter") {
           m.status = "running"; render();
-          // Launch the Workspace Projection in a new tab — the VS Code IDE (CC-13).
-          window.open(`workspace.html?id=${encodeURIComponent(k)}&name=${encodeURIComponent(m.name)}`, "_blank");
-          toast("entering " + m.name + " — the workspace opens in a new tab");
+          // Launch the Workspace Projection in a new tab — the REAL VS Code web
+          // workbench over the running holospace (CC-17; ADR-012 supersedes the
+          // CC-13 Monaco fallback at workspace.html).
+          window.open(`workbench.html?id=${encodeURIComponent(k)}&name=${encodeURIComponent(m.name)}`, "_blank");
+          toast("entering " + m.name + " — the VS Code workbench opens in a new tab");
         } else if (act === "suspend") {
           m.status = "suspended"; render(); toast(m.name + " suspended (state is its κ snapshot, Law L3)");
         } else if (act === "terminate") {
