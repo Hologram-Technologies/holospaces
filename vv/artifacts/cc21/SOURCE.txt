@@ -1,0 +1,30 @@
+CC-21 — port-forwarding / running-app preview authority artifacts.
+
+A server running inside the devcontainer is reachable from outside as a forwarded
+port (the app preview a Codespace/Gitpod surfaces). holospaces realizes this with
+the INGRESS dual of the CC-16 userspace TCP/IP NAT: it accepts an inbound
+connection on a forwarded port and opens a connection TO the guest's listening
+port — the NAT is the active opener toward the guest (it sends the SYN; the guest
+server's SYN-ACK completes the handshake). The forwarded ports come from the
+devcontainer.json `forwardPorts` (CC-4).
+
+initserv.c — a freestanding RV64 program (no libc, raw syscalls): socket / bind
+  0.0.0.0:8080 / listen / accept one connection over its virtio-net interface /
+  serve an HTTP response (HELLO-FROM-GUEST-SERVER) / power off. The server a
+  devcontainer runs. Built: riscv64-linux-gnu-gcc -nostdlib -static -Os
+  -ffreestanding -fno-builtin, stripped.
+
+image/ — a real OCI image-layout whose tar+gzip layer is /init = initserv.
+
+kernel — reused from CC-16 (vv/artifacts/cc16/kernel/Image.gz).
+
+Differential oracle — qemu-system-riscv64's user-mode `hostfwd`
+  (-netdev user,hostfwd=tcp:127.0.0.1:PORT-:8080): the same 10.0.2.0/24 NAT
+  model forwarding a host port to the guest's listener. The guest software is
+  byte-for-byte identical.
+
+Witness — crates/holospaces/tests/cc21_port_forward.rs; suite
+  vv/suites/cc21-port-forward.sh: boots the server devcontainer, forwards an
+  ephemeral host port to guest:8080 (StdIngress), and a host client reaches the
+  guest server through the forward and reads HELLO-FROM-GUEST-SERVER. The browser
+  peer substitutes a relay-served ingress route; the NAT is identical (ADR-014).

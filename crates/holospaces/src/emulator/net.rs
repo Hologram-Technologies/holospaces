@@ -92,6 +92,44 @@ pub trait Egress {
     fn close(&mut self, id: u32);
 }
 
+/// A **forwarded-port ingress transport** (`CC-21`) — the dual of [`Egress`]: it
+/// accepts *inbound* connections from outside the peer (a host listener on a
+/// forwarded port natively; a relay-served route in the browser) and bridges
+/// each to a server *inside* the devcontainer, so the running-app preview a
+/// Codespace surfaces works. The NAT polls it; for each accepted connection it
+/// opens a TCP connection toward the guest's listening port. Non-blocking.
+pub trait Ingress {
+    /// Poll for a newly-accepted inbound connection: `(id, guest_port)` — a
+    /// connection arrived on a forwarded port destined for the guest's listening
+    /// `guest_port`. `None` if none is waiting (never blocks).
+    fn poll_accept(&mut self) -> Option<(u32, u16)>;
+    /// The status of connection `id`.
+    fn status(&mut self, id: u32) -> EgressStatus;
+    /// Drain bytes that arrived from the outside client (empty if none).
+    fn recv(&mut self, id: u32) -> Vec<u8>;
+    /// Send the guest server's reply back toward the outside client.
+    fn send(&mut self, id: u32, data: &[u8]);
+    /// Close connection `id`.
+    fn close(&mut self, id: u32);
+}
+
+/// A no-op ingress — the default when no port is forwarded (the machine has no
+/// inbound connections to service).
+pub struct NoIngress;
+impl Ingress for NoIngress {
+    fn poll_accept(&mut self) -> Option<(u32, u16)> {
+        None
+    }
+    fn status(&mut self, _id: u32) -> EgressStatus {
+        EgressStatus::Closed
+    }
+    fn recv(&mut self, _id: u32) -> Vec<u8> {
+        Vec::new()
+    }
+    fn send(&mut self, _id: u32, _data: &[u8]) {}
+    fn close(&mut self, _id: u32) {}
+}
+
 /// The state of one guest-originated TCP connection the NAT is bridging.
 struct Conn {
     g_ip: [u8; 4],
@@ -108,15 +146,27 @@ struct Conn {
     iss: u32,
     /// The guest's advertised receive window (unscaled).
     guest_wnd: u32,
-    /// The egress connection id this is bridged to.
+    /// The host-side transport connection id this is bridged to — an
+    /// [`Egress`] id for a guest-initiated connection, or an [`Ingress`] id for
+    /// a forwarded inbound one (`ingress_id`).
     eid: u32,
+    /// For a forwarded *inbound* connection (`CC-21`), the [`Ingress`] id; `None`
+    /// for an ordinary guest-initiated egress connection. When set, the NAT is
+    /// the *active opener* toward the guest (it sent the SYN), and payload is
+    /// bridged to the ingress transport rather than the egress.
+    ingress_id: Option<u32>,
     /// Whether the NAT has emitted its SYN-ACK yet (it waits for the egress to
-    /// reach [`EgressStatus::Open`]).
+    /// reach [`EgressStatus::Open`]). For an ingress connection this is set once
+    /// the NAT's own SYN has been sent.
     synack_sent: bool,
-    /// Whether the guest has acknowledged the SYN-ACK (the connection is open).
+    /// Whether the connection is open (the guest acknowledged the SYN-ACK, or —
+    /// for ingress — the NAT acknowledged the guest's SYN-ACK).
     established: bool,
     /// Host-side bytes awaiting segmentation toward the guest.
     to_guest: VecDeque<u8>,
+    /// Guest-side bytes awaiting delivery to the host transport (drained in
+    /// [`Self::poll`] for egress, [`Self::poll_ingress`] for ingress).
+    from_guest: VecDeque<u8>,
     /// Whether the guest has half-closed (sent FIN).
     guest_fin: bool,
     /// Whether the NAT has sent its own FIN.
@@ -200,6 +250,12 @@ impl Nat {
         let mut frames: Vec<Vec<u8>> = Vec::new();
         let mut i = 0;
         while i < self.conns.len() {
+            // Ingress (forwarded inbound) connections are serviced in
+            // poll_ingress; here we drive only egress (guest-initiated) ones.
+            if self.conns[i].ingress_id.is_some() {
+                i += 1;
+                continue;
+            }
             let status = egress.status(self.conns[i].eid);
             // 1. Bring the connection up (or refuse it).
             if !self.conns[i].synack_sent {
@@ -222,8 +278,14 @@ impl Nat {
                     EgressStatus::Connecting => {}
                 }
             }
-            // 2. Relay host → guest while the connection is established.
+            // 2. Relay both ways while the connection is established.
             if self.conns[i].established {
+                // guest → host
+                let out: Vec<u8> = self.conns[i].from_guest.drain(..).collect();
+                if !out.is_empty() {
+                    egress.send(self.conns[i].eid, &out);
+                }
+                // host → guest
                 let data = egress.recv(self.conns[i].eid);
                 if !data.is_empty() {
                     self.conns[i].to_guest.extend(data);
@@ -242,8 +304,94 @@ impl Nat {
             }
             // 4. Reap a fully-closed connection.
             let c = &self.conns[i];
-            if c.fin_sent && c.guest_fin && c.snd_una == c.snd_nxt {
+            if c.guest_fin && (c.fin_sent && c.snd_una == c.snd_nxt) {
                 egress.close(c.eid);
+                self.conns.remove(i);
+                continue;
+            }
+            i += 1;
+        }
+        for f in frames {
+            self.rx.push_back(f);
+        }
+    }
+
+    /// Service the **forwarded inbound** (port-forward) connections (`CC-21`) —
+    /// the ingress dual of [`Self::poll`]. Accept new inbound connections from
+    /// the [`Ingress`] transport (the NAT opens a connection *to* the guest's
+    /// listening port — it is the active opener), and relay each established one
+    /// both ways. A server the devcontainer runs is thereby reachable from
+    /// outside as a forwarded port (the app-preview capability).
+    pub fn poll_ingress(&mut self, ingress: &mut dyn Ingress) {
+        // 1. Accept any new inbound connections → open toward the guest.
+        while let Some((iid, guest_port)) = ingress.poll_accept() {
+            let iss = self.next_iss();
+            let r_port = 49152u16.wrapping_add((iss & 0x3fff) as u16); // synthetic client port
+            let mut c = Conn {
+                g_ip: GUEST_IP,
+                g_port: guest_port,
+                r_ip: GW_IP, // the connection appears to come from the gateway
+                r_port,
+                rcv_nxt: 0, // learned from the guest's SYN-ACK
+                snd_nxt: iss,
+                snd_una: iss,
+                iss,
+                guest_wnd: RECV_WINDOW as u32,
+                eid: iid,
+                ingress_id: Some(iid),
+                synack_sent: true, // the NAT's SYN is its handshake send
+                established: false,
+                to_guest: VecDeque::new(),
+                from_guest: VecDeque::new(),
+                guest_fin: false,
+                fin_sent: false,
+            };
+            // Send the SYN to the guest's listener (the NAT is the active opener).
+            let opts = [2u8, 4, (MSS >> 8) as u8, MSS as u8];
+            let frame = tcp_to_guest(&c, F_SYN, &opts, &[], self.guest_mac);
+            c.snd_nxt = c.iss.wrapping_add(1); // the SYN consumes one sequence
+            self.conns.push(c);
+            self.rx.push_back(frame);
+        }
+
+        // 2. Relay each established ingress connection both ways.
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        let mut i = 0;
+        while i < self.conns.len() {
+            let Some(iid) = self.conns[i].ingress_id else {
+                i += 1;
+                continue;
+            };
+            if self.conns[i].established {
+                // guest → host (the server's reply to the external client)
+                let out: Vec<u8> = self.conns[i].from_guest.drain(..).collect();
+                if !out.is_empty() {
+                    ingress.send(iid, &out);
+                }
+                // host → guest (the external client's request)
+                let data = ingress.recv(iid);
+                if !data.is_empty() {
+                    self.conns[i].to_guest.extend(data);
+                }
+                self.segment_to_guest(i, &mut frames);
+                let drained = self.conns[i].to_guest.is_empty()
+                    && self.conns[i].snd_una == self.conns[i].snd_nxt;
+                if ingress.status(iid) == EgressStatus::Closed && drained && !self.conns[i].fin_sent
+                {
+                    let c = &mut self.conns[i];
+                    frames.push(tcp_to_guest(c, F_FIN | F_ACK, &[], &[], self.guest_mac));
+                    c.snd_nxt = c.snd_nxt.wrapping_add(1);
+                    c.fin_sent = true;
+                }
+            }
+            // Once the guest has closed (its server finished the response and
+            // closed the socket) and we have relayed everything, close the
+            // outside client — promptly, without waiting for the guest to
+            // acknowledge our FIN (a one-shot server may already be gone). The
+            // response was drained to the ingress in the relay step above.
+            let c = &self.conns[i];
+            if c.guest_fin && c.fin_sent && c.to_guest.is_empty() {
+                ingress.close(iid);
                 self.conns.remove(i);
                 continue;
             }
@@ -454,9 +602,11 @@ impl Nat {
                 iss,
                 guest_wnd: window,
                 eid,
+                ingress_id: None,
                 synack_sent: false,
                 established: false,
                 to_guest: VecDeque::new(),
+                from_guest: VecDeque::new(),
                 guest_fin: false,
                 fin_sent: false,
             });
@@ -468,30 +618,52 @@ impl Nat {
         };
 
         if flags & F_RST != 0 {
-            egress.close(self.conns[idx].eid);
             self.conns.remove(idx);
             return;
         }
 
         self.conns[idx].guest_wnd = window;
 
-        // Process the guest's acknowledgement of our bytes.
+        // Process the acknowledgement of our bytes.
         if flags & F_ACK != 0 {
             let c = &mut self.conns[idx];
             if seq_gt(ack, c.snd_una) {
                 c.snd_una = ack;
             }
-            if c.synack_sent && !c.established && seq_geq(c.snd_una, c.iss.wrapping_add(1)) {
+            // The egress established-transition: the guest acknowledged our
+            // SYN-ACK. Ingress connections become established in the SYN-ACK
+            // handler below (where `rcv_nxt` is also learned), so exclude them
+            // here — their SYN-ACK *also* carries an ACK and must not preempt it.
+            if c.ingress_id.is_none()
+                && c.synack_sent
+                && !c.established
+                && seq_geq(c.snd_una, c.iss.wrapping_add(1))
+            {
                 c.established = true;
             }
         }
 
         let mut reply: Option<Vec<u8>> = None;
 
-        // Accept in-order payload and hand it to the egress.
+        // For a *forwarded inbound* connection (CC-21) the NAT is the active
+        // opener: it sent the SYN, and this is the guest server's SYN-ACK.
+        // Record the guest's ISN, mark the connection open, and ACK it.
+        if self.conns[idx].ingress_id.is_some()
+            && !self.conns[idx].established
+            && flags & F_SYN != 0
+        {
+            let c = &mut self.conns[idx];
+            c.rcv_nxt = seq.wrapping_add(1); // past the guest's SYN
+            c.established = true;
+            reply = Some(tcp_to_guest(c, F_ACK, &[], &[], self.guest_mac));
+        }
+
+        // Accept in-order payload and buffer it for the host transport (drained
+        // in poll/poll_ingress — handle_tcp stays transport-agnostic).
         if !payload.is_empty() && self.conns[idx].established {
             if seq == self.conns[idx].rcv_nxt {
-                egress.send(self.conns[idx].eid, payload);
+                let p = payload.to_vec();
+                self.conns[idx].from_guest.extend(p);
                 self.conns[idx].rcv_nxt =
                     self.conns[idx].rcv_nxt.wrapping_add(payload.len() as u32);
             }
@@ -501,13 +673,12 @@ impl Nat {
         }
 
         // The guest's FIN (half-close): acknowledge it, mark it, and start our own
-        // close so the egress is released.
+        // close so the host transport is released.
         if flags & F_FIN != 0 && !self.conns[idx].guest_fin {
             let fin_seq = seq.wrapping_add(payload.len() as u32);
             if fin_seq == self.conns[idx].rcv_nxt {
                 self.conns[idx].rcv_nxt = self.conns[idx].rcv_nxt.wrapping_add(1);
                 self.conns[idx].guest_fin = true;
-                egress.close(self.conns[idx].eid);
                 let c = &mut self.conns[idx];
                 if !c.fin_sent {
                     // ACK the FIN, then send our FIN (consumes one sequence).
@@ -524,13 +695,8 @@ impl Nat {
         if let Some(f) = reply {
             self.rx.push_back(f);
         }
-
-        // Reap if both sides have closed and our FIN is acknowledged.
-        let c = &self.conns[idx];
-        if c.fin_sent && c.guest_fin && c.snd_una == c.snd_nxt {
-            egress.close(c.eid);
-            self.conns.remove(idx);
-        }
+        // The host-transport close (egress.close / ingress.close) and the final
+        // reap happen in poll/poll_ingress, where the transport is in scope.
     }
 }
 
@@ -842,6 +1008,122 @@ impl Egress for StdEgress {
     }
 }
 
+/// The native **ingress transport** (`CC-21`): a host `TcpListener` per forwarded
+/// port. An outside connection to a forwarded host port is accepted and bridged
+/// to the guest's listening `guest_port` — the running-app preview, reachable
+/// from outside the devcontainer. The browser peer substitutes a relay-served
+/// route; the NAT above is identical.
+#[cfg(feature = "std")]
+pub struct StdIngress {
+    /// `(listener, guest_port)` — each host listener forwards to a guest port.
+    listeners: Vec<(std::net::TcpListener, u16)>,
+    conns: std::collections::BTreeMap<u32, StdConn>,
+    next_id: u32,
+}
+
+#[cfg(feature = "std")]
+impl StdIngress {
+    /// A new ingress with no forwarded ports.
+    #[must_use]
+    pub fn new() -> Self {
+        StdIngress {
+            listeners: Vec::new(),
+            conns: std::collections::BTreeMap::new(),
+            next_id: 1,
+        }
+    }
+
+    /// Forward a host port to the guest's `guest_port`: bind a listener on
+    /// `127.0.0.1` and return the host port chosen (pass `0` for an ephemeral
+    /// port — the witness reads it back). An outside connection to that host
+    /// port reaches the server listening on `guest_port` inside the devcontainer.
+    pub fn forward(&mut self, host_port: u16, guest_port: u16) -> std::io::Result<u16> {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", host_port))?;
+        listener.set_nonblocking(true)?;
+        let chosen = listener.local_addr()?.port();
+        self.listeners.push((listener, guest_port));
+        Ok(chosen)
+    }
+}
+
+#[cfg(feature = "std")]
+impl Default for StdIngress {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "std")]
+impl Ingress for StdIngress {
+    fn poll_accept(&mut self) -> Option<(u32, u16)> {
+        for (listener, guest_port) in &self.listeners {
+            if let Ok((stream, _)) = listener.accept() {
+                let _ = stream.set_nonblocking(true);
+                let id = self.next_id;
+                self.next_id += 1;
+                self.conns.insert(
+                    id,
+                    StdConn {
+                        stream: Some(stream),
+                        out: Vec::new(),
+                        closed: false,
+                    },
+                );
+                return Some((id, *guest_port));
+            }
+        }
+        None
+    }
+
+    fn status(&mut self, id: u32) -> EgressStatus {
+        match self.conns.get(&id) {
+            Some(c) if c.closed => EgressStatus::Closed,
+            Some(_) => EgressStatus::Open,
+            None => EgressStatus::Closed,
+        }
+    }
+
+    fn recv(&mut self, id: u32) -> Vec<u8> {
+        use std::io::Read;
+        let Some(c) = self.conns.get_mut(&id) else {
+            return Vec::new();
+        };
+        StdEgress::flush(c);
+        if c.closed {
+            return Vec::new();
+        }
+        let Some(s) = c.stream.as_mut() else {
+            return Vec::new();
+        };
+        let mut buf = [0u8; 8192];
+        match s.read(&mut buf) {
+            Ok(0) => {
+                c.closed = true;
+                Vec::new()
+            }
+            Ok(n) => buf[..n].to_vec(),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Vec::new(),
+            Err(_) => {
+                c.closed = true;
+                Vec::new()
+            }
+        }
+    }
+
+    fn send(&mut self, id: u32, data: &[u8]) {
+        if let Some(c) = self.conns.get_mut(&id) {
+            if !c.closed {
+                c.out.extend_from_slice(data);
+                StdEgress::flush(c);
+            }
+        }
+    }
+
+    fn close(&mut self, id: u32) {
+        self.conns.remove(&id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1041,11 +1323,13 @@ mod tests {
             ),
             &mut eg,
         );
+        // Pump: the buffered request is flushed to the egress, and the response
+        // comes back as a data segment.
+        nat.poll(&mut eg);
         assert!(
             eg.sent.starts_with(b"GET /"),
             "the request reached the egress"
         );
-        // Pump: the response should come back as a data segment.
         nat.poll(&mut eg);
         let mut got = Vec::new();
         while let Some(frame) = nat.take_rx() {

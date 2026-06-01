@@ -218,6 +218,26 @@ impl MachineSpec {
         emu.boot_kernel(kernel, &dtb, self.base + DTB_OFFSET)?;
         Ok(emu)
     }
+
+    /// Boot like [`Self::boot_net`], additionally **forwarding ports**: an
+    /// `ingress` transport carries inbound connections to a server inside the
+    /// devcontainer (`CC-21`) — the running-app preview a Codespace surfaces. Use
+    /// with [`Self::devcontainer_net`] (the guest's interface comes up with DHCP).
+    pub fn boot_net_forward(
+        &self,
+        kernel: &[u8],
+        rootfs: Vec<u8>,
+        egress: alloc::boxed::Box<dyn net::Egress>,
+        ingress: alloc::boxed::Box<dyn net::Ingress>,
+    ) -> Result<Emulator, crate::emulator::Trap> {
+        let mut emu = Emulator::new(self.base, self.ram_bytes as usize);
+        emu.enable_sbi();
+        emu.attach_disk(rootfs);
+        emu.attach_net_forward(egress, ingress);
+        let dtb = self.device_tree();
+        emu.boot_kernel(kernel, &dtb, self.base + DTB_OFFSET)?;
+        Ok(emu)
+    }
 }
 
 // ── A minimal flattened-device-tree (DTB) writer ───────────────────────────
