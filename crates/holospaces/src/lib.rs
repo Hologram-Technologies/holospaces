@@ -94,6 +94,9 @@ pub mod emulator;
 #[cfg(feature = "std")]
 pub mod engine;
 pub mod identity;
+/// Boot Orchestrator (arc42 ch.5): generates the machine's device tree and boots
+/// a kernel + κ-disk on the emulator — the first-class `CC-14` boot operation.
+pub mod machine;
 pub mod manager;
 /// OCI image ingestion (the host-side provisioning surface for a devcontainer's
 /// operating-system image; `std` only). Conformance: `CC-10`.

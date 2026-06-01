@@ -230,8 +230,9 @@ pub struct Emulator {
 }
 
 /// The CLINT memory-mapped region (one hart): `msip` at +0, `mtimecmp` at
-/// +0x4000, `mtime` at +0xBFF8.
-const CLINT_BASE: u64 = 0x0200_0000;
+/// +0x4000, `mtime` at +0xBFF8. Public so the [machine](crate::machine) Boot
+/// Orchestrator generates a device tree describing the same memory map.
+pub(crate) const CLINT_BASE: u64 = 0x0200_0000;
 const CLINT_END: u64 = 0x0201_0000;
 
 /// The PLIC (platform-level interrupt controller) memory-mapped region — the
@@ -240,14 +241,14 @@ const CLINT_END: u64 = 0x0201_0000;
 /// interrupts (here, the VirtIO block device) to the hart's external-interrupt
 /// line. Single hart → two contexts: 0 = M-mode, 1 = S-mode (the one a Linux
 /// kernel drives).
-const PLIC_BASE: u64 = 0x0c00_0000;
+pub(crate) const PLIC_BASE: u64 = 0x0c00_0000;
 const PLIC_END: u64 = 0x1000_0000;
 /// The VirtIO-MMIO transport region (one device), mirroring QEMU `virt`'s first
 /// virtio-mmio slot at `0x1000_1000` with PLIC source 1.
-const VIRTIO_BASE: u64 = 0x1000_1000;
-const VIRTIO_END: u64 = 0x1000_2000;
+pub(crate) const VIRTIO_BASE: u64 = 0x1000_1000;
+pub(crate) const VIRTIO_END: u64 = 0x1000_2000;
 /// The PLIC interrupt source number the VirtIO block device raises.
-const VIRTIO_IRQ: u32 = 1;
+pub(crate) const VIRTIO_IRQ: u32 = 1;
 /// PLIC contexts for a single hart: M-mode (0) and S-mode (1).
 const PLIC_CONTEXTS: usize = 2;
 

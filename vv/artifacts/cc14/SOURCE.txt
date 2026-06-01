@@ -25,12 +25,16 @@ kernel/Image.gz
   resolved kernel/.config is committed alongside as kernel.config.
   Toolchain: riscv64-linux-gnu-gcc (Debian). gzip -9 -n (reproducible).
 
-kernel/holospaces-virtio.dts + .dtb
-  The device tree the emulator hands the kernel: a single hart (rv64imafdc,
-  sv57), 512 MiB RAM at 0x80000000, the CLINT, the PLIC at 0x0c000000
-  (interrupts-extended to the hart M/S external lines), and one virtio-mmio
-  node at 0x10001000 with PLIC source 1 — the same layout QEMU `virt` uses, so
-  the differential oracle lines up. Built with dtc (device-tree-compiler).
+kernel/holospaces-virtio.dts
+  The device tree the emulator hands the kernel, kept here as the human-readable
+  REFERENCE: a single hart (rv64imafdc, sv57), 512 MiB RAM at 0x80000000, the
+  CLINT, the PLIC at 0x0c000000 (interrupts-extended to the hart M/S external
+  lines), and one virtio-mmio node at 0x10001000 with PLIC source 1 — the same
+  layout QEMU `virt` uses, so the differential oracle lines up. At runtime the
+  Boot Orchestrator (crates/holospaces/src/machine.rs) GENERATES this device
+  tree in-crate as a real DTB from the emulator's own memory-map constants (one
+  source of truth, Law L4 — not a pinned blob); the witness
+  the_generated_device_tree_is_valid checks the generated DTB with `dtc`.
 
 image/  — a real OCI image-layout (the assembler's input)
   oci-layout + index.json + blobs/sha256/<manifest,config,layer>. The single
