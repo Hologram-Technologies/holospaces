@@ -35,7 +35,9 @@
 use alloc::collections::BTreeMap;
 #[cfg(not(feature = "std"))]
 #[allow(unused_imports)]
-use alloc::{vec, vec::Vec};
+use alloc::{boxed::Box, vec, vec::Vec};
+
+pub mod net;
 
 /// The Linux RISC-V syscall numbers the emulator's `ecall` boundary recognises
 /// (a guest passes the number in `a7`). A real statically-linked binary that
@@ -230,6 +232,9 @@ pub struct Emulator {
     /// The VirtIO 9P device serving the shared workspace filesystem, when
     /// attached (`CC-15`); `None` otherwise.
     virtio9p: Option<Virtio9p>,
+    /// The VirtIO network device + userspace TCP/IP NAT, when networking is
+    /// attached (`CC-16`); `None` for an offline machine.
+    virtionet: Option<VirtioNet>,
 }
 
 /// The CLINT memory-mapped region (one hart): `msip` at +0, `mtimecmp` at
@@ -260,6 +265,13 @@ pub(crate) const VIRTIO9P_END: u64 = 0x1000_3000;
 pub(crate) const VIRTIO9P_IRQ: u32 = 2;
 /// The `mount_tag` the guest selects the workspace 9P share by.
 pub(crate) const WORKSPACE_TAG: &str = "hsworkspace";
+/// The third `virtio-mmio` slot — the VirtIO **network** device (`CC-16`), with
+/// PLIC source 3. The guest drives a real NIC over it; its frames terminate in
+/// the userspace TCP/IP [NAT](net) and stream out over a pluggable egress.
+pub(crate) const VIRTIONET_BASE: u64 = 0x1000_3000;
+pub(crate) const VIRTIONET_END: u64 = 0x1000_4000;
+/// The PLIC interrupt source number the VirtIO network device raises.
+pub(crate) const VIRTIONET_IRQ: u32 = 3;
 /// PLIC contexts for a single hart: M-mode (0) and S-mode (1).
 const PLIC_CONTEXTS: usize = 2;
 
@@ -435,6 +447,61 @@ impl Virtio9p {
             avail_addr: 0,
             used_addr: 0,
             last_avail: 0,
+            interrupt_status: 0,
+            irq_pending: false,
+        }
+    }
+}
+
+/// The VirtIO **network device** over the **virtio-mmio** transport (OASIS
+/// VirtIO v1.2 §5.1; device id 1). It carries the guest's Ethernet frames to and
+/// from the userspace TCP/IP [NAT](net), which streams the payloads out over a
+/// pluggable [egress](net::Egress) (`CC-16`, ADR-014). Two virtqueues: the
+/// **receive** queue (index 0, device → guest) and the **transmit** queue (index
+/// 1, guest → device). With `VIRTIO_F_VERSION_1` negotiated every buffer carries
+/// the 12-byte `virtio_net_hdr_v1` prefix.
+struct VirtioNet {
+    /// The userspace network the device terminates the guest's link layer in.
+    nat: net::Nat,
+    /// The egress transport the NAT's TCP streams flow out over (a host socket
+    /// natively; a WebSocket tunnel in the browser).
+    egress: Box<dyn net::Egress>,
+    /// MAC reported in config space (`VIRTIO_NET_F_MAC`).
+    mac: [u8; 6],
+    status: u32,
+    device_features_sel: u32,
+    driver_features_sel: u32,
+    driver_features: [u32; 2],
+    /// Selected queue (0 = receive, 1 = transmit).
+    queue_sel: u32,
+    // Per-queue transport state (index 0 = RX, 1 = TX).
+    queue_num: [u32; 2],
+    queue_ready: [u32; 2],
+    desc_addr: [u64; 2],
+    avail_addr: [u64; 2],
+    used_addr: [u64; 2],
+    last_avail: [u16; 2],
+    interrupt_status: u32,
+    irq_pending: bool,
+}
+
+impl VirtioNet {
+    fn new(egress: Box<dyn net::Egress>) -> Self {
+        VirtioNet {
+            nat: net::Nat::new(),
+            egress,
+            mac: net::GUEST_MAC,
+            status: 0,
+            device_features_sel: 0,
+            driver_features_sel: 0,
+            driver_features: [0; 2],
+            queue_sel: 0,
+            queue_num: [0; 2],
+            queue_ready: [0; 2],
+            desc_addr: [0; 2],
+            avail_addr: [0; 2],
+            used_addr: [0; 2],
+            last_avail: [0; 2],
             interrupt_status: 0,
             irq_pending: false,
         }
@@ -924,6 +991,7 @@ impl Emulator {
             plic: Plic::new(),
             virtio: None,
             virtio9p: None,
+            virtionet: None,
         }
     }
 
@@ -955,6 +1023,16 @@ impl Emulator {
     /// reproducible state (it is snapshotted with the rest).
     pub fn attach_disk(&mut self, image: Vec<u8>) {
         self.virtio = Some(VirtioBlk::new(image));
+    }
+
+    /// Attach the machine's VirtIO **network** device, bridged to the world over
+    /// `egress` (`CC-16`). The guest kernel discovers the NIC through the device
+    /// tree's third `virtio_mmio` node, configures it with DHCP, and its frames
+    /// are terminated by the userspace TCP/IP [NAT](net) and streamed out over
+    /// `egress` — a host socket natively ([`net::StdEgress`]) or a WebSocket
+    /// tunnel in the browser (ADR-014).
+    pub fn attach_net(&mut self, egress: Box<dyn net::Egress>) {
+        self.virtionet = Some(VirtioNet::new(egress));
     }
 
     /// Run the emulator as the M-mode firmware (SEE), servicing supervisor SBI
@@ -1384,6 +1462,12 @@ impl Emulator {
             // CLINT interrupt latches into `mip`, and take a pending interrupt
             // (which redirects the PC) before the next instruction.
             self.tick();
+            // Pump the network periodically so host-side data and connection
+            // events reach the guest without it having to transmit first (the
+            // `virtio-net` receive path; CC-16).
+            if self.virtionet.is_some() && self.mtime & 0x3ff == 0 {
+                self.virtio_net_pump();
+            }
             if self.take_interrupt() {
                 continue;
             }
@@ -1421,6 +1505,9 @@ impl Emulator {
         if (VIRTIO9P_BASE..VIRTIO9P_END).contains(&addr) {
             return Ok(self.virtio9p_read(addr));
         }
+        if (VIRTIONET_BASE..VIRTIONET_END).contains(&addr) {
+            return Ok(self.virtionet_read(addr));
+        }
         let o = self.offset(addr, width)?;
         let mut v = 0u64;
         for i in 0..width {
@@ -1444,6 +1531,10 @@ impl Emulator {
         }
         if (VIRTIO9P_BASE..VIRTIO9P_END).contains(&addr) {
             self.virtio9p_write(addr, value as u32);
+            return Ok(());
+        }
+        if (VIRTIONET_BASE..VIRTIONET_END).contains(&addr) {
+            self.virtionet_write(addr, value as u32);
             return Ok(());
         }
         let o = self.offset(addr, width)?;
@@ -1889,6 +1980,230 @@ impl Emulator {
         written
     }
 
+    // ── VirtIO network device (the userspace TCP/IP NAT; CC-16) ──
+
+    /// Read a VirtIO-MMIO register or net-config field of the network device.
+    fn virtionet_read(&self, addr: u64) -> u64 {
+        let Some(dev) = self.virtionet.as_ref() else {
+            return 0;
+        };
+        let off = addr - VIRTIONET_BASE;
+        match off {
+            0x000 => 0x7472_6976, // MagicValue "virt"
+            0x004 => 2,           // Version (modern)
+            0x008 => 1,           // DeviceID = network
+            0x00c => 0x554d_4551, // VendorID "QEMU"
+            0x010 => match dev.device_features_sel {
+                // word 0: VIRTIO_NET_F_MAC (bit 5); word 1: VERSION_1 (bit 32).
+                0 => 0x20,
+                1 => 1,
+                _ => 0,
+            },
+            0x034 => 1024, // QueueNumMax
+            0x044 => u64::from(dev.queue_ready[(dev.queue_sel.min(1)) as usize]),
+            0x060 => u64::from(dev.interrupt_status),
+            0x070 => u64::from(dev.status),
+            0x0fc => 0, // ConfigGeneration
+            // virtio_net_config: mac[6] at offset 0.
+            _ if (0x100..0x106).contains(&off) => u64::from(dev.mac[(off - 0x100) as usize]),
+            _ => 0,
+        }
+    }
+
+    /// Write a VirtIO-MMIO register of the network device; a write to
+    /// `QueueNotify` services the transmit queue (or tries to fill the receive
+    /// queue). Queue registers apply to the currently selected queue
+    /// (0 = receive, 1 = transmit).
+    fn virtionet_write(&mut self, addr: u64, value: u32) {
+        let off = addr - VIRTIONET_BASE;
+        if self.virtionet.is_none() {
+            return;
+        }
+        {
+            let dev = self.virtionet.as_mut().unwrap();
+            let q = (dev.queue_sel.min(1)) as usize;
+            match off {
+                0x014 => dev.device_features_sel = value,
+                0x020 => {
+                    let w = dev.driver_features_sel.min(1) as usize;
+                    dev.driver_features[w] = value;
+                }
+                0x024 => dev.driver_features_sel = value,
+                0x030 => dev.queue_sel = value,
+                0x038 => dev.queue_num[q] = value,
+                0x044 => dev.queue_ready[q] = value,
+                0x064 => dev.interrupt_status &= !value,
+                0x070 => dev.status = value,
+                0x080 => dev.desc_addr[q] = (dev.desc_addr[q] & !0xffff_ffff) | u64::from(value),
+                0x084 => {
+                    dev.desc_addr[q] = (dev.desc_addr[q] & 0xffff_ffff) | (u64::from(value) << 32);
+                }
+                0x090 => dev.avail_addr[q] = (dev.avail_addr[q] & !0xffff_ffff) | u64::from(value),
+                0x094 => {
+                    dev.avail_addr[q] =
+                        (dev.avail_addr[q] & 0xffff_ffff) | (u64::from(value) << 32);
+                }
+                0x0a0 => dev.used_addr[q] = (dev.used_addr[q] & !0xffff_ffff) | u64::from(value),
+                0x0a4 => {
+                    dev.used_addr[q] = (dev.used_addr[q] & 0xffff_ffff) | (u64::from(value) << 32);
+                }
+                _ => {}
+            }
+        }
+        if off == 0x050 {
+            // QueueNotify: `value` is the notified queue index. The guest filled
+            // the transmit queue (1) with frames, or posted buffers to the
+            // receive queue (0); either way, service the network.
+            if value == 1 {
+                self.virtionet_process_tx();
+            } else {
+                self.virtio_net_pump();
+            }
+        }
+    }
+
+    /// Service the transmit queue: for each frame the guest queued, strip the
+    /// 12-byte `virtio_net_hdr` and hand the Ethernet frame to the NAT, then pump
+    /// the NAT so any immediate replies (ARP, DHCP, SYN-ACK) reach the guest.
+    fn virtionet_process_tx(&mut self) {
+        let mut dev = self.virtionet.take().unwrap();
+        let q = 1usize; // transmit
+        let qsz = dev.queue_num[q] as u16;
+        if dev.queue_ready[q] == 0 || qsz == 0 {
+            self.virtionet = Some(dev);
+            return;
+        }
+        let avail_idx = self.rd16(dev.avail_addr[q] + 2);
+        while dev.last_avail[q] != avail_idx {
+            let slot = dev.last_avail[q] % qsz;
+            let head = self.rd16(dev.avail_addr[q] + 4 + 2 * u64::from(slot));
+            let frame = self.virtionet_gather(&dev, q, head);
+            // Strip the virtio_net_hdr_v1 (12 bytes) → the Ethernet frame.
+            if frame.len() > 12 {
+                dev.nat.on_guest_frame(&frame[12..], dev.egress.as_mut());
+            }
+            let used_idx = self.rd16(dev.used_addr[q] + 2);
+            let ring = dev.used_addr[q] + 4 + 8 * u64::from(used_idx % qsz);
+            self.wr32(ring, u32::from(head));
+            self.wr32(ring + 4, frame.len() as u32);
+            self.wr16(dev.used_addr[q] + 2, used_idx.wrapping_add(1));
+            dev.last_avail[q] = dev.last_avail[q].wrapping_add(1);
+            dev.interrupt_status |= 1;
+            dev.irq_pending = true;
+        }
+        let raise = dev.irq_pending;
+        dev.irq_pending = false;
+        self.virtionet = Some(dev);
+        if raise {
+            self.plic.raise(VIRTIONET_IRQ);
+        }
+        // The transmitted frames may have produced replies — deliver them.
+        self.virtio_net_pump();
+    }
+
+    /// Pump the NAT (pull host-side bytes + advance connection state) and deliver
+    /// any pending receive frames into the guest's receive queue. Called on a
+    /// receive-queue notify and periodically from the run loop (so host data
+    /// arrives without the guest having to transmit first).
+    fn virtio_net_pump(&mut self) {
+        if self.virtionet.is_none() {
+            return;
+        }
+        let mut dev = self.virtionet.take().unwrap();
+        dev.nat.poll(dev.egress.as_mut());
+        let q = 0usize; // receive
+        let qsz = dev.queue_num[q] as u16;
+        let mut raise = false;
+        if dev.queue_ready[q] != 0 && qsz != 0 {
+            while dev.nat.has_rx() {
+                let avail_idx = self.rd16(dev.avail_addr[q] + 2);
+                if dev.last_avail[q] == avail_idx {
+                    break; // the guest has posted no receive buffer
+                }
+                let frame = dev.nat.take_rx().unwrap();
+                let slot = dev.last_avail[q] % qsz;
+                let head = self.rd16(dev.avail_addr[q] + 4 + 2 * u64::from(slot));
+                let written = self.virtionet_scatter_rx(&dev, q, head, &frame);
+                let used_idx = self.rd16(dev.used_addr[q] + 2);
+                let ring = dev.used_addr[q] + 4 + 8 * u64::from(used_idx % qsz);
+                self.wr32(ring, u32::from(head));
+                self.wr32(ring + 4, written);
+                self.wr16(dev.used_addr[q] + 2, used_idx.wrapping_add(1));
+                dev.last_avail[q] = dev.last_avail[q].wrapping_add(1);
+                dev.interrupt_status |= 1;
+                raise = true;
+            }
+        }
+        self.virtionet = Some(dev);
+        if raise {
+            self.plic.raise(VIRTIONET_IRQ);
+        }
+    }
+
+    /// Gather the bytes of a transmit descriptor chain (all descriptors carry
+    /// guest-provided data: the `virtio_net_hdr` followed by the frame).
+    fn virtionet_gather(&mut self, dev: &VirtioNet, q: usize, head: u16) -> Vec<u8> {
+        const F_NEXT: u16 = 1;
+        let mut out: Vec<u8> = Vec::new();
+        let mut idx = head;
+        let mut guard = 0u32;
+        loop {
+            let d = dev.desc_addr[q] + 16 * u64::from(idx);
+            let addr = self.rd64(d);
+            let len = self.rd32(d + 8);
+            let flags = self.rd16(d + 12);
+            let next = self.rd16(d + 14);
+            for i in 0..u64::from(len) {
+                out.push(self.rd8(addr + i));
+            }
+            guard += 1;
+            if flags & F_NEXT == 0 || guard > dev.queue_num[q] {
+                break;
+            }
+            idx = next;
+        }
+        out
+    }
+
+    /// Scatter a received frame — prefixed with a 12-byte `virtio_net_hdr_v1`
+    /// (zeroed, `num_buffers = 1`) — into the writable descriptors of a receive
+    /// chain. Returns the number of bytes written (the used-ring length).
+    fn virtionet_scatter_rx(&mut self, dev: &VirtioNet, q: usize, head: u16, frame: &[u8]) -> u32 {
+        const F_NEXT: u16 = 1;
+        const F_WRITE: u16 = 2;
+        // virtio_net_hdr_v1: 10 zero bytes then num_buffers = 1 (little-endian).
+        let mut buf: Vec<u8> = Vec::with_capacity(12 + frame.len());
+        buf.extend_from_slice(&[0u8; 10]);
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(frame);
+
+        let mut idx = head;
+        let mut pos = 0usize;
+        let mut written = 0u32;
+        let mut guard = 0u32;
+        loop {
+            let d = dev.desc_addr[q] + 16 * u64::from(idx);
+            let addr = self.rd64(d);
+            let len = self.rd32(d + 8);
+            let flags = self.rd16(d + 12);
+            let next = self.rd16(d + 14);
+            if flags & F_WRITE != 0 && pos < buf.len() {
+                let n = (len as usize).min(buf.len() - pos);
+                for i in 0..n {
+                    self.wr8(addr + i as u64, buf[pos + i]);
+                }
+                pos += n;
+                written += n as u32;
+            }
+            guard += 1;
+            if flags & F_NEXT == 0 || guard > dev.queue_num[q] || pos >= buf.len() {
+                break;
+            }
+            idx = next;
+        }
+        written
+    }
+
     /// Advance the timer and reconcile the memory-mapped interrupt latches into
     /// `mip` (CLINT → MTIP/MSIP), called once per executed instruction.
     fn tick(&mut self) {
@@ -1919,7 +2234,7 @@ impl Emulator {
         // Only a machine with a device wired to the PLIC drives these bits; a
         // diskless machine leaves SEIP/MEIP software-managed (the privileged
         // riscv-tests write them directly — `CC-9` is unchanged).
-        if self.virtio.is_some() || self.virtio9p.is_some() {
+        if self.virtio.is_some() || self.virtio9p.is_some() || self.virtionet.is_some() {
             if self.plic.pending_for(1) {
                 mip |= 1 << csr::SEIP;
             } else {
