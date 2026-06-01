@@ -48,6 +48,10 @@ spin                    = { version = "0.9", default-features = false, features 
 # built on — used by the emulator's F/D extension for deterministic, reproducible
 # floating point across peers. Same version hologram uses.
 libm                    = "0.2"
+# The no_std DEFLATE decoder (RFC 1951) the Layer Assembler uses to gunzip OCI
+# `tar+gzip` layers — pure-Rust, alloc-only (no std), so it compiles into the
+# portable peer core alongside the κ-disk.
+miniz_oxide             = { version = "0.8", default-features = false, features = ["with-alloc"] }
 
 # Quality commitments enforced from the beginning (arc42 ch.10). CI runs clippy
 # with `-D warnings`, so every workspace member upholds these.

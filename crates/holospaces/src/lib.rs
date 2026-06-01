@@ -82,6 +82,10 @@
 
 extern crate alloc;
 
+/// Layer Assembler: OCI image layers → a bootable `ext4` root filesystem
+/// (the *Rootfs Assembly* of SD5; arc42 ch.5). Connects `CC-10` → `CC-7`.
+/// no_std + alloc — part of the portable peer core, like the κ-disk it feeds.
+pub mod assembly;
 pub mod boot;
 pub mod disk;
 pub mod emulator;
