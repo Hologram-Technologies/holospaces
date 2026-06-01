@@ -1,0 +1,31 @@
+# A minimal but REAL Language Server, built to run inside the devcontainer OS as
+# the CC-18 authority. It speaks the Language Server Protocol over the standard
+# stdio base-protocol transport (Content-Length framing) and uses `lsp-types` —
+# rust-analyzer's own LSP type crate, the spec's authoritative Rust embodiment —
+# for every message body and for its advertised ServerCapabilities. It is
+# single-threaded (no threading dependency on the emulator) and does real,
+# document-based language intelligence (hover, completion, go-to-definition,
+# diagnostics) over the opened source file. Built static for riscv64; the binary
+# is committed as the CC-18 artifact (see ../SOURCE.txt). Its own workspace root
+# so the holospaces workspace does not adopt it.
+[workspace]
+
+[package]
+name = "lsp-demo"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "lsp-demo"
+path = "src/main.rs"
+
+[dependencies]
+lsp-types = "0.95"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"

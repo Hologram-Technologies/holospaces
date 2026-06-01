@@ -102,6 +102,10 @@ sha2 = "0.10"
 sha3 = "0.10"
 # Parse the imported KAT / Dev Container artifacts in the CC-1 / CC-4 witnesses.
 serde_json = "1"
+# CC-18 — the LSP spec's authoritative Rust types: build the LSP session the
+# workbench sends and validate the in-OS language server's responses against the
+# spec (the same crate rust-analyzer uses).
+lsp-types = "0.95"
 # CC-5 — drive the WebAssembly spec test/core .wast suite (directives + encode).
 wat = "1"
 wast = "251"

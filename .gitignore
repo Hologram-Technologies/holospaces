@@ -21,3 +21,4 @@
 # Excluded wasm codemodule crate build output (artifact is staged under vv/)
 crates/holospaces-emulator/target/
 /crates/holospaces-web/web/.vscode-test-web
+/vv/artifacts/cc18/lsp-demo/target
