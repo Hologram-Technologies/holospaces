@@ -1,0 +1,22 @@
+Devcontainer Provisioning is informatical.
+Repository Fetching is informatical.
+Config Parsing is informatical.
+Image Ingestion is informatical.
+Rootfs Assembly is informatical.
+Repository is informatical.
+Devcontainer Config is informatical.
+Base Image is informatical.
+Root Filesystem is informatical.
+Holospace is informatical.
+Substrate is informatical.
+Devcontainer Provisioning consists of Repository Fetching, Config Parsing, Image Ingestion, and Rootfs Assembly.
+Repository Fetching requires Substrate.
+Repository Fetching yields Repository.
+Config Parsing requires Repository.
+Config Parsing yields Devcontainer Config.
+Image Ingestion requires Devcontainer Config.
+Image Ingestion requires Substrate.
+Image Ingestion yields Base Image.
+Rootfs Assembly requires Base Image.
+Rootfs Assembly yields Root Filesystem.
+Devcontainer Provisioning yields Holospace.
