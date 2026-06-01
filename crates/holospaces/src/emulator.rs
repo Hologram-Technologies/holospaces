@@ -466,6 +466,10 @@ struct VirtioNet {
     /// The egress transport the NAT's TCP streams flow out over (a host socket
     /// natively; a WebSocket tunnel in the browser).
     egress: Box<dyn net::Egress>,
+    /// The ingress transport carrying forwarded-port (inbound) connections to a
+    /// server inside the devcontainer (`CC-21`); a no-op when no port is
+    /// forwarded.
+    ingress: Box<dyn net::Ingress>,
     /// MAC reported in config space (`VIRTIO_NET_F_MAC`).
     mac: [u8; 6],
     status: u32,
@@ -486,10 +490,11 @@ struct VirtioNet {
 }
 
 impl VirtioNet {
-    fn new(egress: Box<dyn net::Egress>) -> Self {
+    fn new(egress: Box<dyn net::Egress>, ingress: Box<dyn net::Ingress>) -> Self {
         VirtioNet {
             nat: net::Nat::new(),
             egress,
+            ingress,
             mac: net::GUEST_MAC,
             status: 0,
             device_features_sel: 0,
@@ -1091,7 +1096,19 @@ impl Emulator {
     /// `egress` — a host socket natively ([`net::StdEgress`]) or a WebSocket
     /// tunnel in the browser (ADR-014).
     pub fn attach_net(&mut self, egress: Box<dyn net::Egress>) {
-        self.virtionet = Some(VirtioNet::new(egress));
+        self.virtionet = Some(VirtioNet::new(egress, Box::new(net::NoIngress)));
+    }
+
+    /// Attach the network device with both an `egress` (outbound) and an
+    /// `ingress` (forwarded-port inbound) transport (`CC-16` + `CC-21`). A server
+    /// the devcontainer runs on a forwarded port is then reachable from outside
+    /// (the running-app preview).
+    pub fn attach_net_forward(
+        &mut self,
+        egress: Box<dyn net::Egress>,
+        ingress: Box<dyn net::Ingress>,
+    ) {
+        self.virtionet = Some(VirtioNet::new(egress, ingress));
     }
 
     /// Run the emulator as the M-mode firmware (SEE), servicing supervisor SBI
@@ -2170,6 +2187,9 @@ impl Emulator {
         }
         let mut dev = self.virtionet.take().unwrap();
         dev.nat.poll(dev.egress.as_mut());
+        // Service forwarded-port (inbound) connections too (CC-21).
+        let VirtioNet { nat, ingress, .. } = &mut dev;
+        nat.poll_ingress(ingress.as_mut());
         let q = 0usize; // receive
         let qsz = dev.queue_num[q] as u16;
         let mut raise = false;
