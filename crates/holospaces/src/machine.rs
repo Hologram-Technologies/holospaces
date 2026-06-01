@@ -15,7 +15,10 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::emulator::{Emulator, CLINT_BASE, PLIC_BASE, VIRTIO_BASE, VIRTIO_END, VIRTIO_IRQ};
+use crate::emulator::{
+    Emulator, CLINT_BASE, PLIC_BASE, VIRTIO9P_BASE, VIRTIO9P_END, VIRTIO9P_IRQ, VIRTIO_BASE,
+    VIRTIO_END, VIRTIO_IRQ,
+};
 
 /// Where the device tree blob is placed in RAM, relative to `base` (clear of the
 /// kernel image, which loads at `base + text_offset`).
@@ -125,6 +128,16 @@ impl MachineSpec {
         fdt.prop_u32("interrupts", VIRTIO_IRQ);
         fdt.end_node();
 
+        // The 9P (shared workspace filesystem) virtio-mmio slot (CC-15). Declared
+        // always; if no workspace is attached the device reports no magic and the
+        // kernel skips it.
+        fdt.begin_node(&format!("virtio_mmio@{VIRTIO9P_BASE:x}"));
+        fdt.prop_str("compatible", "virtio,mmio");
+        fdt.prop_reg(VIRTIO9P_BASE, VIRTIO9P_END - VIRTIO9P_BASE);
+        fdt.prop_u32("interrupt-parent", PH_PLIC);
+        fdt.prop_u32("interrupts", VIRTIO9P_IRQ);
+        fdt.end_node();
+
         fdt.end_node(); // soc
         fdt.end_node(); // root
         fdt.finish()
@@ -138,6 +151,26 @@ impl MachineSpec {
         let mut emu = Emulator::new(self.base, self.ram_bytes as usize);
         emu.enable_sbi();
         emu.attach_disk(rootfs);
+        let dtb = self.device_tree();
+        emu.boot_kernel(kernel, &dtb, self.base + DTB_OFFSET)?;
+        Ok(emu)
+    }
+
+    /// Boot like [`Self::boot`], additionally attaching a shared **workspace
+    /// filesystem** over `virtio-9p` (`CC-15`): `seed` is the files holospaces
+    /// places on the share (name → bytes). The guest mounts it (tag
+    /// `hsworkspace`) and the editor and the running OS read/write the same
+    /// files; observe the guest's writes with [`Emulator::workspace_file`].
+    pub fn boot_workspace(
+        &self,
+        kernel: &[u8],
+        rootfs: Vec<u8>,
+        seed: &[(&str, &[u8])],
+    ) -> Result<Emulator, crate::emulator::Trap> {
+        let mut emu = Emulator::new(self.base, self.ram_bytes as usize);
+        emu.enable_sbi();
+        emu.attach_disk(rootfs);
+        emu.attach_workspace(seed);
         let dtb = self.device_tree();
         emu.boot_kernel(kernel, &dtb, self.base + DTB_OFFSET)?;
         Ok(emu)
