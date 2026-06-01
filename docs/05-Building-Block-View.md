@@ -84,17 +84,29 @@ holospaces starts with Linux.
 *Sync binding* (scopes which content an operator’s instances announce
 and resolve over the substrate).
 
-**Platform Manager** — a *View* (a projection of the operator’s
-holospaces and the substrate) and an *Intent* surface (lifecycle and
-provisioning actions); its own state is canonical and held in the store
-(Law L2). The management projection (Chapter 8).
+**Platform Manager** — the **management console** (ADR-010): the
+operator signs in to a self-sovereign identity (`CC-1`), and the console
+organizes their holospaces and presents the lifecycle as first-class
+operations — provision (`CC-4`), **enter**, suspend, resume, terminate —
+the same shape as any platform/infrastructure manager. A *View* (a
+projection of the operator’s holospaces and the substrate, with status)
+and an *Intent* surface (the lifecycle actions); it holds no state of
+its own — the holospaces and roster are canonical κ in the store (Laws
+L2, L3). The management projection (Chapter 8); witnessed by `CC-12`.
 
-**Workspace Projection** — an *Editor / FS view* (the running
-holospace’s environment content, read by κ) and a *Terminal / Intent*
-surface (operator input published as canonical events on the holospace’s
-channels). It holds no state of its own (Law L3); a uor-native rendering
-of a running holospace, launched from the Platform Manager — the
-Codespaces/Gitpod experience (ADR-009; Chapter 8, *Projection*).
+**Workspace Projection** — the **VS Code devcontainer experience**
+(ADR-010), launched in a new tab when the operator *enters* a holospace.
+Built from the **real** VS Code editor and terminal components — the
+Monaco editor and the xterm.js terminal (the libraries VS Code /
+Codespaces / Gitpod are built from), pinned and verified by
+re-derivation (Law L5) — bound to the running holospace: an *Editor / FS
+view* (Monaco + a file tree over the environment’s content, read and
+edited by κ) and a *Terminal / Intent* surface (xterm.js over the booted
+OS’s console, operator input published as canonical events on the
+holospace’s channels). It holds no state of its own (Law L3); a
+uor-native rendering of a running holospace — the Codespaces/Gitpod
+experience (ADR-009, ADR-010; Chapter 8, *Projection*); witnessed by
+`CC-13`.
 
 Each component realizes the Architecture Decisions of Chapter 9 and
 applies the Concepts of Chapter 8.

@@ -1,0 +1,37 @@
+CC-13 — the VS Code devcontainer experience (the real editor + terminal components)
+===================================================================================
+
+Entering a holospace renders the Codespaces/Gitpod experience (ADR-010) from the
+*actual components VS Code, Codespaces, and Gitpod are built from*: the Monaco
+code editor and the xterm.js terminal. They are external authorities — pinned,
+published releases — imported into the workspace as κ-addressed content and
+**verified by re-derivation through the substrate itself** before they load
+(Law L5; the browser peer's own blake3 σ-axis, CC-1), exactly like any holospace's
+code (ADR-006, ADR-009). Nothing is trusted from a `<script src>`; the substrate
+verifies its own UI. This is the uor-native realization — the platform makes use
+of itself.
+
+Pinned releases (npm; mirrored verbatim from the official packages):
+  monaco-editor      0.52.2   (microsoft/monaco-editor; min/vs AMD core)
+  @xterm/xterm       5.5.0    (xtermjs/xterm.js — the VS Code terminal)
+  @xterm/addon-fit   0.10.0   (xtermjs/xterm.js)
+
+Files (vendor/) and their κ (the substrate's content address) are pinned in
+vendor.kappa; the traditional sha256 digests are in vendor.sha256. On load the
+workspace fetches each from the gateway and calls the browser peer's
+`verify_kappa(bytes, κ)` — a forged byte is refused (the gateway cannot lie).
+
+  monaco/loader.js                 the AMD loader (entry point)
+  monaco/editor/editor.main.js     the editor bundle (defines the vs/editor modules)
+  monaco/editor/editor.main.css    the editor styles
+  monaco/editor/editor.main.nls.js the localization shim
+  monaco/base/worker/workerMain.js the editor web-worker
+  xterm/xterm.js, xterm/xterm.css  the terminal + its styles
+  xterm/addon-fit.js               the fit addon (sizes the terminal to the panel)
+
+The workspace boots the holospace's devcontainer OS on the system emulator
+(CC-9; the pinned CC-11 interactive image, also imported by κ), drives it through
+the xterm.js terminal (CC-11 — the output matches the QEMU oracle), and edits the
+environment's content through Monaco by κ (CC-11). The devcontainer.json is the
+validated environment (CC-4). Witness: crates/holospaces-web/web/workspace-test.mjs
++ tests/cc13_vscode_workspace.rs (the pinned components re-derive to their κ).

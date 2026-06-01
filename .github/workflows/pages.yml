@@ -16,6 +16,7 @@ on:
       - 'crates/holospaces-web/**'
       - 'vv/artifacts/cc11/**'
       - 'vv/artifacts/cc9/linux/**'
+      - 'vv/artifacts/cc13/**'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 
@@ -54,15 +55,19 @@ jobs:
       - name: Assemble the site
         run: |
           mkdir -p _site
-          cp crates/holospaces-web/web/index.html _site/
+          cp crates/holospaces-web/web/index.html _site/        # the management console
+          cp crates/holospaces-web/web/workspace.html _site/    # the VS Code workspace IDE
           cp crates/holospaces-web/web/fixture.holo _site/
           cp crates/holospaces-web/web/fixture-userland.wasm _site/
           cp -r crates/holospaces-web/web/pkg _site/pkg
-          # The workspace fixture: a real RISC-V Linux kernel + its device tree
-          # (the pinned CC-11 interactive image; provenance in vv/artifacts/cc11).
-          # The browser peer boots it on the system emulator — CC-9 / CC-11.
+          # The workspace devcontainer OS: a real RISC-V Linux kernel + device tree
+          # (the pinned CC-11 image; provenance in vv/artifacts/cc11). Booted on the
+          # system emulator — CC-9 / CC-11.
           cp vv/artifacts/cc11/Image.gz _site/workspace-kernel.gz
           cp vv/artifacts/cc9/linux/holospaces.dtb _site/workspace.dtb
+          # The real VS Code components (Monaco + xterm.js; pinned CC-13 vendor set).
+          # The workspace imports them by κ and verifies by re-derivation (CC-13).
+          cp -r vv/artifacts/cc13/vendor _site/vendor
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

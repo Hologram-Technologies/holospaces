@@ -171,6 +171,23 @@ impl Console {
         self.provision_source(Source::HoloFile { artifact }, memory_bytes)
     }
 
+    /// Provision a holospace from a **devcontainer** for the management console
+    /// (CC-12): the `devcontainer.json` is validated against the Dev Container
+    /// spec (`CC-4`) and κ-addressed into the store; the holospace's identity is
+    /// the content address of its devcontainer definition (reproducible — same
+    /// source ⇒ same κ, Law L1). This *provisions* (records) the holospace; the
+    /// operator *enters* it to boot its OS in the workspace IDE (`CC-13`).
+    /// Returns the holospace identity κ.
+    pub fn provision_devcontainer(
+        &mut self,
+        config_json: &[u8],
+        memory_bytes: f64,
+    ) -> Result<String, JsValue> {
+        devcontainer::parse(config_json).map_err(js_err)?;
+        let artifact = self.runtime.store().put("blake3", config_json).map_err(js_err)?;
+        self.provision_source(Source::HoloFile { artifact }, memory_bytes)
+    }
+
     /// Provision a holospace from a *Wasm-recompiled userland* (the execution
     /// surface, the second compute form — ADR-008). The module is validated
     /// against the surface contract ([`validate_userland`]) before it is
@@ -330,6 +347,7 @@ pub struct Workspace {
     machine: Emulator,
     store: MemKappaStore,
     channel: Vec<Kappa>,
+    files: std::collections::BTreeMap<String, Kappa>,
     halted: bool,
 }
 
@@ -354,6 +372,7 @@ impl Workspace {
             machine,
             store: MemKappaStore::new(),
             channel: Vec::new(),
+            files: std::collections::BTreeMap::new(),
             halted: false,
         })
     }
@@ -437,6 +456,7 @@ impl Workspace {
         };
         self.channel.push(intent.kappa());
         let stored = self.store.put("blake3", content).map_err(js_err)?;
+        self.files.insert(path.to_owned(), stored);
         Ok(stored.as_str().to_owned())
     }
 
@@ -448,5 +468,31 @@ impl Workspace {
             .get(&kappa)
             .map(|opt| opt.map(|b| b.to_vec()))
             .map_err(js_err)
+    }
+
+    /// The **file tree**: the workspace's files as a JSON array of
+    /// `{ path, kappa }` — each file's current content κ (its identity, Law L1).
+    /// What the editor's explorer renders.
+    #[must_use]
+    pub fn files(&self) -> String {
+        let entries: Vec<serde_json::Value> = self
+            .files
+            .iter()
+            .map(|(path, kappa)| serde_json::json!({ "path": path, "kappa": kappa.as_str() }))
+            .collect();
+        serde_json::Value::Array(entries).to_string()
+    }
+
+    /// Open a file *by path*: the content at the file's current κ (the editor
+    /// reads the environment content by κ). `undefined` if the path is unknown.
+    pub fn read_path(&self, path: &str) -> Result<Option<Vec<u8>>, JsValue> {
+        match self.files.get(path) {
+            Some(kappa) => self
+                .store
+                .get(kappa)
+                .map(|opt| opt.map(|b| b.to_vec()))
+                .map_err(js_err),
+            None => Ok(None),
+        }
     }
 }

@@ -87,6 +87,36 @@ Dev Container with no Docker daemon and no cloud VM, on a thin device.
     (Q6). The browser is a first-class compute substrate; the only
     limits are the device’s, not an account cap.
 
+## Entering a holospace — the VS Code workspace (the management → IDE flow)
+
+The operator manages holospaces from the console and *enters* one to
+work in it — the Codespaces/Gitpod flow (ADR-010; `CC-12`, `CC-13`).
+
+1.  The operator signs in to the **Platform Manager** (cold-started from
+    GitHub Pages) — a self-sovereign identity, content-addressed
+    (`CC-1`). The console lists and organizes their holospaces with
+    status; lifecycle actions (provision · enter · suspend · resume ·
+    terminate) are first-class (`CC-12`).
+
+2.  They **enter** a holospace. A new browser tab opens the **Workspace
+    Projection** — a VS Code-shaped IDE built from the real
+    [Monaco](https://microsoft.github.io/monaco-editor/) editor and
+    [xterm.js](https://xtermjs.org) terminal, both loaded and **verified
+    by re-derivation** against their pinned κ (Law L5; provenance in
+    `vv/PROVENANCE.md`).
+
+3.  The tab boots the holospace’s devcontainer OS on the system emulator
+    (the browser’s `wasmi`/own wasm engine — `CC-9`). The xterm.js
+    terminal streams the boot console, then drives the running OS: each
+    command is a **canonical event** that advances the holospace’s κ
+    snapshot (`CC-11`).
+
+4.  The Monaco editor and file tree read and edit the environment’s
+    content **by κ**; an edit advances the file’s κ (Law L1). The
+    `devcontainer.json` is the validated environment (`CC-4`). It is the
+    real VS Code experience, rendered by the browser peer with no server
+    (`CC-13`).
+
 ## Cold-start from GitHub Pages
 
 1.  The browser loads a minimal loader from GitHub Pages and the

@@ -20,11 +20,14 @@ echo "==> generating the .holo fixture (native executor → reference output κ)
 echo "==> building the browser peer (wasm32-unknown-unknown)"
 wasm-pack build "$CRATE" --release --target web --out-dir web/pkg
 
-# The workspace fixture: a real RISC-V Linux kernel + its device tree (the pinned
-# CC-11 interactive image), the same bytes the Pages deploy ships. The browser
-# peer boots it on the system emulator (CC-9 / CC-11).
+# The workspace fixtures, the same bytes the Pages deploy ships and the browser
+# imports by κ: the devcontainer OS (the pinned CC-11 Linux image + device tree;
+# CC-9/CC-11) and the real VS Code components (Monaco + xterm.js; the pinned CC-13
+# vendor set). The workspace verifies each by re-derivation before loading (L5).
 cp "$ROOT/vv/artifacts/cc11/Image.gz" "$CRATE/web/workspace-kernel.gz"
 cp "$ROOT/vv/artifacts/cc9/linux/holospaces.dtb" "$CRATE/web/workspace.dtb"
+rm -rf "$CRATE/web/vendor"
+cp -r "$ROOT/vv/artifacts/cc13/vendor" "$CRATE/web/vendor"
 
 cd "$CRATE/web"
 [ -d node_modules/playwright ] || npm install playwright >/dev/null 2>&1
@@ -33,8 +36,8 @@ if [ ! -d "$HOME/.cache/ms-playwright" ]; then
   exit 0
 fi
 
-echo "==> running the Platform Manager test in Chromium"
+echo "==> running the Platform Manager console test in Chromium (CC-12)"
 node manager-test.mjs
 
-echo "==> running the workspace test (boots a real Linux kernel in the browser)"
+echo "==> running the VS Code workspace test in Chromium (CC-13: κ-verified Monaco + xterm.js, real OS)"
 node workspace-test.mjs

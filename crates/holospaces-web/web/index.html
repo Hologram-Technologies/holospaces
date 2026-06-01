@@ -6,239 +6,176 @@
     <title>Hologram Platform Manager</title>
     <style>
       :root { color-scheme: dark; }
-      body {
-        font: 14px/1.5 system-ui, sans-serif; margin: 0; background: #0d1117; color: #c9d1d9;
-      }
-      header { padding: 1rem 1.5rem; border-bottom: 1px solid #21262d; }
-      h1 { font-size: 1.2rem; margin: 0; }
-      h2 { font-size: 0.95rem; margin: 0 0 0.5rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; }
+      * { box-sizing: border-box; }
+      body { font: 14px/1.5 system-ui, sans-serif; margin: 0; background: #0d1117; color: #c9d1d9; }
+      header { padding: 0.9rem 1.5rem; border-bottom: 1px solid #21262d; display: flex; align-items: center; gap: 1rem; }
+      header h1 { font-size: 1.1rem; margin: 0; }
+      header .op { margin-left: auto; font-size: 0.85em; }
+      .k { color: #58a6ff; font-family: ui-monospace, monospace; word-break: break-all; }
       .muted { color: #8b949e; }
-      .k { color: #58a6ff; font-family: ui-monospace, monospace; word-break: break-all; font-size: 0.85em; }
-      main { padding: 1.5rem; max-width: 70rem; margin: 0 auto; }
-      section { margin-bottom: 1.5rem; }
-      button {
-        font: inherit; padding: 0.35rem 0.8rem; margin: 0 0.4rem 0.4rem 0; cursor: pointer;
-        background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px;
-      }
+      main { padding: 1.5rem; max-width: 64rem; margin: 0 auto; }
+      h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.06em; color: #8b949e; margin: 1.5rem 0 0.6rem; }
+      button { font: inherit; padding: 0.3rem 0.75rem; margin: 0 0.3rem 0.3rem 0; cursor: pointer; background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; }
       button:hover { background: #30363d; }
       button.primary { background: #238636; border-color: #2ea043; color: #fff; }
-      button:disabled { opacity: 0.5; cursor: default; }
-      #holospaces { list-style: none; padding: 0; margin: 0.5rem 0; }
-      #holospaces li { padding: 0.3rem 0; border-bottom: 1px solid #21262d; }
-      .workspace { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
-      .panel { border: 1px solid #21262d; border-radius: 8px; overflow: hidden; }
-      .panel-head { background: #161b22; padding: 0.4rem 0.8rem; border-bottom: 1px solid #21262d; font-size: 0.85em; color: #8b949e; }
-      #terminal {
-        font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.45;
-        background: #010409; color: #c9d1d9; padding: 0.8rem; height: 22rem; overflow-y: auto;
-        white-space: pre-wrap; word-break: break-word; margin: 0;
-      }
-      .prompt { display: flex; border-top: 1px solid #21262d; }
-      .prompt span { padding: 0.5rem 0 0.5rem 0.8rem; color: #2ea043; font-family: ui-monospace, monospace; }
-      #cmd { flex: 1; background: #010409; color: #c9d1d9; border: 0; padding: 0.5rem 0.8rem; font-family: ui-monospace, monospace; outline: none; }
-      #editor { width: 100%; height: 16rem; box-sizing: border-box; background: #010409; color: #c9d1d9; border: 0; padding: 0.8rem; font-family: ui-monospace, monospace; font-size: 12px; resize: none; outline: none; }
-      .editor-foot { padding: 0.5rem 0.8rem; border-top: 1px solid #21262d; display: flex; align-items: center; gap: 0.5rem; }
-      .editor-foot input { background: #010409; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 0.3rem 0.5rem; font-family: ui-monospace, monospace; }
-      #status { font-size: 0.85em; }
-      .hidden { display: none; }
-      a { color: #58a6ff; }
+      button.sm { padding: 0.15rem 0.5rem; font-size: 0.85em; }
+      button:disabled { opacity: 0.45; cursor: default; }
+      input, textarea { background: #010409; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 0.4rem 0.6rem; font: inherit; }
+      textarea { width: 100%; font-family: ui-monospace, monospace; font-size: 0.85em; min-height: 6rem; }
+      table { width: 100%; border-collapse: collapse; font-size: 0.92em; }
+      th { text-align: left; color: #8b949e; font-weight: 500; font-size: 0.8em; text-transform: uppercase; letter-spacing: 0.04em; padding: 0.4rem 0.6rem; border-bottom: 1px solid #21262d; }
+      td { padding: 0.55rem 0.6rem; border-bottom: 1px solid #161b22; vertical-align: top; }
+      tr:hover td { background: #0f141a; }
+      .badge { display: inline-block; padding: 0.05rem 0.5rem; border-radius: 999px; font-size: 0.78em; border: 1px solid; }
+      .badge.stopped { color: #8b949e; border-color: #30363d; }
+      .badge.running { color: #3fb950; border-color: #238636; }
+      .badge.suspended { color: #d29922; border-color: #9e6a03; }
+      .new { background: #0f141a; border: 1px solid #21262d; border-radius: 8px; padding: 1rem; }
+      .new label { display: block; font-size: 0.85em; color: #8b949e; margin: 0.5rem 0 0.2rem; }
+      .row { display: flex; gap: 0.6rem; align-items: end; flex-wrap: wrap; }
+      #toast { position: fixed; bottom: 1rem; right: 1rem; background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 0.5rem 0.9rem; font-size: 0.85em; max-width: 28rem; display: none; }
     </style>
   </head>
   <body>
     <header>
       <h1>Hologram Platform Manager</h1>
-      <p class="muted" style="margin:0.3rem 0 0">
-        The browser is a peer that <em>is</em> the substrate — no server (Law L1).
-        Identity is content; every byte is verified by re-derivation (Law L5).
-      </p>
+      <span class="muted">manage your holospaces · enter one to work in it</span>
+      <span class="op">
+        <button id="signin" class="primary sm">Sign in</button>
+        <span class="muted">operator</span> <span id="operator" class="k">(signed out)</span>
+      </span>
     </header>
     <main>
-      <section>
-        <h2>Operator</h2>
-        <button id="signin" class="primary">Sign in</button>
-        <span id="operator" class="k">(signed out)</span>
-        <span class="muted"> · roster κ </span><span id="roster" class="k">—</span>
-      </section>
-
-      <section>
-        <h2>Holospaces</h2>
-        <button id="provision">Provision a .holo</button>
-        <button id="userland">Provision a userland</button>
-        <button id="runholo">Run a .holo (CC-2)</button>
-        <button id="boot">Boot a userland (CC-6)</button>
-        <ul id="holospaces"><li class="muted">none yet</li></ul>
-      </section>
-
-      <section>
-        <h2>Launch a workspace — a real OS in your tab (CC-9 · CC-11)</h2>
-        <p class="muted" style="margin:0 0 0.6rem">
-          Launch boots a real, unmodified <strong>Linux kernel</strong> on the
-          κ-addressed system emulator — <em>in this tab</em>, no Docker daemon and
-          no cloud VM (ADR-009). Then drive it: the <strong>terminal</strong>
-          publishes your commands as canonical events that advance the holospace's
-          κ snapshot, and the <strong>editor</strong> reads and edits content by κ.
-        </p>
-        <button id="launch" class="primary" disabled>Launch workspace</button>
-        <span id="status" class="muted">loading…</span>
-
-        <div id="workspace" class="workspace hidden" style="margin-top:1rem">
-          <div class="panel">
-            <div class="panel-head">Terminal — the running holospace</div>
-            <pre id="terminal"></pre>
-            <div class="prompt">
-              <span>$</span>
-              <input id="cmd" placeholder="try: echo hello · version · exit" disabled autocomplete="off" />
-            </div>
+      <h2>New holospace</h2>
+      <div class="new">
+        <div class="row">
+          <div style="flex:1; min-width:14rem">
+            <label for="hname">Name</label>
+            <input id="hname" value="my-devcontainer" style="width:100%" />
           </div>
-          <div class="panel">
-            <div class="panel-head">Editor — environment content, addressed by κ</div>
-            <textarea id="editor" spellcheck="false">edit me, then Save — my κ is my identity (Law L1)
-</textarea>
-            <div class="editor-foot">
-              <input id="path" value="/work/readme.txt" />
-              <button id="save">Save</button>
-              <span class="muted">κ</span> <span id="filekappa" class="k">—</span>
-            </div>
-          </div>
+          <button id="create" class="primary" disabled>Create devcontainer</button>
         </div>
-        <p style="margin-top:0.6rem">
-          holospace state κ: <span id="statekappa" class="k">—</span>
-        </p>
-      </section>
+        <label for="dcjson">devcontainer.json (validated against the Dev Container spec — CC-4)</label>
+        <textarea id="dcjson" spellcheck="false">{
+  "name": "my-devcontainer",
+  "image": "mcr.microsoft.com/devcontainers/base:debian-12",
+  "features": {}
+}</textarea>
+      </div>
+
+      <h2>Holospaces</h2>
+      <table>
+        <thead>
+          <tr><th>Name</th><th>Source</th><th>Identity</th><th>Status</th><th style="width:18rem">Actions</th></tr>
+        </thead>
+        <tbody id="rows">
+          <tr><td colspan="5" class="muted">No holospaces yet — sign in and create one.</td></tr>
+        </tbody>
+      </table>
+      <p class="muted" style="margin-top:1rem">
+        roster κ <span id="roster" class="k">—</span> · the browser is a peer that
+        <em>is</em> the substrate (Law L1); your holospaces are content in the store (Law L3).
+      </p>
     </main>
+    <div id="toast"></div>
 
     <script type="module">
       import init, { kappa, verify_kappa, run_holo, validate_userland, Console, Workspace }
         from "./pkg/holospaces_web.js";
       await init();
-
-      // Expose the surface for the Playwright browser test.
       window.hs = { kappa, verify_kappa, run_holo, validate_userland, Console, Workspace };
 
       const console0 = new Console();
       const $ = (id) => document.getElementById(id);
-      const status = (m) => ($("status").textContent = m);
-      let n = 0;
+      // Presentation metadata for the console (name · source · status); the
+      // canonical state is the holospace κ + roster in the store (Law L3).
+      const meta = new Map(); // κ -> { name, source, status }
+
+      let toastTimer;
+      function toast(m) {
+        const t = $("toast"); t.textContent = m; t.style.display = "block";
+        clearTimeout(toastTimer); toastTimer = setTimeout(() => (t.style.display = "none"), 4000);
+      }
 
       function render() {
         const v = JSON.parse(console0.view());
         $("operator").textContent = v.operator || "(signed out)";
-        $("holospaces").innerHTML =
-          v.holospaces.length === 0
-            ? '<li class="muted">none yet</li>'
-            : v.holospaces.map((k) => `<li class="k">${k}</li>`).join("");
         $("roster").textContent = console0.roster_kappa() || "—";
+        const tbody = $("rows");
+        if (v.holospaces.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="5" class="muted">No holospaces yet — sign in and create one.</td></tr>';
+          return;
+        }
+        tbody.innerHTML = v.holospaces.map((k) => {
+          const m = meta.get(k) || { name: "holospace", source: "devcontainer", status: "stopped" };
+          const enter = m.status === "stopped" || m.status === "suspended";
+          return `<tr>
+            <td>${m.name}</td>
+            <td class="muted">${m.source}</td>
+            <td class="k">${k.slice(0, 24)}…</td>
+            <td><span class="badge ${m.status}">${m.status}</span></td>
+            <td>
+              <button class="sm primary" data-act="enter" data-k="${k}" ${enter ? "" : "disabled"}>Enter</button>
+              <button class="sm" data-act="suspend" data-k="${k}" ${m.status === "running" ? "" : "disabled"}>Suspend</button>
+              <button class="sm" data-act="terminate" data-k="${k}" ${m.status !== "stopped" ? "" : "disabled"}>Terminate</button>
+              <button class="sm" data-act="remove" data-k="${k}">Remove</button>
+            </td></tr>`;
+        }).join("");
+        for (const b of tbody.querySelectorAll("button[data-act]")) {
+          b.onclick = () => action(b.dataset.act, b.dataset.k);
+        }
       }
+
+      function action(act, k) {
+        const m = meta.get(k);
+        if (act === "enter") {
+          m.status = "running"; render();
+          // Launch the Workspace Projection in a new tab — the VS Code IDE (CC-13).
+          window.open(`workspace.html?id=${encodeURIComponent(k)}&name=${encodeURIComponent(m.name)}`, "_blank");
+          toast("entering " + m.name + " — the workspace opens in a new tab");
+        } else if (act === "suspend") {
+          m.status = "suspended"; render(); toast(m.name + " suspended (state is its κ snapshot, Law L3)");
+        } else if (act === "terminate") {
+          m.status = "stopped"; render(); toast(m.name + " terminated");
+        } else if (act === "remove") {
+          meta.delete(k); remove(k); render();
+        }
+      }
+      // The console's view is canonical; removal drops the holospace from the
+      // operator's set (a presentation action — the content stays addressable).
+      const removed = new Set();
+      function remove(k) { removed.add(k); }
 
       $("signin").onclick = () => {
         console0.sign_in(new TextEncoder().encode("operator-self-sovereign-key"));
+        $("create").disabled = false;
         render();
-      };
-      $("provision").onclick = () => {
-        console0.provision(new TextEncoder().encode("holospace code #" + ++n), 256 * 1024 * 1024);
-        render();
-      };
-      $("userland").onclick = async () => {
-        const m = new Uint8Array(await (await fetch("./fixture-userland.wasm")).arrayBuffer());
-        console0.provision_userland(m, 4 * 1024 * 1024);
-        render();
-      };
-      $("boot").onclick = async () => {
-        const m = new Uint8Array(await (await fetch("./fixture-userland.wasm")).arrayBuffer());
-        const snap = console0.boot_userland(m, 4 * 1024 * 1024);
-        render();
-        status("booted a userland in-browser → snapshot κ " + snap);
-      };
-      $("runholo").onclick = async () => {
-        const a = new Uint8Array(await (await fetch("./fixture.holo")).arrayBuffer());
-        status("browser .holo engine → output κ " + run_holo(a));
+        toast("signed in — a self-sovereign, content-addressed identity (CC-1)");
       };
 
-      // ── The workspace: boot a real OS and drive it (CC-9 · CC-11) ──
-      let ws = null;
-
-      async function gunzip(url) {
-        const res = await fetch(url);
-        const stream = res.body.pipeThrough(new DecompressionStream("gzip"));
-        return new Uint8Array(await new Response(stream).arrayBuffer());
-      }
-
-      const BASE = 0x80000000, RAM = 128 * 1024 * 1024, DTB_ADDR = 0x87000000;
-      const READY = "HOLOSPACES-WORKSPACE-READY";
-
-      function renderTerminal() {
-        const t = $("terminal");
-        t.textContent = ws.terminal();
-        t.scrollTop = t.scrollHeight;
-        $("statekappa").textContent = ws.state_kappa();
-      }
-
-      $("launch").onclick = async () => {
-        $("launch").disabled = true;
+      $("create").onclick = () => {
+        const name = $("hname").value.trim() || "devcontainer";
+        const json = new TextEncoder().encode($("dcjson").value);
         try {
-          status("fetching the kernel image…");
-          const [kernel, dtb] = await Promise.all([
-            gunzip("./workspace-kernel.gz"),
-            fetch("./workspace.dtb").then((r) => r.arrayBuffer()).then((b) => new Uint8Array(b)),
-          ]);
-          status(`booting a real Linux kernel (${(kernel.length / 1048576).toFixed(1)} MiB) on the emulator…`);
-          ws = Workspace.boot(kernel, dtb, RAM, BASE, DTB_ADDR);
-          $("workspace").classList.remove("hidden");
-
-          // Boot in instruction chunks so the tab stays live and streams the console.
-          let steps = 0;
-          await new Promise((resolve) => {
-            const tick = () => {
-              const halted = ws.run(5_000_000);
-              steps += 5_000_000;
-              renderTerminal();
-              if (ws.shows(READY) || halted) return resolve();
-              status(`booting… (${(steps / 1e6).toFixed(0)}M instructions)`);
-              setTimeout(tick, 0);
-            };
-            tick();
-          });
-
-          status("workspace ready — type a command, or edit a file");
-          $("cmd").disabled = false;
-          $("cmd").focus();
+          const k = console0.provision_devcontainer(json, 128 * 1024 * 1024);
+          meta.set(k, { name, source: "devcontainer", status: "stopped" });
+          render();
+          toast("provisioned " + name + " → " + k.slice(0, 28) + "…");
         } catch (e) {
-          status("launch failed: " + e);
-          $("launch").disabled = false;
+          toast("invalid devcontainer.json: " + e);
         }
       };
 
-      // Terminal input: each line is a canonical event that drives the holospace.
-      $("cmd").addEventListener("keydown", (e) => {
-        if (e.key !== "Enter" || !ws) return;
-        const line = $("cmd").value;
-        $("cmd").value = "";
-        const eventKappa = ws.type_line(line);
-        renderTerminal();
-        status("event published on the channel → κ " + eventKappa);
-        if (ws.halted) {
-          $("cmd").disabled = true;
-          status("the workspace powered off (the OS halted)");
-        }
-      });
-
-      // Editor: an edit content-addresses the file — its κ is its identity (L1).
-      function rehash() {
-        if (!ws) return;
-        $("filekappa").textContent = kappa(new TextEncoder().encode($("editor").value));
-      }
-      $("editor").addEventListener("input", rehash);
-      $("save").onclick = () => {
-        if (!ws) return;
-        const k = ws.save_file($("path").value, new TextEncoder().encode($("editor").value));
-        $("filekappa").textContent = k;
-        status("saved — content addressed to κ " + k);
+      // Filter removed holospaces out of the rendered view.
+      const view0 = console0.view.bind(console0);
+      console0.view = () => {
+        const v = JSON.parse(view0());
+        v.holospaces = v.holospaces.filter((k) => !removed.has(k));
+        return JSON.stringify(v);
       };
 
       render();
-      $("launch").disabled = false;
       window.__ready = true;
-      status("ready — sign in, provision holospaces, or launch a workspace");
     </script>
   </body>
 </html>

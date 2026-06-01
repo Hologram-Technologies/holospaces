@@ -163,7 +163,32 @@ try {
   );
   check(surface.rejected, "an invalid/ambient userland module is refused (closed host surface)");
 
-  console.log(failed ? "MANAGER-TEST: FAILED" : "MANAGER-TEST: PASS (browser peer + Platform Manager)");
+  // CC-12 — the management console: provision a holospace from a validated
+  // devcontainer (reproducible κ), and the dashboard renders the resource table.
+  const dash = await page.evaluate(() => {
+    const c = new window.hs.Console();
+    c.sign_in(new TextEncoder().encode("operator-self-sovereign-key"));
+    const cfg = new TextEncoder().encode('{"name":"my-devcontainer","image":"debian:12","features":{}}');
+    const k1 = c.provision_devcontainer(cfg, 128 * 1024 * 1024);
+    const k2 = new window.hs.Console();
+    k2.sign_in(new TextEncoder().encode("operator-self-sovereign-key"));
+    const k1b = k2.provision_devcontainer(cfg, 128 * 1024 * 1024);
+    let rejected = false;
+    try { c.provision_devcontainer(new TextEncoder().encode("not json"), 1); } catch { rejected = true; }
+    return {
+      holospace: k1,
+      reproducible: k1 === k1b,
+      listed: JSON.parse(c.view()).holospaces.includes(k1),
+      rejected,
+      hasTable: !!document.querySelector("#rows") || !!document.querySelector("#holospaces"),
+    };
+  });
+  check(dash.holospace.startsWith("blake3:") && dash.listed, `provisioned a devcontainer holospace (${dash.holospace.slice(0, 24)}…)`);
+  check(dash.reproducible, "same devcontainer ⇒ same holospace κ (reproducible, L1/Q4)");
+  check(dash.rejected, "an invalid devcontainer.json is refused (CC-4)");
+  check(dash.hasTable, "the management console renders the holospaces dashboard");
+
+  console.log(failed ? "MANAGER-TEST: FAILED" : "MANAGER-TEST: PASS (browser peer + Platform Manager console)");
 } finally {
   await browser.close();
   server.close();

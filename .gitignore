@@ -8,10 +8,11 @@
 /crates/holospaces-web/web/fixture.holo
 /crates/holospaces-web/web/fixture.kappa
 /crates/holospaces-web/web/fixture-userland.wasm
-# The workspace kernel fixture — copied from vv/artifacts at build time, not
-# committed twice (the canonical, pinned copy lives under vv/artifacts/cc11).
+# The workspace fixtures — copied from vv/artifacts at build time, not committed
+# twice (the canonical, pinned copies live under vv/artifacts/cc11 + cc13).
 /crates/holospaces-web/web/workspace-kernel.gz
 /crates/holospaces-web/web/workspace.dtb
+/crates/holospaces-web/web/vendor
 
 # Excluded wasm codemodule crate build output (artifact is staged under vv/)
 crates/holospaces-emulator/target/
