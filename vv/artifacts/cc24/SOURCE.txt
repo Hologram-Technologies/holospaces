@@ -1,0 +1,38 @@
+CC-24 — external-service authentication authority artifacts.
+
+The devcontainer signs in to GitHub (and any other service) over the holospaces
+network. holospaces does NOT intermediate the auth (ADR-017): it provides the
+CC-16 network, and the devcontainer's tools authenticate over it with the
+service's own OAuth flow — the OAuth 2.0 Device Authorization Grant (RFC 8628),
+the secretless flow `gh auth login` uses, which needs no client secret and no
+redirect-URI backend and so works from a static GitHub-Pages deployment. The
+token lives in the devcontainer, never in holospaces (content-blind; Laws L1/L3).
+
+initauth.c — a freestanding RV64 program (no libc, raw syscalls): POSTs the
+  device-authorization request (RFC 8628 §3.1), parses the device_code, prints
+  the user_code (which the user enters at the verification URI), and polls the
+  token endpoint (§3.4) through authorization_pending until it receives an
+  access_token. Built: riscv64-linux-gnu-gcc -nostdlib -static -Os -ffreestanding
+  -fno-builtin, stripped.
+
+image/ — a real OCI image-layout whose tar+gzip layer is /init = initauth
+  (reproducible tar: numeric owner, fixed mtime; gzip -9 -n). The witness ingests
+  it (CC-10), assembles it into an ext4 rootfs (CC-7), and boots it with
+  networking (CC-16).
+
+kernel — reused from CC-16 (vv/artifacts/cc16/kernel/Image.gz; VIRTIO_NET + the
+  INET stack + ip=dhcp).
+
+Authority: RFC 8628 (the OAuth 2.0 Device Authorization Grant). Oracle: a
+hermetic GitHub-shaped device-flow server in the witness
+(crates/holospaces/tests/cc24_auth.rs) implementing /login/device/code and
+/login/oauth/access_token exactly as GitHub does (authorization_pending until
+authorized, then the token). The guest reaches it over the CC-16 userspace NAT +
+native egress, port-forwarded (10.0.2.9:80 → 127.0.0.1:PORT) as `gh` reaches
+github.com. A network-gated live variant would point at the real GitHub device
+endpoints with a real OAuth app's client_id.
+
+Witness — crates/holospaces/tests/cc24_auth.rs; suite vv/suites/cc24-auth.sh:
+  DEVICE-CODE-OK · POLL-PENDING · AUTH-OK:gho_… (the token, held in the
+  devcontainer). The same flow signs in to any service, not just GitHub —
+  holospaces bundles no service's credentials and brokers no auth.
