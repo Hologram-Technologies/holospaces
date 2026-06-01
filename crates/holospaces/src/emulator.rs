@@ -605,6 +605,44 @@ mod ninep {
             (!n.is_dir).then_some(n.data.as_slice())
         }
 
+        /// List the root directory — `(name, is_dir, size)` per entry. The
+        /// editor-side enumeration of the shared workspace (the workbench's
+        /// `FileSystemProvider.readDirectory`; `CC-17`).
+        pub fn list_root(&self) -> Vec<(String, bool, usize)> {
+            let mut out = Vec::new();
+            if let Some(root) = self.inodes.get(&1) {
+                for (name, &id) in &root.children {
+                    if let Some(n) = self.inodes.get(&id) {
+                        out.push((name.clone(), n.is_dir, n.data.len()));
+                    }
+                }
+            }
+            out
+        }
+
+        /// Write a root file (update in place, or create) — the editor saving
+        /// into the *same* shared content the guest OS reads over `virtio-9p`
+        /// (one content, Law L1; the workbench's `FileSystemProvider.writeFile`,
+        /// `CC-17`). Returns the bytes' content address (κ on the blake3 axis) —
+        /// the file's identity (Law L1/L2).
+        pub fn write_file(&mut self, name: &str, data: &[u8]) {
+            if let Some(&id) = self.inodes.get(&1).and_then(|r| r.children.get(name)) {
+                if let Some(n) = self.inodes.get_mut(&id) {
+                    if !n.is_dir {
+                        n.data = data.to_vec();
+                        return;
+                    }
+                }
+            }
+            let id = self.alloc(false, S_IFREG | 0o644);
+            self.inodes.get_mut(&id).unwrap().data = data.to_vec();
+            self.inodes
+                .get_mut(&1)
+                .unwrap()
+                .children
+                .insert(name.into(), id);
+        }
+
         fn alloc(&mut self, is_dir: bool, mode: u32) -> u64 {
             let id = self.next;
             self.next += 1;
@@ -1014,6 +1052,27 @@ impl Emulator {
     #[must_use]
     pub fn workspace_file(&self, name: &str) -> Option<&[u8]> {
         self.virtio9p.as_ref().and_then(|d| d.fs.read_file(name))
+    }
+
+    /// List the shared workspace's root entries — `(name, is_dir, size)` — the
+    /// editor's directory view over the running holospace (`CC-17`; the workbench
+    /// `FileSystemProvider` binds to this over the wasm peer). Empty if no
+    /// workspace is attached.
+    #[must_use]
+    pub fn workspace_list(&self) -> Vec<(alloc::string::String, bool, usize)> {
+        self.virtio9p
+            .as_ref()
+            .map(|d| d.fs.list_root())
+            .unwrap_or_default()
+    }
+
+    /// Write a file into the shared workspace — the editor saving content the
+    /// running OS reads over `virtio-9p` (one content, Law L1; `CC-17`). No-op if
+    /// no workspace is attached.
+    pub fn workspace_write(&mut self, name: &str, data: &[u8]) {
+        if let Some(d) = self.virtio9p.as_mut() {
+            d.fs.write_file(name, data);
+        }
     }
 
     /// Attach a root filesystem disk to the machine's VirtIO block device — the
