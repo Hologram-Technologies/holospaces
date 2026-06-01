@@ -1,4 +1,4 @@
-CC-16 — VirtIO networking authority artifacts (foundation).
+CC-16 — VirtIO networking authority artifacts.
 
 kernel/Image.gz — a real Linux 6.6.0 RV64GC kernel built from defconfig with
   VIRTIO_NET + VIRTIO_BLK + VIRTIO_MMIO + EXT4 + NET_9P_VIRTIO/9P_FS, the INET
@@ -8,9 +8,17 @@ kernel/Image.gz — a real Linux 6.6.0 RV64GC kernel built from defconfig with
   riscv64-linux-gnu-gcc.
 
 initnet.c — a freestanding RV64 program (no libc, raw syscalls): after the
-  kernel does DHCP, it socket()s, connect()s a TCP stream, sends an HTTP request,
-  reads the response (NET-CONNECTED / NET-RECV / NET-DONE), and powers off. The
-  guest userspace that exercises the network path.
+  kernel does DHCP, it socket()s, connect()s a TCP stream (to 10.0.2.9:8080),
+  sends an HTTP request, reads the response (NET-CONNECTED / NET-RECV / NET-DONE),
+  and powers off. The guest userspace that exercises the network path.
+
+image/ — a real OCI image-layout whose tar+gzip layer is /init = initnet
+  (compiled from initnet.c with riscv64-linux-gnu-gcc -nostdlib -static -Os
+  -ffreestanding -fno-builtin, stripped; reproducible tar: numeric owner, fixed
+  mtime; gzip -9 -n). The witness (crates/holospaces/tests/cc16_network.rs)
+  ingests this image (CC-10), assembles it into an ext4 rootfs (CC-7), and boots
+  it on the emulator with networking attached (boot_net + a native StdEgress
+  port-forwarding 10.0.2.9:8080 → 127.0.0.1:PORT, the analogue of QEMU guestfwd).
 
 Differential oracle — qemu-system-riscv64's user-mode (slirp) network is the
   reference holospaces' userspace NAT must match. Confirmed: the guest does DHCP
@@ -26,6 +34,9 @@ Differential oracle — qemu-system-riscv64's user-mode (slirp) network is the
   → IP-Config: Complete · NET-CONNECTED · NET-RECV: HTTP/1.0 200 OK … · NET-DONE.
 
 The emulator-side virtio-net device + the userspace TCP/IP NAT (ARP + DHCP + the
-guest-facing TCP state machine) and the pluggable egress transport (direct host
-socket natively; a WebSocket tunnel to a relay in the browser — ADR-014) are the
-implementation this foundation supports.
+guest-facing TCP state machine) and the native egress transport (a direct host
+socket) are IMPLEMENTED and witnessed against this oracle
+(crates/holospaces/src/emulator/net.rs; crates/holospaces/tests/cc16_network.rs;
+vv/suites/cc16-network.sh). The NAT is no_std and compiles to wasm32 with the
+peer core; the browser peer substitutes a WebSocket tunnel to a relay for the
+egress seam (ADR-014) — that browser transport + relay is the remaining slice.

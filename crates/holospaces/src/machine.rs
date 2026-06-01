@@ -16,8 +16,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::emulator::{
-    Emulator, CLINT_BASE, PLIC_BASE, VIRTIO9P_BASE, VIRTIO9P_END, VIRTIO9P_IRQ, VIRTIO_BASE,
-    VIRTIO_END, VIRTIO_IRQ,
+    net, Emulator, CLINT_BASE, PLIC_BASE, VIRTIO9P_BASE, VIRTIO9P_END, VIRTIO9P_IRQ,
+    VIRTIONET_BASE, VIRTIONET_END, VIRTIONET_IRQ, VIRTIO_BASE, VIRTIO_END, VIRTIO_IRQ,
 };
 
 /// Where the device tree blob is placed in RAM, relative to `base` (clear of the
@@ -46,6 +46,19 @@ impl MachineSpec {
             base: 0x8000_0000,
             ram_bytes: 512 * 1024 * 1024,
             bootargs: String::from("root=/dev/vda rw console=hvc0 earlycon=sbi init=/init"),
+        }
+    }
+
+    /// A default **networked** devcontainer machine: like [`Self::devcontainer`]
+    /// but with the kernel's built-in DHCP autoconfiguration enabled
+    /// (`ip=dhcp`), so the guest brings its `virtio-net` interface up against the
+    /// userspace NAT at boot (`CC-16`).
+    #[must_use]
+    pub fn devcontainer_net() -> Self {
+        MachineSpec {
+            base: 0x8000_0000,
+            ram_bytes: 512 * 1024 * 1024,
+            bootargs: String::from("root=/dev/vda rw console=hvc0 earlycon=sbi ip=dhcp init=/init"),
         }
     }
 
@@ -138,6 +151,15 @@ impl MachineSpec {
         fdt.prop_u32("interrupts", VIRTIO9P_IRQ);
         fdt.end_node();
 
+        // The network virtio-mmio slot (CC-16). Declared always; if no egress is
+        // attached the device reports no magic and the kernel skips it.
+        fdt.begin_node(&format!("virtio_mmio@{VIRTIONET_BASE:x}"));
+        fdt.prop_str("compatible", "virtio,mmio");
+        fdt.prop_reg(VIRTIONET_BASE, VIRTIONET_END - VIRTIONET_BASE);
+        fdt.prop_u32("interrupt-parent", PH_PLIC);
+        fdt.prop_u32("interrupts", VIRTIONET_IRQ);
+        fdt.end_node();
+
         fdt.end_node(); // soc
         fdt.end_node(); // root
         fdt.finish()
@@ -171,6 +193,27 @@ impl MachineSpec {
         emu.enable_sbi();
         emu.attach_disk(rootfs);
         emu.attach_workspace(seed);
+        let dtb = self.device_tree();
+        emu.boot_kernel(kernel, &dtb, self.base + DTB_OFFSET)?;
+        Ok(emu)
+    }
+
+    /// Boot like [`Self::boot`], additionally attaching a **network** device
+    /// bridged to the world over `egress` (`CC-16`). The guest configures its
+    /// `virtio-net` interface with DHCP against the userspace [NAT](crate::emulator::net)
+    /// and its TCP streams flow out over `egress` (a host socket natively; a
+    /// WebSocket tunnel in the browser — ADR-014). Use with
+    /// [`Self::devcontainer_net`] so the kernel command line carries `ip=dhcp`.
+    pub fn boot_net(
+        &self,
+        kernel: &[u8],
+        rootfs: Vec<u8>,
+        egress: alloc::boxed::Box<dyn net::Egress>,
+    ) -> Result<Emulator, crate::emulator::Trap> {
+        let mut emu = Emulator::new(self.base, self.ram_bytes as usize);
+        emu.enable_sbi();
+        emu.attach_disk(rootfs);
+        emu.attach_net(egress);
         let dtb = self.device_tree();
         emu.boot_kernel(kernel, &dtb, self.base + DTB_OFFSET)?;
         Ok(emu)
