@@ -1,0 +1,31 @@
+CC-16 — VirtIO networking authority artifacts (foundation).
+
+kernel/Image.gz — a real Linux 6.6.0 RV64GC kernel built from defconfig with
+  VIRTIO_NET + VIRTIO_BLK + VIRTIO_MMIO + EXT4 + NET_9P_VIRTIO/9P_FS, the INET
+  IPv4 stack, the kernel's built-in DHCP autoconfiguration (IP_PNP + IP_PNP_DHCP,
+  used via the `ip=dhcp` kernel cmdline), and an SBI console. Reproducible build
+  (KBUILD_BUILD_TIMESTAMP/USER/HOST fixed); kernel.config committed. Toolchain:
+  riscv64-linux-gnu-gcc.
+
+initnet.c — a freestanding RV64 program (no libc, raw syscalls): after the
+  kernel does DHCP, it socket()s, connect()s a TCP stream, sends an HTTP request,
+  reads the response (NET-CONNECTED / NET-RECV / NET-DONE), and powers off. The
+  guest userspace that exercises the network path.
+
+Differential oracle — qemu-system-riscv64's user-mode (slirp) network is the
+  reference holospaces' userspace NAT must match. Confirmed: the guest does DHCP
+  ("IP-Config: Complete"), opens a TCP connection through the NAT, and completes
+  an HTTP exchange to a host server:
+    python3 -m http.server (a host listener on 127.0.0.1:PORT), then
+    qemu-system-riscv64 -M virt -m 512M -nographic -bios default \
+      -global virtio-mmio.force-legacy=false -kernel <Image> \
+      -drive file=<rootfs.ext4>,format=raw,if=none,id=hd0 -device virtio-blk-device,drive=hd0 \
+      -netdev user,id=n0,guestfwd=tcp:10.0.2.9:8080-tcp:127.0.0.1:PORT \
+      -device virtio-net-device,netdev=n0 \
+      -append "root=/dev/vda rw console=hvc0 earlycon=sbi ip=dhcp init=/init"
+  → IP-Config: Complete · NET-CONNECTED · NET-RECV: HTTP/1.0 200 OK … · NET-DONE.
+
+The emulator-side virtio-net device + the userspace TCP/IP NAT (ARP + DHCP + the
+guest-facing TCP state machine) and the pluggable egress transport (direct host
+socket natively; a WebSocket tunnel to a relay in the browser — ADR-014) are the
+implementation this foundation supports.
