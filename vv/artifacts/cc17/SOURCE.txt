@@ -35,8 +35,16 @@ Phase status (this row is staged; ADR-012/015):
     the real OS over 9p (one content, Law L1). Witness
     crates/holospaces/tests/cc17_workspace_fs.rs; exposed on the wasm peer as
     Workspace.ws_list/ws_read/ws_write for the workbench's FileSystemProvider.
-  Phase 2 (remaining) — the browser wiring: a service worker bridging the
-    workbench's web-extension FileSystemProvider to those wasm-peer methods, and
+  Phase 2 SUPPORTED-MECHANISM WITNESS (DONE) — the real VS Code web workbench is
+    served the holospace's workspace the way github.dev / vscode.dev / Codespaces
+    do: Microsoft's own @vscode/test-web built-in FileSystemProvider (--browser
+    none serves; our own Chromium drives, as the harness's bundled launcher is
+    unavailable here). The genuine workbench loads and its readDirectory reaches
+    the real editor. Witness crates/holospaces-web/web/vscode-workbench-fs-test.mjs;
+    suite vv/suites/cc17-workbench-fs.sh. NO hand-rolled embedder / service worker
+    / custom extension — the earlier attempts at those were the legacy detour.
+  Phase 2 (remaining) — wire the same supported FileSystemProvider serving to the
+    LIVE wasm peer's ws_* (the running 9p workspace) in the holospaces page, and
     the terminal over the console (CC-11). The extension host is per-peer
     (ADR-015 feasibility refinement): the BROWSER peer uses the vscode.dev "web"
     model (a FileSystemProvider web extension whose fetches a service worker
