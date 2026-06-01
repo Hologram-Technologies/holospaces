@@ -27,6 +27,12 @@ std = [
     "hologram-exec/std",
     "hologram-backend/std",
 ]
+# `net` (off by default) enables the internet *import boundary* (ADR-013): the
+# Repository Fetcher + OCI registry Image Fetcher (`CC-20`), an HTTP(S) client
+# (ureq + rustls). A host-only surface — kept out of `default` so the portable
+# peer core (wasm32 / bare-metal) never links a TCP/TLS stack (the browser peer
+# imports through the page's own fetch).
+net = ["std", "dep:ureq", "dep:sha2"]
 
 [dependencies]
 # The hologram substrate, consumed by reference (ADR-003, ADR-006). holospaces
@@ -56,6 +62,12 @@ hologram-backend = { workspace = true, features = ["cpu"], optional = true }
 # (CC-4) parses devcontainer.json; the Wasm validator (CC-5) checks modules.
 serde_json = { version = "1", optional = true }
 wasmparser = { version = "0.221", optional = true }
+# The import boundary's HTTP(S) client (the `net` feature): a blocking client
+# with pure-Rust TLS (rustls) — the verifiable transport that fetches a
+# repository archive and pulls an OCI image from a registry (ADR-013, CC-20).
+ureq = { version = "2", optional = true }
+# sha256 over a registry manifest (the OCI content digest) at the import boundary.
+sha2 = { version = "0.10", optional = true }
 
 [dev-dependencies]
 # Named directly in the CC-8 witness (a source-peer KappaSync, SyncError, Bytes,
