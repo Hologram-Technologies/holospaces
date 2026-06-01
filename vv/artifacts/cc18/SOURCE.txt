@@ -1,0 +1,75 @@
+CC-18 — language intelligence (Language Server Protocol) authority artifacts.
+
+The workbench provides language intelligence by speaking the Language Server
+Protocol to a real language server running in the devcontainer OS. holospaces
+realizes this: a real language server runs inside the booted OS (CC-14) and the
+workbench's LSP session flows to it over the standard LSP stdio base-protocol
+transport; its responses conform to the LSP spec.
+
+Authorities
+-----------
+Language Server Protocol specification — the authority for the protocol (the
+  Content-Length base-protocol framing, the initialize handshake + advertised
+  ServerCapabilities, and the textDocument/* request+response shapes). It is
+  embodied by the `lsp-types` crate (v0.95.1) — rust-analyzer's own LSP type
+  crate. BOTH sides of the witness speak it: the session is built with lsp-types
+  and the server's responses are deserialized back through lsp-types and checked
+  for spec conformance (InitializeResult, Hover, CompletionResponse, Location,
+  PublishDiagnosticsParams). lsp-types pins in crates/holospaces/Cargo.lock.
+
+A real language server (running in the OS) — `lsp-demo`, a minimal but real
+  single-threaded LSP server built ON lsp-types (its advertised capabilities and
+  every message body are lsp-types values). It does real, document-based language
+  intelligence over the opened source file: hover (the symbol under the cursor),
+  completion (the document's identifiers + keywords), go-to-definition (the
+  symbol's first occurrence), and diagnostics (a TODO marker). It is "minimal but
+  real" by design — its purpose is to witness the LSP CHANNEL and spec
+  CONFORMANCE end to end (workbench ⇄ server, in the OS), not to reproduce
+  rust-analyzer's analysis depth; a heavier server (rust-analyzer, clangd, …) is
+  the same channel with a larger binary.
+
+ext4 on-disk format — e2fsprogs (e2fsck/debugfs) is the oracle that the language
+  server binary and the LSP session are present and exact in the assembled rootfs.
+
+holospaces' own emulator — the substrate the holospace actually boots on. It boots
+  the assembled rootfs, execs the language server under a real libc, and the
+  server's LSP responses appear on the console (between LSP-BEGIN/LSP-END), where
+  the witness validates them against lsp-types.
+
+Artifacts
+---------
+vv/artifacts/cc18/lsp-demo/ — the language server's SOURCE (a self-contained Rust
+  crate: src/main.rs + Cargo.toml + Cargo.lock). Pure Rust (lsp-types, serde,
+  serde_json); single-threaded; the LSP base-protocol framing is implemented per
+  spec and every body is an lsp-types value.
+
+vv/artifacts/cc18/image/ — a real OCI image (riscv64/linux) whose tar+gzip layer
+  (digest sha256:ae280fa3d1bb28c22ab3905f58d4ec0e8bc5c076c3aedac364698d3cd505fb8f)
+  provides /usr/bin/lsp-demo (the language server) over /bin/busybox (the shell,
+  the SAME BusyBox v1.37.0 riscv64 as CC-22). Reuses the CC-14 kernel.
+
+lsp-demo binary — sha256 9f9abac3d8671163715310da1ffc084d0941d9f03fe32ecaf1d251169148d17a,
+  1067336 bytes, ELF riscv64 statically-linked (glibc, crt-static).
+
+Build (lsp-demo, riscv64 static):
+  cd vv/artifacts/cc18/lsp-demo
+  rustup target add riscv64gc-unknown-linux-gnu
+  # riscv64 glibc cross-dev provides the static libc (Ubuntu: libc6-dev-riscv64-cross)
+  CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER=riscv64-linux-gnu-gcc \
+    RUSTFLAGS="-C target-feature=+crt-static" \
+    cargo build --release --target riscv64gc-unknown-linux-gnu
+  # toolchain: rustc 1.96.0; riscv64-linux-gnu-gcc 13.3.0 (Ubuntu)
+The committed image layer embeds the resulting binary; the witness boots it.
+
+Witness — crates/holospaces/tests/cc18_lsp.rs; suite vv/suites/cc18-lsp.sh:
+  (1) the workbench's LSP session is spec-valid (its params round-trip through
+      lsp-types) and the real language server binary + the session are present in
+      the assembled ext4 rootfs — e2fsck clean, debugfs reads /usr/bin/lsp-demo
+      (a ~1 MB multi-extent ELF) and /session.lsp back;
+  (2) holospaces' own emulator runs the language server in the OS and it speaks
+      LSP — its responses, deserialized through lsp-types, conform to the spec:
+      initialize advertises hover/completion/definition capabilities; hover names
+      the symbol `greet`; completion offers the document's identifiers;
+      go-to-definition returns a Location at the definition (line 0); a
+      publishDiagnostics reports the TODO on line 1. #[ignore]d (heavy, a real-OS
+      boot to userland).
