@@ -1,0 +1,69 @@
+CC-22 — devcontainer lifecycle-command realization authority artifacts.
+
+A Codespace/Gitpod runs the Dev Container lifecycle commands (onCreateCommand,
+postCreateCommand, postStartCommand, …) in the environment so dependencies are
+installed and the workspace is ready when you open it. holospaces realizes this:
+the Boot Orchestrator parses the commands from devcontainer.json (CC-4), builds an
+/init lifecycle runner from the parsed config, and injects it into the assembled
+rootfs over a base image that provides a shell — so the booted OS runs the
+declared commands in spec order, with the config's remoteEnv applied.
+
+Authorities
+-----------
+Dev Container specification — the lifecycle hooks and their run order
+  (onCreate → updateContent → postCreate → postStart → postAttach). The
+  generated /init runs the parsed commands in that order, each framed with its
+  spec hook name (HOOK:postCreateCommand …). The same published
+  devContainer.base.schema.json as CC-4 is the judge of the parsed config.
+
+ext4 on-disk format — e2fsprogs (e2fsck/debugfs) is the oracle that the injected
+  /init is present in the assembled rootfs and byte-identical to what holospaces
+  built, alongside the base image's large multi-extent /bin/busybox. e2fsck finds
+  the assembled image structurally clean.
+
+qemu-system-riscv64 — the reference RISC-V machine (as in CC-9/CC-14/CC-16) is
+  the differential runtime oracle: it boots the holospaces-assembled rootfs with
+  the CC-14 kernel and runs the injected lifecycle /init; the declared
+  postCreateCommand output (CC22-POSTCREATE:ready-on-entry, the remoteEnv applied)
+  appears on the console — the environment is ready on entry.
+
+Artifacts
+---------
+image/ — a real OCI image-layout. Its single tar+gzip layer provides the shell:
+  /bin/busybox — a statically-linked BusyBox v1.37.0 for riscv64 (glibc),
+    sha256 644f74d33b34ce07b3cff32247a2cd01efca5bfa4301d118a04d29406f8f9030,
+    1614632 bytes, mode 0755. The base image a devcontainer's lifecycle commands
+    run under. The layer's placeholder /init is replaced at assembly time by the
+    config-derived lifecycle runner (assemble_ext4_with_init).
+  config Cmd /init; rootfs diff_id
+    sha256:5cebffb0bbdac1d7f8577b2c3c08a26fab0601440e14c68bb70ad9146098af0c.
+
+kernel — reused from CC-14 (vv/artifacts/cc14/kernel/Image.gz), the same RISC-V
+  Linux the emulator and QEMU both boot.
+
+Witness — crates/holospaces/tests/cc22_lifecycle.rs; suite
+  vv/suites/cc22-lifecycle.sh. Three checks:
+  (1) the lifecycle /init is built from the parsed config (commands in spec order,
+      remoteEnv exported, hooks marked, powers off) — driven by the config, not
+      hard-coded;
+  (2) the /init is injected into the assembled ext4 rootfs — e2fsck clean and
+      debugfs reads /init AND the 1.6 MB multi-extent /bin/busybox back
+      byte-identically (the rootfs the OS boots);
+  (3) the real OS runs the lifecycle commands — qemu-system-riscv64 boots the
+      holospaces rootfs and the declared postCreateCommand output appears, with
+      remoteEnv applied (the environment is ready on entry). #[ignore]d (heavy +
+      needs QEMU).
+
+Emulator-CPU note (honest)
+--------------------------
+holospaces' own RISC-V emulator boots this identical rootfs, mounts the ext4,
+and execs the lifecycle /init — but its CPU does not yet correctly run a real
+*libc* userland: the glibc-static busybox faults at startup (unhandled SIGSEGV
+inside glibc, e.g. badaddr 0x04218db0), where a freestanding raw-syscall init
+(CC-9/CC-14/CC-16/CC-21) runs cleanly. QEMU runs the byte-for-byte identical
+rootfs end to end (check (3) passes), and the ext4 is verified correct by
+e2fsprogs (check (2)) — so the fault is isolated to the emulator's execution of
+libc-shaped userland (demand-paged TLS/relocation-heavy startup), not to the
+lifecycle realization, the rootfs, or the image. That emulator-CPU gap is the
+focused next item; this CC witnesses the lifecycle realization, proven end to end
+by the QEMU oracle.

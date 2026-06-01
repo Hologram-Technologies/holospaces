@@ -2,7 +2,7 @@
 
 # Conceptual Model
 
-The holospaces conceptual model in Object-Process Methodology (OPM, ISO 19450). The top-level System Diagram (SD) presents holospaces at its highest abstraction — the **Provisioning**, **Booting**, and **Projecting** processes the operator handles; each in-zoom diagram refines one part — **SD1** provisioning, **SD2** the lifecycle (boot · suspend · resume · migrate · terminate), **SD3** identity and sync, **SD4** projecting (managing holospaces and working in one through a projection). Each diagram is bimodal: an Object-Process Diagram (OPD) paired with equivalent Object-Process Language (OPL) sentences.
+The holospaces conceptual model in Object-Process Methodology (OPM, ISO 19450). The top-level System Diagram (SD) presents holospaces at its highest abstraction — the **Provisioning**, **Booting**, and **Projecting** processes the operator handles; each in-zoom diagram refines one part — **SD1** provisioning, **SD2** the lifecycle (boot · suspend · resume · migrate · terminate), **SD3** identity and sync, **SD4** projecting (managing holospaces and working in one through a projection), **SD5** the in-zoom of devcontainer provisioning (how a devcontainer becomes a holospace — fetching the repository, parsing its config, ingesting the base image, and assembling the root filesystem). Each diagram is bimodal: an Object-Process Diagram (OPD) paired with equivalent Object-Process Language (OPL) sentences.
 
 Scope: the substrate is modeled as a single external object (`Substrate`); its internal pillars are defined by [hologram](https://github.com/Hologram-Technologies/hologram), not here. Peer deployment topology (browser / native / bare-metal) is described in the Deployment View (arc42 chapter 7), not modeled as an OPD.
 
@@ -103,5 +103,34 @@ Projecting consists of Managing and Working.
 Managing requires Projection.
 Working requires Projection.
 Working affects Holospace.
+```
+
+## SD5 Devcontainer
+
+![SD5 Devcontainer](images/opm-SD5-Devcontainer.svg)
+
+```opl
+Devcontainer Provisioning is informatical.
+Repository Fetching is informatical.
+Config Parsing is informatical.
+Image Ingestion is informatical.
+Rootfs Assembly is informatical.
+Repository is informatical.
+Devcontainer Config is informatical.
+Base Image is informatical.
+Root Filesystem is informatical.
+Holospace is informatical.
+Substrate is informatical.
+Devcontainer Provisioning consists of Repository Fetching, Config Parsing, Image Ingestion, and Rootfs Assembly.
+Repository Fetching requires Substrate.
+Repository Fetching yields Repository.
+Config Parsing requires Repository.
+Config Parsing yields Devcontainer Config.
+Image Ingestion requires Devcontainer Config.
+Image Ingestion requires Substrate.
+Image Ingestion yields Base Image.
+Rootfs Assembly requires Base Image.
+Rootfs Assembly yields Root Filesystem.
+Devcontainer Provisioning yields Holospace.
 ```
 

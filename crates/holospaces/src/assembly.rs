@@ -146,6 +146,30 @@ pub fn assemble_ext4(layers: &[Layer]) -> Result<Vec<u8>, AssemblyError> {
     Ok(ext4::write_image(&tree)?)
 }
 
+/// Assemble `layers` into an ext4 image, but with `/init` set to `init_bytes`
+/// (mode `0755`) — the Boot Orchestrator's hook for injecting the **dev-container
+/// lifecycle runner** (`CC-22`): a script that runs the config's lifecycle
+/// commands (`postCreateCommand`, …) in the booted OS so the environment is ready
+/// on entry. Overrides any `/init` the base image carried.
+pub fn assemble_ext4_with_init(
+    layers: &[Layer],
+    init_bytes: &[u8],
+) -> Result<Vec<u8>, AssemblyError> {
+    let mut tree = overlay_layers(layers)?;
+    let id = tree.contents.keys().copied().max().map_or(0, |m| m + 1);
+    tree.contents.insert(id, init_bytes.to_vec());
+    let meta = Meta {
+        mode: 0o755,
+        uid: 0,
+        gid: 0,
+        mtime: 0,
+    };
+    if let Node::Dir { children, .. } = &mut tree.root {
+        children.insert("init".into(), Node::File { meta, content: id });
+    }
+    Ok(ext4::write_image(&tree)?)
+}
+
 /// Find the Dev Container config inside a repository archive `layer` (a `tar` or
 /// `tar+gzip`, e.g. a git-host archive). Matches `.devcontainer/devcontainer.json`
 /// or a top-level `.devcontainer.json`, ignoring the archive's leading directory

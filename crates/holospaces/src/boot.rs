@@ -164,6 +164,56 @@ pub mod devcontainer {
         PostAttach,
     }
 
+    impl LifecycleHook {
+        /// The Dev Container spec property name of this hook.
+        #[must_use]
+        pub fn spec_name(self) -> &'static str {
+            match self {
+                LifecycleHook::OnCreate => "onCreateCommand",
+                LifecycleHook::UpdateContent => "updateContentCommand",
+                LifecycleHook::PostCreate => "postCreateCommand",
+                LifecycleHook::PostStart => "postStartCommand",
+                LifecycleHook::PostAttach => "postAttachCommand",
+            }
+        }
+    }
+
+    impl DevContainer {
+        /// Build the `/init` the Boot Orchestrator injects to run this
+        /// devcontainer's lifecycle commands in the booted OS (`CC-22`): a busybox
+        /// shell script that exports the config's `remoteEnv`, runs each lifecycle
+        /// command in spec order (each framed with a marker), and powers off. The
+        /// base image must provide `/bin/busybox`;
+        /// [`assemble_ext4_with_init`](crate::assembly::assemble_ext4_with_init)
+        /// writes the script as `/init`. This makes the environment *ready on
+        /// entry* — the Codespaces/Gitpod behaviour — driven by the config, not by
+        /// any holospaces hard-coding.
+        #[must_use]
+        pub fn lifecycle_init(&self) -> Vec<u8> {
+            let mut s = String::from("#!/bin/busybox sh\n");
+            s.push_str("export PATH=/bin:/usr/bin\n");
+            // The config's environment, applied to the lifecycle scripts (remoteEnv).
+            for (k, v) in &self.remote_env {
+                s.push_str("export ");
+                s.push_str(k);
+                s.push_str("='");
+                s.push_str(v);
+                s.push_str("'\n");
+            }
+            s.push_str("echo LIFECYCLE-START\n");
+            for (hook, cmd) in &self.lifecycle {
+                s.push_str("echo HOOK:");
+                s.push_str(hook.spec_name());
+                s.push('\n');
+                s.push_str(cmd);
+                s.push('\n');
+            }
+            s.push_str("echo LIFECYCLE-DONE\n");
+            s.push_str("busybox reboot -f\n");
+            s.into_bytes()
+        }
+    }
+
     /// Normalize JSONC `devcontainer.json` bytes to plain JSON (Law L2): strip
     /// line/block comments and trailing commas. The Dev Container format is
     /// JSONC; this is the canonicalization at the provisioning boundary.

@@ -384,3 +384,380 @@ Container spec). The workbench is large; it is imported by κ and
 verified by re-derivation, served from the cold-start gateway, and
 bridged with no server (Laws L1, L3, L4). The Monaco/xterm workspace of
 ADR-010 is the reduced fallback the workbench supersedes.
+
+## ADR-013: holospaces imports from the internet at an untrusted gateway boundary; a repository with no devcontainer gets a default
+
+**Status:** accepted
+
+**Context:** The conceptual model says a holospace is provisioned from a
+**devcontainer the operator names by a repository URL** (Chapter 1; OPD
+SD5). To uphold that, holospaces must **reach the internet** — retrieve
+the repository’s content from its git host and pull the devcontainer’s
+base image from its container registry — and bring that content *into*
+the substrate. This is the one place holospaces is location-aware: a URL
+and a registry reference are *locations* (the very thing Law L1 forbids
+as *identity*). The substrate’s own network layer is content-addressed
+(`get_with_fetch`, peer-to-peer by κ; ADR-006) and does not speak
+arbitrary HTTPS, git, or the OCI distribution protocol.
+
+- The internet is an **untrusted gateway**, exactly like the GitHub
+  Pages cold-start gateway (ADR-005): it may serve any bytes. holospaces
+  therefore **verifies every byte by re-derivation** on the way in — an
+  OCI blob’s `sha256` digest **is** a κ-label on the `sha256` axis
+  (`CC-10`, Law L5); a repository archive’s content yields its κ. The
+  located reference is only the *request*; the κ that results is the
+  *identity*, and from there everything is uor-native.
+
+- A repository need not contain a `devcontainer.json`. The Dev Container
+  specification defines a **default** (a standard base image).
+  holospaces applies it, so *any* repository — not only those already
+  set up for Dev Containers — provisions and boots.
+
+- The import boundary is the host-side edge of the Boot Layer (a `std`,
+  network-enabled surface, like the OCI ingestor `CC-10` and the Dev
+  Container parser `CC-4`); the portable peer core (browser /
+  bare-metal) never links a TCP/TLS client. The browser peer imports
+  through the page’s own `fetch`, the same verify-on-receipt boundary.
+
+**Decision:** holospaces interfaces with the internet at a single,
+explicit **import boundary**: a **Repository Fetcher** retrieves a
+repository’s content at a URL+reference, and an **Image Fetcher** pulls
+an OCI image by registry reference via the OCI distribution protocol.
+Both treat the remote as an untrusted gateway and **verify by
+re-derivation** (Law L5), turning a located reference into κ-addressed
+content the rest of the pipeline (`CC-4` → `CC-10` → `CC-7` → `CC-14`)
+consumes. When a repository declares no devcontainer, a **default Dev
+Container** image is used. The boundary is a host-side `std` surface,
+gated so the portable peer core does not link a network stack.
+
+**Consequences:** A user supplies only a git URL and gets a running
+devcontainer — the Codespaces/Gitpod entry point (Chapter 1) — including
+repositories with no Dev Container configuration. The location-awareness
+is confined to the import boundary and immediately dissolved into
+content addressing, so Laws L1/L2 hold everywhere inward. Because the
+gateway is untrusted and every byte is re-derived, a compromised
+registry or git host cannot inject content that does not match its
+digest (Law L5). The boundary is witnessed both **hermetically** (a
+localhost server serving pinned content — reproducible, in CI) and
+against the **live** internet (a network-gated smoke test). The fetch
+transport is a host concern; the browser peer uses the page’s `fetch` at
+the same verify-on-receipt boundary.
+
+## ADR-014: the devcontainer reaches the internet through virtio-net + a userspace TCP/IP NAT with a tunneled egress
+
+**Status:** accepted
+
+**Context:** A development environment that cannot `git clone`,
+`apt-get`, or `npm install` from the open internet is not one. The
+devcontainer’s OS must reach the network. But holospaces' first-class
+peer is the **browser** (Chapter 7), and **a browser tab has no raw
+network interface** — it cannot open arbitrary TCP sockets. So the
+guest’s network cannot be bridged to a host NIC (that would also need
+privileges and is not portable); it must be **carried** by a transport
+the browser actually has.
+
+- The emulator gives the guest a spec-conformant **`virtio-net`** device
+  (`CC-16`). The guest runs its own TCP/IP stack and emits Ethernet
+  frames.
+
+- holospaces terminates those frames in a **userspace TCP/IP NAT** (the
+  "slirp" model): it answers ARP and DHCP (the guest gets an address
+  with no external broadcast), and for each TCP/UDP flow the guest
+  opens, it makes a corresponding **outbound** connection and relays the
+  bytes. The guest sees an ordinary network; holospaces sees a set of
+  streams.
+
+- The NAT’s **egress transport** is **pluggable**, because the streams
+  must leave by whatever the peer can use:
+
+  - **native / codespace peer** — a direct host socket (`std::net`);
+
+  - **browser peer** — a **WebSocket tunnel to a relay** (the tab opens
+    a WebSocket; the relay opens the real TCP to the destination and
+    shuttles bytes). The relay is the **egress gateway** — the network
+    analogue of the GitHub Pages cold-start gateway (ADR-005): generic,
+    content-blind infrastructure (a TCP-over-WebSocket proxy, like a
+    TURN server), not a holospaces control plane.
+
+- The NAT itself (frame parsing, ARP, DHCP, the TCP state machine that
+  faces the guest) is environment-agnostic and compiles to wasm; only
+  the egress transport is per-environment. The transport is a small seam
+  (`open(addr) → stream`, `read`/`write`), so the same NAT serves the
+  native socket and the browser tunnel.
+
+**Decision:** The devcontainer reaches the internet over a `virtio-net`
+device whose backend is a userspace TCP/IP NAT, with a **pluggable
+egress transport**: a direct host socket on a native/codespace peer, and
+a WebSocket tunnel to a relay on the browser peer. The relay is generic
+egress infrastructure (a content-blind TCP-over-WebSocket proxy), not
+part of the holospaces control plane.
+
+**Consequences:** `git clone`, `apt-get`, and `npm install` work in the
+devcontainer — **including in a browser tab**, where the guest’s traffic
+is tunnelled out over WebSocket to the egress relay and back. The NAT is
+portable (the hard part — the guest-facing TCP/IP — is written once and
+runs in wasm); only the thin egress seam differs per peer. The browser
+cannot open raw sockets, so it depends on the egress relay exactly as
+cold-start depends on the Pages gateway; both are untrusted transports
+(the **content** is still content-addressed and verified end to end
+where applicable). Witnessed natively against \`qemu-system-riscv64’s
+user-mode network (the differential oracle — the guest does DHCP, opens
+TCP, and completes an HTTP exchange through the NAT) and, for the
+browser, over a WebSocket relay to a localhost server.
+
+## ADR-015: extensions run in a remote extension host inside the devcontainer OS; integrations work through the OS’s own network
+
+**Status:** accepted
+
+**Context:** The workspace must be a **real** Codespace/Gitpod, which
+means **extensions and their integrations work as expected** —
+concretely: a user signs in to GitHub through the workbench and manages
+their pull requests and issues from the editor, exactly as in a
+Codespace; a language extension drives a real language server; a
+debugger drives a real program. ADR-012 settled that the workspace is
+the real VS Code web workbench bridged to the holospace, but left open
+**where the extension host runs** and **how an extension reaches its
+backing service** (GitHub’s API, a registry, an OAuth endpoint). Running
+extensions purely in the browser’s **web** extension host is the wrong
+answer: a tab cannot make arbitrary cross-origin requests (CORS), many
+extensions are not web-only, and — most importantly — the holospace’s
+environment (its files, its tools, its network identity) lives in the
+**devcontainer OS**, not the tab.
+
+- VS Code already solves this with the **remote extension host**: in a
+  Codespace the workbench runs in the browser while the **extension host
+  process runs on the remote machine**, so extensions see the remote’s
+  filesystem, terminal, tools, and **network**. holospaces' "remote
+  machine" is the **devcontainer OS booted on the emulator** — so the
+  extension host belongs there.
+
+- That placement makes integrations fall out of primitives holospaces
+  already has: the extension host’s **files** are the `virtio-9p`
+  workspace (`CC-15`), its **terminal/process** surface is the holospace
+  console and the running OS (`CC-11`/`CC-14`), and its **network** —
+  the GitHub API call, the OAuth token exchange, the `git push` — is the
+  OS’s own stack over the userspace NAT and the tunnelled egress
+  (`CC-16`). An extension authenticating to GitHub and listing pull
+  requests is just HTTPS from a process in the OS, carried out the same
+  egress as `apt`.
+
+- The workbench (browser) and the extension host (OS) speak VS Code’s
+  **remote protocol** — the same management/IPC channel a Codespace uses
+  between the browser and the remote server. holospaces carries it over
+  a **substrate channel** between the browser peer and the running
+  holospace (publish/subscribe; Law L4), not a bespoke socket. The
+  workbench and every extension are still **imported by κ and verified
+  by re-derivation** before they load or activate (Law L5; ADR-012).
+
+- Authentication is the published VS Code **authentication provider**
+  contract (e.g. the built-in GitHub provider’s OAuth device/redirect
+  flow); the token lives in the OS-side extension host’s secret storage,
+  and the authenticated requests leave through `CC-16`. holospaces
+  implements the **contract**, not a GitHub-specific shim — any
+  extension’s provider works the same way.
+
+**Decision:** Extensions run in a **remote extension host inside the
+devcontainer OS** (the VS Code remote model), not in the browser tab.
+The workbench in the browser drives them over VS Code’s remote protocol
+carried on a substrate channel; the host exposes the holospace’s
+filesystem (`CC-15`), terminal/process surface (`CC-11`/`CC-14`), and
+network (`CC-16`) to extensions through the published VS Code APIs.
+Integrations and authentication use the extensions' own published
+provider contracts; their traffic is ordinary OS network egress.
+Witnessed (Chapter 10) against the concrete acceptance scenario: a user
+signs in to GitHub through the workbench and manages pull requests and
+issues, the requests leaving through the devcontainer’s `CC-16` network
+— the same flow as a Codespace.
+
+**Consequences:** The authentic Codespace experience holds **because the
+architecture is the same as a Codespace’s** — a browser workbench over a
+remote extension host — only the remote is a holospace, not a cloud VM,
+and the transport is the substrate, not a control-plane socket (Laws L1,
+L3, L4). Extensions and integrations work without holospaces knowing
+anything about them: a new extension brings its own provider, runs in
+the OS host, and uses the OS’s files/terminal/network. The cost is real
+— the remote-protocol bridge and the OS-side extension host are
+substantial, so `CC-17`/`CC-18`/`CC-19` are staged: `CC-17` the
+workbench + the filesystem/terminal providers, `CC-18` a language server
+in the OS over LSP, `CC-19` extensions + a real integration (the GitHub
+sign-in → pull-requests/issues scenario) + the Debug Adapter Protocol.
+The egress relay (ADR-014) carries the integration traffic in the
+browser, so the relay’s availability is part of "extensions work in a
+tab" (the same cold-start-gateway dependency).
+
+**Where the extension host runs is per-peer (a feasibility
+refinement).** VS Code ships **two** real models, and holospaces uses
+the one each peer can host. (a) The **remote** model (Codespaces): the
+extension host runs in the OS over the remote-server protocol —
+faithful, and used by a peer whose holospace OS can host that server (a
+native or remote peer backed by a full container/VM). (b) The **web**
+model (`vscode.dev` / `github.dev`): the extension host runs in the
+browser’s web worker, and the editor’s files come from a
+`FileSystemProvider` **web extension** whose data source is reached by
+`fetch`, which a **service worker** serves from the peer. The
+**browser** peer uses the web model, because its devcontainer OS is the
+minimal emulated Linux of ADR-011 — it boots a real kernel + rootfs but
+is not provisioned to run the full Node-based `vscode-server`. In both
+models the **backends are the same holospace primitives**: the
+`FileSystemProvider` is the `virtio-9p` workspace (`CC-15`, reached
+through the wasm peer in the web model or the OS host in the remote
+model), the terminal is the console (`CC-11`), and integration traffic
+leaves over `CC-16`. So parity is preserved — both are real VS Code
+extension hosts — and the choice is a transport detail, not a capability
+difference. (`CC-17` Phase 1 — the κ-verified workbench loads — is
+witnessed; the provider wiring is the web model on the browser peer and
+the remote model on a server-capable peer.)
+
+## ADR-016: the workspace targets full Codespaces/Gitpod capability parity, mapped to substrate primitives
+
+**Status:** accepted
+
+**Context:** The goal is not a single integration but **the same
+capabilities and experience as Codespaces/Gitpod**: a repository becomes
+a ready, real development environment, opened in the authentic VS Code
+workbench, with everything a developer expects — extensions and their
+integrations, language intelligence, debugging, a terminal, source
+control, port-forwarded app previews, dev-container Features and
+lifecycle setup, and personalization (settings, dotfiles, secrets) — and
+it must hold across holospaces' peers (native, remote, and the browser
+tab). To be sure the conceptual model has **no gaps** against that
+target, the capability set is enumerated and each capability is mapped
+to its holospaces realization (a conformance row and the substrate
+primitive it composes). Anything Codespaces/Gitpod do that does not map
+is a gap to close, not a feature to omit.
+
+- The Codespaces/Gitpod capability set, and its holospaces realization:
+
+  - **Create an environment from a repo + `devcontainer.json`** — the
+    import boundary (`CC-20`) + Dev Container parse (`CC-4`).
+
+  - **A real OS with tools; install packages** — the system emulator
+    boots the assembled rootfs over `virtio-blk` (`CC-9`/`CC-14`) with
+    internet (`CC-16`).
+
+  - **The browser VS Code editor + terminal** — the κ-verified workbench
+    (`CC-13` components → `CC-17` workbench) over the `virtio-9p`
+    filesystem (`CC-15`) and the OS console (`CC-11`).
+
+  - **Extensions + extension host** — a remote extension host **in the
+    devcontainer OS** (ADR-015; `CC-19`).
+
+  - **Language intelligence / debugging** — LSP (`CC-18`) and DAP
+    (`CC-19`) servers running in the OS.
+
+  - **Integrations + authentication** (GitHub and any other) — the
+    extensions' published authentication-provider contracts, their
+    traffic leaving over the OS network (`CC-16`); witnessed by the
+    GitHub pull-requests/issues scenario (`CC-19`).
+
+  - **Source control** — `git` in the OS over `CC-16`, surfaced by the
+    workbench’s SCM view.
+
+  - **Port forwarding / running-app preview** — the **ingress** dual of
+    `CC-16` (`CC-21`): an inbound connection bridged to a listener in
+    the OS.
+
+  - **Dev Container lifecycle commands** — built into the rootfs `/init`
+    from the parsed config and run in the OS in spec order, the
+    environment ready on entry (`CC-22`); Dev Container Features (each
+    an OCI artifact imported by κ, the same machinery as `CC-20`)
+    applied into the rootfs are the planned extension of the same seam.
+
+  - **Personalization — settings, dotfiles, secrets** — κ-addressed
+    content scoped to the operator’s identity and synced across peers
+    (`CC-23`; Laws L1/L3, Q6).
+
+  - **Suspend / resume / move the environment** — the κ snapshot
+    (already a first-class lifecycle operation; Q6).
+
+- The realization differs from Codespaces/Gitpod in **substrate, not
+  capability**: there is no cloud VM and no control plane. The "remote
+  machine" is a holospace (a κ-addressed OS the browser itself can run);
+  the transports are the substrate (channels, `KappaSync`) and the
+  cold-start/egress gateways — content-addressed and verified, never a
+  server holding the operator’s state (Laws L1/L3/L4). The browser tab
+  reaches parity by tunnelling what a tab cannot do natively (egress
+  `CC-16`, ingress `CC-21`) through the gateway, exactly as cold-start
+  depends on the Pages gateway (ADR-005/014).
+
+**Decision:** holospaces' workspace targets **full Codespaces/Gitpod
+capability parity**. The capability set above is the acceptance bar;
+each capability maps to a conformance row (`CC-17`…`CC-23`, composing
+`CC-1`…`CC-16`) with an external authority and a witness (Chapter 10).
+New Codespaces/Gitpod capabilities are added as conformance rows mapped
+to substrate primitives, never as server features. The GitHub
+integration is **one witnessed example** of the general
+extension-integration mechanism (ADR-015), not the scope.
+
+**Consequences:** "Same as a Codespace/Gitpod" is made concrete and
+gap-checkable: the model is the capability map, and
+`specs/feature-matrix.md` tracks each row’s status. The realization is
+uniform — every capability is a composition of the emulator’s devices
+(`virtio-blk`/`-9p`/`-net`), the workbench, and the remote extension
+host, over the substrate — so parity grows by adding witnessed rows
+rather than bespoke services. The cost is the breadth of
+`CC-17`…`CC-23`, each a real phase against its published authority; they
+are staged, and until a row is `live` the matrix says so (no notional
+parity claims).
+
+## ADR-017: authentication is the devcontainer’s and the extension’s, over the holospaces network; holospaces holds no secrets
+
+**Status:** accepted
+
+**Context:** A Codespace/Gitpod lets you **sign in to GitHub and other
+services** — from the terminal (`gh auth login`, `git`) and from
+extensions (the GitHub authentication provider). holospaces must offer
+the same, **without** becoming an identity broker or holding anyone’s
+tokens (that would violate Laws L1/L3 — identity is the user’s,
+content/secrets are not holospaces' to hold — and would be a security
+liability).
+
+- The insight: holospaces does not **do** the authentication. It
+  provides the **network** (`CC-16`: `virtio-net` + the userspace NAT +
+  the tunnelled egress). Auth happens **in the devcontainer** (the OS’s
+  `gh`/`git`/SDKs) and **in the extension host** (an extension’s
+  published authentication provider), using each **service’s own** OAuth
+  flow **over** that network. holospaces carries the bytes
+  content-blind, exactly as the egress relay does.
+
+- The flow that fits a **browser/Pages** deployment is the **OAuth 2.0
+  Device Authorization Grant (RFC 8628)**: the client requests a
+  device + user code, the user authorizes at the service’s verification
+  URI, and the client polls for the token. It needs **no client secret
+  and no redirect-URI backend** — so a static GitHub-Pages-served
+  holospaces needs no server-side auth component. (`gh auth login` uses
+  exactly this.) The standard redirect-based code flow remains available
+  to a server-capable peer.
+
+- The **token lives where it is used** — in the devcontainer OS, or in
+  the extension host’s secret storage — and leaves only as the
+  `Authorization` header on the service’s own API calls, over `CC-16`.
+  holospaces never sees, stores, or brokers it.
+
+- This is service-agnostic: GitHub, GitLab, a registry, a cloud SDK —
+  each authenticates with **its own** provider over the network.
+  holospaces is not GitHub-specific and bundles no service’s
+  credentials.
+
+**Decision:** holospaces does not implement or intermediate
+authentication. It provides the network (`CC-16`), and the
+devcontainer’s tools and the extension host authenticate with GitHub and
+other services over it using those services' published OAuth flows — the
+**Device Authorization Grant** (RFC 8628) being the secretless flow that
+works from a Pages deployment. Tokens live in the
+devcontainer/extension, never in holospaces (content-blind; Laws L1/L3).
+Witnessed (`CC-24`) against RFC 8628 with a hermetic GitHub-shaped
+device-flow oracle: the devcontainer completes the device flow and
+obtains an access token over the holospaces network.
+
+**Consequences:** "Sign in to GitHub and other services" works **as
+expected** — because it is the **services'** auth, run by the **user’s**
+tools, over a real network, not a holospaces feature. holospaces holds
+no secrets and is no identity broker (a security and a uor-native win,
+Laws L1/L3). Any service’s extension or CLI authenticates the same way;
+nothing is GitHub-specific. On the browser peer the auth traffic rides
+the egress relay (ADR-014), so the relay’s availability is part of "auth
+works in a tab" — the same cold-start-gateway dependency. The one
+ergonomic difference from a redirect flow is that the device flow asks
+the user to enter a short code at a verification URL — standard for
+device/CLI sign-in.
