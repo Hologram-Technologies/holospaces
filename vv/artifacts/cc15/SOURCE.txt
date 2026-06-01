@@ -1,0 +1,28 @@
+CC-15 — VirtIO 9P (shared workspace filesystem) authority artifacts.
+
+The witness (crates/holospaces/tests/cc15_workspace.rs) assembles the OCI image
+below into a rootfs, boots the CC-14 kernel (which has CONFIG_NET_9P_VIRTIO +
+CONFIG_9P_FS) on the emulator with that rootfs AND a shared workspace seeded by
+holospaces, and asserts the guest mounts the workspace over virtio-9p and reads
+holospaces' file, and that holospaces reads back the file the guest wrote — one
+shared content (Law L1). The protocol authority is 9P2000.L; the differential
+oracle is qemu-system-riscv64's own 9p server (same kernel + init + markers).
+
+image/  — a real OCI image-layout whose tar+gzip layer is /init = init9p
+  (image/init9p.c), a freestanding RV64 program (no libc, raw syscalls) that:
+    mkdir /mnt; mount("hsworkspace","/mnt","9p",0,"trans=virtio,version=9p2000.L");
+    read /mnt/from-holospaces.txt and echo it (READ:…); create + write
+    /mnt/from-guest.txt = "GUEST-WROTE-THIS"; print 9P-MOUNTED / 9P-WROTE /
+    9P-DONE; power off via the reboot(2) syscall.
+  Built: riscv64-linux-gnu-gcc -nostdlib -static -Os -ffreestanding -fno-builtin.
+
+kernel — reused from CC-14 (vv/artifacts/cc14/kernel/Image.gz); its defconfig
+  base already enables the 9p virtio transport + filesystem.
+
+QEMU oracle (the reference this device matches):
+  qemu-system-riscv64 -M virt -m 512M -nographic -bios default \
+    -global virtio-mmio.force-legacy=false -kernel <Image> \
+    -drive file=<rootfs.ext4>,format=raw,if=none,id=hd0 -device virtio-blk-device,drive=hd0 \
+    -fsdev local,id=fs,path=<dir>,security_model=none \
+    -device virtio-9p-device,fsdev=fs,mount_tag=hsworkspace \
+    -append "root=/dev/vda rw console=hvc0 earlycon=sbi init=/init"

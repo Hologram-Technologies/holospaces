@@ -227,6 +227,9 @@ pub struct Emulator {
     /// The VirtIO block device, when a root filesystem disk is attached; `None`
     /// for a diskless machine (the `CC-9` boot path is unchanged).
     virtio: Option<VirtioBlk>,
+    /// The VirtIO 9P device serving the shared workspace filesystem, when
+    /// attached (`CC-15`); `None` otherwise.
+    virtio9p: Option<Virtio9p>,
 }
 
 /// The CLINT memory-mapped region (one hart): `msip` at +0, `mtimecmp` at
@@ -249,6 +252,14 @@ pub(crate) const VIRTIO_BASE: u64 = 0x1000_1000;
 pub(crate) const VIRTIO_END: u64 = 0x1000_2000;
 /// The PLIC interrupt source number the VirtIO block device raises.
 pub(crate) const VIRTIO_IRQ: u32 = 1;
+/// The second `virtio-mmio` slot — the VirtIO 9P (shared workspace filesystem)
+/// device, with PLIC source 2 (`CC-15`).
+pub(crate) const VIRTIO9P_BASE: u64 = 0x1000_2000;
+pub(crate) const VIRTIO9P_END: u64 = 0x1000_3000;
+/// The PLIC interrupt source number the VirtIO 9P device raises.
+pub(crate) const VIRTIO9P_IRQ: u32 = 2;
+/// The `mount_tag` the guest selects the workspace 9P share by.
+pub(crate) const WORKSPACE_TAG: &str = "hsworkspace";
 /// PLIC contexts for a single hart: M-mode (0) and S-mode (1).
 const PLIC_CONTEXTS: usize = 2;
 
@@ -380,6 +391,505 @@ impl VirtioBlk {
     }
 }
 
+/// The VirtIO **9P transport** block — a second `virtio-mmio` device carrying a
+/// `virtio-9p` filesystem (OASIS VirtIO §5.7; device id 9). It serves a shared
+/// **workspace filesystem** to the guest over the **9P2000.L** protocol: the
+/// editor and the running OS read and write the *same* files (the IDE's shared
+/// FS — `CC-15`). The guest mounts it with `-t 9p -o trans=virtio`, matching the
+/// `mount_tag` in this device's config space.
+struct Virtio9p {
+    /// The 9P2000.L backend filesystem (the shared workspace tree).
+    fs: ninep::Fs9p,
+    /// Open file ids → backend inode (the 9P fid table).
+    fids: alloc::collections::BTreeMap<u32, u64>,
+    /// The mount tag the guest selects this device by.
+    tag: alloc::string::String,
+    // ── the virtio-mmio transport registers (same shape as VirtioBlk) ──
+    status: u32,
+    device_features_sel: u32,
+    driver_features_sel: u32,
+    driver_features: [u32; 2],
+    queue_num: u32,
+    queue_ready: u32,
+    desc_addr: u64,
+    avail_addr: u64,
+    used_addr: u64,
+    last_avail: u16,
+    interrupt_status: u32,
+    irq_pending: bool,
+}
+
+impl Virtio9p {
+    fn new(fs: ninep::Fs9p, tag: &str) -> Self {
+        Virtio9p {
+            fs,
+            fids: alloc::collections::BTreeMap::new(),
+            tag: tag.into(),
+            status: 0,
+            device_features_sel: 0,
+            driver_features_sel: 0,
+            driver_features: [0; 2],
+            queue_num: 0,
+            queue_ready: 0,
+            desc_addr: 0,
+            avail_addr: 0,
+            used_addr: 0,
+            last_avail: 0,
+            interrupt_status: 0,
+            irq_pending: false,
+        }
+    }
+}
+
+/// The **9P2000.L** protocol + an in-memory backend filesystem — the shared
+/// workspace the `virtio-9p` device serves (the protocol authority is the
+/// 9P2000.L specification; the differential oracle is `qemu-system-riscv64`'s
+/// own 9p server). Only the messages a Linux 9p client issues to mount, stat,
+/// open, read, write, create, and read directories are implemented; anything
+/// else replies `Rlerror(EOPNOTSUPP)`.
+mod ninep {
+    use alloc::collections::BTreeMap;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    // 9P2000.L message types.
+    const RLERROR: u8 = 7;
+    const TSTATFS: u8 = 8;
+    const TLOPEN: u8 = 12;
+    const TLCREATE: u8 = 14;
+    const TGETATTR: u8 = 24;
+    const TSETATTR: u8 = 26;
+    const TREADDIR: u8 = 40;
+    const TMKDIR: u8 = 72;
+    const TVERSION: u8 = 100;
+    const TATTACH: u8 = 104;
+    const TFLUSH: u8 = 108;
+    const TWALK: u8 = 110;
+    const TREAD: u8 = 116;
+    const TWRITE: u8 = 118;
+    const TCLUNK: u8 = 120;
+
+    // POSIX file-type bits.
+    const S_IFDIR: u32 = 0x4000;
+    const S_IFREG: u32 = 0x8000;
+    // Directory-entry types.
+    const DT_DIR: u8 = 4;
+    const DT_REG: u8 = 8;
+    // errno values the backend returns.
+    const ENOENT: u32 = 2;
+    const EOPNOTSUPP: u32 = 95;
+
+    /// A backend inode: a directory (name → child inode) or a file (bytes).
+    struct Inode {
+        is_dir: bool,
+        mode: u32,
+        data: Vec<u8>,
+        children: BTreeMap<String, u64>,
+    }
+
+    /// The shared workspace filesystem. Inode 1 is the root directory.
+    pub struct Fs9p {
+        inodes: BTreeMap<u64, Inode>,
+        next: u64,
+    }
+
+    impl Fs9p {
+        /// A new filesystem with an empty root directory.
+        pub fn new() -> Self {
+            let mut inodes = BTreeMap::new();
+            inodes.insert(
+                1,
+                Inode {
+                    is_dir: true,
+                    mode: S_IFDIR | 0o755,
+                    data: Vec::new(),
+                    children: BTreeMap::new(),
+                },
+            );
+            Fs9p { inodes, next: 2 }
+        }
+
+        /// Seed a regular file `name` in the root with `data` — content
+        /// holospaces places on the share for the guest to read.
+        pub fn seed_file(&mut self, name: &str, data: &[u8]) {
+            let id = self.next;
+            self.next += 1;
+            self.inodes.insert(
+                id,
+                Inode {
+                    is_dir: false,
+                    mode: S_IFREG | 0o644,
+                    data: data.to_vec(),
+                    children: BTreeMap::new(),
+                },
+            );
+            self.inodes
+                .get_mut(&1)
+                .unwrap()
+                .children
+                .insert(name.into(), id);
+        }
+
+        /// Read a root file's bytes back (what the guest wrote) — how holospaces
+        /// observes the guest's edits to the shared workspace.
+        pub fn read_file(&self, name: &str) -> Option<&[u8]> {
+            let id = *self.inodes.get(&1)?.children.get(name)?;
+            let n = self.inodes.get(&id)?;
+            (!n.is_dir).then_some(n.data.as_slice())
+        }
+
+        fn alloc(&mut self, is_dir: bool, mode: u32) -> u64 {
+            let id = self.next;
+            self.next += 1;
+            self.inodes.insert(
+                id,
+                Inode {
+                    is_dir,
+                    mode,
+                    data: Vec::new(),
+                    children: BTreeMap::new(),
+                },
+            );
+            id
+        }
+    }
+
+    /// A little-endian cursor over a 9P message body.
+    struct R<'a> {
+        b: &'a [u8],
+        p: usize,
+    }
+    impl<'a> R<'a> {
+        fn new(b: &'a [u8]) -> Self {
+            R { b, p: 0 }
+        }
+        fn u8(&mut self) -> u8 {
+            let v = self.b.get(self.p).copied().unwrap_or(0);
+            self.p += 1;
+            v
+        }
+        fn u16(&mut self) -> u16 {
+            let mut a = [0u8; 2];
+            a.copy_from_slice(self.b.get(self.p..self.p + 2).unwrap_or(&[0, 0]));
+            self.p += 2;
+            u16::from_le_bytes(a)
+        }
+        fn u32(&mut self) -> u32 {
+            let mut a = [0u8; 4];
+            if let Some(s) = self.b.get(self.p..self.p + 4) {
+                a.copy_from_slice(s);
+            }
+            self.p += 4;
+            u32::from_le_bytes(a)
+        }
+        fn u64(&mut self) -> u64 {
+            let mut a = [0u8; 8];
+            if let Some(s) = self.b.get(self.p..self.p + 8) {
+                a.copy_from_slice(s);
+            }
+            self.p += 8;
+            u64::from_le_bytes(a)
+        }
+        fn str(&mut self) -> String {
+            let n = self.u16() as usize;
+            let s = self.b.get(self.p..self.p + n).unwrap_or(&[]);
+            self.p += n;
+            String::from_utf8_lossy(s).into_owned()
+        }
+        fn bytes(&mut self, n: usize) -> &'a [u8] {
+            let s = self.b.get(self.p..self.p + n).unwrap_or(&[]);
+            self.p += n;
+            s
+        }
+    }
+
+    /// A little-endian 9P message body builder.
+    struct W(Vec<u8>);
+    impl W {
+        fn new() -> Self {
+            W(Vec::new())
+        }
+        fn u8(&mut self, v: u8) {
+            self.0.push(v);
+        }
+        fn u16(&mut self, v: u16) {
+            self.0.extend_from_slice(&v.to_le_bytes());
+        }
+        fn u32(&mut self, v: u32) {
+            self.0.extend_from_slice(&v.to_le_bytes());
+        }
+        fn u64(&mut self, v: u64) {
+            self.0.extend_from_slice(&v.to_le_bytes());
+        }
+        fn str(&mut self, s: &str) {
+            self.u16(s.len() as u16);
+            self.0.extend_from_slice(s.as_bytes());
+        }
+        /// A `qid[13]`: type, version, path.
+        fn qid(&mut self, is_dir: bool, path: u64) {
+            self.u8(if is_dir { 0x80 } else { 0x00 });
+            self.u32(0);
+            self.u64(path);
+        }
+    }
+
+    /// Wrap a reply body in the `size[4] type[1] tag[2] body` envelope.
+    fn envelope(rtype: u8, tag: u16, body: &[u8]) -> Vec<u8> {
+        let size = 7 + body.len() as u32;
+        let mut out = Vec::with_capacity(size as usize);
+        out.extend_from_slice(&size.to_le_bytes());
+        out.push(rtype);
+        out.extend_from_slice(&tag.to_le_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn rlerror(tag: u16, ecode: u32) -> Vec<u8> {
+        let mut w = W::new();
+        w.u32(ecode);
+        envelope(RLERROR, tag, &w.0)
+    }
+
+    /// Handle one T-message against `fs`/`fids`, returning the R-message bytes.
+    pub fn handle(fs: &mut Fs9p, fids: &mut BTreeMap<u32, u64>, msg: &[u8]) -> Vec<u8> {
+        let mut r = R::new(msg);
+        let _size = r.u32();
+        let ttype = r.u8();
+        let tag = r.u16();
+
+        match ttype {
+            TVERSION => {
+                let msize = r.u32();
+                let _ver = r.str();
+                let mut w = W::new();
+                w.u32(msize.min(64 * 1024));
+                w.str("9P2000.L");
+                envelope(TVERSION + 1, tag, &w.0)
+            }
+            TATTACH => {
+                let fid = r.u32();
+                fids.insert(fid, 1); // the root inode
+                let mut w = W::new();
+                w.qid(true, 1);
+                envelope(TATTACH + 1, tag, &w.0)
+            }
+            TWALK => {
+                let fid = r.u32();
+                let newfid = r.u32();
+                let nwname = r.u16() as usize;
+                let Some(&start) = fids.get(&fid) else {
+                    return rlerror(tag, ENOENT);
+                };
+                let mut cur = start;
+                let mut qids: Vec<(bool, u64)> = Vec::new();
+                for i in 0..nwname {
+                    let name = r.str();
+                    let next = match fs.inodes.get(&cur) {
+                        Some(n) if n.is_dir => resolve_child(n, &name),
+                        _ => None,
+                    };
+                    match next {
+                        Some(id) => {
+                            cur = id;
+                            let isd = fs.inodes.get(&id).map(|n| n.is_dir).unwrap_or(false);
+                            qids.push((isd, id));
+                        }
+                        None => {
+                            if i == 0 {
+                                return rlerror(tag, ENOENT);
+                            }
+                            break; // partial walk
+                        }
+                    }
+                }
+                if qids.len() == nwname {
+                    fids.insert(newfid, cur);
+                }
+                let mut w = W::new();
+                w.u16(qids.len() as u16);
+                for (isd, id) in &qids {
+                    w.qid(*isd, *id);
+                }
+                envelope(TWALK + 1, tag, &w.0)
+            }
+            TGETATTR => {
+                let fid = r.u32();
+                let _mask = r.u64();
+                let Some(n) = fids.get(&fid).and_then(|id| fs.inodes.get(id)) else {
+                    return rlerror(tag, ENOENT);
+                };
+                let id = *fids.get(&fid).unwrap();
+                let mut w = W::new();
+                w.u64(0x0000_07ff); // valid: the basic fields
+                w.qid(n.is_dir, id);
+                w.u32(n.mode);
+                w.u32(0); // uid
+                w.u32(0); // gid
+                w.u64(if n.is_dir { 2 } else { 1 }); // nlink
+                w.u64(0); // rdev
+                w.u64(n.data.len() as u64); // size
+                w.u64(4096); // blksize
+                w.u64(n.data.len().div_ceil(512) as u64); // blocks
+                for _ in 0..8 {
+                    w.u64(0); // atime/mtime/ctime/btime sec+nsec
+                }
+                w.u64(0); // gen
+                w.u64(0); // data_version
+                envelope(TGETATTR + 1, tag, &w.0)
+            }
+            TLOPEN => {
+                let fid = r.u32();
+                let _flags = r.u32();
+                let Some(&id) = fids.get(&fid) else {
+                    return rlerror(tag, ENOENT);
+                };
+                let isd = fs.inodes.get(&id).map(|n| n.is_dir).unwrap_or(false);
+                let mut w = W::new();
+                w.qid(isd, id);
+                w.u32(0); // iounit (0 = no limit)
+                envelope(TLOPEN + 1, tag, &w.0)
+            }
+            TLCREATE => {
+                let dfid = r.u32();
+                let name = r.str();
+                let _flags = r.u32();
+                let mode = r.u32();
+                let _gid = r.u32();
+                let Some(&dir) = fids.get(&dfid) else {
+                    return rlerror(tag, ENOENT);
+                };
+                let id = fs.alloc(false, S_IFREG | (mode & 0o7777));
+                if let Some(d) = fs.inodes.get_mut(&dir) {
+                    d.children.insert(name, id);
+                }
+                fids.insert(dfid, id); // the fid now refers to the new file
+                let mut w = W::new();
+                w.qid(false, id);
+                w.u32(0);
+                envelope(TLCREATE + 1, tag, &w.0)
+            }
+            TMKDIR => {
+                let dfid = r.u32();
+                let name = r.str();
+                let mode = r.u32();
+                let _gid = r.u32();
+                let Some(&dir) = fids.get(&dfid) else {
+                    return rlerror(tag, ENOENT);
+                };
+                let id = fs.alloc(true, S_IFDIR | (mode & 0o7777));
+                if let Some(d) = fs.inodes.get_mut(&dir) {
+                    d.children.insert(name, id);
+                }
+                let mut w = W::new();
+                w.qid(true, id);
+                envelope(TMKDIR + 1, tag, &w.0)
+            }
+            TREAD => {
+                let fid = r.u32();
+                let offset = r.u64() as usize;
+                let count = r.u32() as usize;
+                let Some(n) = fids.get(&fid).and_then(|id| fs.inodes.get(id)) else {
+                    return rlerror(tag, ENOENT);
+                };
+                let slice = n.data.get(offset..).unwrap_or(&[]);
+                let take = slice.len().min(count);
+                let mut w = W::new();
+                w.u32(take as u32);
+                w.0.extend_from_slice(&slice[..take]);
+                envelope(TREAD + 1, tag, &w.0)
+            }
+            TWRITE => {
+                let fid = r.u32();
+                let offset = r.u64() as usize;
+                let count = r.u32() as usize;
+                let data = r.bytes(count);
+                let Some(&id) = fids.get(&fid) else {
+                    return rlerror(tag, ENOENT);
+                };
+                if let Some(n) = fs.inodes.get_mut(&id) {
+                    if n.data.len() < offset + count {
+                        n.data.resize(offset + count, 0);
+                    }
+                    n.data[offset..offset + count].copy_from_slice(data);
+                }
+                let mut w = W::new();
+                w.u32(count as u32);
+                envelope(TWRITE + 1, tag, &w.0)
+            }
+            TREADDIR => {
+                let fid = r.u32();
+                let offset = r.u64();
+                let count = r.u32() as usize;
+                let Some(&id) = fids.get(&fid) else {
+                    return rlerror(tag, ENOENT);
+                };
+                let mut body = W::new();
+                let mut entries: Vec<(String, u64, bool)> = Vec::new();
+                if let Some(n) = fs.inodes.get(&id) {
+                    // "." and ".." then the children, with sequential cookies.
+                    entries.push((".".into(), id, true));
+                    entries.push(("..".into(), 1, true));
+                    for (name, cid) in &n.children {
+                        let isd = fs.inodes.get(cid).map(|c| c.is_dir).unwrap_or(false);
+                        entries.push((name.clone(), *cid, isd));
+                    }
+                }
+                let mut data = W::new();
+                for (i, (name, cid, isd)) in entries.iter().enumerate() {
+                    let cookie = (i + 1) as u64;
+                    if cookie <= offset {
+                        continue;
+                    }
+                    let mut e = W::new();
+                    e.qid(*isd, *cid);
+                    e.u64(cookie);
+                    e.u8(if *isd { DT_DIR } else { DT_REG });
+                    e.str(name);
+                    if data.0.len() + e.0.len() > count {
+                        break;
+                    }
+                    data.0.extend_from_slice(&e.0);
+                }
+                body.u32(data.0.len() as u32);
+                body.0.extend_from_slice(&data.0);
+                envelope(TREADDIR + 1, tag, &body.0)
+            }
+            TCLUNK => {
+                let fid = r.u32();
+                fids.remove(&fid);
+                envelope(TCLUNK + 1, tag, &[])
+            }
+            TSTATFS => {
+                let _fid = r.u32();
+                let mut w = W::new();
+                w.u32(0x0102_1997); // f_type (V9FS_MAGIC)
+                w.u32(4096); // bsize
+                w.u64(1 << 20); // blocks
+                w.u64(1 << 20); // bfree
+                w.u64(1 << 20); // bavail
+                w.u64(1 << 16); // files
+                w.u64(1 << 16); // ffree
+                w.u64(0); // fsid
+                w.u32(255); // namelen
+                envelope(TSTATFS + 1, tag, &w.0)
+            }
+            TSETATTR => {
+                // Accept (and ignore) attribute changes — our FS has no perms.
+                envelope(TSETATTR + 1, tag, &[])
+            }
+            TFLUSH => envelope(TFLUSH + 1, tag, &[]),
+            _ => rlerror(tag, EOPNOTSUPP),
+        }
+    }
+
+    fn resolve_child(dir: &Inode, name: &str) -> Option<u64> {
+        match name {
+            "." => None, // handled by the caller's current fid
+            _ => dir.children.get(name).copied(),
+        }
+    }
+}
+
 impl Emulator {
     /// Create a machine with `ram_bytes` of RAM mapped at `base`, the reset PC.
     #[must_use]
@@ -413,7 +923,29 @@ impl Emulator {
             provide_sbi: false,
             plic: Plic::new(),
             virtio: None,
+            virtio9p: None,
         }
+    }
+
+    /// Attach a shared **workspace filesystem** to the machine's VirtIO 9P device
+    /// (`CC-15`). `seed` is the files holospaces places on the share (name →
+    /// bytes); the guest mounts it (`-t 9p`, tag `hsworkspace`) and the editor and
+    /// the running OS read and write the *same* files. Read the guest's writes
+    /// back with [`Self::workspace_file`].
+    pub fn attach_workspace(&mut self, seed: &[(&str, &[u8])]) {
+        let mut fs = ninep::Fs9p::new();
+        for (name, data) in seed {
+            fs.seed_file(name, data);
+        }
+        self.virtio9p = Some(Virtio9p::new(fs, WORKSPACE_TAG));
+    }
+
+    /// Read a file from the shared workspace filesystem — how holospaces observes
+    /// the edits the guest made over 9P (`CC-15`). `None` if no 9P device is
+    /// attached or the file is absent.
+    #[must_use]
+    pub fn workspace_file(&self, name: &str) -> Option<&[u8]> {
+        self.virtio9p.as_ref().and_then(|d| d.fs.read_file(name))
     }
 
     /// Attach a root filesystem disk to the machine's VirtIO block device — the
@@ -886,6 +1418,9 @@ impl Emulator {
         if (VIRTIO_BASE..VIRTIO_END).contains(&addr) {
             return Ok(self.virtio_read(addr, width));
         }
+        if (VIRTIO9P_BASE..VIRTIO9P_END).contains(&addr) {
+            return Ok(self.virtio9p_read(addr));
+        }
         let o = self.offset(addr, width)?;
         let mut v = 0u64;
         for i in 0..width {
@@ -905,6 +1440,10 @@ impl Emulator {
         }
         if (VIRTIO_BASE..VIRTIO_END).contains(&addr) {
             self.virtio_write(addr, value as u32);
+            return Ok(());
+        }
+        if (VIRTIO9P_BASE..VIRTIO9P_END).contains(&addr) {
+            self.virtio9p_write(addr, value as u32);
             return Ok(());
         }
         let o = self.offset(addr, width)?;
@@ -1204,6 +1743,152 @@ impl Emulator {
         let _ = self.store_phys(a, 4, u64::from(v));
     }
 
+    // ── VirtIO 9P device (the shared workspace filesystem; CC-15) ──
+
+    /// Read a VirtIO-MMIO register or 9P-config field of the 9P device.
+    fn virtio9p_read(&self, addr: u64) -> u64 {
+        let Some(dev) = self.virtio9p.as_ref() else {
+            return 0;
+        };
+        let off = addr - VIRTIO9P_BASE;
+        match off {
+            0x000 => 0x7472_6976, // MagicValue
+            0x004 => 2,           // Version (modern)
+            0x008 => 9,           // DeviceID = 9P transport
+            0x00c => 0x554d_4551, // VendorID
+            0x010 => match dev.device_features_sel {
+                // word 0: VIRTIO_9P_MOUNT_TAG (bit 0); word 1: VERSION_1 (bit 32).
+                0 => 1,
+                1 => 1,
+                _ => 0,
+            },
+            0x034 => 1024, // QueueNumMax
+            0x044 => u64::from(dev.queue_ready),
+            0x060 => u64::from(dev.interrupt_status),
+            0x070 => u64::from(dev.status),
+            0x0fc => 0, // ConfigGeneration
+            // 9P config: tag length (u16) then the tag bytes.
+            0x100 => dev.tag.len() as u64,
+            0x101 => (dev.tag.len() >> 8) as u64,
+            _ if (0x102..0x102 + dev.tag.len() as u64).contains(&off) => {
+                u64::from(dev.tag.as_bytes()[(off - 0x102) as usize])
+            }
+            _ => 0,
+        }
+    }
+
+    /// Write a VirtIO-MMIO register of the 9P device; `QueueNotify` runs the queue.
+    fn virtio9p_write(&mut self, addr: u64, value: u32) {
+        let off = addr - VIRTIO9P_BASE;
+        if self.virtio9p.is_none() {
+            return;
+        }
+        {
+            let dev = self.virtio9p.as_mut().unwrap();
+            match off {
+                0x014 => dev.device_features_sel = value,
+                0x020 => {
+                    let w = dev.driver_features_sel.min(1) as usize;
+                    dev.driver_features[w] = value;
+                }
+                0x024 => dev.driver_features_sel = value,
+                0x038 => dev.queue_num = value,
+                0x044 => dev.queue_ready = value,
+                0x064 => dev.interrupt_status &= !value,
+                0x070 => dev.status = value,
+                0x080 => dev.desc_addr = (dev.desc_addr & !0xffff_ffff) | u64::from(value),
+                0x084 => dev.desc_addr = (dev.desc_addr & 0xffff_ffff) | (u64::from(value) << 32),
+                0x090 => dev.avail_addr = (dev.avail_addr & !0xffff_ffff) | u64::from(value),
+                0x094 => dev.avail_addr = (dev.avail_addr & 0xffff_ffff) | (u64::from(value) << 32),
+                0x0a0 => dev.used_addr = (dev.used_addr & !0xffff_ffff) | u64::from(value),
+                0x0a4 => dev.used_addr = (dev.used_addr & 0xffff_ffff) | (u64::from(value) << 32),
+                _ => {}
+            }
+        }
+        if off == 0x050 {
+            self.virtio9p_process_queue();
+        }
+    }
+
+    /// Process every newly-available 9P request: gather the T-message from the
+    /// chain's readable descriptors, handle it against the workspace filesystem,
+    /// scatter the R-message into the writable descriptors, and raise the IRQ.
+    fn virtio9p_process_queue(&mut self) {
+        let mut dev = self.virtio9p.take().unwrap();
+        let qsz = dev.queue_num as u16;
+        if dev.queue_ready == 0 || qsz == 0 {
+            self.virtio9p = Some(dev);
+            return;
+        }
+        let avail_idx = self.rd16(dev.avail_addr + 2);
+        while dev.last_avail != avail_idx {
+            let slot = dev.last_avail % qsz;
+            let head = self.rd16(dev.avail_addr + 4 + 2 * u64::from(slot));
+            let written = self.virtio9p_service_chain(&mut dev, head);
+            let used_idx = self.rd16(dev.used_addr + 2);
+            let ring = dev.used_addr + 4 + 8 * u64::from(used_idx % qsz);
+            self.wr32(ring, u32::from(head));
+            self.wr32(ring + 4, written);
+            self.wr16(dev.used_addr + 2, used_idx.wrapping_add(1));
+            dev.last_avail = dev.last_avail.wrapping_add(1);
+            dev.interrupt_status |= 1;
+            dev.irq_pending = true;
+        }
+        let raise = dev.irq_pending;
+        dev.irq_pending = false;
+        self.virtio9p = Some(dev);
+        if raise {
+            self.plic.raise(VIRTIO9P_IRQ);
+        }
+    }
+
+    /// Service one 9P request chain: the leading read-only descriptors carry the
+    /// T-message; the trailing write-only descriptors receive the R-message.
+    fn virtio9p_service_chain(&mut self, dev: &mut Virtio9p, head: u16) -> u32 {
+        const F_NEXT: u16 = 1;
+        const F_WRITE: u16 = 2;
+        let mut readable: Vec<u8> = Vec::new();
+        let mut writable: Vec<(u64, u32)> = Vec::new();
+        let mut idx = head;
+        let mut guard = 0;
+        loop {
+            let d = dev.desc_addr + 16 * u64::from(idx);
+            let addr = self.rd64(d);
+            let len = self.rd32(d + 8);
+            let flags = self.rd16(d + 12);
+            let next = self.rd16(d + 14);
+            if flags & F_WRITE != 0 {
+                writable.push((addr, len));
+            } else {
+                for i in 0..u64::from(len) {
+                    readable.push(self.rd8(addr + i));
+                }
+            }
+            guard += 1;
+            if flags & F_NEXT == 0 || guard > dev.queue_num {
+                break;
+            }
+            idx = next;
+        }
+        // Handle the T-message, producing the R-message.
+        let reply = ninep::handle(&mut dev.fs, &mut dev.fids, &readable);
+        // Scatter the reply into the writable descriptors.
+        let mut written = 0u32;
+        let mut pos = 0usize;
+        for (addr, len) in &writable {
+            if pos >= reply.len() {
+                break;
+            }
+            let n = ((*len as usize).min(reply.len() - pos)) as u32;
+            for i in 0..n {
+                self.wr8(addr + u64::from(i), reply[pos + i as usize]);
+            }
+            pos += n as usize;
+            written += n;
+        }
+        written
+    }
+
     /// Advance the timer and reconcile the memory-mapped interrupt latches into
     /// `mip` (CLINT → MTIP/MSIP), called once per executed instruction.
     fn tick(&mut self) {
@@ -1234,7 +1919,7 @@ impl Emulator {
         // Only a machine with a device wired to the PLIC drives these bits; a
         // diskless machine leaves SEIP/MEIP software-managed (the privileged
         // riscv-tests write them directly — `CC-9` is unchanged).
-        if self.virtio.is_some() {
+        if self.virtio.is_some() || self.virtio9p.is_some() {
             if self.plic.pending_for(1) {
                 mip |= 1 << csr::SEIP;
             } else {
