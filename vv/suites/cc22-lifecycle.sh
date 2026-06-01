@@ -20,12 +20,18 @@ if ! command -v cargo >/dev/null 2>&1; then echo "cc22-lifecycle: SKIP — cargo
 cargo test --manifest-path "$ROOT/Cargo.toml" -p holospaces --release \
     --test cc22_lifecycle -- --nocapture || exit 1
 
-# (3) the real OS runs the lifecycle commands — qemu-system-riscv64 boots the
-# holospaces-assembled rootfs and the declared postCreateCommand output appears.
+# (4) holospaces' OWN emulator runs the lifecycle commands under a real libc
+# (busybox) shell — the substrate the holospace actually boots on, no QEMU.
+cargo test --manifest-path "$ROOT/Cargo.toml" -p holospaces --release \
+    --test cc22_lifecycle -- --ignored --nocapture \
+    the_holospaces_emulator_runs_the_lifecycle || exit 1
+
+# (3) the differential oracle — qemu-system-riscv64 boots the byte-identical
+# rootfs and produces the same markers (when QEMU is available).
 if command -v qemu-system-riscv64 >/dev/null 2>&1; then
     cargo test --manifest-path "$ROOT/Cargo.toml" -p holospaces --release \
         --test cc22_lifecycle -- --ignored --nocapture \
         the_os_runs_the_devcontainer_lifecycle_commands || exit 1
 else
-    echo "cc22-lifecycle: SKIP runtime oracle — qemu-system-riscv64 unavailable" >&2
+    echo "cc22-lifecycle: SKIP differential oracle — qemu-system-riscv64 unavailable" >&2
 fi

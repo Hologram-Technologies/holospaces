@@ -14,9 +14,11 @@
 //! The external authority is the **Dev Container specification** (the lifecycle
 //! hooks + their run order) and the **`ext4` on-disk format** (e2fsprogs
 //! `e2fsck`/`debugfs` as the oracle: the injected `/init` is present and exact in
-//! the assembled rootfs). This witness verifies the holospaces realization
-//! deterministically; the booted OS *executing* a real libc shell is gated on the
-//! emulator's demand-paged-userland support (see `vv/artifacts/cc22/SOURCE.txt`).
+//! the assembled rootfs). The booted OS *executing* the lifecycle commands under
+//! a real **libc** shell (`busybox`) is witnessed two ways: on **holospaces' own
+//! emulator** (the substrate the holospace actually runs on) and, differentially,
+//! on `qemu-system-riscv64` (the reference RISC-V machine) — the same rootfs
+//! produces the same lifecycle markers on both.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -26,7 +28,28 @@ use hologram_store_mem::MemKappaStore;
 use hologram_substrate_core::KappaStore;
 use holospaces::assembly::{assemble_ext4_with_init, Layer};
 use holospaces::boot::devcontainer::{self, LifecycleHook};
+use holospaces::machine::MachineSpec;
 use holospaces::oci::{ingest_image, IngestedImage, OciError};
+
+/// Assemble the CC-22 rootfs: the busybox base image's layers with the
+/// config-derived lifecycle `/init` injected (the rootfs the OS boots).
+fn assemble_rootfs(store: &MemKappaStore, init: &[u8]) -> Vec<u8> {
+    let img = ingest(store).expect("ingest the CC-22 busybox image");
+    let layers_owned: Vec<(String, Vec<u8>)> = img
+        .layers()
+        .iter()
+        .zip(img.layer_media_types())
+        .map(|(k, mt)| (mt.clone(), store.get(k).unwrap().unwrap().as_ref().to_vec()))
+        .collect();
+    let layers: Vec<Layer> = layers_owned
+        .iter()
+        .map(|(mt, b)| Layer {
+            media_type: mt,
+            blob: b,
+        })
+        .collect();
+    assemble_ext4_with_init(&layers, init).expect("assemble")
+}
 
 fn cc22_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vv/artifacts/cc22")
@@ -125,19 +148,11 @@ fn the_lifecycle_init_is_built_from_the_parsed_config() {
     );
 }
 
-/// (3) The real OS runs the lifecycle commands from the holospaces-assembled
-/// rootfs. The differential oracle is `qemu-system-riscv64` (the reference RISC-V
-/// machine, as in `CC-9`/`CC-14`/`CC-16`): it boots the holospaces rootfs and
-/// runs the injected lifecycle `/init`, and the declared `postCreateCommand`
-/// output appears — the environment is ready on entry. Heavy + needs QEMU, so
-/// `#[ignore]`d.
-///
-/// (holospaces' own emulator boots this rootfs and execs the lifecycle `/init`,
-/// but its RISC-V core does not yet run a real *libc* userland — a busybox shell
-/// faults at startup where a freestanding init does not; QEMU runs the identical
-/// rootfs cleanly. That emulator-CPU gap is the focused next item, recorded in
-/// `vv/artifacts/cc22/SOURCE.txt`; it does not affect the lifecycle realization,
-/// which this oracle proves end to end.)
+/// (3) The **differential oracle**: `qemu-system-riscv64` (the reference RISC-V
+/// machine, as in `CC-9`/`CC-14`/`CC-16`) boots the byte-identical holospaces
+/// rootfs and runs the injected lifecycle `/init`, producing the same markers as
+/// holospaces' own emulator (test 4) — the lifecycle realization is correct
+/// independent of the emulator. Heavy + needs QEMU, so `#[ignore]`d.
 #[test]
 #[ignore]
 fn the_os_runs_the_devcontainer_lifecycle_commands() {
@@ -219,6 +234,54 @@ fn the_os_runs_the_devcontainer_lifecycle_commands() {
     assert!(
         console.contains("CC22-POSTCREATE:ready-on-entry"),
         "the OS ran the declared postCreateCommand, with the config's remoteEnv applied — the environment is ready on entry (CC-22); console:\n{console}"
+    );
+    assert!(
+        console.contains("CC22-POSTSTART"),
+        "the postStartCommand ran too (lifecycle order); console:\n{console}"
+    );
+}
+
+/// (4) holospaces' **own emulator** runs the lifecycle commands — the substrate
+/// the holospace actually boots on, with a real **libc** (`busybox`) userland.
+/// The emulator boots the holospaces-assembled rootfs, execs the injected
+/// lifecycle `/init`, and the declared `postCreateCommand` output appears on its
+/// console with `remoteEnv` applied — the environment is ready on entry, no QEMU
+/// in the loop. Heavy (a real-OS boot to userland), so `#[ignore]`d.
+#[test]
+#[ignore]
+fn the_holospaces_emulator_runs_the_lifecycle() {
+    let dc = devcontainer::parse(CONFIG).expect("parse");
+    let init = dc.lifecycle_init();
+    let store = MemKappaStore::new();
+    let rootfs = assemble_rootfs(&store, &init);
+
+    let kernel_gz =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vv/artifacts/cc14/kernel/Image.gz");
+    let kernel = {
+        let raw = std::fs::read(&kernel_gz).unwrap();
+        let mut d = flate2::read::GzDecoder::new(&raw[..]);
+        let mut k = Vec::new();
+        d.read_to_end(&mut k).unwrap();
+        k
+    };
+
+    let mut emu = MachineSpec::devcontainer()
+        .boot(&kernel, rootfs)
+        .expect("boot the holospaces emulator");
+    emu.run(1_500_000_000);
+    let console = String::from_utf8_lossy(emu.console()).into_owned();
+
+    assert!(
+        console.contains("LIFECYCLE-START") && console.contains("LIFECYCLE-DONE"),
+        "the holospaces emulator ran the lifecycle runner from the assembled rootfs; console:\n{console}"
+    );
+    assert!(
+        console.contains("HOOK:postCreateCommand"),
+        "the postCreateCommand hook ran in spec order; console:\n{console}"
+    );
+    assert!(
+        console.contains("CC22-POSTCREATE:ready-on-entry"),
+        "the holospaces emulator ran the declared postCreateCommand under a real libc shell, with remoteEnv applied — ready on entry (CC-22); console:\n{console}"
     );
     assert!(
         console.contains("CC22-POSTSTART"),
