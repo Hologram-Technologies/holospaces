@@ -1,0 +1,54 @@
+CC-14 — VirtIO block-device boot authority artifacts.
+
+The witness (crates/holospaces/tests/cc14_virtio_block.rs) ingests the OCI image
+below (CC-10), assembles its layers into an ext4 rootfs with the in-crate Layer
+Assembler (CC-7 / crates/holospaces/src/assembly), and boots the real Linux
+kernel below on the emulator — which mounts that rootfs over its VirtIO block
+device (virtio-mmio + virtio-blk, PLIC-routed) and runs userspace. The
+differential oracle is qemu-system-riscv64 on the same kernel + rootfs.
+
+
+kernel/Image.gz
+  A real, unmodified Linux 6.6.0 RV64GC kernel (torvalds/linux v6.6), built for
+  this witness with VirtIO-MMIO + VirtIO-BLK + EXT4 and an SBI console. Derived
+  from the riscv `defconfig` (a known-good base that boots QEMU `virt` and
+  delivers device interrupts — an over-trimmed config cannot), then:
+    make ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- defconfig
+    scripts/config --enable VIRTIO_MMIO --enable VIRTIO_BLK --enable EXT4_FS \
+      --enable RISCV_SBI_V01 --enable HVC_RISCV_SBI --enable SERIAL_EARLYCON_RISCV_SBI \
+      --disable CMDLINE_FORCE --set-str INITRAMFS_SOURCE "" \
+      --disable USB_SUPPORT --disable SOUND --disable DRM --disable FB \
+      --disable NETDEVICES --disable SCSI --disable PCI ...
+    make olddefconfig
+  Reproducible build env: KBUILD_BUILD_TIMESTAMP="Fri 31 May 2026 00:00:00 UTC",
+  KBUILD_BUILD_USER=holospaces, KBUILD_BUILD_HOST=cc14, .version=0. The full
+  resolved kernel/.config is committed alongside as kernel.config.
+  Toolchain: riscv64-linux-gnu-gcc (Debian). gzip -9 -n (reproducible).
+
+kernel/holospaces-virtio.dts + .dtb
+  The device tree the emulator hands the kernel: a single hart (rv64imafdc,
+  sv57), 512 MiB RAM at 0x80000000, the CLINT, the PLIC at 0x0c000000
+  (interrupts-extended to the hart M/S external lines), and one virtio-mmio
+  node at 0x10001000 with PLIC source 1 — the same layout QEMU `virt` uses, so
+  the differential oracle lines up. Built with dtc (device-tree-compiler).
+
+image/  — a real OCI image-layout (the assembler's input)
+  oci-layout + index.json + blobs/sha256/<manifest,config,layer>. The single
+  layer is `application/vnd.oci.image.layer.v1.tar+gzip`: a reproducible USTAR
+  (numeric-owner, owner/group 0, mtime @1700000000) containing one file, /init.
+  /init is a freestanding RV64 program (no libc) that writes the marker
+  "USERSPACE-OK" via the write(2) syscall and powers off via reboot(2)
+  (LINUX_REBOOT_CMD_POWER_OFF) — assembled from image/init.S with
+  `riscv64-linux-gnu-gcc -nostdlib -static`. It is the userspace the kernel
+  runs from the assembled rootfs, exercising the whole devcontainer data path
+  with a minimal, deterministic, committable payload.
+
+expected.txt
+  "USERSPACE-OK" — the userspace marker. qemu-system-riscv64 (the external
+  differential oracle) prints the same marker booting the same kernel + the
+  same assembled rootfs over its own virtio-blk:
+    qemu-system-riscv64 -M virt -m 512M -nographic -bios default \
+      -global virtio-mmio.force-legacy=false -kernel <Image> \
+      -drive file=<rootfs.ext4>,format=raw,if=none,id=hd0 \
+      -device virtio-blk-device,drive=hd0 \
+      -append "root=/dev/vda rw console=hvc0 earlycon=sbi init=/init"

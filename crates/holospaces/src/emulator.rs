@@ -221,12 +221,163 @@ pub struct Emulator {
     /// `ecall` is serviced as an SBI call (console / timer / shutdown) rather
     /// than trapping — the boot mode a real S-mode kernel runs under.
     provide_sbi: bool,
+    /// The platform-level interrupt controller — routes device interrupts (the
+    /// VirtIO block device) to the hart's external-interrupt line (`CC-14`).
+    plic: Plic,
+    /// The VirtIO block device, when a root filesystem disk is attached; `None`
+    /// for a diskless machine (the `CC-9` boot path is unchanged).
+    virtio: Option<VirtioBlk>,
 }
 
 /// The CLINT memory-mapped region (one hart): `msip` at +0, `mtimecmp` at
 /// +0x4000, `mtime` at +0xBFF8.
 const CLINT_BASE: u64 = 0x0200_0000;
 const CLINT_END: u64 = 0x0201_0000;
+
+/// The PLIC (platform-level interrupt controller) memory-mapped region — the
+/// same base the QEMU `virt` machine uses, so the device tree and the
+/// differential oracle line up (RISC-V PLIC specification). It routes device
+/// interrupts (here, the VirtIO block device) to the hart's external-interrupt
+/// line. Single hart → two contexts: 0 = M-mode, 1 = S-mode (the one a Linux
+/// kernel drives).
+const PLIC_BASE: u64 = 0x0c00_0000;
+const PLIC_END: u64 = 0x1000_0000;
+/// The VirtIO-MMIO transport region (one device), mirroring QEMU `virt`'s first
+/// virtio-mmio slot at `0x1000_1000` with PLIC source 1.
+const VIRTIO_BASE: u64 = 0x1000_1000;
+const VIRTIO_END: u64 = 0x1000_2000;
+/// The PLIC interrupt source number the VirtIO block device raises.
+const VIRTIO_IRQ: u32 = 1;
+/// PLIC contexts for a single hart: M-mode (0) and S-mode (1).
+const PLIC_CONTEXTS: usize = 2;
+
+/// The RISC-V **PLIC** — priority per source, a pending latch, per-context
+/// enable bits and a priority threshold, and the claim/complete handshake
+/// (RISC-V PLIC spec). Only the sources holospaces wires (the VirtIO IRQ) are
+/// live; the array is sized to cover them with headroom.
+struct Plic {
+    /// Interrupt priority for each source (index 0 is unused/"no interrupt").
+    priority: [u32; 32],
+    /// Pending latch, one bit per source (bit `i` = source `i`).
+    pending: u32,
+    /// Per-context enable bitmaps (bit `i` = source `i` enabled for the context).
+    enable: [u32; PLIC_CONTEXTS],
+    /// Per-context priority threshold (a source fires only if its priority is
+    /// strictly greater).
+    threshold: [u32; PLIC_CONTEXTS],
+}
+
+impl Plic {
+    fn new() -> Self {
+        Plic {
+            priority: [0; 32],
+            pending: 0,
+            enable: [0; PLIC_CONTEXTS],
+            threshold: [0; PLIC_CONTEXTS],
+        }
+    }
+
+    /// Raise (latch pending) interrupt source `src`.
+    fn raise(&mut self, src: u32) {
+        self.pending |= 1 << src;
+    }
+
+    /// The highest-priority source pending, enabled for `context`, and above the
+    /// context threshold — or 0 if none. Does not clear it (that is *claim*).
+    fn best(&self, context: usize) -> u32 {
+        let mut best_src = 0u32;
+        let mut best_pri = 0u32;
+        let candidates = self.pending & self.enable[context];
+        for src in 1..32u32 {
+            if candidates & (1 << src) != 0 {
+                let pri = self.priority[src as usize];
+                if pri > self.threshold[context] && pri > best_pri {
+                    best_pri = pri;
+                    best_src = src;
+                }
+            }
+        }
+        best_src
+    }
+
+    /// True if `context` has a deliverable external interrupt (drives `*EIP`).
+    fn pending_for(&self, context: usize) -> bool {
+        self.best(context) != 0
+    }
+
+    /// Claim the top interrupt for `context`: return its source and clear its
+    /// pending bit (the driver will service it, then *complete*).
+    fn claim(&mut self, context: usize) -> u32 {
+        let src = self.best(context);
+        if src != 0 {
+            self.pending &= !(1 << src);
+        }
+        src
+    }
+}
+
+/// The VirtIO **block device** over the **virtio-mmio** transport (modern /
+/// version 2, OASIS VirtIO v1.2). Its backing store is the root filesystem
+/// image (the κ-disk's content, `CC-7`); a guest kernel mounts it over
+/// `/dev/vda`. The device processes the split virtqueue on `QueueNotify`:
+/// read the available ring, walk each request's descriptor chain (header →
+/// data → status), serve it against the disk, write the used ring, and raise
+/// the PLIC interrupt (`CC-14`).
+struct VirtioBlk {
+    /// The backing disk image — the assembled rootfs (`CC-7` content). Reads and
+    /// writes hit this directly; it is part of the machine's reproducible state.
+    disk: Vec<u8>,
+    /// Device status (the guest's driver progresses ACKNOWLEDGE→DRIVER→…→OK).
+    status: u32,
+    /// `DeviceFeaturesSel` / `DriverFeaturesSel` (which 32-bit feature word).
+    device_features_sel: u32,
+    driver_features_sel: u32,
+    /// The features the driver accepted (word 0 and word 1).
+    driver_features: [u32; 2],
+    /// Selected queue (this device has one, index 0).
+    queue_sel: u32,
+    /// Negotiated queue size.
+    queue_num: u32,
+    /// Whether the queue is live (`QueueReady`).
+    queue_ready: u32,
+    /// Guest-physical addresses of the descriptor table, available ring, used
+    /// ring (set by the driver via the `Queue*Low/High` registers).
+    desc_addr: u64,
+    avail_addr: u64,
+    used_addr: u64,
+    /// The last available-ring index the device has consumed.
+    last_avail: u16,
+    /// `InterruptStatus` — bit 0 = used-ring update (the driver ACKs it).
+    interrupt_status: u32,
+    /// Set when the device has raised its IRQ and the PLIC must latch it.
+    irq_pending: bool,
+}
+
+impl VirtioBlk {
+    fn new(disk: Vec<u8>) -> Self {
+        VirtioBlk {
+            disk,
+            status: 0,
+            device_features_sel: 0,
+            driver_features_sel: 0,
+            driver_features: [0; 2],
+            queue_sel: 0,
+            queue_num: 0,
+            queue_ready: 0,
+            desc_addr: 0,
+            avail_addr: 0,
+            used_addr: 0,
+            last_avail: 0,
+            interrupt_status: 0,
+            irq_pending: false,
+        }
+    }
+
+    /// The disk capacity in 512-byte sectors (the `virtio_blk_config.capacity`).
+    fn capacity_sectors(&self) -> u64 {
+        self.disk.len() as u64 / 512
+    }
+}
 
 impl Emulator {
     /// Create a machine with `ram_bytes` of RAM mapped at `base`, the reset PC.
@@ -259,7 +410,18 @@ impl Emulator {
             mtimecmp: 0,
             msip: false,
             provide_sbi: false,
+            plic: Plic::new(),
+            virtio: None,
         }
+    }
+
+    /// Attach a root filesystem disk to the machine's VirtIO block device — the
+    /// assembled rootfs (`CC-7` κ-disk content). The guest kernel discovers it
+    /// through the device tree's `virtio_mmio` node and mounts it over
+    /// `/dev/vda` (`CC-14`). The disk image is part of the machine's
+    /// reproducible state (it is snapshotted with the rest).
+    pub fn attach_disk(&mut self, image: Vec<u8>) {
+        self.virtio = Some(VirtioBlk::new(image));
     }
 
     /// Run the emulator as the M-mode firmware (SEE), servicing supervisor SBI
@@ -648,6 +810,36 @@ impl Emulator {
         out.extend_from_slice(&(self.console_in.len() as u64).to_le_bytes());
         out.extend_from_slice(&self.console_in);
         out.extend_from_slice(&(self.in_cursor as u64).to_le_bytes());
+        // The PLIC state (priority / pending / enable / threshold) — so a
+        // suspended machine with a device interrupt in flight resumes identically.
+        for p in &self.plic.priority {
+            out.extend_from_slice(&p.to_le_bytes());
+        }
+        out.extend_from_slice(&self.plic.pending.to_le_bytes());
+        for e in &self.plic.enable {
+            out.extend_from_slice(&e.to_le_bytes());
+        }
+        for t in &self.plic.threshold {
+            out.extend_from_slice(&t.to_le_bytes());
+        }
+        // The VirtIO block device: its negotiated queue state and the disk
+        // contents (the κ-disk is part of the machine's reproducible state).
+        match &self.virtio {
+            None => out.push(0),
+            Some(dev) => {
+                out.push(1);
+                out.extend_from_slice(&dev.status.to_le_bytes());
+                out.extend_from_slice(&dev.queue_num.to_le_bytes());
+                out.extend_from_slice(&dev.queue_ready.to_le_bytes());
+                out.extend_from_slice(&dev.desc_addr.to_le_bytes());
+                out.extend_from_slice(&dev.avail_addr.to_le_bytes());
+                out.extend_from_slice(&dev.used_addr.to_le_bytes());
+                out.extend_from_slice(&dev.last_avail.to_le_bytes());
+                out.extend_from_slice(&dev.interrupt_status.to_le_bytes());
+                out.extend_from_slice(&(dev.disk.len() as u64).to_le_bytes());
+                out.extend_from_slice(&dev.disk);
+            }
+        }
         out.extend_from_slice(&self.ram);
         out
     }
@@ -683,9 +875,15 @@ impl Emulator {
         Ok(off as usize)
     }
 
-    fn load_phys(&self, addr: u64, width: usize) -> Result<u64, Trap> {
+    fn load_phys(&mut self, addr: u64, width: usize) -> Result<u64, Trap> {
         if (CLINT_BASE..CLINT_END).contains(&addr) {
             return Ok(self.clint_read(addr));
+        }
+        if (PLIC_BASE..PLIC_END).contains(&addr) {
+            return Ok(self.plic_read(addr));
+        }
+        if (VIRTIO_BASE..VIRTIO_END).contains(&addr) {
+            return Ok(self.virtio_read(addr, width));
         }
         let o = self.offset(addr, width)?;
         let mut v = 0u64;
@@ -698,6 +896,14 @@ impl Emulator {
     fn store_phys(&mut self, addr: u64, width: usize, value: u64) -> Result<(), Trap> {
         if (CLINT_BASE..CLINT_END).contains(&addr) {
             self.clint_write(addr, value);
+            return Ok(());
+        }
+        if (PLIC_BASE..PLIC_END).contains(&addr) {
+            self.plic_write(addr, value as u32);
+            return Ok(());
+        }
+        if (VIRTIO_BASE..VIRTIO_END).contains(&addr) {
+            self.virtio_write(addr, value as u32);
             return Ok(());
         }
         let o = self.offset(addr, width)?;
@@ -726,6 +932,277 @@ impl Emulator {
         }
     }
 
+    // ── PLIC (RISC-V platform-level interrupt controller) ──
+
+    /// Read a PLIC register (priority / pending / enable / threshold / claim).
+    /// A read of a context's claim register *claims* the top interrupt (clears
+    /// its pending bit) — the only mutating read.
+    fn plic_read(&mut self, addr: u64) -> u64 {
+        let off = addr - PLIC_BASE;
+        if off < 0x1000 {
+            let src = (off / 4) as usize;
+            return u64::from(*self.plic.priority.get(src).unwrap_or(&0));
+        }
+        if (0x1000..0x2000).contains(&off) {
+            // Pending bits; word 0 holds sources 0..31 (all we wire).
+            return if (off - 0x1000) / 4 == 0 {
+                u64::from(self.plic.pending)
+            } else {
+                0
+            };
+        }
+        if (0x2000..0x20_0000).contains(&off) {
+            let ctx = ((off - 0x2000) / 0x80) as usize;
+            let word = ((off - 0x2000) % 0x80) / 4;
+            if word == 0 && ctx < PLIC_CONTEXTS {
+                return u64::from(self.plic.enable[ctx]);
+            }
+            return 0;
+        }
+        // Threshold (reg 0) / claim (reg 4) per context.
+        let ctx = ((off - 0x20_0000) / 0x1000) as usize;
+        let reg = (off - 0x20_0000) % 0x1000;
+        if ctx >= PLIC_CONTEXTS {
+            return 0;
+        }
+        match reg {
+            0 => u64::from(self.plic.threshold[ctx]),
+            4 => u64::from(self.plic.claim(ctx)),
+            _ => 0,
+        }
+    }
+
+    /// Write a PLIC register. A write to a context's complete register (the same
+    /// offset as claim) acknowledges the source; pending was already cleared on
+    /// claim, so the source is free to fire again.
+    fn plic_write(&mut self, addr: u64, value: u32) {
+        let off = addr - PLIC_BASE;
+        if off < 0x1000 {
+            let src = (off / 4) as usize;
+            if let Some(p) = self.plic.priority.get_mut(src) {
+                *p = value;
+            }
+            return;
+        }
+        if (0x2000..0x20_0000).contains(&off) {
+            let ctx = ((off - 0x2000) / 0x80) as usize;
+            let word = ((off - 0x2000) % 0x80) / 4;
+            if word == 0 && ctx < PLIC_CONTEXTS {
+                self.plic.enable[ctx] = value;
+            }
+            return;
+        }
+        if off >= 0x20_0000 {
+            let ctx = ((off - 0x20_0000) / 0x1000) as usize;
+            let reg = (off - 0x20_0000) % 0x1000;
+            if ctx < PLIC_CONTEXTS && reg == 0 {
+                self.plic.threshold[ctx] = value;
+            }
+            // reg == 4 is *complete*: a no-op here (pending cleared at claim).
+        }
+    }
+
+    // ── VirtIO-MMIO transport + block device (OASIS VirtIO v1.2) ──
+
+    /// Read a VirtIO-MMIO register or the block-config space.
+    fn virtio_read(&self, addr: u64, _width: usize) -> u64 {
+        let Some(dev) = self.virtio.as_ref() else {
+            return 0;
+        };
+        let off = addr - VIRTIO_BASE;
+        match off {
+            0x000 => 0x7472_6976, // MagicValue "virt"
+            0x004 => 2,           // Version (modern)
+            0x008 => 2,           // DeviceID = block
+            0x00c => 0x554d_4551, // VendorID "QEMU"
+            0x010 => {
+                // DeviceFeatures: we offer only VIRTIO_F_VERSION_1 (bit 32).
+                match dev.device_features_sel {
+                    1 => 1, // bit 32 = bit 0 of word 1
+                    _ => 0,
+                }
+            }
+            0x034 => 1024, // QueueNumMax
+            0x044 => u64::from(dev.queue_ready),
+            0x060 => u64::from(dev.interrupt_status),
+            0x070 => u64::from(dev.status),
+            0x0fc => 0,                                    // ConfigGeneration
+            0x100 => dev.capacity_sectors() & 0xffff_ffff, // config.capacity lo
+            0x104 => dev.capacity_sectors() >> 32,         // config.capacity hi
+            _ => 0,
+        }
+    }
+
+    /// Write a VirtIO-MMIO register; a write to `QueueNotify` runs the queue.
+    fn virtio_write(&mut self, addr: u64, value: u32) {
+        let off = addr - VIRTIO_BASE;
+        if self.virtio.is_none() {
+            return;
+        }
+        // Borrow the device for register writes; queue processing needs the
+        // machine's memory, so it temporarily moves the device out (below).
+        {
+            let dev = self.virtio.as_mut().unwrap();
+            match off {
+                0x014 => dev.device_features_sel = value,
+                0x020 => {
+                    let w = dev.driver_features_sel.min(1) as usize;
+                    dev.driver_features[w] = value;
+                }
+                0x024 => dev.driver_features_sel = value,
+                0x030 => dev.queue_sel = value,
+                0x038 => dev.queue_num = value,
+                0x044 => dev.queue_ready = value,
+                0x064 => dev.interrupt_status &= !value, // InterruptACK
+                0x070 => {
+                    dev.status = value;
+                    if value == 0 {
+                        // Reset: clear the negotiated queue state.
+                        *dev = VirtioBlk::new(core::mem::take(&mut dev.disk));
+                    }
+                }
+                0x080 => dev.desc_addr = (dev.desc_addr & !0xffff_ffff) | u64::from(value),
+                0x084 => dev.desc_addr = (dev.desc_addr & 0xffff_ffff) | (u64::from(value) << 32),
+                0x090 => dev.avail_addr = (dev.avail_addr & !0xffff_ffff) | u64::from(value),
+                0x094 => dev.avail_addr = (dev.avail_addr & 0xffff_ffff) | (u64::from(value) << 32),
+                0x0a0 => dev.used_addr = (dev.used_addr & !0xffff_ffff) | u64::from(value),
+                0x0a4 => dev.used_addr = (dev.used_addr & 0xffff_ffff) | (u64::from(value) << 32),
+                _ => {}
+            }
+        }
+        if off == 0x050 {
+            self.virtio_process_queue();
+        }
+    }
+
+    /// Process every newly-available request in the block device's virtqueue:
+    /// walk each descriptor chain (header → data → status), serve it against the
+    /// disk, write the used ring, and raise the PLIC interrupt (VirtIO v1.2 §2.7
+    /// split virtqueue; §5.2 block device).
+    fn virtio_process_queue(&mut self) {
+        let mut dev = self.virtio.take().unwrap();
+        let qsz = dev.queue_num as u16;
+        if dev.queue_ready == 0 || qsz == 0 {
+            self.virtio = Some(dev);
+            return;
+        }
+        // avail.idx is at avail_addr + 2 (after the 2-byte flags).
+        let avail_idx = self.rd16(dev.avail_addr + 2);
+        while dev.last_avail != avail_idx {
+            let slot = dev.last_avail % qsz;
+            // avail.ring[slot] at avail_addr + 4 + 2*slot
+            let head = self.rd16(dev.avail_addr + 4 + 2 * u64::from(slot));
+            let written = self.virtio_service_chain(&mut dev, head);
+            // used.ring[used.idx % qsz] = { id: head, len: written }
+            let used_idx = self.rd16(dev.used_addr + 2);
+            let ring = dev.used_addr + 4 + 8 * u64::from(used_idx % qsz);
+            self.wr32(ring, u32::from(head));
+            self.wr32(ring + 4, written);
+            self.wr16(dev.used_addr + 2, used_idx.wrapping_add(1));
+            dev.last_avail = dev.last_avail.wrapping_add(1);
+            dev.interrupt_status |= 1;
+            dev.irq_pending = true;
+        }
+        let raise = dev.irq_pending;
+        dev.irq_pending = false;
+        self.virtio = Some(dev);
+        if raise {
+            self.plic.raise(VIRTIO_IRQ);
+        }
+    }
+
+    /// Service one request descriptor chain; returns the number of bytes the
+    /// device wrote into guest-writable buffers (the used-ring length).
+    fn virtio_service_chain(&mut self, dev: &mut VirtioBlk, head: u16) -> u32 {
+        const VIRTQ_DESC_F_NEXT: u16 = 1;
+        const VIRTQ_DESC_F_WRITE: u16 = 2;
+        // Collect the chain's descriptors (addr, len, flags).
+        let mut chain: Vec<(u64, u32, u16)> = Vec::new();
+        let mut idx = head;
+        loop {
+            let d = dev.desc_addr + 16 * u64::from(idx);
+            let addr = self.rd64(d);
+            let len = self.rd32(d + 8);
+            let flags = self.rd16(d + 12);
+            let next = self.rd16(d + 14);
+            chain.push((addr, len, flags));
+            if flags & VIRTQ_DESC_F_NEXT == 0 {
+                break;
+            }
+            idx = next;
+            if chain.len() > dev.queue_num as usize {
+                break; // malformed/looping chain guard
+            }
+        }
+        if chain.is_empty() {
+            return 0;
+        }
+        // Descriptor 0 is the request header: type (u32), reserved, sector (u64).
+        let (haddr, _, _) = chain[0];
+        let req_type = self.rd32(haddr);
+        let sector = self.rd64(haddr + 8);
+        // The last descriptor is the status byte (device-writable).
+        let status_desc = *chain.last().unwrap();
+        // Data descriptors are everything between header and status.
+        let data = &chain[1..chain.len() - 1];
+
+        let mut written = 0u32;
+        let mut disk_off = (sector * 512) as usize;
+        const VIRTIO_BLK_T_IN: u32 = 0; // read from disk → guest
+        const VIRTIO_BLK_T_OUT: u32 = 1; // write guest → disk
+        match req_type {
+            VIRTIO_BLK_T_IN => {
+                for (addr, len, _flags) in data {
+                    for i in 0..*len as usize {
+                        let byte = dev.disk.get(disk_off + i).copied().unwrap_or(0);
+                        self.wr8(addr + i as u64, byte);
+                    }
+                    disk_off += *len as usize;
+                    written += *len;
+                }
+            }
+            VIRTIO_BLK_T_OUT => {
+                for (addr, len, _flags) in data {
+                    if disk_off + *len as usize > dev.disk.len() {
+                        dev.disk.resize(disk_off + *len as usize, 0);
+                    }
+                    for i in 0..*len as usize {
+                        dev.disk[disk_off + i] = self.rd8(addr + i as u64);
+                    }
+                    disk_off += *len as usize;
+                }
+            }
+            _ => {} // FLUSH / GET_ID / others: ack OK with no data.
+        }
+        // Status = 0 (VIRTIO_BLK_S_OK).
+        let _ = VIRTQ_DESC_F_WRITE;
+        self.wr8(status_desc.0, 0);
+        written + 1 // + the status byte
+    }
+
+    // Little-endian guest-physical helpers for virtqueue structures.
+    fn rd8(&mut self, a: u64) -> u8 {
+        self.load_phys(a, 1).unwrap_or(0) as u8
+    }
+    fn rd16(&mut self, a: u64) -> u16 {
+        self.load_phys(a, 2).unwrap_or(0) as u16
+    }
+    fn rd32(&mut self, a: u64) -> u32 {
+        self.load_phys(a, 4).unwrap_or(0) as u32
+    }
+    fn rd64(&mut self, a: u64) -> u64 {
+        self.load_phys(a, 8).unwrap_or(0)
+    }
+    fn wr8(&mut self, a: u64, v: u8) {
+        let _ = self.store_phys(a, 1, u64::from(v));
+    }
+    fn wr16(&mut self, a: u64, v: u16) {
+        let _ = self.store_phys(a, 2, u64::from(v));
+    }
+    fn wr32(&mut self, a: u64, v: u32) {
+        let _ = self.store_phys(a, 4, u64::from(v));
+    }
+
     /// Advance the timer and reconcile the memory-mapped interrupt latches into
     /// `mip` (CLINT → MTIP/MSIP), called once per executed instruction.
     fn tick(&mut self) {
@@ -749,6 +1226,24 @@ impl Emulator {
             mip |= 1 << csr::MSIP;
         } else {
             mip &= !(1 << csr::MSIP);
+        }
+        // External interrupts from the PLIC: the S-mode context (1) drives SEIP
+        // — the line a Linux kernel's PLIC driver services — and the M-mode
+        // context (0) drives MEIP (RISC-V PLIC → hart external-interrupt line).
+        // Only a machine with a device wired to the PLIC drives these bits; a
+        // diskless machine leaves SEIP/MEIP software-managed (the privileged
+        // riscv-tests write them directly — `CC-9` is unchanged).
+        if self.virtio.is_some() {
+            if self.plic.pending_for(1) {
+                mip |= 1 << csr::SEIP;
+            } else {
+                mip &= !(1 << csr::SEIP);
+            }
+            if self.plic.pending_for(0) {
+                mip |= 1 << csr::MEIP;
+            } else {
+                mip &= !(1 << csr::MEIP);
+            }
         }
         self.csrs.insert(csr::MIP, mip);
     }
