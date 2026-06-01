@@ -155,19 +155,70 @@ pub fn assemble_ext4_with_init(
     layers: &[Layer],
     init_bytes: &[u8],
 ) -> Result<Vec<u8>, AssemblyError> {
+    assemble_ext4_with_files(layers, &[("init", 0o755, init_bytes)])
+}
+
+/// Assemble `layers` into an ext4 image with extra `files` injected — each an
+/// `(absolute path, mode, bytes)` — creating intermediate directories as needed
+/// and overriding any colliding entry. The Boot Orchestrator's hook for placing
+/// the lifecycle runner (`/init`, `CC-22`) and the operator's dotfiles
+/// (`/root/.gitconfig`, …) and entry runner into the booted OS so personalization
+/// is applied on entry (`CC-23`).
+pub fn assemble_ext4_with_files(
+    layers: &[Layer],
+    files: &[(&str, u16, &[u8])],
+) -> Result<Vec<u8>, AssemblyError> {
     let mut tree = overlay_layers(layers)?;
-    let id = tree.contents.keys().copied().max().map_or(0, |m| m + 1);
-    tree.contents.insert(id, init_bytes.to_vec());
-    let meta = Meta {
-        mode: 0o755,
-        uid: 0,
-        gid: 0,
-        mtime: 0,
-    };
-    if let Node::Dir { children, .. } = &mut tree.root {
-        children.insert("init".into(), Node::File { meta, content: id });
+    let base = tree.contents.keys().copied().max().map_or(0, |m| m + 1);
+    for (i, (path, mode, bytes)) in files.iter().enumerate() {
+        let id = base + i as u32;
+        tree.contents.insert(id, bytes.to_vec());
+        insert_file_at(&mut tree.root, path.trim_start_matches('/'), *mode, id);
     }
     Ok(ext4::write_image(&tree)?)
+}
+
+/// Insert a file at `rel` (a `/`-separated path relative to `dir`), creating any
+/// missing intermediate directories (mode `0755`) and replacing a colliding
+/// non-directory along the way. A no-op if `dir` is not a directory.
+fn insert_file_at(dir: &mut Node, rel: &str, mode: u16, content: u32) {
+    let Node::Dir { children, .. } = dir else {
+        return;
+    };
+    match rel.split_once('/') {
+        None => {
+            let meta = Meta {
+                mode,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+            };
+            children.insert(rel.into(), Node::File { meta, content });
+        }
+        Some((head, tail)) => {
+            let entry = children.entry(head.into()).or_insert_with(|| Node::Dir {
+                meta: Meta {
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 0,
+                },
+                children: BTreeMap::new(),
+            });
+            if !matches!(entry, Node::Dir { .. }) {
+                *entry = Node::Dir {
+                    meta: Meta {
+                        mode: 0o755,
+                        uid: 0,
+                        gid: 0,
+                        mtime: 0,
+                    },
+                    children: BTreeMap::new(),
+                };
+            }
+            insert_file_at(entry, tail, mode, content);
+        }
+    }
 }
 
 /// Find the Dev Container config inside a repository archive `layer` (a `tar` or

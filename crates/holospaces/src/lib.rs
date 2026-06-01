@@ -108,6 +108,7 @@ pub mod manager;
 #[cfg(feature = "std")]
 pub mod oci;
 pub mod peer;
+pub mod personalization;
 pub mod projection;
 pub mod realizations;
 pub mod surface;
