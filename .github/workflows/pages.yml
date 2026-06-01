@@ -83,6 +83,19 @@ jobs:
           nmfdig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['manifests'][0]['digest'].split(':')[1])" vv/artifacts/cc16/image/index.json)
           nldig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['layers'][0]['digest'].split(':')[1])" "vv/artifacts/cc16/image/blobs/sha256/$nmfdig")
           cp "vv/artifacts/cc16/image/blobs/sha256/$nldig" _site/devcontainer-net-layer.tar.gz
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      # The REAL VS Code web workbench (CC-17 Phase 3, ADR-012): holospaces serves
+      # Microsoft's κ-verified executable core BYTE-IDENTICAL (Law L5) and composes
+      # it with the supported web `create()` bootstrap + the `holospace-fs` builtin
+      # extension that boots the holospace in the extension-host worker and binds
+      # the workbench to its virtio-9p workspace (CC-15) + console (CC-11), wired to
+      # the open gallery (Open VSX — CC-19). Writes _site/workbench.html +
+      # _site/workbench/ (the dist) + _site/ext/holospace-fs/. The Manager enters
+      # this; workspace.html (Monaco, CC-13) remains the documented fallback.
+      - name: Compose the real VS Code workbench (CC-17 Phase 3)
+        run: node crates/holospaces-web/web/build-workbench.mjs _site
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
