@@ -117,7 +117,10 @@ fn the_devcontainer_authenticates_with_github_over_the_network() {
         .collect();
     let layers: Vec<Layer> = blobs
         .iter()
-        .map(|(mt, b)| Layer { media_type: mt, blob: b })
+        .map(|(mt, b)| Layer {
+            media_type: mt,
+            blob: b,
+        })
         .collect();
     let rootfs = assemble_ext4(&layers).expect("assemble rootfs");
 
