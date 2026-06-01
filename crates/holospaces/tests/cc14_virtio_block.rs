@@ -25,7 +25,8 @@ use std::path::{Path, PathBuf};
 use hologram_store_mem::MemKappaStore;
 use hologram_substrate_core::KappaStore;
 use holospaces::assembly::{assemble_ext4, Layer};
-use holospaces::emulator::{Emulator, Halt};
+use holospaces::emulator::Halt;
+use holospaces::machine::MachineSpec;
 use holospaces::oci::{ingest_image, IngestedImage, OciError};
 
 fn cc14_dir() -> PathBuf {
@@ -78,6 +79,46 @@ fn assemble_rootfs(store: &MemKappaStore, img: &IngestedImage) -> Vec<u8> {
     assemble_ext4(&layers).expect("assemble rootfs")
 }
 
+/// The Boot Orchestrator's generated device tree is a valid DTB: `dtc` (the
+/// device-tree-compiler authority) decompiles it, and it declares the machine
+/// the kernel needs — the memory, the PLIC, and the virtio-mmio block device.
+#[test]
+fn the_generated_device_tree_is_valid() {
+    use std::process::Command;
+    if Command::new("dtc").arg("-v").output().is_err() {
+        eprintln!("SKIP: dtc not available");
+        return;
+    }
+    let dtb = MachineSpec::devcontainer().device_tree();
+    assert_eq!(&dtb[0..4], &[0xd0, 0x0d, 0xfe, 0xed], "DTB magic");
+    let path = std::env::temp_dir().join("cc14-gen.dtb");
+    std::fs::write(&path, &dtb).unwrap();
+    let out = Command::new("dtc")
+        .args(["-I", "dtb", "-O", "dts"])
+        .arg(&path)
+        .output()
+        .expect("run dtc");
+    assert!(
+        out.status.success(),
+        "dtc must parse the generated DTB:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let dts = String::from_utf8_lossy(&out.stdout);
+    for needle in [
+        "virtio_mmio@10001000",
+        "interrupt-controller@c000000", // the PLIC
+        "memory@80000000",
+        "compatible = \"virtio,mmio\"",
+        "root=/dev/vda",
+    ] {
+        assert!(
+            dts.contains(needle),
+            "generated DTB missing {needle:?}:\n{dts}"
+        );
+    }
+    std::fs::remove_file(&path).ok();
+}
+
 /// The full chain — ingest, assemble, and boot a real Linux that mounts the
 /// assembled ext4 over the emulator's virtio-blk and runs userspace. Heavy
 /// (a real kernel boot on the interpreter), so `#[ignore]` like the other
@@ -95,15 +136,11 @@ fn a_real_linux_mounts_an_assembled_oci_rootfs_over_virtio_blk() {
         rootfs.len()
     );
 
-    // 3 + 4: boot a real Linux that mounts it over the emulator's virtio-blk.
+    // 3 + 4: the Boot Orchestrator generates the device tree and boots a real
+    // Linux that mounts the assembled rootfs over the emulator's virtio-blk.
     let kernel = gunzip(&cc14_dir().join("kernel/Image.gz"));
-    let dtb = std::fs::read(cc14_dir().join("kernel/holospaces-virtio.dtb")).expect("dtb");
-
-    let base = 0x8000_0000u64;
-    let mut emu = Emulator::new(base, 512 * 1024 * 1024);
-    emu.enable_sbi();
-    emu.attach_disk(rootfs);
-    emu.boot_kernel(&kernel, &dtb, base + 0x0700_0000)
+    let mut emu = MachineSpec::devcontainer()
+        .boot(&kernel, rootfs)
         .expect("boot the kernel");
     let halt = emu.run(600_000_000);
     let console = String::from_utf8_lossy(emu.console()).into_owned();
@@ -136,12 +173,7 @@ fn the_virtio_boot_is_reproducible() {
         let img = ingest(&store).unwrap();
         let rootfs = assemble_rootfs(&store, &img);
         let kernel = gunzip(&cc14_dir().join("kernel/Image.gz"));
-        let dtb = std::fs::read(cc14_dir().join("kernel/holospaces-virtio.dtb")).unwrap();
-        let base = 0x8000_0000u64;
-        let mut emu = Emulator::new(base, 512 * 1024 * 1024);
-        emu.enable_sbi();
-        emu.attach_disk(rootfs);
-        emu.boot_kernel(&kernel, &dtb, base + 0x0700_0000).unwrap();
+        let mut emu = MachineSpec::devcontainer().boot(&kernel, rootfs).unwrap();
         emu.run(600_000_000);
         emu.console().to_vec()
     };
