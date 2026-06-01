@@ -146,6 +146,30 @@ pub fn assemble_ext4(layers: &[Layer]) -> Result<Vec<u8>, AssemblyError> {
     Ok(ext4::write_image(&tree)?)
 }
 
+/// Find the Dev Container config inside a repository archive `layer` (a `tar` or
+/// `tar+gzip`, e.g. a git-host archive). Matches `.devcontainer/devcontainer.json`
+/// or a top-level `.devcontainer.json`, ignoring the archive's leading directory
+/// component (git hosts wrap the tree in `<repo>-<ref>/…`). Returns the config
+/// bytes, or `None` if the repository declares no devcontainer.
+pub fn find_devcontainer_json(layer: &Layer) -> Result<Option<Vec<u8>>, AssemblyError> {
+    let tar = decompress(layer)?;
+    for entry in tar::Reader::new(&tar) {
+        let entry = entry?;
+        if entry.kind != tar::Kind::File {
+            continue;
+        }
+        // Strip the archive's leading path component (e.g. "repo-main/").
+        let rel = match entry.path.split_once('/') {
+            Some((_, rest)) => rest,
+            None => entry.path.as_str(),
+        };
+        if rel == ".devcontainer/devcontainer.json" || rel == ".devcontainer.json" {
+            return Ok(Some(entry.data));
+        }
+    }
+    Ok(None)
+}
+
 /// Overlay `layers` (lowest first) into one unified filesystem [`Tree`],
 /// applying the OCI whiteout / opaque-directory rules.
 pub fn overlay_layers(layers: &[Layer]) -> Result<Tree, AssemblyError> {
@@ -157,22 +181,21 @@ pub fn overlay_layers(layers: &[Layer]) -> Result<Tree, AssemblyError> {
     Ok(builder.finish())
 }
 
-/// Decompress a layer blob to its raw tar bytes per its OCI media type.
+/// Decompress a layer (or repository archive) blob to its raw tar bytes. The
+/// codec is chosen from the gzip magic first (authoritative), then the media
+/// type — so an OCI `tar+gzip` layer, a bare `application/gzip` repository
+/// archive, and a plain `tar` all work.
 fn decompress(layer: &Layer) -> Result<Vec<u8>, AssemblyError> {
-    // Media type drives the codec, but be tolerant: detect gzip by magic too,
-    // since some producers tag a gzipped layer as the plain `.tar` type.
     let gz = layer.blob.len() >= 2 && layer.blob[0] == 0x1f && layer.blob[1] == 0x8b;
     let mt = layer.media_type;
-    let is_tar = mt.contains("tar") || mt.is_empty();
-    if !is_tar {
-        return Err(AssemblyError::UnsupportedMediaType(mt.to_string()));
-    }
-    if mt.ends_with("gzip") || mt.ends_with("+gzip") || gz {
+    if gz || mt.contains("gzip") {
         gunzip(layer.blob)
-    } else if mt.ends_with("zstd") || mt.ends_with("+zstd") {
+    } else if mt.contains("zstd") {
         Err(AssemblyError::UnsupportedMediaType(mt.to_string()))
+    } else if mt.contains("tar") || mt.is_empty() {
+        Ok(layer.blob.to_vec()) // plain (uncompressed) tar
     } else {
-        Ok(layer.blob.to_vec())
+        Err(AssemblyError::UnsupportedMediaType(mt.to_string()))
     }
 }
 
