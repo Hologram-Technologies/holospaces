@@ -80,10 +80,10 @@
     <div id="toast"></div>
 
     <script type="module">
-      import init, { kappa, verify_kappa, run_holo, validate_userland, Console, Workspace }
+      import init, { kappa, verify_kappa, run_holo, validate_userland, Console, Workspace, DevcontainerImage }
         from "./pkg/holospaces_web.js";
       await init();
-      window.hs = { kappa, verify_kappa, run_holo, validate_userland, Console, Workspace };
+      window.hs = { kappa, verify_kappa, run_holo, validate_userland, Console, Workspace, DevcontainerImage };
 
       const console0 = new Console();
       const $ = (id) => document.getElementById(id);

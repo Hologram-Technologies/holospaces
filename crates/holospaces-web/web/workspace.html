@@ -50,7 +50,7 @@
     </div>
 
     <script type="module">
-      import init, { kappa, verify_kappa, Workspace } from "./pkg/holospaces_web.js";
+      import init, { kappa, verify_kappa, Workspace, DevcontainerImage } from "./pkg/holospaces_web.js";
 
       // The browser peer is the trust root: once it is loaded, the substrate's
       // own σ-axis (blake3, CC-1) verifies every other byte by re-derivation
@@ -81,6 +81,8 @@
         "vendor/xterm/addon-fit.js": "blake3:0be65ad91c9fc0c898229b532748d569154398412d8737ff5e9d13f5d6b92a99",
         "workspace-kernel.gz": "blake3:69d01fad85dee601f35c3406f32ad203ef58ba260d2a3f0f7c7566edc3bf9a57",
         "workspace.dtb": "blake3:e1afd55f442345e6020b0a45a240b363fe0de19eca69dc88ebe58f90b0544d5b",
+        "devcontainer-kernel.gz": "blake3:86444b599981098edbc377ed17cf81236efd56321edb86119dcf516f80fc2632",
+        "devcontainer-layer.tar.gz": "blake3:bd7614da27950a93ebc69c6e41f8e59a1bd733789b9cc46984c9b1bafa72852a",
       };
 
       // Import content from the gateway and verify it by re-derivation through
@@ -148,10 +150,28 @@
         const stream = new Response(bytes).body.pipeThrough(new DecompressionStream("gzip"));
         return new Uint8Array(await new Response(stream).arrayBuffer());
       }
-      const kernel = await gunzip(await importKappa("workspace-kernel.gz"));
-      const dtb = await importKappa("workspace.dtb");
-
-      const ws = Workspace.boot(kernel, dtb, 128 * 1024 * 1024, 0x80000000, 0x87000000);
+      // Two boot modes (both κ-verified, both in the browser peer):
+      //   default            — the pinned CC-11 interactive OS (the VS Code demo);
+      //   ?devcontainer      — import a devcontainer's OCI image from the gateway,
+      //                        assemble its rootfs (the in-crate Layer Assembler,
+      //                        wasm), and boot it over virtio-blk (CC-14 / CC-20).
+      const devcontainer = new URLSearchParams(location.search).has("devcontainer");
+      let ws, READY;
+      if (devcontainer) {
+        setStatus("importing the devcontainer image by κ + assembling its rootfs…");
+        const kernel = await gunzip(await importKappa("devcontainer-kernel.gz"));
+        const layer = await importKappa("devcontainer-layer.tar.gz");
+        const image = new DevcontainerImage();
+        image.add_layer("application/vnd.oci.image.layer.v1.tar+gzip", layer);
+        const rootfs = image.assemble(); // gunzip + untar + overlay + ext4, in wasm
+        ws = Workspace.boot_devcontainer(kernel, rootfs);
+        READY = "USERSPACE-OK";
+      } else {
+        const kernel = await gunzip(await importKappa("workspace-kernel.gz"));
+        const dtb = await importKappa("workspace.dtb");
+        ws = Workspace.boot(kernel, dtb, 128 * 1024 * 1024, 0x80000000, 0x87000000);
+        READY = "HOLOSPACES-WORKSPACE-READY";
+      }
       window.__ws = ws; // for the browser witness
 
       // Reveal the IDE; xterm renders the terminal, Monaco the editor.
@@ -186,7 +206,6 @@
       }
 
       // Boot in instruction chunks so the tab stays live and streams the boot.
-      const READY = "HOLOSPACES-WORKSPACE-READY";
       await new Promise((resolve) => {
         let steps = 0;
         const tick = () => {

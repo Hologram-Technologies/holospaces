@@ -68,6 +68,14 @@ jobs:
           # The real VS Code components (Monaco + xterm.js; pinned CC-13 vendor set).
           # The workspace imports them by κ and verifies by re-derivation (CC-13).
           cp -r vv/artifacts/cc13/vendor _site/vendor
+          # The devcontainer (CC-14 / CC-20): the virtio-mmio kernel + the OCI
+          # image's layer. The browser peer assembles the rootfs (the in-crate
+          # Layer Assembler, wasm) and boots it over virtio-blk — the devcontainer
+          # flow, in the browser.
+          cp vv/artifacts/cc14/kernel/Image.gz _site/devcontainer-kernel.gz
+          mfdig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['manifests'][0]['digest'].split(':')[1])" vv/artifacts/cc14/image/index.json)
+          ldig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['layers'][0]['digest'].split(':')[1])" "vv/artifacts/cc14/image/blobs/sha256/$mfdig")
+          cp "vv/artifacts/cc14/image/blobs/sha256/$ldig" _site/devcontainer-layer.tar.gz
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

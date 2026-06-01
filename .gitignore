@@ -13,6 +13,8 @@
 /crates/holospaces-web/web/workspace-kernel.gz
 /crates/holospaces-web/web/workspace.dtb
 /crates/holospaces-web/web/vendor
+/crates/holospaces-web/web/devcontainer-kernel.gz
+/crates/holospaces-web/web/devcontainer-layer.tar.gz
 
 # Excluded wasm codemodule crate build output (artifact is staged under vv/)
 crates/holospaces-emulator/target/
