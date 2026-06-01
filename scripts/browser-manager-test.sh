@@ -67,3 +67,6 @@ node vscode-workbench-test.mjs
 
 echo "==> running the VS Code workbench FS test in Chromium (CC-17 Phase 2: the real workbench is served the holospace workspace, github.dev-style)"
 node vscode-workbench-fs-test.mjs
+
+echo "==> running the VS Code extension test in Chromium (CC-19 foundation: a real extension activates in the real workbench)"
+node vscode-extension-test.mjs
