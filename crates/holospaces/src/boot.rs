@@ -125,6 +125,13 @@ pub mod devcontainer {
         pub name: Option<String>,
         /// The declared container image source (or [`ImageSource::Default`]).
         pub image_source: ImageSource,
+        /// The VS Code extensions the config declares
+        /// (`customizations.vscode.extensions`) — the *base extensions*
+        /// holospaces installs into the workbench for this devcontainer, exactly
+        /// as a Codespace does (the Dev Container spec's extension management).
+        /// Each is a marketplace id `"<publisher>.<name>"`; holospaces installs
+        /// them from the configured open gallery — it bundles none by default.
+        pub extensions: Vec<String>,
     }
 
     /// Normalize JSONC `devcontainer.json` bytes to plain JSON (Law L2): strip
@@ -190,7 +197,33 @@ pub mod devcontainer {
             ImageSource::Default
         };
         let name = obj.get("name").and_then(Value::as_str).map(str::to_owned);
-        Ok(DevContainer { name, image_source })
+
+        // The base extensions the config manages (Dev Container spec:
+        // `customizations.vscode.extensions`, the successor to the legacy
+        // top-level `extensions`). Each entry must be a marketplace id string.
+        let mut extensions: Vec<String> = Vec::new();
+        let ext_value = obj
+            .get("customizations")
+            .and_then(|c| c.get("vscode"))
+            .and_then(|v| v.get("extensions"))
+            .or_else(|| obj.get("extensions"));
+        if let Some(list) = ext_value {
+            let arr = list
+                .as_array()
+                .ok_or(DevcontainerError::MalformedProperty("extensions"))?;
+            for e in arr {
+                let id = e
+                    .as_str()
+                    .ok_or(DevcontainerError::MalformedProperty("extensions"))?;
+                extensions.push(id.to_owned());
+            }
+        }
+
+        Ok(DevContainer {
+            name,
+            image_source,
+            extensions,
+        })
     }
 
     /// Strip JSONC line (`//`) and block (`/* */`) comments, respecting string

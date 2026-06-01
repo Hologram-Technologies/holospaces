@@ -139,3 +139,60 @@ fn devcontainer_holospace_is_reproducible_from_its_source() {
     assert_eq!(mk(cfg), mk(cfg), "same source ⇒ same κ");
     assert_ne!(mk(cfg), mk(other), "different config ⇒ different identity");
 }
+
+/// (3) The devcontainer spec manages the workbench's base extensions: holospaces
+/// parses `customizations.vscode.extensions` (the list a Codespace would
+/// auto-install) and that list drives what holospaces installs from the open
+/// gallery — it bundles none by default. The config is validated against the
+/// published schema first (the spec is the judge), then holospaces extracts the
+/// declared extension ids.
+#[test]
+fn devcontainer_extensions_are_parsed_from_the_spec_customizations() {
+    let schema = schema();
+    let config = serde_json::json!({
+        "name": "rust-dev",
+        "image": "mcr.microsoft.com/devcontainers/rust:1",
+        "customizations": {
+            "vscode": {
+                "extensions": ["rust-lang.rust-analyzer", "tamasfe.even-better-toml"],
+                "settings": { "editor.formatOnSave": true }
+            }
+        }
+    });
+    // The schema (the external authority) accepts this real-shaped config.
+    assert!(
+        schema.is_valid(&config),
+        "customizations.vscode.extensions is a valid Dev Container config"
+    );
+    let bytes = serde_json::to_vec(&config).unwrap();
+
+    // holospaces parses the declared base extensions (the spec's extension
+    // management) — exactly the list a Codespace auto-installs.
+    let dc = devcontainer::parse(&bytes).expect("parse the devcontainer");
+    assert_eq!(
+        dc.extensions,
+        vec![
+            "rust-lang.rust-analyzer".to_string(),
+            "tamasfe.even-better-toml".to_string()
+        ],
+        "the base extensions are taken from customizations.vscode.extensions"
+    );
+
+    // A config with no customizations declares no base extensions (holospaces
+    // bundles none — no lock-in).
+    let bare = serde_json::to_vec(&serde_json::json!({ "image": "debian:12" })).unwrap();
+    assert!(
+        devcontainer::parse(&bare).unwrap().extensions.is_empty(),
+        "no customizations ⇒ no bundled extensions"
+    );
+
+    // A malformed extensions list is rejected (a non-string id).
+    let bad = serde_json::to_vec(
+        &serde_json::json!({ "image": "debian:12", "customizations": { "vscode": { "extensions": [42] } } }),
+    )
+    .unwrap();
+    assert!(
+        devcontainer::parse(&bad).is_err(),
+        "a malformed extension id is refused"
+    );
+}
