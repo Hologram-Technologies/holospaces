@@ -43,6 +43,15 @@ The operator manages holospaces from the console and _enters_ one to work in it 
 . The tab boots the holospace's devcontainer OS on the system emulator (the holospaces crate compiled to wasm, run by the browser's own JIT — `CC-9`; the devcontainer rootfs is assembled in the browser and mounted over `virtio-blk`, `CC-14`). The xterm.js terminal streams the boot console, then drives the running OS: each command is a *canonical event* that advances the holospace's κ snapshot (`CC-11`).
 . The Monaco editor and file tree read and edit the environment's content *by κ*; an edit advances the file's κ (Law L1). The `devcontainer.json` is the validated environment (`CC-4`). It is the real VS Code experience, rendered by the browser peer with no server (`CC-13`).
 
+=== Working in the holospace — extensions and integrations (the GitHub scenario)
+
+The full workbench (ADR-012) connects the browser to a *remote extension host running in the devcontainer OS* (ADR-015), so extensions and their integrations work exactly as in a Codespace.
+
+. Entering the holospace loads the κ-verified *VS Code web workbench* in the tab (Law L5; `CC-17`). The workbench opens a connection — VS Code's *remote protocol* — to a *remote extension host* started *inside the booted devcontainer OS* (`CC-14`), carried over a *substrate channel* between the browser peer and the holospace (publish/subscribe; Law L4), not a control-plane socket.
+. The host exposes the holospace through VS Code's published APIs backed by holospaces' primitives: the editor's `FileSystemProvider` is the `virtio-9p` workspace (`CC-15`), the integrated terminal is the holospace console over the running OS (`CC-11`), and language servers and debug adapters run *as processes in the OS* reached over LSP / DAP (`CC-18`, `CC-19`).
+. An extension the `devcontainer.json` selects (e.g. the GitHub Pull Requests extension) is *imported by κ and verified by re-derivation* (Law L5), then *activated in the OS-side host*. The operator *signs in to GitHub* through the workbench: the extension's published *authentication provider* runs the OAuth flow, and the token-exchange and every subsequent GitHub API call leave through the *devcontainer's own network* — the userspace NAT and the tunnelled egress (`CC-16`) — the same path `apt` and `git` take.
+. The operator *manages their pull requests and issues* from the editor — listing, opening, commenting, reviewing — and pushes commits over `git`; all of it is ordinary network and filesystem activity from a process in the OS, surfaced in the authentic VS Code UI (`CC-19`). The experience is a Codespace's because the architecture is a Codespace's — a browser workbench over a remote extension host — only the remote is a holospace and the transport is the substrate (Laws L1/L3/L4).
+
 === Cold-start from GitHub Pages
 
 . The browser loads a minimal loader from GitHub Pages and the *Hologram* platform's κ.
