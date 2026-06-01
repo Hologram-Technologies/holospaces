@@ -43,6 +43,9 @@ spin = { workspace = true }
 # The emulator's F/D floating-point extension (CC-9) on hologram's no_std float
 # foundation (libm) — deterministic, reproducible across peers.
 libm = { workspace = true }
+# The Layer Assembler's gzip (DEFLATE) decoder for OCI `tar+gzip` layers
+# (no_std + alloc — part of the portable core, like the κ-disk it feeds).
+miniz_oxide = { workspace = true }
 # The .holo Engine building block: holospaces supplies the .holo execution
 # backend (arc42 ch.5 / ch.7), bound to hologram's executor. The CPU kernels'
 # float math needs std today, so the engine is a `std` surface (the bare-metal

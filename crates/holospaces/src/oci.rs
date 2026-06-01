@@ -54,6 +54,7 @@ pub struct IngestedImage {
     manifest: Kappa,
     config: Kappa,
     layers: Vec<Kappa>,
+    layer_media_types: Vec<String>,
     identity: Kappa,
 }
 
@@ -83,6 +84,13 @@ impl IngestedImage {
     #[must_use]
     pub fn layers(&self) -> &[Kappa] {
         &self.layers
+    }
+
+    /// The OCI media type of each layer, in the same order as [`Self::layers`]
+    /// — selects the decompression in the Layer Assembler (plain `tar`, gzip).
+    #[must_use]
+    pub fn layer_media_types(&self) -> &[String] {
+        &self.layer_media_types
     }
 
     /// The image's reproducible identity: a κ derived from its OCI manifest
@@ -154,11 +162,18 @@ where
         .and_then(Value::as_array)
         .ok_or(OciError::BadManifest)?;
     let mut layers = Vec::with_capacity(layer_descs.len());
+    let mut layer_media_types = Vec::with_capacity(layer_descs.len());
     for desc in layer_descs {
         expect_layer_media(desc)?;
+        let mt = desc
+            .get("mediaType")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let digest = descriptor_digest(desc)?;
         let (_, layer_k) = fetch_verified(store, &mut blob, &digest)?;
         layers.push(layer_k);
+        layer_media_types.push(mt);
     }
 
     let identity = image_identity(&manifest_digest);
@@ -167,6 +182,7 @@ where
         manifest: manifest_k,
         config: config_k,
         layers,
+        layer_media_types,
         identity,
     })
 }
