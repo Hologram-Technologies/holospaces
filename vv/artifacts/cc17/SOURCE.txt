@@ -29,7 +29,18 @@ Witness — crates/holospaces-web/web/vscode-workbench-test.mjs (Chromium via
 
 Phase status (this row is staged; ADR-012/015):
   Phase 1 (DONE/witnessed) — the real workbench loads κ-verified in the tab.
-  Phase 2 — a FileSystemProvider over the virtio-9p workspace (CC-15) + the
-    terminal over the holospace console (CC-11), via the remote extension host.
-  Phase 3 — the remote extension host in the devcontainer OS (ADR-015), the
-    foundation for CC-18 (LSP) and CC-19 (extensions + integrations).
+  Phase 2 — the editor's FileSystemProvider over the virtio-9p workspace (CC-15)
+    + the terminal over the console (CC-11). The extension host is per-peer
+    (ADR-015 feasibility refinement): the BROWSER peer uses the vscode.dev "web"
+    model (a FileSystemProvider web extension whose fetches a service worker
+    serves from the wasm peer's 9p workspace), because its emulated OS does not
+    host the Node-based vscode-server; a server-capable (native/remote) peer uses
+    the "remote" model (the extension host in the OS over the remote protocol).
+  Phase 3 — extension integrations + LSP/DAP (CC-18/CC-19) on whichever host.
+  NB (a witnessed finding): a custom builtin FileSystemProvider web extension
+    served over HTTP via additionalBuiltinExtensions did NOT activate under
+    headless Chromium in vscode-web@1.91.1 (the web-worker extension host starts
+    but the extension's code is never loaded; webEndpointUrlTemplate same-origin
+    + package.nls.json + "*" activation did not fix it). The Phase-2 web model
+    needs that activation path resolved (likely the service-worker /
+    extension-resource loading), so it is not yet witnessed.
