@@ -60,3 +60,6 @@ node devcontainer-test.mjs
 
 echo "==> running the devcontainer network test in Chromium (CC-16: virtio-net + userspace NAT, egress tunnelled over a WebSocket relay)"
 node devcontainer-net-test.mjs
+
+echo "==> running the VS Code workbench test in Chromium (CC-17 Phase 1: the real VS Code web workbench loads κ-verified)"
+node vscode-workbench-test.mjs
