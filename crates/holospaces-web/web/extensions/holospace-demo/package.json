@@ -1,0 +1,12 @@
+{
+  "name": "holospace-demo",
+  "publisher": "holospaces",
+  "version": "1.0.0",
+  "engines": { "vscode": "^1.75.0" },
+  "browser": "./extension.js",
+  "activationEvents": ["onStartupFinished"],
+  "extensionKind": ["web"],
+  "contributes": {
+    "commands": [{ "command": "holospace.hello", "title": "Holospace: Hello" }]
+  }
+}
