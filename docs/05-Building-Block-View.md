@@ -43,12 +43,42 @@ consumed here by reference.
 The Level-3 (component) responsibilities of the building blocks follow
 from the design:
 
-**Boot Layer** — an *Ingestor* (canonicalizes a provisioning source, a
-git repo + devcontainer or a holo-file, at the boundary into κ-addressed
-content, Law L2); a *Resolver* (resolves a holospace κ, fetching and
-verifying its parts, Law L5); a *Spawner* (instantiates the holospace
-through the substrate runtime with its capabilities); and a *Lifecycle*
-component (suspend → κ snapshot, resume, migrate, terminate).
+**Boot Layer** — an *Ingestor* that canonicalizes a provisioning source
+at the boundary into κ-addressed content (Law L2). For a devcontainer
+the Ingestor is the pipeline of the in-zoom OPD **SD5**, each stage a
+composition of substrate operations (no git binary, no container daemon,
+no out-of-substrate registry client):
+
+- a *Repository Fetcher* — retrieves a **repository** by URL + reference
+  from its git host over the internet (the import boundary, ADR-013 — an
+  untrusted gateway), ingesting its content as κ content verified by
+  re-derivation (Laws L1/L5); a repository with no `devcontainer.json`
+  gets a **default Dev Container**;
+
+- a *Config Parser* — reads and validates `devcontainer.json` against
+  the Dev Container spec (`CC-4`), yielding the config κ and the
+  base-image reference;
+
+- an *Image Fetcher / Ingestor* — pulls the referenced OCI image from
+  its container registry over the internet (the OCI distribution
+  protocol; the import boundary, ADR-013) and verifies every blob by
+  re-derivation against its OCI digest (`CC-10`), storing manifest +
+  config + layers as κ content (shared layers dedupe, Law L3);
+
+- a *Layer Assembler* — stacks the image’s layers per the OCI
+  image-layer whiteout / opaque-directory rules into a single root
+  filesystem and writes it to a **κ-disk** (an `ext4` image, each sector
+  κ-addressed over the store — `CC-7`, Law L4), yielding the bootable
+  rootfs κ.
+
+  A *Resolver* resolves a holospace κ, fetching and verifying its parts
+  (Law L5); a *Boot Orchestrator* generates the device tree (memory,
+  CLINT, PLIC, and the `virtio-mmio` block-device node) and hands the
+  kernel + device tree + κ-disk to the **Spawner**, which instantiates
+  the holospace through the substrate runtime with its capabilities; and
+  a *Lifecycle* component (suspend → κ snapshot, resume, migrate,
+  terminate). (For a holo-file the Ingestor is the trivial identity —
+  the `.holo` κ *is* the content.)
 
 **.holo Engine** — binds hologram’s `.holo` executor
 (`` hologram-exec’s `InferenceSession ``) to run a tensor `.holo` and
@@ -72,13 +102,25 @@ browser and on bare-metal.
 codemodule (ADR-009): a real RISC-V machine (RV64GC (= IMAFDC) + Zicsr,
 machine/supervisor traps, Sv39/Sv48/Sv57 paging, CLINT interrupts, SBI)
 bound to the host ABI and verified against the official riscv-tests
-conformance suite (`CC-9`). A *κ-disk* (a `KappaStore`-backed block
-device — the OS image and repository as κ-addressed blocks) is its
-storage; its console / input / network are bound to hologram channels;
-its running state is a κ snapshot. It is itself a κ-addressed code
-module satisfying the Execution Surface — imported and verified
-trustlessly (`get_with_fetch`). It computes an arbitrary OS image;
-holospaces starts with Linux.
+conformance suite (`CC-9`). For real devices it adds a *PLIC* (the
+RISC-V platform-level interrupt controller, routing device interrupts to
+the hart’s external-interrupt line) and a *VirtIO transport*
+(`virtio-mmio`, modern/v1 per the OASIS VirtIO 1.2 spec) carrying a
+*\`virtio-blk\` device* whose backing store is the *κ-disk* — a
+`KappaStore`-backed block device (the OS image and repository as
+κ-addressed blocks, `CC-7`); the guest kernel mounts its root filesystem
+over `virtio-blk` (`CC-14`). The device set is declared to the guest by
+the device tree the Boot Orchestrator generates. Its console / input /
+network are bound to hologram channels: a *\`virtio-9p\` device* serves
+the shared workspace filesystem (`CC-15`), and a *\`virtio-net\` device*
+carries the guest’s Ethernet frames into a *userspace TCP/IP NAT* (ARP +
+DHCP + the guest-facing TCP state machine) whose streams flow out over a
+*pluggable egress transport* — a direct host socket natively, a
+WebSocket tunnel to a relay in the browser (no raw NIC in a tab;
+`CC-16`, ADR-014); its running state is a κ snapshot. It is itself a
+κ-addressed code module satisfying the Execution Surface — imported and
+verified trustlessly (`get_with_fetch`). It computes an arbitrary OS
+image; holospaces starts with Linux.
 
 **Identity** — a *Key store* (the self-sovereign sign-in key) and a
 *Sync binding* (scopes which content an operator’s instances announce
@@ -106,7 +148,30 @@ OS’s console, operator input published as canonical events on the
 holospace’s channels). It holds no state of its own (Law L3); a
 uor-native rendering of a running holospace — the Codespaces/Gitpod
 experience (ADR-009, ADR-010; Chapter 8, *Projection*); witnessed by
-`CC-13`.
+`CC-13`. It grows into the **real VS Code web workbench** (ADR-012): the
+κ-verified workbench in the tab, driving a *Remote Extension Host* over
+VS Code’s remote protocol carried on a substrate channel (`CC-17`).
+
+**Remote Extension Host** — where the workbench’s **extensions** run
+(ADR-015). Its placement is per-peer, matching VS Code’s two real
+models: a **server-capable** peer (native/remote) runs the host **inside
+the devcontainer OS** (`CC-14`) over the remote-server protocol, exactly
+as a Codespace; the **browser** peer, whose emulated OS does not host
+the Node-based `vscode-server`, runs the host in the browser’s web
+worker (the `vscode.dev` model) with the editor’s files served from the
+wasm peer’s `virtio-9p` workspace. It exposes the holospace to
+extensions through VS Code’s published APIs backed by holospaces'
+primitives — the *filesystem* is the `virtio-9p` workspace (`CC-15`),
+the *terminal/process* surface is the holospace console and the running
+OS (`CC-11`/`CC-14`), and the *network* — a GitHub API call, an OAuth
+token exchange, a `git push` — is the OS’s own stack over the userspace
+NAT and tunnelled egress (`CC-16`). So extensions and their integrations
+work as in a Codespace (sign in to GitHub, manage pull requests and
+issues) because the architecture *is* a Codespace’s — a browser
+workbench over a remote extension host — only the remote is a holospace
+and the transport is the substrate (Laws L1/L3/L4); language servers
+(`CC-18`), debug adapters, and extension integrations (`CC-19`) all run
+here.
 
 Each component realizes the Architecture Decisions of Chapter 9 and
 applies the Concepts of Chapter 8.
