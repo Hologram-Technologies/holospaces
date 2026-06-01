@@ -21,11 +21,15 @@ ext4 on-disk format — e2fsprogs (e2fsck/debugfs) is the oracle that the inject
   built, alongside the base image's large multi-extent /bin/busybox. e2fsck finds
   the assembled image structurally clean.
 
+holospaces' own emulator — the substrate the holospace actually boots on. It
+  boots the assembled rootfs, execs the injected lifecycle /init, and runs the
+  declared commands under a real libc (busybox) userland; CC22-POSTCREATE:
+  ready-on-entry appears on its console (test 4 — no QEMU in the loop).
+
 qemu-system-riscv64 — the reference RISC-V machine (as in CC-9/CC-14/CC-16) is
-  the differential runtime oracle: it boots the holospaces-assembled rootfs with
-  the CC-14 kernel and runs the injected lifecycle /init; the declared
-  postCreateCommand output (CC22-POSTCREATE:ready-on-entry, the remoteEnv applied)
-  appears on the console — the environment is ready on entry.
+  the differential runtime oracle: it boots the byte-identical holospaces rootfs
+  with the CC-14 kernel and runs the injected lifecycle /init; the same markers
+  appear — the lifecycle realization is correct independent of the emulator.
 
 Artifacts
 ---------
@@ -49,21 +53,25 @@ Witness — crates/holospaces/tests/cc22_lifecycle.rs; suite
   (2) the /init is injected into the assembled ext4 rootfs — e2fsck clean and
       debugfs reads /init AND the 1.6 MB multi-extent /bin/busybox back
       byte-identically (the rootfs the OS boots);
-  (3) the real OS runs the lifecycle commands — qemu-system-riscv64 boots the
-      holospaces rootfs and the declared postCreateCommand output appears, with
-      remoteEnv applied (the environment is ready on entry). #[ignore]d (heavy +
-      needs QEMU).
+  (3) qemu-system-riscv64 (the differential oracle) boots the byte-identical
+      rootfs and produces the same markers — the realization is correct
+      independent of the emulator. #[ignore]d (heavy + needs QEMU);
+  (4) holospaces' own emulator boots the rootfs and runs the lifecycle commands
+      under a real libc (busybox) shell — CC22-POSTCREATE:ready-on-entry on its
+      console. #[ignore]d (heavy, a real-OS boot to userland).
 
-Emulator-CPU note (honest)
---------------------------
-holospaces' own RISC-V emulator boots this identical rootfs, mounts the ext4,
-and execs the lifecycle /init — but its CPU does not yet correctly run a real
-*libc* userland: the glibc-static busybox faults at startup (unhandled SIGSEGV
-inside glibc, e.g. badaddr 0x04218db0), where a freestanding raw-syscall init
-(CC-9/CC-14/CC-16/CC-21) runs cleanly. QEMU runs the byte-for-byte identical
-rootfs end to end (check (3) passes), and the ext4 is verified correct by
-e2fsprogs (check (2)) — so the fault is isolated to the emulator's execution of
-libc-shaped userland (demand-paged TLS/relocation-heavy startup), not to the
-lifecycle realization, the rootfs, or the image. That emulator-CPU gap is the
-focused next item; this CC witnesses the lifecycle realization, proven end to end
-by the QEMU oracle.
+Emulator libc-userland note
+---------------------------
+Running a real libc userland (the glibc-static busybox shell) initially faulted
+on holospaces' own emulator where freestanding raw-syscall inits (CC-9/CC-14/
+CC-16/CC-21) ran cleanly. The differential trace against the QEMU oracle isolated
+it to a single CPU bug: a virtual memory access (including an instruction fetch)
+that *straddles a 4 KiB page boundary* was translated once and read as contiguous
+physical bytes, so the spilled bytes came from the wrong frame when the two pages
+mapped to non-adjacent physical frames — which a demand-paged libc userland
+routinely produces but a small freestanding init never does. The faulting case
+was an `auipc` fetch at a 2-byte-aligned address spanning a page boundary, whose
+corrupted immediate yielded a wild pointer. Fixed by translating each page of a
+straddling access independently (emulator `load`/`store`); regression-tested by
+`page_straddling_access_translates_each_page` (emulator unit tests) and by check
+(4) above. The emulator now runs the libc userland end to end.

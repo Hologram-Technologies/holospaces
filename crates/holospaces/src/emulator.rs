@@ -2369,14 +2369,41 @@ impl Emulator {
 
     /// A guest virtual load (translate then read).
     fn load(&mut self, addr: u64, width: usize, access: Access) -> Result<u64, Trap> {
-        let pa = self.translate(addr, access)?;
-        self.load_phys(pa, width)
+        // An access that stays within one 4 KiB page translates once (the common
+        // case). One that *straddles* a page boundary must translate each page
+        // independently: the two pages may map to non-adjacent physical frames
+        // (e.g. a demand-paged userland), so reading `width` contiguous physical
+        // bytes from a single translation would draw the spilled bytes from the
+        // wrong frame. RISC-V permits unaligned (hence page-crossing) accesses.
+        let off = (addr & 0xfff) as usize;
+        if off + width <= 0x1000 {
+            let pa = self.translate(addr, access)?;
+            return self.load_phys(pa, width);
+        }
+        let first = 0x1000 - off;
+        let pa1 = self.translate(addr, access)?;
+        let pa2 = self.translate(addr.wrapping_add(first as u64), access)?;
+        let lo = self.load_phys(pa1, first)?;
+        let hi = self.load_phys(pa2, width - first)?;
+        Ok(lo | (hi << (8 * first)))
     }
 
     /// A guest virtual store (translate then write).
     fn store(&mut self, addr: u64, width: usize, value: u64) -> Result<(), Trap> {
-        let pa = self.translate(addr, Access::Store)?;
-        self.store_phys(pa, width, value)
+        let off = (addr & 0xfff) as usize;
+        if off + width <= 0x1000 {
+            let pa = self.translate(addr, Access::Store)?;
+            return self.store_phys(pa, width, value);
+        }
+        // Page-straddling store: translate *both* pages before writing either, so
+        // a fault on the second page leaves no partial write (the handler maps the
+        // page and the instruction re-executes). `store_phys` writes the low
+        // `width` bytes of its value, so the high page gets `value >> 8*first`.
+        let first = 0x1000 - off;
+        let pa1 = self.translate(addr, Access::Store)?;
+        let pa2 = self.translate(addr.wrapping_add(first as u64), Access::Store)?;
+        self.store_phys(pa1, first, value)?;
+        self.store_phys(pa2, width - first, value >> (8 * first))
     }
 
     /// Translate a virtual address through Sv39/Sv48/Sv57 paging (RISC-V Privileged ISA
@@ -4222,6 +4249,60 @@ mod tests {
         let mut emu = Emulator::new(0, 4096);
         emu.load_flat(&prog).unwrap();
         assert_eq!(emu.run(1000), Halt::OutOfBudget);
+    }
+
+    /// A virtual access that straddles a 4 KiB page boundary must translate each
+    /// page independently — the two pages can map to non-adjacent physical frames
+    /// (a demand-paged userland), so the spilled bytes come from the *second*
+    /// frame, not from physical bytes contiguous with the first. (Regression: a
+    /// glibc userland faulted because a page-crossing `auipc` fetch drew its high
+    /// half from the wrong frame; freestanding inits never straddle a mapping.)
+    #[test]
+    // `l2 + 0 * 8` / `l0 + 1 * 8` keep the page-table index explicit and aligned.
+    #[allow(clippy::identity_op, clippy::erasing_op)]
+    fn page_straddling_access_translates_each_page() {
+        let mut emu = Emulator::new(0, 4 * 1024 * 1024);
+        // A minimal Sv39 table: VA 0x1000→PA 0x200000, VA 0x2000→PA 0x100000
+        // (deliberately *lower* than the first frame — non-adjacent). Both VAs
+        // share VPN[2]=VPN[1]=0, so one L2, one L1, one L0 table suffice.
+        let (l2, l1, l0) = (0x10000u64, 0x11000u64, 0x12000u64);
+        let (frame_a, frame_b) = (0x200000u64, 0x100000u64);
+        let ptr = |ppn: u64| (ppn << 10) | 0b0000_0001; // pointer PTE (V, no RWX)
+        let leaf = |ppn: u64| (ppn << 10) | 0b0000_1111; // leaf PTE (V|R|W|X)
+        emu.store_phys(l2 + 0 * 8, 8, ptr(l1 >> 12)).unwrap(); // L2[0] → L1
+        emu.store_phys(l1 + 0 * 8, 8, ptr(l0 >> 12)).unwrap(); // L1[0] → L0
+        emu.store_phys(l0 + 1 * 8, 8, leaf(frame_a >> 12)).unwrap(); // L0[1] → A
+        emu.store_phys(l0 + 2 * 8, 8, leaf(frame_b >> 12)).unwrap(); // L0[2] → B
+        emu.csrs.insert(0x180, (8u64 << 60) | (l2 >> 12)); // satp: Sv39, root=l2
+        emu.priv_level = PRIV_S; // translate (S-mode into non-U leaves is allowed)
+
+        // A 4-byte load at VA 0x1ffe spans the boundary: 2 bytes from frame A's
+        // tail, 2 from frame B's head. Seed distinct bytes and read it back.
+        emu.store_phys(frame_a + 0xffe, 2, 0xbbaa).unwrap();
+        emu.store_phys(frame_b, 2, 0xddcc).unwrap();
+        assert_eq!(
+            emu.load(0x1ffe, 4, Access::Load).unwrap(),
+            0xddcc_bbaa,
+            "the high half must come from the second page's frame, not contiguous RAM"
+        );
+
+        // An 8-byte load straddling the same boundary (5 bytes A, 3 bytes B).
+        emu.store_phys(frame_a + 0xffb, 5, 0x55_4433_2211).unwrap();
+        emu.store_phys(frame_b, 3, 0x88_77_66).unwrap();
+        assert_eq!(
+            emu.load(0x1ffb, 8, Access::Load).unwrap(),
+            0x8877_6655_4433_2211,
+        );
+
+        // A straddling *store* must land in both frames (and read back identically).
+        emu.store(0x1ffe, 4, 0x1122_3344).unwrap();
+        assert_eq!(emu.load_phys(frame_a + 0xffe, 2).unwrap(), 0x3344);
+        assert_eq!(emu.load_phys(frame_b, 2).unwrap(), 0x1122);
+        assert_eq!(emu.load(0x1ffe, 4, Access::Load).unwrap(), 0x1122_3344);
+
+        // A within-page access still translates once and is unaffected.
+        emu.store(0x1100, 4, 0xdead_beef).unwrap();
+        assert_eq!(emu.load_phys(frame_a + 0x100, 4).unwrap(), 0xdead_beef);
     }
 
     #[test]
