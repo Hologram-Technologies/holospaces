@@ -44,6 +44,7 @@ cp "$ROOT/vv/artifacts/cc16/image/blobs/sha256/$nldig" "$CRATE/web/devcontainer-
 
 cd "$CRATE/web"
 [ -d node_modules/playwright ] || npm install playwright >/dev/null 2>&1
+[ -d node_modules/@vscode/test-web ] || npm install --no-save @vscode/test-web@0.0.80 >/dev/null 2>&1
 if [ ! -d "$HOME/.cache/ms-playwright" ]; then
   echo "SKIP: Playwright browser not installed (run: npx playwright install chromium)"
   exit 0
@@ -63,3 +64,6 @@ node devcontainer-net-test.mjs
 
 echo "==> running the VS Code workbench test in Chromium (CC-17 Phase 1: the real VS Code web workbench loads κ-verified)"
 node vscode-workbench-test.mjs
+
+echo "==> running the VS Code workbench FS test in Chromium (CC-17 Phase 2: the real workbench is served the holospace workspace, github.dev-style)"
+node vscode-workbench-fs-test.mjs
