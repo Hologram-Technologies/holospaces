@@ -35,6 +35,12 @@ cp "$ROOT/vv/artifacts/cc14/kernel/Image.gz" "$CRATE/web/devcontainer-kernel.gz"
 mfdig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['manifests'][0]['digest'].split(':')[1])" "$ROOT/vv/artifacts/cc14/image/index.json")
 ldig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['layers'][0]['digest'].split(':')[1])" "$ROOT/vv/artifacts/cc14/image/blobs/sha256/$mfdig")
 cp "$ROOT/vv/artifacts/cc14/image/blobs/sha256/$ldig" "$CRATE/web/devcontainer-layer.tar.gz"
+# The networked devcontainer (CC-16): the net-enabled kernel + the init layer, so
+# the browser peer boots virtio-net + the userspace NAT and tunnels TCP out.
+cp "$ROOT/vv/artifacts/cc16/kernel/Image.gz" "$CRATE/web/devcontainer-net-kernel.gz"
+nmfdig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['manifests'][0]['digest'].split(':')[1])" "$ROOT/vv/artifacts/cc16/image/index.json")
+nldig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['layers'][0]['digest'].split(':')[1])" "$ROOT/vv/artifacts/cc16/image/blobs/sha256/$nmfdig")
+cp "$ROOT/vv/artifacts/cc16/image/blobs/sha256/$nldig" "$CRATE/web/devcontainer-net-layer.tar.gz"
 
 cd "$CRATE/web"
 [ -d node_modules/playwright ] || npm install playwright >/dev/null 2>&1
@@ -51,3 +57,6 @@ node workspace-test.mjs
 
 echo "==> running the devcontainer boot test in Chromium (CC-14/CC-20: assemble OCI image + virtio-blk boot in the browser)"
 node devcontainer-test.mjs
+
+echo "==> running the devcontainer network test in Chromium (CC-16: virtio-net + userspace NAT, egress tunnelled over a WebSocket relay)"
+node devcontainer-net-test.mjs

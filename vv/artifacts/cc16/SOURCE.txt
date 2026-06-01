@@ -39,4 +39,10 @@ socket) are IMPLEMENTED and witnessed against this oracle
 (crates/holospaces/src/emulator/net.rs; crates/holospaces/tests/cc16_network.rs;
 vv/suites/cc16-network.sh). The NAT is no_std and compiles to wasm32 with the
 peer core; the browser peer substitutes a WebSocket tunnel to a relay for the
-egress seam (ADR-014) — that browser transport + relay is the remaining slice.
+egress seam (ADR-014). That browser slice is ALSO IMPLEMENTED and witnessed:
+crates/holospaces-web/src/wsnet.rs (the WsEgress over a WebSocket),
+crates/holospaces-web/web/relay.mjs (a pure-Node RFC 6455 TCP-over-WebSocket
+relay — the egress gateway), and crates/holospaces-web/web/devcontainer-net-test.mjs
+(Chromium/Playwright: the same wasm peer boots the net devcontainer in a tab,
+does DHCP over virtio-net, and completes the HTTP exchange tunnelled over the
+relay) — wired into scripts/browser-manager-test.sh.

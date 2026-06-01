@@ -28,6 +28,8 @@
 //! reads and edits environment content by κ — the documented launch experience,
 //! realized on the browser peer.
 
+mod wsnet;
+
 use hologram_runtime::Runtime;
 use hologram_runtime_bare::BareMetalEngine;
 use hologram_store_mem::MemKappaStore;
@@ -445,6 +447,32 @@ impl Workspace {
     pub fn boot_devcontainer(kernel: &[u8], rootfs: &[u8]) -> Result<Workspace, JsValue> {
         let machine = MachineSpec::devcontainer()
             .boot(kernel, rootfs.to_vec())
+            .map_err(js_err)?;
+        Ok(Workspace {
+            machine,
+            store: MemKappaStore::new(),
+            channel: Vec::new(),
+            files: std::collections::BTreeMap::new(),
+            halted: false,
+        })
+    }
+
+    /// Boot a **networked** devcontainer workspace (`CC-16`): like
+    /// [`boot_devcontainer`](Workspace::boot_devcontainer), but the machine also
+    /// has a `virtio-net` device whose userspace TCP/IP NAT tunnels the guest's
+    /// TCP streams out over a WebSocket to the relay at `relay_url` (there is no
+    /// raw NIC behind a tab; ADR-014). The guest brings its interface up with
+    /// DHCP and can then reach the internet — `git clone`, `apt`, `npm` — from the
+    /// browser peer. Drive it with [`run`](Workspace::run), yielding to the event
+    /// loop between chunks so the WebSocket delivers host-side bytes.
+    pub fn boot_devcontainer_net(
+        kernel: &[u8],
+        rootfs: &[u8],
+        relay_url: &str,
+    ) -> Result<Workspace, JsValue> {
+        let egress = wsnet::WsEgress::connect_relay(relay_url)?;
+        let machine = MachineSpec::devcontainer_net()
+            .boot_net(kernel, rootfs.to_vec(), Box::new(egress))
             .map_err(js_err)?;
         Ok(Workspace {
             machine,
