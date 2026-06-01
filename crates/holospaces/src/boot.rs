@@ -99,6 +99,7 @@ impl core::error::Error for ProvisionError {}
 /// provisioning surface, available with the `std` feature.
 #[cfg(feature = "std")]
 pub mod devcontainer {
+    use alloc::collections::BTreeMap;
     use core::fmt;
     use serde_json::Value;
 
@@ -132,6 +133,35 @@ pub mod devcontainer {
         /// Each is a marketplace id `"<publisher>.<name>"`; holospaces installs
         /// them from the configured open gallery — it bundles none by default.
         pub extensions: Vec<String>,
+        /// Ports the config forwards (`forwardPorts`) — a server the devcontainer
+        /// runs on one of these is reachable from outside as a forwarded port /
+        /// app preview (`CC-21`). Each is a TCP port number (the `host:port`
+        /// string form keeps the port).
+        pub forward_ports: Vec<u16>,
+        /// The lifecycle commands the config declares, in spec run-order
+        /// (`onCreateCommand`, `updateContentCommand`, `postCreateCommand`,
+        /// `postStartCommand`, `postAttachCommand`) — what holospaces runs *in the
+        /// devcontainer OS* so the environment is ready on entry (`CC-22`). Each
+        /// entry is `(hook, command)`; the command is normalized to a shell line.
+        pub lifecycle: Vec<(LifecycleHook, String)>,
+        /// Environment the config sets in the devcontainer (`remoteEnv`) —
+        /// applied into the OS / surfaced to the workbench (`CC-23`).
+        pub remote_env: BTreeMap<String, String>,
+    }
+
+    /// A Dev Container lifecycle hook, in spec execution order.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum LifecycleHook {
+        /// `onCreateCommand` — first, during image creation.
+        OnCreate,
+        /// `updateContentCommand` — after `onCreate`, on content updates.
+        UpdateContent,
+        /// `postCreateCommand` — after the container is created (e.g. install deps).
+        PostCreate,
+        /// `postStartCommand` — each time the container starts.
+        PostStart,
+        /// `postAttachCommand` — each time a tool attaches.
+        PostAttach,
     }
 
     /// Normalize JSONC `devcontainer.json` bytes to plain JSON (Law L2): strip
@@ -219,11 +249,96 @@ pub mod devcontainer {
             }
         }
 
+        // forwardPorts: an array of port numbers or "host:port" / "port" strings.
+        let mut forward_ports: Vec<u16> = Vec::new();
+        if let Some(fp) = obj.get("forwardPorts") {
+            let arr = fp
+                .as_array()
+                .ok_or(DevcontainerError::MalformedProperty("forwardPorts"))?;
+            for p in arr {
+                let port = if let Some(n) = p.as_u64() {
+                    u16::try_from(n)
+                        .map_err(|_| DevcontainerError::MalformedProperty("forwardPorts"))?
+                } else if let Some(s) = p.as_str() {
+                    // "port" or "host:port" → the port component.
+                    s.rsplit(':')
+                        .next()
+                        .and_then(|t| t.parse::<u16>().ok())
+                        .ok_or(DevcontainerError::MalformedProperty("forwardPorts"))?
+                } else {
+                    return Err(DevcontainerError::MalformedProperty("forwardPorts"));
+                };
+                forward_ports.push(port);
+            }
+        }
+
+        // Lifecycle commands, in spec run-order. Each may be a string (a shell
+        // line), an array (an exec-form argv), or an object (named parallel
+        // commands); normalize to a single shell line per hook.
+        let mut lifecycle: Vec<(LifecycleHook, String)> = Vec::new();
+        for (key, hook) in [
+            ("onCreateCommand", LifecycleHook::OnCreate),
+            ("updateContentCommand", LifecycleHook::UpdateContent),
+            ("postCreateCommand", LifecycleHook::PostCreate),
+            ("postStartCommand", LifecycleHook::PostStart),
+            ("postAttachCommand", LifecycleHook::PostAttach),
+        ] {
+            if let Some(v) = obj.get(key) {
+                lifecycle.push((
+                    hook,
+                    normalize_command(v).ok_or(DevcontainerError::MalformedProperty(key))?,
+                ));
+            }
+        }
+
+        // remoteEnv: a string→string (or null) map.
+        let mut remote_env: BTreeMap<String, String> = BTreeMap::new();
+        if let Some(env) = obj.get("remoteEnv") {
+            let map = env
+                .as_object()
+                .ok_or(DevcontainerError::MalformedProperty("remoteEnv"))?;
+            for (k, v) in map {
+                if v.is_null() {
+                    continue;
+                }
+                let s = v
+                    .as_str()
+                    .ok_or(DevcontainerError::MalformedProperty("remoteEnv"))?;
+                remote_env.insert(k.clone(), s.to_owned());
+            }
+        }
+
         Ok(DevContainer {
             name,
             image_source,
             extensions,
+            forward_ports,
+            lifecycle,
+            remote_env,
         })
+    }
+
+    /// Normalize a Dev Container command value (string / argv array / named
+    /// object) to a single shell line; `None` if malformed.
+    fn normalize_command(v: &Value) -> Option<String> {
+        match v {
+            Value::String(s) => Some(s.clone()),
+            // Exec-form argv → space-joined (the spec runs it without a shell;
+            // the joined form is the human-readable command line).
+            Value::Array(items) => {
+                let parts: Option<Vec<&str>> = items.iter().map(Value::as_str).collect();
+                parts.map(|p| p.join(" "))
+            }
+            // Object form: named commands run in parallel; join their lines.
+            Value::Object(map) => {
+                let mut lines = Vec::new();
+                for cmd in map.values() {
+                    lines.push(normalize_command(cmd)?);
+                }
+                Some(lines.join(" & "))
+            }
+            _ => None,
+        }
     }
 
     /// Strip JSONC line (`//`) and block (`/* */`) comments, respecting string

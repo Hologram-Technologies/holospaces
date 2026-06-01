@@ -152,6 +152,10 @@ fn devcontainer_extensions_are_parsed_from_the_spec_customizations() {
     let config = serde_json::json!({
         "name": "rust-dev",
         "image": "mcr.microsoft.com/devcontainers/rust:1",
+        "forwardPorts": [3000, "db:5432"],
+        "postCreateCommand": "cargo fetch",
+        "postStartCommand": ["echo", "started"],
+        "remoteEnv": { "RUST_LOG": "debug", "EMPTY": null },
         "customizations": {
             "vscode": {
                 "extensions": ["rust-lang.rust-analyzer", "tamasfe.even-better-toml"],
@@ -162,7 +166,7 @@ fn devcontainer_extensions_are_parsed_from_the_spec_customizations() {
     // The schema (the external authority) accepts this real-shaped config.
     assert!(
         schema.is_valid(&config),
-        "customizations.vscode.extensions is a valid Dev Container config"
+        "the full managed-parameters config is valid per the Dev Container schema"
     );
     let bytes = serde_json::to_vec(&config).unwrap();
 
@@ -176,6 +180,36 @@ fn devcontainer_extensions_are_parsed_from_the_spec_customizations() {
             "tamasfe.even-better-toml".to_string()
         ],
         "the base extensions are taken from customizations.vscode.extensions"
+    );
+
+    // The other managed parameters the spec defines (CC-21/22/23 consume these):
+    assert_eq!(
+        dc.forward_ports,
+        vec![3000u16, 5432],
+        "forwardPorts (integer / \"host:port\") → the forwarded ports (CC-21)"
+    );
+    assert_eq!(
+        dc.lifecycle,
+        vec![
+            (
+                devcontainer::LifecycleHook::PostCreate,
+                "cargo fetch".to_string()
+            ),
+            (
+                devcontainer::LifecycleHook::PostStart,
+                "echo started".to_string()
+            ),
+        ],
+        "the lifecycle commands, in spec run-order, normalized to shell lines (CC-22)"
+    );
+    assert_eq!(
+        dc.remote_env.get("RUST_LOG").map(String::as_str),
+        Some("debug"),
+        "remoteEnv is applied into the devcontainer (CC-23); a null value is skipped"
+    );
+    assert!(
+        !dc.remote_env.contains_key("EMPTY"),
+        "a null remoteEnv value is dropped"
     );
 
     // A config with no customizations declares no base extensions (holospaces
