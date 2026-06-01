@@ -1,0 +1,35 @@
+CC-17 — the real VS Code web workbench (authority artifacts).
+
+The workspace is the REAL VS Code web workbench — the same compilation that runs
+vscode.dev / github.dev (ADR-012), not a reconstruction from components (that is
+CC-13's Monaco + xterm). holospaces embeds it as the Workspace Projection and,
+per ADR-015, drives a remote extension host inside the devcontainer OS so
+extensions and integrations work as in a Codespace.
+
+Pin (the authority):
+  npm package  vscode-web@1.91.1  (a packaged build of the official Microsoft
+    VS Code web compilation; https://www.npmjs.com/package/vscode-web)
+  npm integrity (sha512 of the tarball):
+    sha512-kzrbnxxmAmBDBLcTXQBM5Ehucdf35MI4pX1DHMPa6SFFg4IVKd18Qn6TrdG+VT4O4fk6nySovNP22GHky3nD8Q==
+  tarball: https://registry.npmjs.org/vscode-web/-/vscode-web-1.91.1.tgz
+
+vendor.sha256 — the sha256 of the workbench's EXECUTABLE CORE (the AMD loader,
+  the web package paths, the workbench.web.main bundle + its nls, and the
+  workbench.js bootstrap). The browser peer re-derives each file's sha256 over
+  the served bytes and REFUSES to load on any mismatch (Law L5) — the workbench
+  is verified content, exactly as CC-13 verifies Monaco + xterm by re-derivation.
+  The 60 MB build itself is not committed (it is fetched by the pin above, as the
+  browser tests fetch Playwright by pin); the manifest is its κ-identity.
+
+Witness — crates/holospaces-web/web/vscode-workbench-test.mjs (Chromium via
+  Playwright): assembles the pinned vscode-web dist, VERIFIES the executable core
+  against vendor.sha256 (a forged byte is refused), serves it as the holospaces
+  workspace tab, and asserts the REAL workbench boots to its authentic UI (the
+  "holospaces VS Code" title, the .monaco-workbench, the activity bar).
+
+Phase status (this row is staged; ADR-012/015):
+  Phase 1 (DONE/witnessed) — the real workbench loads κ-verified in the tab.
+  Phase 2 — a FileSystemProvider over the virtio-9p workspace (CC-15) + the
+    terminal over the holospace console (CC-11), via the remote extension host.
+  Phase 3 — the remote extension host in the devcontainer OS (ADR-015), the
+    foundation for CC-18 (LSP) and CC-19 (extensions + integrations).

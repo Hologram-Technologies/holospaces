@@ -1,0 +1,9 @@
+# CC-17 — the executable core of the real VS Code web workbench (vscode-web@1.91.1).
+# The browser peer re-derives the sha256 of each served file and refuses to load
+# on any mismatch (Law L5) — the workbench is content, verified, not a bare
+# <script src>. The pin + npm integrity (the authority) are in SOURCE.txt.
+f619eca8e832ea3da4ab3137f7335e02292b5c8af59395aafff0c0600fa938f9  out/vs/loader.js
+8fde77142788cc63278154b3eb857e54a52d94250a9b718f5c5035e3cdaace1d  out/vs/webPackagePaths.js
+a36fdea3e793d15dc3158318185322ed4164d7703f6c702074e9a4d74f7e138f  out/vs/workbench/workbench.web.main.js
+aca2f87d308342983216b89e8756e9e214592261e464dcbdb8c5a000fc66b9b3  out/vs/workbench/workbench.web.main.nls.js
+b810dff069f69e6aaef26b6f50bcdfa381baef27df5f2e9b2ed702813ccfe8e3  out/vs/code/browser/workbench/workbench.js
