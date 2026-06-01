@@ -84,6 +84,16 @@ const productJson = JSON.stringify({
     nameLong: "holospaces VS Code",
     applicationName: "code-web",
     version: "1.91.1",
+    // The OPEN marketplace — Open VSX (https://open-vsx.org), the gallery
+    // vscode.dev / Gitpod / code-server use. holospaces wires the *open* gallery
+    // so an operator installs ARBITRARY extensions (no Microsoft/GitHub lock-in;
+    // the MS Marketplace ToS forbids non-MS products) — CC-19. None are bundled.
+    extensionsGallery: {
+      serviceUrl: "https://open-vsx.org/vscode/gallery",
+      itemUrl: "https://open-vsx.org/vscode/item",
+      resourceUrlTemplate:
+        "https://open-vsx.org/vscode/unpkg/{publisher}/{name}/{version}/{path}",
+    },
   },
 });
 const server = http.createServer(async (req, res) => {
@@ -119,7 +129,22 @@ try {
   check(booted, "the real VS Code web workbench booted to its authentic UI in the tab (.monaco-workbench)");
   check(activitybar, "the workbench rendered its activity bar (the real workbench shell, not Monaco-only — CC-13)");
   check(title.includes("holospaces"), `the workbench is the holospaces Workspace Projection (title: "${title}")`);
-  console.log(failed ? "WORKBENCH-TEST: FAILED" : "WORKBENCH-TEST: PASS (the real VS Code web workbench loads κ-verified in the holospaces tab)");
+
+  // CC-19 — the workbench is wired to the OPEN marketplace (Open VSX), so an
+  // operator installs ARBITRARY extensions, with no Microsoft/GitHub lock-in.
+  const gallery = await page.evaluate(async () => {
+    const product = await (await fetch("./product.json")).json();
+    return product?.productConfiguration?.extensionsGallery?.serviceUrl ?? null;
+  });
+  check(
+    typeof gallery === "string" && gallery.includes("open-vsx.org"),
+    `the real workbench is wired to the open gallery (Open VSX) — arbitrary extensions install, no lock-in (serviceUrl: ${gallery})`,
+  );
+  check(
+    !(gallery || "").includes("marketplace.visualstudio.com"),
+    "holospaces does not lock the workbench to the Microsoft Marketplace (no proprietary gallery)",
+  );
+  console.log(failed ? "WORKBENCH-TEST: FAILED" : "WORKBENCH-TEST: PASS (the real VS Code web workbench loads κ-verified in the holospaces tab, wired to the open gallery)");
 } finally {
   await browser.close();
   server.close();
