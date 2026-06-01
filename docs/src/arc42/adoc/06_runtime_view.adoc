@@ -3,12 +3,14 @@
 
 The runtime scenarios below show how holospaces behaves over time. (The arc42 template placeholder scenario headings are retained at the end for structural conformance.)
 
-=== Provisioning a holospace from a devcontainer
+This scenario realizes the in-zoom OPD *SD5 — Devcontainer Provisioning* (conceptual model): the steps below are its sub-processes (Repository Fetching, Config Parsing, Image Ingestion, Rootfs Assembly) and the objects they yield (Repository, Devcontainer Config, Base Image, Root Filesystem). Each step is a composition of substrate operations — no git binary, no container daemon, no registry client outside the substrate.
 
-. The operator gives the Manager a repository with a valid `devcontainer.json`.
-. holospaces ingests the repository, the config, and the operating-system image as *κ-addressed content* — fetched and verified through the substrate (`get_with_fetch`), addressed by what they _are_, never a located image (Laws L1/L2/L5); shared content dedupes.
-. It composes a *holospace definition* — a κ over those parts (the OS image, the repository, the system-emulator codemodule, the capabilities); the same source yields the same κ (reproducibility, Q4).
-. The Boot Layer boots the holospace: the *system-emulator codemodule* (ADR-009) computes the operating system from its κ-addressed content over the substrate runtime — disk as κ-addressed blocks, console / input / network as hologram channels, running state as a κ snapshot.
+. *Repository Fetching.* The operator names a devcontainer by *repository URL + reference + config path* (e.g. `github.com/org/repo`, `main`, `.devcontainer/devcontainer.json`) — a _what_, not a local checkout. The Repository Fetcher resolves the tree through the substrate's verified fetch (`get_with_fetch`) and yields the *Repository* as κ-addressed content; the URL+ref is the request, the κ is the identity (Laws L1/L5).
+. *Config Parsing.* It reads `devcontainer.json` from the Repository and validates it against the Dev Container spec (`CC-4`), yielding the *Devcontainer Config* (a reproducible κ). The config's `image` field names the base image (a registry reference — a _location_, which is resolved next, not stored).
+. *Image Ingestion.* The Image Ingestor fetches the named OCI image through the substrate and *verifies every blob by re-derivation against its OCI digest* (`CC-10`, Law L5), storing manifest + config + each layer as κ content. It yields the *Base Image* — an image κ derived from the verified manifest, identity-by-content (Laws L1/L2). Shared layers dedupe across holospaces (Law L3).
+. *Rootfs Assembly.* The Layer Assembler stacks the Base Image's layers in order — applying the OCI image-layer *whiteout / opaque-directory* rules — into a single root filesystem, and writes it into a *κ-disk*: an `ext4` image whose every sector is κ-addressed content over the store (`CC-7`, no second medium — Law L4). It yields the *Root Filesystem* (the bootable rootfs κ).
+. *Composition.* holospaces composes the *holospace definition* — a κ over the parts (the Root Filesystem κ-disk, the Repository workspace, the system-emulator codemodule, the kernel image, the capabilities); the same source yields the same holospace κ (reproducibility, Q4).
+. *Boot orchestration.* The Boot Layer generates the *device tree* declaring the machine (memory, CLINT, PLIC, and a `virtio-mmio` node for the block device), then boots the *system-emulator codemodule* (ADR-009/ADR-011) with the kernel + device tree. The emulator's `virtio-blk` device reads the Root Filesystem through the κ-disk seam (`CC-14`); the kernel mounts it over `virtio-blk` and runs the real OS — disk as κ-addressed blocks, console / input / network as hologram channels, running state as a κ snapshot.
 . The holospace appears in the Manager, ready to open.
 
 === Provisioning a holospace from a holo-file
