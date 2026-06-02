@@ -43,12 +43,11 @@ nldig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['layers']
 cp "$ROOT/vv/artifacts/cc16/image/blobs/sha256/$nldig" "$CRATE/web/devcontainer-net-layer.tar.gz"
 
 cd "$CRATE/web"
-[ -d node_modules/playwright ] || npm install playwright >/dev/null 2>&1
-[ -d node_modules/@vscode/test-web ] || npm install --no-save @vscode/test-web@0.0.80 >/dev/null 2>&1
-if [ ! -d "$HOME/.cache/ms-playwright" ]; then
-  echo "SKIP: Playwright browser not installed (run: npx playwright install chromium)"
-  exit 0
-fi
+# Install the declared browser-test dependencies (playwright, @vscode/test-web,
+# vscode-web) in one go — declared in package.json so nothing is pruned by a
+# later ad-hoc install. A real witness installs its prerequisites; it does not skip.
+npm install >/dev/null 2>&1
+npx --yes playwright install chromium chromium-headless-shell >/dev/null 2>&1
 
 echo "==> running the Platform Manager console test in Chromium (CC-12)"
 node manager-test.mjs
