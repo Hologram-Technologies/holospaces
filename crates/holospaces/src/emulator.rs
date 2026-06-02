@@ -2142,12 +2142,22 @@ impl Emulator {
         let mut disk_off = (sector * 512) as usize;
         const VIRTIO_BLK_T_IN: u32 = 0; // read from disk → guest
         const VIRTIO_BLK_T_OUT: u32 = 1; // write guest → disk
+        const VIRTIO_BLK_T_GET_ID: u32 = 8; // report the device id string
+        const VIRTIO_BLK_S_OK: u8 = 0;
+        const VIRTIO_BLK_S_IOERR: u8 = 1;
+        // A fixed-capacity block device (the spec): an access beyond the backing
+        // image is an I/O error, not a silent disk-resize. This matches the
+        // κ-disk HAL ([`crate::disk`]), which likewise refuses out-of-range I/O.
+        let mut status = VIRTIO_BLK_S_OK;
         match req_type {
             VIRTIO_BLK_T_IN => {
                 for (addr, len, _flags) in data {
+                    if disk_off + *len as usize > dev.disk.len() {
+                        status = VIRTIO_BLK_S_IOERR;
+                        break;
+                    }
                     for i in 0..*len as usize {
-                        let byte = dev.disk.get(disk_off + i).copied().unwrap_or(0);
-                        self.wr8(addr + i as u64, byte);
+                        self.wr8(addr + i as u64, dev.disk[disk_off + i]);
                     }
                     disk_off += *len as usize;
                     written += *len;
@@ -2156,7 +2166,8 @@ impl Emulator {
             VIRTIO_BLK_T_OUT => {
                 for (addr, len, _flags) in data {
                     if disk_off + *len as usize > dev.disk.len() {
-                        dev.disk.resize(disk_off + *len as usize, 0);
+                        status = VIRTIO_BLK_S_IOERR;
+                        break;
                     }
                     for i in 0..*len as usize {
                         dev.disk[disk_off + i] = self.rd8(addr + i as u64);
@@ -2164,11 +2175,21 @@ impl Emulator {
                     disk_off += *len as usize;
                 }
             }
-            _ => {} // FLUSH / GET_ID / others: ack OK with no data.
+            VIRTIO_BLK_T_GET_ID => {
+                // Answer with the device id (a 20-byte serial), padded with NUL —
+                // not an empty ack a `blkid`/`udev` probe would read as garbage.
+                const ID: &[u8] = b"holospaces-rootfs";
+                for (addr, len, _flags) in data {
+                    for i in 0..*len as usize {
+                        self.wr8(addr + i as u64, ID.get(i).copied().unwrap_or(0));
+                    }
+                    written += *len;
+                }
+            }
+            _ => {} // FLUSH and others: ack OK with no data.
         }
-        // Status = 0 (VIRTIO_BLK_S_OK).
         let _ = VIRTQ_DESC_F_WRITE;
-        self.wr8(status_desc.0, 0);
+        self.wr8(status_desc.0, status);
         written + 1 // + the status byte
     }
 
