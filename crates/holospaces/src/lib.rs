@@ -88,6 +88,10 @@ extern crate alloc;
 pub mod assembly;
 pub mod boot;
 pub mod disk;
+/// Dockerfile parsing + substrate-native build of a `build.dockerfile` Dev
+/// Container (`CC-26`); a host-side provisioning surface, `std` only.
+#[cfg(feature = "std")]
+pub mod dockerfile;
 pub mod emulator;
 /// The `.holo` Engine (the host-side execution backend; `std` only — the CPU
 /// kernels' float math needs `std`).
