@@ -599,6 +599,34 @@ impl Workspace {
         })
     }
 
+    /// Suspend the running machine to a κ snapshot — the canonical,
+    /// content-addressed bytes of the whole machine: CPU, RAM, the rootfs disk,
+    /// and the *workspace files* (virtio-9p). The browser persists these (gzipped)
+    /// to OPFS so the next launch *resumes* instead of cold-booting (`CC-30`).
+    /// Most of guest RAM is zero, so the gzipped snapshot is a small fraction of
+    /// the machine size.
+    pub fn suspend(&self) -> Vec<u8> {
+        self.machine.snapshot()
+    }
+
+    /// Resume a devcontainer workspace from a κ snapshot [`suspend`](Workspace::suspend)
+    /// produced, instead of cold-booting it (`CC-30`). The running OS, its disk,
+    /// and the workspace files come back exactly — so a second launch skips the
+    /// boot entirely and the editor's content is intact. The snapshot's integrity
+    /// is the caller's to check by re-derivation before trusting it across a
+    /// session boundary (Law L5; ADR-019) — OPFS is durable but untrusted storage.
+    pub fn resume_devcontainer(snapshot: &[u8]) -> Result<Workspace, JsValue> {
+        let base = MachineSpec::devcontainer().base;
+        let machine = Emulator::restore(base, snapshot).map_err(js_err)?;
+        Ok(Workspace {
+            machine,
+            store: MemKappaStore::new(),
+            channel: Vec::new(),
+            files: std::collections::BTreeMap::new(),
+            halted: false,
+        })
+    }
+
     /// Advance the running holospace by `budget` instructions (one chunk of the
     /// boot or of servicing input). Returns `true` once the machine has halted
     /// (powered off). Call repeatedly from a UI loop, rendering

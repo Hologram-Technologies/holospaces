@@ -392,12 +392,15 @@ fn store_le(ram: &mut [u8], o: usize, width: usize, value: u64) {
 pub enum SnapshotError {
     /// The snapshot bytes were truncated mid-field.
     Truncated,
+    /// A field held an invalid value (e.g. a non-UTF-8 9P path name).
+    Malformed,
 }
 
 impl core::fmt::Display for SnapshotError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             SnapshotError::Truncated => write!(f, "snapshot is truncated"),
+            SnapshotError::Malformed => write!(f, "snapshot field is malformed"),
         }
     }
 }
@@ -800,6 +803,66 @@ mod ninep {
                 }
             }
             out
+        }
+
+        /// Serialize the filesystem into a machine snapshot — every inode (the
+        /// `BTreeMap` iterates in id order, and each inode's children in name
+        /// order, so the bytes are deterministic and the snapshot κ reproducible,
+        /// Law L1). The dual of [`Fs9p::restore`].
+        pub fn snapshot_into(&self, out: &mut Vec<u8>) {
+            out.extend_from_slice(&self.next.to_le_bytes());
+            out.extend_from_slice(&(self.inodes.len() as u64).to_le_bytes());
+            for (id, node) in &self.inodes {
+                out.extend_from_slice(&id.to_le_bytes());
+                out.push(u8::from(node.is_dir));
+                out.extend_from_slice(&node.mode.to_le_bytes());
+                out.extend_from_slice(&(node.data.len() as u64).to_le_bytes());
+                out.extend_from_slice(&node.data);
+                out.extend_from_slice(&(node.children.len() as u64).to_le_bytes());
+                for (name, child) in &node.children {
+                    out.extend_from_slice(&(name.len() as u64).to_le_bytes());
+                    out.extend_from_slice(name.as_bytes());
+                    out.extend_from_slice(&child.to_le_bytes());
+                }
+            }
+        }
+
+        /// Reconstruct a filesystem from snapshot bytes (the inverse of
+        /// [`Fs9p::snapshot_into`]).
+        ///
+        /// # Errors
+        ///
+        /// [`super::SnapshotError`] if the bytes are truncated or a path name is
+        /// not valid UTF-8.
+        pub fn restore(r: &mut super::SnapshotReader) -> Result<Self, super::SnapshotError> {
+            let next = r.u64()?;
+            let count = r.u64()?;
+            let mut inodes = BTreeMap::new();
+            for _ in 0..count {
+                let id = r.u64()?;
+                let is_dir = r.u8()? != 0;
+                let mode = r.u32()?;
+                let data_len = r.u64()? as usize;
+                let data = r.bytes(data_len)?.to_vec();
+                let nchild = r.u64()?;
+                let mut children = BTreeMap::new();
+                for _ in 0..nchild {
+                    let name_len = r.u64()? as usize;
+                    let name = String::from_utf8(r.bytes(name_len)?.to_vec())
+                        .map_err(|_| super::SnapshotError::Malformed)?;
+                    children.insert(name, r.u64()?);
+                }
+                inodes.insert(
+                    id,
+                    Inode {
+                        is_dir,
+                        mode,
+                        data,
+                        children,
+                    },
+                );
+            }
+            Ok(Fs9p { inodes, next })
         }
 
         /// Write a root file (update in place, or create) — the editor saving
@@ -2025,6 +2088,40 @@ impl Emulator {
                 out.extend_from_slice(&dev.disk);
             }
         }
+        // The VirtIO 9P device: its transport state, the fid table, the mount
+        // tag, and the shared workspace filesystem itself (the user's files) —
+        // so a suspended *workspace* resumes with its content intact (`CC-15`).
+        match &self.virtio9p {
+            None => out.push(0),
+            Some(dev) => {
+                out.push(1);
+                out.extend_from_slice(&dev.status.to_le_bytes());
+                out.extend_from_slice(&dev.device_features_sel.to_le_bytes());
+                out.extend_from_slice(&dev.driver_features_sel.to_le_bytes());
+                out.extend_from_slice(&dev.driver_features[0].to_le_bytes());
+                out.extend_from_slice(&dev.driver_features[1].to_le_bytes());
+                out.extend_from_slice(&dev.queue_num.to_le_bytes());
+                out.extend_from_slice(&dev.queue_ready.to_le_bytes());
+                out.extend_from_slice(&dev.desc_addr.to_le_bytes());
+                out.extend_from_slice(&dev.avail_addr.to_le_bytes());
+                out.extend_from_slice(&dev.used_addr.to_le_bytes());
+                out.extend_from_slice(&dev.last_avail.to_le_bytes());
+                out.extend_from_slice(&dev.interrupt_status.to_le_bytes());
+                out.push(u8::from(dev.irq_pending));
+                out.extend_from_slice(&(dev.tag.len() as u64).to_le_bytes());
+                out.extend_from_slice(dev.tag.as_bytes());
+                out.extend_from_slice(&(dev.fids.len() as u64).to_le_bytes());
+                for (fid, ino) in &dev.fids {
+                    out.extend_from_slice(&fid.to_le_bytes());
+                    out.extend_from_slice(&ino.to_le_bytes());
+                }
+                dev.fs.snapshot_into(&mut out);
+            }
+        }
+        // VirtIO networking is deliberately *not* snapshotted: its egress/ingress
+        // are live, external transports (a host socket, or a WebSocket to a relay)
+        // that cannot be frozen into content. A resumed machine re-establishes its
+        // network — connections reset, exactly as a host does on wake.
         out.extend_from_slice(&self.ram);
         out
     }
@@ -2102,6 +2199,50 @@ impl Emulator {
                     driver_features_sel,
                     driver_features,
                     queue_sel,
+                    queue_num,
+                    queue_ready,
+                    desc_addr,
+                    avail_addr,
+                    used_addr,
+                    last_avail,
+                    interrupt_status,
+                    irq_pending,
+                })
+            }
+        };
+        emu.virtio9p = match r.u8()? {
+            0 => None,
+            _ => {
+                let status = r.u32()?;
+                let device_features_sel = r.u32()?;
+                let driver_features_sel = r.u32()?;
+                let driver_features = [r.u32()?, r.u32()?];
+                let queue_num = r.u32()?;
+                let queue_ready = r.u32()?;
+                let desc_addr = r.u64()?;
+                let avail_addr = r.u64()?;
+                let used_addr = r.u64()?;
+                let last_avail = r.u16()?;
+                let interrupt_status = r.u32()?;
+                let irq_pending = r.u8()? != 0;
+                let tag_len = r.u64()? as usize;
+                let tag = alloc::string::String::from_utf8(r.bytes(tag_len)?.to_vec())
+                    .map_err(|_| SnapshotError::Malformed)?;
+                let nfids = r.u64()?;
+                let mut fids = BTreeMap::new();
+                for _ in 0..nfids {
+                    let fid = r.u32()?;
+                    fids.insert(fid, r.u64()?);
+                }
+                let fs = ninep::Fs9p::restore(&mut r)?;
+                Some(Virtio9p {
+                    fs,
+                    fids,
+                    tag,
+                    status,
+                    device_features_sel,
+                    driver_features_sel,
+                    driver_features,
                     queue_num,
                     queue_ready,
                     desc_addr,

@@ -11,7 +11,8 @@
 //! `qemu-system-riscv64` differential oracle. Witnessed:
 //!   * **round-trip identity** — `restore(snapshot(m))` re-snapshots to the
 //!     *same* bytes (so restore faithfully reconstructs everything snapshot
-//!     captured), including a machine with a virtio-blk disk attached;
+//!     captured), including a machine with a virtio-blk disk and a virtio-9p
+//!     *workspace* (the user's files survive the round trip);
 //!   * **identical continuation** — the restored machine continues execution
 //!     byte-identically to the one that was suspended (same console, same final
 //!     snapshot, Law L1);
@@ -99,6 +100,35 @@ fn restore_reconstructs_a_machine_with_a_virtio_disk() {
         resumed.snapshot(),
         snap,
         "a machine with a virtio disk round-trips through snapshot/restore exactly"
+    );
+}
+
+#[test]
+fn restore_reconstructs_a_workspace_filesystem_over_virtio_9p() {
+    // A workspace machine carries the user's files in the virtio-9p share. Resume
+    // must bring them back, or a resumed devcontainer would lose the editor's
+    // content. The whole machine — including the 9p filesystem — round-trips.
+    let mut emu = Emulator::new(0x8000_0000, 1024 * 1024);
+    emu.attach_workspace(&[("README.md", b"# hello"), ("src/main.rs", b"fn main() {}")]);
+    emu.workspace_write("notes.txt", b"a file the user edited");
+    let snap = emu.snapshot();
+
+    let resumed = Emulator::restore(0x8000_0000, &snap).expect("restore");
+    assert_eq!(
+        resumed.snapshot(),
+        snap,
+        "a machine with a virtio-9p workspace round-trips through snapshot/restore exactly"
+    );
+    // The workspace content itself survives the resume (the user's files).
+    assert_eq!(resumed.workspace_file("README.md"), Some(&b"# hello"[..]));
+    assert_eq!(
+        resumed.workspace_file("src/main.rs"),
+        Some(&b"fn main() {}"[..])
+    );
+    assert_eq!(
+        resumed.workspace_file("notes.txt"),
+        Some(&b"a file the user edited"[..]),
+        "an edit made before suspend is present after resume"
     );
 }
 
