@@ -46,6 +46,21 @@ export async function composeWorkbenchHtml({ distDir, twDir, baseUrl }) {
     .replaceAll("{{WORKBENCH_WEB_CONFIGURATION}}", "{}")
     .replaceAll("{{WORKBENCH_AUTH_SESSION}}", "")
     .replaceAll("{{WORKBENCH_NLS_BASE_URL}}", "");
+  // vscode-web's bootstrap resolves the dist base with
+  // `new URL(baseUrl, window.location.origin)` — but `origin` has NO path, so on
+  // a *project* GitHub Pages site (served under `/<repo>/`) the deploy sub-path is
+  // dropped and every secondary resource (the web-worker extension-host iframe,
+  // themes, keybinding layouts) 404s under `/workbench/...` instead of
+  // `/<repo>/workbench/...`. With the extension-host iframe missing, the
+  // `holospace-fs` extension never activates, no FileSystemProvider is registered
+  // for `holospace:/workspace`, and no content loads. Resolve against the full
+  // page URL so the base keeps the sub-path (correct at the root *and* a sub-path).
+  for (const q of ["'", '"']) {
+    html = html.replaceAll(
+      `new URL(${q}${baseUrl}${q}, window.location.origin)`,
+      `new URL(${q}${baseUrl}${q}, window.location.href)`,
+    );
+  }
   // Fill the config at runtime (after the meta, before the bootstrap).
   html = html.replace(
     '<meta id="vscode-workbench-web-configuration" data-settings="{}">',
