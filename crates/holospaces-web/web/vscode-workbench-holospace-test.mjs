@@ -114,14 +114,28 @@ try {
   ).then(() => true).catch(() => false);
   check(mounted, "the running holospace's virtio-9p workspace mounted into the real workbench (CC-15 — a file the holospace holds is in the editor's file tree)");
 
-  // The editor reads that file's content over the live workspace (FileSystemProvider.readFile).
+  // The editor reads that file's content over the live workspace
+  // (FileSystemProvider.readFile → the holospace's ws_read). Open the file
+  // (double-click — a single click only selects/previews) and poll the editor
+  // until its content renders; retry the open a few times to ride out CI render
+  // timing. A real, fatal assertion of content delivery — not a fixed sleep.
   let editorText = "";
   if (mounted) {
-    try {
-      await page.click(".explorer-folders-view .monaco-list-row:has-text('WELCOME')", { timeout: 5000 });
-      await page.waitForTimeout(3000);
-      editorText = await page.evaluate(() => document.querySelector(".monaco-editor .view-lines")?.innerText || "");
-    } catch { /* timing-flaky; the mount above is the deterministic fact */ }
+    const welcome = page.locator(".explorer-folders-view .monaco-list-row", { hasText: "WELCOME" }).first();
+    for (let pass = 0; pass < 6 && !/holospace/i.test(editorText); pass++) {
+      await welcome.dblclick({ timeout: 5000 }).catch(() => {});
+      editorText = await page
+        .waitForFunction(
+          () => {
+            const t = document.querySelector(".monaco-editor .view-lines")?.innerText || "";
+            return /holospace/i.test(t) ? t : false;
+          },
+          null,
+          { timeout: 20000, polling: 500 },
+        )
+        .then((h) => h.jsonValue())
+        .catch(() => editorText);
+    }
   }
   check(/holospace/i.test(editorText), `the editor reads the file's content over the live workspace (read by κ; CC-11/CC-15): "${editorText.replace(/\s+/g, " ").slice(0, 60)}"`);
 
