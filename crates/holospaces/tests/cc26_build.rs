@@ -259,3 +259,53 @@ fn gunzip_cc14_kernel() -> Vec<u8> {
     d.read_to_end(&mut k).unwrap();
     k
 }
+
+/// (4) The *import* flow honours a Dockerfile build (it does not silently fall
+/// back to the default image): from a repository archive declaring `build`,
+/// holospaces finds the `devcontainer.json`, parses it to a `Build` source
+/// (retaining the Dockerfile path + args), reads the Dockerfile from the build
+/// context, resolves its `FROM` + its `COPY` sources from the repository — the
+/// resolution the import does before pulling `FROM` and assembling the build.
+#[test]
+fn the_import_resolves_a_dockerfile_build_from_a_repo() {
+    use holospaces::assembly::{find_devcontainer_json, read_archive_file};
+    use holospaces::boot::devcontainer::{self, ImageSource};
+
+    let archive = std::fs::read(art().join("cc26/repo.tar.gz")).unwrap();
+    let layer = Layer {
+        media_type: "application/gzip",
+        blob: &archive,
+    };
+
+    // The import finds the devcontainer.json (the leading `<repo>-<ref>/` dir is
+    // stripped) and parses it — `build` retained, not dropped.
+    let cfg = find_devcontainer_json(&layer)
+        .unwrap()
+        .expect("devcontainer.json in the repo");
+    let dc = devcontainer::parse(&cfg).expect("parse the devcontainer");
+    let bc = match &dc.image_source {
+        ImageSource::Build(bc) => bc,
+        other => panic!("expected a Build image source, got {other:?}"),
+    };
+    assert_eq!(bc.dockerfile, "Dockerfile");
+    assert_eq!(bc.args.get("TAG").map(String::as_str), Some("latest"));
+
+    // The Dockerfile is read from the build context and resolves its FROM.
+    let df_bytes = read_archive_file(&layer, ".devcontainer/Dockerfile")
+        .unwrap()
+        .expect("the build's Dockerfile is read from the repository");
+    let df = dockerfile::parse(&df_bytes, &bc.args).expect("parse the Dockerfile");
+    assert_eq!(
+        df.from, "holospaces/busybox:latest",
+        "FROM is the image to pull"
+    );
+
+    // Every COPY source is resolved from the build context (never dropped).
+    for (src, _dst) in df.copies() {
+        let resolved = read_archive_file(&layer, &format!(".devcontainer/{src}")).unwrap();
+        assert!(
+            resolved.is_some(),
+            "the COPY source `{src}` resolves from the repository"
+        );
+    }
+}

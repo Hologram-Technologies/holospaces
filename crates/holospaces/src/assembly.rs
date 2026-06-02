@@ -245,6 +245,30 @@ pub fn find_devcontainer_json(layer: &Layer) -> Result<Option<Vec<u8>>, Assembly
     Ok(None)
 }
 
+/// Read a single file at `want` (a `/`-separated path) from a repository
+/// `archive` layer (a `tar`/`tar+gzip`), ignoring the archive's leading directory
+/// component (git hosts wrap the tree in `<repo>-<ref>/…`). Returns the file
+/// bytes, or `None` if absent. Used to read a Dockerfile and its `COPY` sources
+/// from the build context (`CC-26`). `want` may itself be prefixed `./`.
+pub fn read_archive_file(archive: &Layer, want: &str) -> Result<Option<Vec<u8>>, AssemblyError> {
+    let want = want.trim_start_matches("./").trim_start_matches('/');
+    let tar = decompress(archive)?;
+    for entry in tar::Reader::new(&tar) {
+        let entry = entry?;
+        if entry.kind != tar::Kind::File {
+            continue;
+        }
+        let rel = match entry.path.split_once('/') {
+            Some((_, rest)) => rest,
+            None => entry.path.as_str(),
+        };
+        if rel.trim_start_matches("./") == want {
+            return Ok(Some(entry.data));
+        }
+    }
+    Ok(None)
+}
+
 /// Extract every regular file from an OCI artifact `layer` (a `tar` or
 /// `tar+gzip`) as `(path, mode, bytes)`, with any leading `./` stripped. The Boot
 /// Orchestrator uses this to unpack a Dev Container *feature* artifact (its
