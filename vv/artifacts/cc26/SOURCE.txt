@@ -25,6 +25,11 @@ ext4 on-disk format — e2fsprogs (the COPY source is in the rootfs); differenti
 
 Artifacts
 ---------
+vv/artifacts/cc26/repo.tar.gz — a hermetic repository archive declaring a build
+  devcontainer (.devcontainer/{devcontainer.json with "build", Dockerfile, setup.sh}),
+  for the import-resolution witness (the import finds + parses + resolves the build
+  from a repository, never silently defaulting).
+
 vv/artifacts/cc26/Dockerfile + setup.sh — the witness's Dockerfile and its build
   context (the COPY source). The FROM base is the CC-22 BusyBox image; the CC-14
   kernel is reused for the boot. (Synthesized in the witness; kept here for
@@ -40,4 +45,10 @@ Witness — crates/holospaces/tests/cc26_build.rs (+ holospaces::dockerfile unit
     FROM is the pulled base — e2fsck clean, debugfs reads the COPY'd script back;
   (2) holospaces' own emulator runs the build in the OS — BUILD-START, SETUP-RAN
     (the COPY'd script ran), BUILD-RAN:cc26 (the RUN expanded the ENV), BUILD-DONE;
-  (3) qemu-system-riscv64 produces the same markers.
+  (3) qemu-system-riscv64 produces the same markers;
+  (4) the IMPORT flow honours a build (import.rs): from a repository archive
+      declaring `build`, holospaces finds the devcontainer.json, parses it to a
+      Build source (the Dockerfile path + args retained), reads the Dockerfile
+      from the build context, and resolves FROM + the COPY sources from the
+      repository — never the silent default. import_and_assemble injects the
+      build /init + the COPY files over the pulled FROM base.

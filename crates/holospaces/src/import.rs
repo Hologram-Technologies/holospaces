@@ -22,7 +22,11 @@ use std::io::Read;
 
 use hologram_substrate_core::KappaStore;
 
-use crate::assembly::{find_devcontainer_json, Layer};
+use crate::assembly::{
+    assemble_ext4, assemble_ext4_with_files, find_devcontainer_json, read_archive_file, Layer,
+};
+use crate::boot::devcontainer::{self, ImageSource};
+use crate::dockerfile;
 use crate::oci::{ingest_image, IngestedImage, OciError};
 
 /// The default Dev Container base image, used when a repository declares no
@@ -384,10 +388,26 @@ fn sha256_digest(bytes: &[u8]) -> String {
 pub struct ImportedDevcontainer {
     /// The `devcontainer.json` bytes (the repository's, or a synthesized default).
     pub config: Vec<u8>,
-    /// Whether the default image was used (the repository had no devcontainer).
+    /// Whether the default image was used (the repository had no devcontainer, or
+    /// a compose source whose service resolution is not yet wired — `CC-27`).
     pub used_default: bool,
-    /// The ingested, verified base image.
+    /// The ingested, verified base image (the `image`, or a Dockerfile build's
+    /// `FROM`).
     pub image: IngestedImage,
+    /// The Dockerfile build plan, when the devcontainer is a `build` (`CC-26`):
+    /// the build `/init` (its `RUN` steps) and the resolved `COPY` files, injected
+    /// over the `FROM` base by [`import_and_assemble`].
+    pub build: Option<BuildPlan>,
+}
+
+/// A resolved Dockerfile build (`CC-26`): the build `/init` and the `COPY` files
+/// (destination path → bytes) to inject into the rootfs over the `FROM` base.
+#[derive(Clone, Debug)]
+pub struct BuildPlan {
+    /// The build `/init` the OS runs (the Dockerfile's `RUN` steps).
+    pub init: Vec<u8>,
+    /// The `COPY` files: `(destination path in the rootfs, bytes)`.
+    pub copy_files: Vec<(String, Vec<u8>)>,
 }
 
 /// Import a devcontainer from a repository URL: fetch the repository, read its
@@ -400,22 +420,101 @@ pub fn import_devcontainer(
     reference: &str,
 ) -> Result<ImportedDevcontainer, ImportError> {
     let archive = fetch_repo_archive(repo_url, reference)?;
-    let (config, used_default, image_ref) = match repo_devcontainer_config(&archive)? {
+    let pull_default =
+        |store: &dyn KappaStore| pull_image(store, &parse_image_ref(DEFAULT_DEVCONTAINER_IMAGE)?);
+
+    let (config, used_default, image, build) = match repo_devcontainer_config(&archive)? {
         Some(cfg) => {
-            let image = image_ref_from_config(&cfg)?;
-            (cfg, false, image)
+            // Resolve the declared image *source* — honouring `build` (a Dockerfile
+            // build, `CC-26`), never silently falling back to the default.
+            let dc = devcontainer::parse(&cfg)
+                .map_err(|e| ImportError::BadContent(format!("devcontainer.json: {e}")))?;
+            let (image, build) = match &dc.image_source {
+                ImageSource::Image(r) => (pull_image(store, &parse_image_ref(r)?)?, None),
+                ImageSource::Build(bc) => {
+                    let archive_layer = Layer {
+                        media_type: "application/gzip",
+                        blob: &archive,
+                    };
+                    let df_bytes = read_build_file(&archive_layer, &bc.context, &bc.dockerfile)?
+                        .ok_or_else(|| {
+                            ImportError::BadContent(format!(
+                                "build dockerfile `{}` not found in the repository",
+                                bc.dockerfile
+                            ))
+                        })?;
+                    let df = dockerfile::parse(&df_bytes, &bc.args)
+                        .map_err(|e| ImportError::BadContent(format!("Dockerfile: {e}")))?;
+                    let image = pull_image(store, &parse_image_ref(&df.from)?)?;
+                    // Resolve the COPY sources from the build context (never dropped).
+                    let mut copy_files = Vec::new();
+                    for (src, dst) in df.copies() {
+                        let bytes = read_build_file(&archive_layer, &bc.context, src)?.ok_or_else(
+                            || {
+                                ImportError::BadContent(format!(
+                                    "COPY source `{src}` not found in the build context"
+                                ))
+                            },
+                        )?;
+                        copy_files.push((dst.trim_start_matches('/').to_owned(), bytes));
+                    }
+                    (
+                        image,
+                        Some(BuildPlan {
+                            init: df.build_init(None),
+                            copy_files,
+                        }),
+                    )
+                }
+                // Compose resolution is `CC-27`; the config is retained. For now a
+                // compose devcontainer provisions on the default base (explicit, in
+                // `used_default`), not a silent image mismatch.
+                ImageSource::Compose(_) | ImageSource::Default => (pull_default(store)?, None),
+            };
+            let used_default = matches!(
+                dc.image_source,
+                ImageSource::Default | ImageSource::Compose(_)
+            );
+            (cfg, used_default, image, build)
         }
         None => {
             let cfg = format!(r#"{{"image":"{DEFAULT_DEVCONTAINER_IMAGE}"}}"#).into_bytes();
-            (cfg, true, DEFAULT_DEVCONTAINER_IMAGE.to_string())
+            (cfg, true, pull_default(store)?, None)
         }
     };
-    let image = pull_image(store, &parse_image_ref(&image_ref)?)?;
     Ok(ImportedDevcontainer {
         config,
         used_default,
         image,
+        build,
     })
+}
+
+/// Read a build file (the Dockerfile, or a `COPY` source) from a repository
+/// archive: the path is `rel` under the build `context`, which is itself relative
+/// to the folder holding `devcontainer.json` (so try both the repository root and
+/// a `.devcontainer/` prefix).
+fn read_build_file(
+    archive: &Layer,
+    context: &str,
+    rel: &str,
+) -> Result<Option<Vec<u8>>, ImportError> {
+    let ctx = context.trim_start_matches("./").trim_matches('/');
+    let rel = rel.trim_start_matches("./");
+    let joined = if ctx.is_empty() {
+        rel.to_owned()
+    } else {
+        format!("{ctx}/{rel}")
+    };
+    for prefix in ["", ".devcontainer/"] {
+        let path = format!("{prefix}{joined}");
+        if let Some(b) =
+            read_archive_file(archive, &path).map_err(|e| ImportError::BadContent(e.to_string()))?
+        {
+            return Ok(Some(b));
+        }
+    }
+    Ok(None)
 }
 
 /// Import a devcontainer from a repository URL and assemble its bootable `ext4`
@@ -451,23 +550,24 @@ pub fn import_and_assemble(
             blob: b,
         })
         .collect();
-    let rootfs = crate::assembly::assemble_ext4(&layers)
-        .map_err(|e| ImportError::BadContent(format!("assemble: {e}")))?;
+    let rootfs = if let Some(build) = &imported.build {
+        // A Dockerfile build (`CC-26`): inject the build `/init` (the `RUN` steps)
+        // and the `COPY` files over the `FROM` base, so the build runs in the OS.
+        let mut owned: Vec<(String, u16, Vec<u8>)> =
+            vec![("init".into(), 0o755, build.init.clone())];
+        for (dst, bytes) in &build.copy_files {
+            owned.push((dst.clone(), 0o755, bytes.clone()));
+        }
+        let files: Vec<(&str, u16, &[u8])> = owned
+            .iter()
+            .map(|(p, m, b)| (p.as_str(), *m, b.as_slice()))
+            .collect();
+        assemble_ext4_with_files(&layers, &files)
+            .map_err(|e| ImportError::BadContent(format!("assemble build: {e}")))?
+    } else {
+        assemble_ext4(&layers).map_err(|e| ImportError::BadContent(format!("assemble: {e}")))?
+    };
     Ok((imported, rootfs))
-}
-
-/// Extract the base-image reference from a `devcontainer.json`'s `image` field.
-fn image_ref_from_config(config: &[u8]) -> Result<String, ImportError> {
-    let v: serde_json::Value =
-        serde_json::from_slice(config).map_err(|e| ImportError::BadContent(e.to_string()))?;
-    v.get("image")
-        .and_then(|i| i.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| {
-            // No `image` (e.g. a Dockerfile build): fall back to the default base.
-            ImportError::BadContent("devcontainer.json has no `image` field".into())
-        })
-        .or(Ok(DEFAULT_DEVCONTAINER_IMAGE.to_string()))
 }
 
 #[cfg(test)]
