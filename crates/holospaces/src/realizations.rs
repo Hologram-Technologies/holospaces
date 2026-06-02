@@ -201,7 +201,7 @@ fn read_u32(bytes: &[u8], cur: &mut usize) -> Result<u32, RealizationError> {
 
 /// The opaque payload after a realization's embedded operand κ-labels — the
 /// inverse of `encode`'s payload region.
-fn payload_of(iri: &str, bytes: &[u8]) -> Result<Vec<u8>, RealizationError> {
+pub(crate) fn payload_of(iri: &str, bytes: &[u8]) -> Result<Vec<u8>, RealizationError> {
     let nul = bytes
         .iter()
         .position(|&b| b == 0)

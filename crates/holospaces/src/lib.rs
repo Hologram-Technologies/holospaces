@@ -91,6 +91,10 @@ pub mod boot;
 /// (`CC-27`); a host-side provisioning surface, `std` only.
 #[cfg(feature = "std")]
 pub mod compose;
+/// The control plane's content-addressed reconfiguration of a running holospace
+/// — lifecycle / storage / network / account directives published over the
+/// substrate and applied by the instance (ADR-018; `CC-28`).
+pub mod config;
 pub mod disk;
 /// Dockerfile parsing + substrate-native build of a `build.dockerfile` Dev
 /// Container (`CC-26`); a host-side provisioning surface, `std` only.

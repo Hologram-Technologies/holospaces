@@ -117,6 +117,7 @@
             <td>
               <button class="sm primary" data-act="enter" data-k="${k}" ${enter ? "" : "disabled"}>Enter</button>
               <button class="sm" data-act="suspend" data-k="${k}" ${m.status === "running" ? "" : "disabled"}>Suspend</button>
+              <button class="sm" data-act="forward" data-k="${k}">Forward port</button>
               <button class="sm" data-act="terminate" data-k="${k}" ${m.status !== "stopped" ? "" : "disabled"}>Terminate</button>
               <button class="sm" data-act="remove" data-k="${k}">Remove</button>
             </td></tr>`;
@@ -124,6 +125,14 @@
         for (const b of tbody.querySelectorAll("button[data-act]")) {
           b.onclick = () => action(b.dataset.act, b.dataset.k);
         }
+      }
+
+      // Reconfigure an instance from the panel: publish a content-addressed
+      // Configuration (ADR-018; CC-28). The running instance resolves and applies
+      // it over the substrate — the panel does NOT call the instance directly.
+      // Returns the configuration κ (the published content), or throws.
+      function configure(k, directives) {
+        return console0.configure(k, JSON.stringify(directives));
       }
 
       function action(act, k) {
@@ -136,9 +145,19 @@
           window.open(`workbench.html?id=${encodeURIComponent(k)}&name=${encodeURIComponent(m.name)}`, "_blank");
           toast("entering " + m.name + " — the VS Code workbench opens in a new tab");
         } else if (act === "suspend") {
-          m.status = "suspended"; render(); toast(m.name + " suspended (state is its κ snapshot, Law L3)");
+          // Real: publish a lifecycle configuration the instance applies (no stub).
+          const cfg = configure(k, [{ lifecycle: "suspend" }]);
+          m.status = "suspended"; render();
+          toast(m.name + " — published suspend config " + cfg.slice(0, 22) + "… (the instance applies it over the substrate)");
         } else if (act === "terminate") {
-          m.status = "stopped"; render(); toast(m.name + " terminated");
+          const cfg = configure(k, [{ lifecycle: "terminate" }]);
+          m.status = "stopped"; render();
+          toast(m.name + " — published terminate config " + cfg.slice(0, 22) + "…");
+        } else if (act === "forward") {
+          const port = parseInt(prompt("Forward which guest port? (the app-preview port the instance runs a server on)", "8080"), 10);
+          if (!Number.isInteger(port) || port < 1 || port > 65535) return;
+          const cfg = configure(k, [{ forwardPort: port }]);
+          toast(m.name + " — published forwardPort " + port + " config " + cfg.slice(0, 18) + "… (the running instance begins forwarding it)");
         } else if (act === "remove") {
           meta.delete(k); remove(k); render();
         }
