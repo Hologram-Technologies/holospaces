@@ -592,9 +592,13 @@ extension host runs in the OS over the remote-server protocol —
 faithful, and used by a peer whose holospace OS can host that server (a
 native or remote peer backed by a full container/VM). (b) The **web**
 model (`vscode.dev` / `github.dev`): the extension host runs in the
-browser’s web worker, and the editor’s files come from a
-`FileSystemProvider` **web extension** whose data source is reached by
-`fetch`, which a **service worker** serves from the peer. The
+browser’s web worker, which **boots the holospace (the wasm peer) in
+itself** — the browser is a first-class compute substrate — and serves
+the editor’s files from its `virtio-9p` workspace directly through a
+`FileSystemProvider` **web extension** (no separate server: the host
+worker **is** the peer; holospaces serves the κ-verified workbench,
+composes the supported `create()` bootstrap + the bridge extension, and
+the extension boots the holospace and registers the provider). The
 **browser** peer uses the web model, because its devcontainer OS is the
 minimal emulated Linux of ADR-011 — it boots a real kernel + rootfs but
 is not provisioned to run the full Node-based `vscode-server`. In both
@@ -604,9 +608,13 @@ through the wasm peer in the web model or the OS host in the remote
 model), the terminal is the console (`CC-11`), and integration traffic
 leaves over `CC-16`. So parity is preserved — both are real VS Code
 extension hosts — and the choice is a transport detail, not a capability
-difference. (`CC-17` Phase 1 — the κ-verified workbench loads — is
-witnessed; the provider wiring is the web model on the browser peer and
-the remote model on a server-capable peer.)
+difference. (The **web model** is witnessed live for the browser peer —
+`CC-17` Phase 3: the κ-verified workbench loads and its extension-host
+worker boots the holospace and binds the workbench to the `virtio-9p`
+workspace + console, served statically. The **remote model** on a
+server-capable peer is the staged extension of the same seam — the
+conformance catalog (Chapter 10) marks each row `live` or staged, and
+V&V/CI and git reflect the status.)
 
 ## ADR-016: the workspace targets full Codespaces/Gitpod capability parity, mapped to substrate primitives
 
@@ -660,8 +668,9 @@ is a gap to close, not a feature to omit.
   - **Dev Container lifecycle commands** — built into the rootfs `/init`
     from the parsed config and run in the OS in spec order, the
     environment ready on entry (`CC-22`); Dev Container Features (each
-    an OCI artifact imported by κ, the same machinery as `CC-20`)
-    applied into the rootfs are the planned extension of the same seam.
+    an OCI artifact imported by κ, the same machinery as `CC-20`) are
+    applied into the rootfs — their `install.sh` runs in the OS before
+    the lifecycle, with the declared options as environment (`CC-25`).
 
   - **Personalization — settings, dotfiles, secrets** — κ-addressed
     content scoped to the operator’s identity and synced across peers
@@ -690,8 +699,9 @@ integration is **one witnessed example** of the general
 extension-integration mechanism (ADR-015), not the scope.
 
 **Consequences:** "Same as a Codespace/Gitpod" is made concrete and
-gap-checkable: the model is the capability map, and
-`specs/feature-matrix.md` tracks each row’s status. The realization is
+gap-checkable: the model is the capability map, and the conformance
+catalog (Chapter 10) marks each row `live` or staged — V&V/CI and git
+reflect the status, never a separate narrative doc. The realization is
 uniform — every capability is a composition of the emulator’s devices
 (`virtio-blk`/`-9p`/`-net`), the workbench, and the remote extension
 host, over the substrate — so parity grows by adding witnessed rows
@@ -761,3 +771,162 @@ works in a tab" — the same cold-start-gateway dependency. The one
 ergonomic difference from a redirect flow is that the device flow asks
 the user to enter a short code at a verification URL — standard for
 device/CLI sign-in.
+
+## ADR-018: the control plane reconfigures a running holospace over the substrate; configuration is content
+
+**Status:** accepted
+
+**Context:** holospaces is two things composed: the **control plane**
+(the operator’s Manager / control panel — peer-local, not a server,
+ADR-001) that organizes holospaces, and the **instances**
+(devcontainers, the first holospace format). A Codespaces/Gitpod (Ona)
+control panel does not only **create** an environment — it
+**reconfigures a running one**: stop/suspend/resume, grow storage,
+forward a port for an app preview, manage who has access. holospaces
+must do the same across the four operation classes — **lifecycle,
+storage, network, account/user** — but UOR-native: the control plane
+must **not** call a server API on the instance (there is no server, and
+identity is what-not-where, not an addressable endpoint).
+
+- The insight: a **configuration is content**. When the operator
+  configures an instance from the panel, the panel produces a
+  κ-addressed `Configuration` — a hologram `Realization` embedding the
+  issuing **operator** identity (Law L3 — the authority is the
+  operator’s, scoped to them) and the **target instance** κ, plus an
+  ordered set of declarative **directives** (one per operation class).
+  The control plane publishes it over the substrate exactly as it
+  publishes a roster (content-addressed resolution + announce — the
+  `Identity and sync` concept, Chapter 8); the running instance
+  **resolves** it by κ over `KappaSync`, **verifies** it by
+  re-derivation (Law L5), checks it targets **this** instance and the
+  operator is authorized, and **applies** each directive. The instance’s
+  state changes — a port begins forwarding, a lifecycle transition
+  occurs, the effective capability set is replaced — driven by content
+  the control plane published, not by a call.
+
+- "Through the hologram network" is therefore literal and uor-native:
+  the configuration travels as verified content (a κ), so **any** of the
+  operator’s peers can issue it (what-not-where), it is reproducible
+  (the same configuration applied to the same instance yields the same
+  resulting state, Law L1), and it is auditable (every configuration
+  **is** a κ).
+
+- Capabilities that are part of a holospace’s identity (storage quota,
+  network authority — Chapter 8) are changed by **replacing the
+  capability set**: the reconfigured instance is, by content, a new
+  effective state with a new κ — consistent with Law L1 rather than a
+  hidden mutation.
+
+**Decision:** The control plane reconfigures a running holospace by
+**publishing a content-addressed `Configuration`** over the substrate,
+which the instance **resolves, verifies (Law L5), and applies**. One
+`Configuration` realization carries directives for all four operation
+classes (lifecycle / storage / network / account-user);
+`Manager::configure` is the control-panel operation (canonicalize →
+store, Law L2 → record as the instance’s current configuration over its
+config channel); the instance’s `reconfigure` applies the directives to
+the live machine and its effective capability set. No
+control-plane→instance RPC, no server. Witnessed (`CC-28`) against the
+substrate’s content-addressing + sync contract and the Codespaces/Gitpod
+control-panel **reconfigure** UX: a configuration issued from the panel
+is resolved and applied by the running instance — a port forwarded from
+the panel becomes reachable on the running instance; a lifecycle
+directive transitions it; the resulting effective state is reproducible
+(same configuration ⇒ same κ); and a configuration for a **different**
+instance, or from an **unauthorized** operator, is refused.
+
+**Consequences:** The control panel’s operations are **real and
+uniform** — each is a directive in a verified, content-addressed
+configuration, not a bespoke endpoint, so a new operation is a new
+directive, not a new service. The four operation classes share one
+mechanism (configuration-as-content) and one check (Law L5), which keeps
+the control plane small and the instance’s trust boundary explicit (it
+applies only verified configurations that target it and name an
+authorized operator). Because configuration is content, an instance is
+reconfigurable from any of the operator’s peers and every change is
+reproducible and auditable. The cost is that the running machine must
+carry a **reconfiguration surface** per directive class (live
+network/storage/lifecycle hooks, not fixed-at-boot), and a capability
+change yields a new effective κ — the reconfigured instance is a new
+state by content (Law L1), which the control plane tracks as the
+instance’s current configuration.
+
+## ADR-019: the deployed artifact is a production target — validation is a CI gate, and L5 verification sits at the trust boundary, not on every local read
+
+**Status:** accepted
+
+**Context:** The GitHub-Pages-served browser peer (ADR-005) is not a
+demo — it is the **production** deployment. It boots a real operating
+system on the system emulator (ADR-009), a hot interpreter loop that
+retires billions of instructions per launch, so its performance is a
+first-class concern. The Verification & Validation suite (the CS
+specification checks and the CC component witnesses, Chapter 10) proves
+the implementation against external authorities — but it is a
+**build-time gate run in CI**, not something the deployed environment
+should re-run at runtime. A production artifact that re-pays validation
+costs the V&V already settled is slower for no added assurance.
+
+- The distinction is **where a check is spent**. Law L5 — content is
+  accepted only when its bytes re-derive to the requested κ — is a
+  **trust-boundary** invariant, not a per-read tax. It must hold
+  wherever **untrusted** bytes enter: the substrate’s network read
+  verifies **on receipt** at an untrusted gateway (`get_with_fetch`; the
+  real loopback HTTP-CAS gateway the `CC-28` / e2e witnesses drive), the
+  internet import verifies every OCI blob against its `sha256` digest
+  (`CC-10`, ADR-013), and a **cross-session** reload from durable
+  storage (a future persisted κ-store) is exactly such a boundary. But
+  once content is in **this** peer’s own in-session store, the store
+  **is** the canonical memory and RAM is its cache (Law L3, ADR-002):
+  the bytes were already verified when they entered (on receipt, or by
+  `put` construction, which content-addresses what it is given).
+  Re-deriving them on **every** local read would treat the peer’s own
+  canonical store as untrusted — the opposite of the model — and is pure
+  overhead in the deployed peer.
+
+- Symmetrically, the deployed **build** drops developer-time weight that
+  the runtime cannot use: the browser peer’s invariants are fatal (a
+  violated invariant means the peer cannot continue), so panic
+  **unwinding** machinery is dead weight — `panic = "abort"` removes it.
+  The `wasm-opt` post-pass (previously disabled as a workaround for an
+  MVP-only binaryen that rejected the reference-type tables
+  `wasm-bindgen` emits) is restored as a real production optimization.
+  None of this touches what V&V checks — it removes what only a
+  **debug** build needs.
+
+- This is not a weakening of the trust model; it is a **placement** of
+  it. The verifying read remains the default for any general or boundary
+  caller, and the conformance harness drives the verifying path over
+  **all** content in CI — so the re-derivation is proven exhaustively
+  where it is free (the gate), and not re-charged where it is redundant
+  (the deployed read).
+
+**Decision:** The Pages artifact is treated as a production target. (1)
+L5 re-derivation is placed at the trust boundary: a `ReadVerify` policy
+makes the choice explicit — `OnRead` (re-derive, the default for a
+general/boundary caller and the mode V&V drives over everything) versus
+`Trusted` (return the canonical store’s bytes as-is, Law L3), which the
+deployed in-session peer uses for local reads (`Console::resolve`). The
+receipt boundaries (`get_with_fetch`, the OCI ingestor) are unchanged
+and still verify every untrusted byte. (2) The deployed build is tuned
+for the running peer — `wasm-opt` restored with the feature flags the
+module needs, `panic = "abort"`, whole-program optimization — none of
+which alters the validated behaviour. Witnessed (`CC-29`) against the
+substrate’s own `verify_kappa` re-derivation contract: the boundary read
+rejects a forging store’s liar, the trusted read returns the store’s
+bytes without re-deriving, honest content reads identically under both
+policies, and `resolve_local` defaults to the verifying boundary policy.
+
+**Consequences:** The deployed peer is leaner and faster without losing
+any assurance: V&V proves L5 exhaustively in CI, the receipt boundaries
+enforce it on every untrusted byte, and the in-session read trusts the
+canonical store as the model says it should (the KappaStore **is** the
+memory, Law L3). The trust boundary is now **explicit** in the code (a
+named policy) rather than implicit, which also guides later work: when
+the κ-store is persisted across sessions (durable cache /
+resume-from-snapshot), the cross-session reload is a boundary and is
+read with `OnRead`. The cost is a second read mode to keep honest —
+mitigated because the verifying mode stays the default and the witness
+pins both behaviours — and a slightly larger one-time wasm download from
+the speed-first `wasm-opt` level (immaterial next to the kernel and
+workbench assets, and dwarfed by the interpreter-throughput win it
+buys).

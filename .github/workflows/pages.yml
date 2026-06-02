@@ -60,6 +60,12 @@ jobs:
           cp crates/holospaces-web/web/fixture.holo _site/
           cp crates/holospaces-web/web/fixture-userland.wasm _site/
           cp -r crates/holospaces-web/web/pkg _site/pkg
+          # Trim wasm-pack's dev-only emissions from the production artifact: the
+          # browser loads only holospaces_web.js + holospaces_web_bg.wasm (see
+          # index.html / the holospace-fs extension). The TypeScript declarations,
+          # the package.json, and the .gitignore are build/tooling files with no
+          # runtime role — they have no place in the deployed site.
+          rm -f _site/pkg/*.d.ts _site/pkg/package.json _site/pkg/.gitignore
           # The workspace devcontainer OS: a real RISC-V Linux kernel + device tree
           # (the pinned CC-11 image; provenance in vv/artifacts/cc11). Booted on the
           # system emulator — CC-9 / CC-11.

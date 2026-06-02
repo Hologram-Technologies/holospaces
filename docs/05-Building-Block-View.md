@@ -20,6 +20,7 @@ alt="Level 2: Containers" />
 | **System Emulator**      | The execution codemodule for a general operating system (ADR-009): a system emulator compiled to Wasm and bound to the host ABI, computing an **arbitrary** OS from κ-addressed content — the OS image as content-addressed blocks, console/input/network as hologram channels, running state as a κ snapshot. Imported and verified like any κ. Starts with Linux; generalizes to any OS it boots. |
 | **Identity**             | Self-sovereign sign-in key and the multi-instance sync keying (an operator’s instances discover and synchronise their holospaces over the substrate).                                                                                                                                                                                                                                               |
 | **Platform Manager**     | The management **projection** (Chapter 8): the operator GUI — served from GitHub Pages — that signs in, provisions, and manages holospaces. Itself a holospace.                                                                                                                                                                                                                                     |
+| **Configuration**        | The control plane’s **reconfiguration as content** (ADR-018): a κ-addressed directive set (lifecycle / storage / network / account-user) the panel publishes over the substrate and a running instance resolves, verifies (Law L5), and applies — its state changes, no server, no RPC (`CC-28`).                                                                                                   |
 | **Workspace Projection** | The Codespaces/Gitpod **projection** (ADR-009; Chapter 8): a browser editor, file tree, and terminal over a **running** holospace — reading its environment content by κ and publishing operator input as canonical events on its channels. A view + intent surface over content, not a server.                                                                                                     |
 
 ## Level 2
@@ -135,6 +136,24 @@ projection of the operator’s holospaces and the substrate, with status)
 and an *Intent* surface (the lifecycle actions); it holds no state of
 its own — the holospaces and roster are canonical κ in the store (Laws
 L2, L3). The management projection (Chapter 8); witnessed by `CC-12`.
+
+**Configuration** — the control plane’s **reconfigure intent**, realized
+as content (ADR-018). A *Configuration* is a hologram `Realization`
+embedding the issuing *operator* identity (Law L3 — the authority is the
+operator’s, scoped to them) and the *target instance* κ, plus an ordered
+set of *directives* across the four operation classes — *lifecycle*
+(start/suspend/resume/terminate), *storage* (quota), *network*
+(forward/unforward a port, fetch/announce), and *account/user* (grant
+another operator access). The Platform Manager’s *Configure* intent
+publishes one over the substrate (store + record, like a roster); the
+running instance *resolves* it (verify-by-re-derivation, Law L5), checks
+it targets this instance and the operator is authorized, and *applies*
+it — the effective capability set is replaced (a new κ, Law L1), a
+lifecycle transition is driven, and a live *network* directive forwards
+a port on the **running** machine (`Machine::forward_port`, the `CC-21`
+ingress dual bound live). No control-plane→instance RPC: the
+configuration is content, the substrate carries it. Witnessed by
+`CC-28`.
 
 **Workspace Projection** — the **VS Code devcontainer experience**
 (ADR-010), launched in a new tab when the operator *enters* a holospace.

@@ -35,7 +35,7 @@ use hologram_runtime_bare::BareMetalEngine;
 use hologram_store_mem::MemKappaStore;
 use hologram_substrate_core::{Capabilities, KappaStore, Realization};
 use holospaces::assembly::{assemble_ext4, assemble_ext4_bootable, Layer};
-use holospaces::boot::{devcontainer, provision, LifecycleError, Resolver, Session};
+use holospaces::boot::{devcontainer, provision, LifecycleError, ReadVerify, Resolver, Session};
 use holospaces::config::{Configuration, Directive, LifecycleAction};
 use holospaces::emulator::{Emulator, Halt};
 use holospaces::identity::{Operator, Roster};
@@ -389,11 +389,19 @@ impl Console {
         serde_json::json!({ "operator": operator, "holospaces": holospaces }).to_string()
     }
 
-    /// Resolve a holospace (or any κ) from the local store, verifying it by
-    /// re-derivation (Law L5). Returns the bytes, or `undefined` if absent.
+    /// Resolve a holospace (or any κ) from this peer's own in-session store.
+    /// Returns the bytes, or `undefined` if absent.
+    ///
+    /// This is a *trusted* read ([`ReadVerify::Trusted`], ADR-019): the store is
+    /// the canonical memory and RAM is its cache (Law L3), so content that
+    /// entered this session was already verified on the way in (on receipt, or
+    /// by `put` construction). The deployed peer does not re-derive κ on every
+    /// local read — that would treat its own canonical store as untrusted and is
+    /// pure overhead. The re-derivation invariant still holds where untrusted
+    /// bytes enter (the import/fetch boundary) and is exercised end-to-end in CI.
     pub fn resolve(&self, kappa: &str) -> Result<Option<Vec<u8>>, JsValue> {
         let kappa = parse_kappa(kappa)?;
-        Resolver::resolve_local(self.runtime.store(), &kappa)
+        Resolver::resolve_local_with(self.runtime.store(), &kappa, ReadVerify::Trusted)
             .map(|opt| opt.map(|b| b.to_vec()))
             .map_err(js_err)
     }

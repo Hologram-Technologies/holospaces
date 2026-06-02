@@ -33,18 +33,33 @@ version = "0.3"
 features = ["WebSocket", "MessageEvent", "BinaryType", "Event", "CloseEvent"]
 
 [profile.release]
-# Optimize for speed, not size: the browser peer boots a real OS on the system
-# emulator (a hot interpreter loop), so throughput matters more than a smaller
-# bundle.
+# This IS the production artifact (served from GitHub Pages). The browser peer
+# boots a real OS on the system emulator — a hot interpreter loop — so it is
+# tuned for throughput and a lean deploy, not developer convenience:
+#   • opt-level = 3, lto = true, codegen-units = 1 — maximal optimization across
+#     the whole crate (one codegen unit, fat LTO) for the interpreter hot path.
+#   • panic = "abort" — the deployed peer's invariants are fatal anyway (a broken
+#     invariant means the peer cannot continue), so unwinding tables are dead
+#     weight in production. Dropping them shrinks the wasm and removes the
+#     landing-pad overhead from the hot path. (Validation that *exercises* those
+#     invariants runs in CI on the host crate, not in the deployed artifact.)
 opt-level = 3
 lto = true
+codegen-units = 1
+panic = "abort"
 
 [package.metadata.wasm-pack.profile.release]
-# Skip `wasm-opt`: wasm-bindgen now emits a module with more than one table
-# (reference types), which the `wasm-opt` bundled with `wasm-pack` rejects
-# ("Only 1 table definition allowed in MVP"). The module is already optimized by
-# the Rust release profile (opt-level=3 + LTO) and is valid wasm the browser runs
-# directly — `wasm-opt` is only a post-pass size optimizer, so skipping it keeps
-# the build reproducible across environments (it was failing only where the
-# bundled `wasm-opt` was an older, MVP-only build).
-wasm-opt = false
+# Run `wasm-opt` — a real production post-pass, not optional. The earlier
+# `wasm-opt = false` was a workaround for an *older*, MVP-only binaryen (bundled
+# with the previous CI action) that rejected the reference-type tables
+# wasm-bindgen now emits ("Only 1 table definition allowed in MVP"). wasm-pack
+# 0.13+ provisions binaryen ≥ v117, which supports these features; we enable them
+# explicitly so the post-pass is reproducible across environments.
+#
+# `-O3` optimizes for SPEED, not size: it is the right call for a hot interpreter
+# loop that retires billions of instructions per boot, where a few-percent
+# per-instruction win dwarfs the cost of a slightly larger one-time download (the
+# wasm is a fraction of the kernel + workbench assets anyway). `-O3` is binaryen's
+# recommended maximum — the experimental `-O4` adds a `flatten` pass that can
+# bloat the module without a throughput win.
+wasm-opt = ['-O3', '--enable-reference-types', '--enable-bulk-memory', '--enable-mutable-globals', '--enable-sign-ext', '--enable-nontrapping-float-to-int']
