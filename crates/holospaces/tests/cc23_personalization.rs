@@ -150,9 +150,7 @@ fn the_operators_dotfiles_are_injected_into_the_assembled_rootfs() {
     );
     assert!(
         got_init.starts_with(b"#!/bin/busybox sh")
-            && got_init
-                .windows(8)
-                .any(|w| w == b"GH_TOKEN"[..8].as_ref()),
+            && got_init.windows(8).any(|w| w == b"GH_TOKEN"[..8].as_ref()),
         "the injected /init applies the operator's secrets"
     );
 }

@@ -28,8 +28,8 @@ use holospaces::assembly::{assemble_ext4_with_files, Layer};
 use holospaces::machine::MachineSpec;
 use holospaces::oci::{ingest_image, IngestedImage, OciError};
 use lsp_types::{
-    CompletionResponse, DidOpenTextDocumentParams, Hover, HoverContents, InitializeResult, Location,
-    PublishDiagnosticsParams, ServerCapabilities,
+    CompletionResponse, DidOpenTextDocumentParams, Hover, HoverContents, InitializeResult,
+    Location, PublishDiagnosticsParams, ServerCapabilities,
 };
 use serde_json::{json, Value};
 
@@ -78,7 +78,11 @@ fn lsp_session() -> Vec<u8> {
     .unwrap();
 
     let messages = vec![
-        req(1, "initialize", json!({ "capabilities": {}, "processId": null })),
+        req(
+            1,
+            "initialize",
+            json!({ "capabilities": {}, "processId": null }),
+        ),
         notif("initialized", json!({})),
         notif(
             "textDocument/didOpen",
@@ -264,9 +268,8 @@ fn the_in_os_language_server_speaks_lsp() {
     );
 
     // hover → a Hover whose markup names the symbol under the cursor.
-    let hover: Hover =
-        serde_json::from_value(by_id(2).expect("hover response")["result"].clone())
-            .expect("Hover conforms to the LSP spec");
+    let hover: Hover = serde_json::from_value(by_id(2).expect("hover response")["result"].clone())
+        .expect("Hover conforms to the LSP spec");
     let hover_text = match hover.contents {
         HoverContents::Markup(m) => m.value,
         _ => String::new(),
