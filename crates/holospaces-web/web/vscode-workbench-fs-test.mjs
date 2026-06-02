@@ -74,6 +74,9 @@ try {
   // The workbench called the served FileSystemProvider's readDirectory and
   // presents the holospace's workspace tree (the supported mechanism delivered
   // the holospace's files to the real workbench — not an embedder hack).
+  // Focus the Explorer (in case the workbench restored another viewlet) so the
+  // folders tree renders, then poll a generous window — a real, fatal assertion.
+  await page.keyboard.press("Control+Shift+E").catch(() => {});
   const mounted = await page
     .waitForFunction(
       () => {
@@ -81,7 +84,7 @@ try {
         return rows.length > 0 && rows.some((r) => /mount/.test(r.textContent || ""));
       },
       null,
-      { timeout: 30000 },
+      { timeout: 90000, polling: 500 },
     )
     .then(() => true)
     .catch(() => false);

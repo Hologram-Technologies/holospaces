@@ -44,7 +44,18 @@ jobs:
         with:
           node-version: lts/*
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      - uses: jetli/wasm-pack-action@v0.4.0
+      - name: Provision the browser-conformance prerequisites (Playwright + Chromium)
+        run: |
+          cd crates/holospaces-web/web
+          npm install playwright
+          # Install Chromium AND chrome-headless-shell with their system deps once
+          # (so the per-suite installs are fast no-ops). The browser CC suites
+          # (cc17/cc19) then run for real in this job — they do not skip.
+          npx --yes playwright install --with-deps chromium chromium-headless-shell
       - name: Cache doc toolchain
         uses: actions/cache@v4
         with:
@@ -115,6 +126,10 @@ jobs:
         run: |
           cd crates/holospaces-web/web
           npm install playwright
-          npx --yes playwright install --with-deps chromium
+          # Install the headed Chromium AND chrome-headless-shell — Playwright's
+          # default headless mode (chromium.launch()) runs chrome-headless-shell,
+          # a separate download from chromium; omitting it makes launch() fail
+          # with "Executable doesn't exist …/chrome-headless-shell".
+          npx --yes playwright install --with-deps chromium chromium-headless-shell
       - name: Run the Platform Manager browser test
         run: scripts/browser-manager-test.sh

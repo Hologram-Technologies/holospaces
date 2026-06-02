@@ -20,10 +20,9 @@ WEB="$ROOT/crates/holospaces-web/web"
 if ! command -v node >/dev/null 2>&1; then
     echo "cc17-workbench-fs: SKIP — node not available" >&2; exit 127
 fi
-if [ ! -d "$HOME/.cache/ms-playwright" ]; then
-    echo "cc17-workbench-fs: SKIP — Playwright browser not installed" >&2; exit 127
-fi
 cd "$WEB"
 [ -d node_modules/playwright ] || npm install playwright >/dev/null 2>&1
+# A real witness installs its prerequisites — it does not skip.
+npx --yes playwright install chromium chromium-headless-shell >/dev/null 2>&1 || exit 1
 [ -d node_modules/@vscode/test-web ] || npm install --no-save @vscode/test-web@0.0.80 >/dev/null 2>&1
 node vscode-workbench-fs-test.mjs || exit 1

@@ -21,11 +21,10 @@ if ! command -v node >/dev/null 2>&1; then
     echo "cc17-vscode-workbench: SKIP — node not available in this environment" >&2
     exit 127
 fi
-if [ ! -d "$HOME/.cache/ms-playwright" ]; then
-    echo "cc17-vscode-workbench: SKIP — Playwright browser not installed" >&2
-    exit 127
-fi
-
 cd "$WEB"
 [ -d node_modules/playwright ] || npm install playwright >/dev/null 2>&1
+# A real witness installs its prerequisites — it does not skip. Ensure the
+# Playwright browser binaries are present (chromium AND chrome-headless-shell, the
+# headless launch shell — a separate download), pinned to the installed Playwright.
+npx --yes playwright install chromium chromium-headless-shell >/dev/null 2>&1 || exit 1
 node vscode-workbench-test.mjs || exit 1
