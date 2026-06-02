@@ -1,5 +1,9 @@
 # holospaces
 
+# list all available targets.
+default:
+  @just --list
+
 # Run the full V&V (evaluate holospaces against external authoritative standards;
 # defined in docs/ arc42 chapter 10, implemented in vv/).
 vv:
