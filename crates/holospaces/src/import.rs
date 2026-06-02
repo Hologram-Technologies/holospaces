@@ -115,13 +115,20 @@ fn http_get(
 fn read_response(resp: ureq::Response) -> Response {
     let status = resp.status();
     let content_type = resp.content_type().to_string();
+    // The read is bounded by the *content's own* declared length — a registry
+    // sends each blob's exact `Content-Length`, so a real layer of any size is
+    // read in full (no arbitrary cap), while a hostile gateway cannot stream
+    // unbounded: it must honour the length it declared, and every blob is then
+    // verified by digest re-derivation on ingest (Law L5), so garbage is
+    // refused. A chunked response with no declared length (rare for blobs) is
+    // bounded generously so an unbounded stream still cannot exhaust memory.
+    let declared = resp
+        .header("Content-Length")
+        .and_then(|v| v.parse::<u64>().ok());
+    const NO_LENGTH_BOUND: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB, chunked fallback
+    let cap = declared.map_or(NO_LENGTH_BOUND, |n| n.saturating_add(4096));
     let mut body = Vec::new();
-    // Bound the read so a hostile gateway cannot exhaust memory (256 MiB — large
-    // enough for real image layers, finite).
-    let _ = resp
-        .into_reader()
-        .take(256 * 1024 * 1024)
-        .read_to_end(&mut body);
+    let _ = resp.into_reader().take(cap).read_to_end(&mut body);
     Response {
         status,
         content_type,

@@ -171,8 +171,14 @@ pub mod devcontainer {
         /// devcontainer OS* so the environment is ready on entry (`CC-22`). Each
         /// entry is `(hook, command)`; the command is normalized to a shell line.
         pub lifecycle: Vec<(LifecycleHook, String)>,
-        /// Environment the config sets in the devcontainer (`remoteEnv`) —
-        /// applied into the OS / surfaced to the workbench (`CC-23`).
+        /// Environment the config sets *in the container itself* (`containerEnv`)
+        /// — set when the container is created, so every process (the lifecycle
+        /// commands and the OS) sees it. Exported before [`Self::remote_env`],
+        /// which layers over it (the Dev Container spec's precedence) (`CC-23`).
+        pub container_env: BTreeMap<String, String>,
+        /// Environment the config sets for the remote/editor side (`remoteEnv`) —
+        /// applied into the OS / surfaced to the workbench, layered over
+        /// `containerEnv` (`CC-23`).
         pub remote_env: BTreeMap<String, String>,
         /// The Dev Container *features* the config declares (`features`), in
         /// declaration order. Each is an OCI artifact (publisher's `install.sh` +
@@ -270,8 +276,10 @@ pub mod devcontainer {
         pub fn lifecycle_init(&self) -> Vec<u8> {
             let mut s = String::from("#!/bin/busybox sh\n");
             s.push_str("export PATH=/bin:/usr/bin\n");
-            // The config's environment, applied to the lifecycle scripts (remoteEnv).
-            for (k, v) in &self.remote_env {
+            // The config's environment, applied to the lifecycle scripts.
+            // `containerEnv` is set first; `remoteEnv` layers over it (the Dev
+            // Container spec's precedence) — both honoured, neither dropped.
+            for (k, v) in self.container_env.iter().chain(self.remote_env.iter()) {
                 s.push_str("export ");
                 s.push_str(k);
                 s.push_str("='");
@@ -524,22 +532,9 @@ pub mod devcontainer {
             }
         }
 
-        // remoteEnv: a string→string (or null) map.
-        let mut remote_env: BTreeMap<String, String> = BTreeMap::new();
-        if let Some(env) = obj.get("remoteEnv") {
-            let map = env
-                .as_object()
-                .ok_or(DevcontainerError::MalformedProperty("remoteEnv"))?;
-            for (k, v) in map {
-                if v.is_null() {
-                    continue;
-                }
-                let s = v
-                    .as_str()
-                    .ok_or(DevcontainerError::MalformedProperty("remoteEnv"))?;
-                remote_env.insert(k.clone(), s.to_owned());
-            }
-        }
+        // containerEnv / remoteEnv: each a string→string (or null) map.
+        let container_env = parse_env_map(obj, "containerEnv")?;
+        let remote_env = parse_env_map(obj, "remoteEnv")?;
 
         Ok(DevContainer {
             name,
@@ -547,9 +542,35 @@ pub mod devcontainer {
             extensions,
             forward_ports,
             lifecycle,
+            container_env,
             remote_env,
             features,
         })
+    }
+
+    /// Parse a Dev Container environment map (`containerEnv` / `remoteEnv`): a
+    /// string→string object; a `null` value drops that key (the spec's way to
+    /// unset). A non-string value is a malformed property (refused, not dropped).
+    fn parse_env_map(
+        obj: &serde_json::Map<String, Value>,
+        key: &'static str,
+    ) -> Result<BTreeMap<String, String>, DevcontainerError> {
+        let mut env = BTreeMap::new();
+        if let Some(v) = obj.get(key) {
+            let map = v
+                .as_object()
+                .ok_or(DevcontainerError::MalformedProperty(key))?;
+            for (k, val) in map {
+                if val.is_null() {
+                    continue;
+                }
+                let s = val
+                    .as_str()
+                    .ok_or(DevcontainerError::MalformedProperty(key))?;
+                env.insert(k.clone(), s.to_owned());
+            }
+        }
+        Ok(env)
     }
 
     /// A Dev Container feature option value (string / bool / number) as the

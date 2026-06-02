@@ -148,6 +148,39 @@ fn the_lifecycle_init_is_built_from_the_parsed_config() {
     );
 }
 
+/// Both `containerEnv` and `remoteEnv` are honoured in the lifecycle environment,
+/// `remoteEnv` layered over `containerEnv` (the Dev Container spec's precedence) —
+/// neither parsed-and-dropped.
+#[test]
+fn container_env_and_remote_env_are_both_honoured() {
+    const CFG: &[u8] = br#"{
+        "image": "holospaces/busybox",
+        "containerEnv": { "TOOL_HOME": "/opt/tool", "GREETING": "from-container" },
+        "remoteEnv": { "GREETING": "from-remote" },
+        "postCreateCommand": "echo $TOOL_HOME:$GREETING"
+    }"#;
+    let dc = devcontainer::parse(CFG).expect("parse");
+    assert_eq!(dc.container_env.get("TOOL_HOME").unwrap(), "/opt/tool");
+    let init = String::from_utf8(dc.lifecycle_init()).unwrap();
+    // containerEnv is exported (honoured, not dropped)…
+    assert!(
+        init.contains("export TOOL_HOME='/opt/tool'"),
+        "containerEnv applied: {init}"
+    );
+    // …and remoteEnv layers over it: its GREETING export comes *after* the
+    // containerEnv one, so the shell's last-wins gives remoteEnv precedence.
+    let container_g = init
+        .find("export GREETING='from-container'")
+        .expect("containerEnv GREETING present");
+    let remote_g = init
+        .find("export GREETING='from-remote'")
+        .expect("remoteEnv GREETING present");
+    assert!(
+        container_g < remote_g,
+        "remoteEnv layers over containerEnv (spec precedence): {init}"
+    );
+}
+
 /// (3) The **differential oracle**: `qemu-system-riscv64` (the reference RISC-V
 /// machine, as in `CC-9`/`CC-14`/`CC-16`) boots the byte-identical holospaces
 /// rootfs and runs the injected lifecycle `/init`, producing the same markers as
