@@ -245,6 +245,27 @@ pub fn find_devcontainer_json(layer: &Layer) -> Result<Option<Vec<u8>>, Assembly
     Ok(None)
 }
 
+/// Extract every regular file from an OCI artifact `layer` (a `tar` or
+/// `tar+gzip`) as `(path, mode, bytes)`, with any leading `./` stripped. The Boot
+/// Orchestrator uses this to unpack a Dev Container *feature* artifact (its
+/// `install.sh` + `devcontainer-feature.json` + any helpers) so it can place the
+/// feature into the rootfs to be installed in the OS (`CC-25`).
+pub fn extract_layer_files(layer: &Layer) -> Result<Vec<(String, u16, Vec<u8>)>, AssemblyError> {
+    let tar = decompress(layer)?;
+    let mut files = Vec::new();
+    for entry in tar::Reader::new(&tar) {
+        let entry = entry?;
+        if entry.kind != tar::Kind::File {
+            continue;
+        }
+        let path = entry.path.trim_start_matches("./").to_string();
+        if !path.is_empty() {
+            files.push((path, entry.mode, entry.data));
+        }
+    }
+    Ok(files)
+}
+
 /// Overlay `layers` (lowest first) into one unified filesystem [`Tree`],
 /// applying the OCI whiteout / opaque-directory rules.
 pub fn overlay_layers(layers: &[Layer]) -> Result<Tree, AssemblyError> {

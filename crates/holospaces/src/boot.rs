@@ -147,6 +147,25 @@ pub mod devcontainer {
         /// Environment the config sets in the devcontainer (`remoteEnv`) —
         /// applied into the OS / surfaced to the workbench (`CC-23`).
         pub remote_env: BTreeMap<String, String>,
+        /// The Dev Container *features* the config declares (`features`), in
+        /// declaration order. Each is an OCI artifact (publisher's `install.sh` +
+        /// `devcontainer-feature.json`) imported by κ and *applied into the rootfs*
+        /// — its `install.sh` runs in the devcontainer OS *before* the lifecycle
+        /// commands, with the declared options passed as environment, exactly as a
+        /// Codespace installs features (`CC-25`; ADR-016).
+        pub features: Vec<Feature>,
+    }
+
+    /// A declared Dev Container *feature*: its OCI artifact reference `id` and the
+    /// `options` the config sets (passed to the feature's `install.sh` as
+    /// uppercased environment variables, per the Dev Container Features spec).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Feature {
+        /// The feature's OCI artifact reference (e.g.
+        /// `ghcr.io/devcontainers/features/node:1`).
+        pub id: String,
+        /// The declared options (option name → value); empty if none.
+        pub options: BTreeMap<String, String>,
     }
 
     /// A Dev Container lifecycle hook, in spec execution order.
@@ -199,6 +218,30 @@ pub mod devcontainer {
                 s.push_str("='");
                 s.push_str(v);
                 s.push_str("'\n");
+            }
+            // Dev Container *features* install in the build phase, *before* the
+            // lifecycle commands (`CC-25`). Each feature's artifact is unpacked at
+            // `/opt/holospaces/features/<idx>/` (the Boot Orchestrator injects it,
+            // verified by κ); run its `install.sh` in a subshell with the declared
+            // options as uppercased environment, per the Dev Container Features spec.
+            if !self.features.is_empty() {
+                s.push_str("echo FEATURES-START\n");
+                for (idx, feat) in self.features.iter().enumerate() {
+                    s.push_str("echo FEATURE:");
+                    s.push_str(&feat.id);
+                    s.push('\n');
+                    s.push_str("( cd /opt/holospaces/features/");
+                    s.push_str(&idx.to_string());
+                    s.push_str(" && ");
+                    for (k, v) in &feat.options {
+                        s.push_str(&k.to_uppercase());
+                        s.push_str("='");
+                        s.push_str(v);
+                        s.push_str("' ");
+                    }
+                    s.push_str("busybox sh ./install.sh )\n");
+                }
+                s.push_str("echo FEATURES-DONE\n");
             }
             s.push_str("echo LIFECYCLE-START\n");
             for (hook, cmd) in &self.lifecycle {
@@ -256,9 +299,37 @@ pub mod devcontainer {
         {
             return Err(DevcontainerError::MultipleImageSources);
         }
-        if let Some(features) = obj.get("features") {
-            if !features.is_object() {
-                return Err(DevcontainerError::MalformedProperty("features"));
+        // Dev Container *features* (`features`): an object of `ref → options`.
+        // Each value is an options object, a string (shorthand for `version`), or
+        // a bool/null (the feature with no options). Parsed and *honoured* — each
+        // feature's `install.sh` runs in the OS before the lifecycle (`CC-25`).
+        let mut features: Vec<Feature> = Vec::new();
+        if let Some(feats) = obj.get("features") {
+            let map = feats
+                .as_object()
+                .ok_or(DevcontainerError::MalformedProperty("features"))?;
+            for (id, val) in map {
+                let mut options = BTreeMap::new();
+                match val {
+                    Value::Object(o) => {
+                        for (k, v) in o {
+                            options.insert(
+                                k.clone(),
+                                scalar_string(v)
+                                    .ok_or(DevcontainerError::MalformedProperty("features"))?,
+                            );
+                        }
+                    }
+                    Value::String(s) => {
+                        options.insert("version".to_owned(), s.clone());
+                    }
+                    Value::Bool(_) | Value::Null => {}
+                    _ => return Err(DevcontainerError::MalformedProperty("features")),
+                }
+                features.push(Feature {
+                    id: id.clone(),
+                    options,
+                });
             }
         }
 
@@ -365,7 +436,19 @@ pub mod devcontainer {
             forward_ports,
             lifecycle,
             remote_env,
+            features,
         })
+    }
+
+    /// A Dev Container feature option value (string / bool / number) as the
+    /// string passed to `install.sh`; `None` for a non-scalar value.
+    fn scalar_string(v: &Value) -> Option<String> {
+        match v {
+            Value::String(s) => Some(s.clone()),
+            Value::Bool(b) => Some(b.to_string()),
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        }
     }
 
     /// Normalize a Dev Container command value (string / argv array / named

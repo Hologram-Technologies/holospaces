@@ -1,0 +1,9 @@
+{
+  "id": "holospace-demo",
+  "version": "1.0.0",
+  "name": "Holospace Demo Feature",
+  "description": "A spec-conformant Dev Container Feature for the CC-25 witness: its install.sh runs in the devcontainer OS with the declared options as environment, and writes a real file into the rootfs.",
+  "options": {
+    "version": { "type": "string", "default": "1.0", "description": "The version the feature installs." }
+  }
+}

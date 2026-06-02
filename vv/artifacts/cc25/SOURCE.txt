@@ -1,0 +1,51 @@
+CC-25 — Dev Container Features authority artifacts.
+
+A Codespace/Gitpod installs the `features` a devcontainer.json declares — each a
+published OCI artifact (a devcontainer-feature.json describing the feature + its
+options, and an install.sh) whose script runs in the container during the build,
+before the lifecycle commands, with the declared options passed as environment.
+holospaces realizes this: it parses `features` (CC-4), the Boot Orchestrator
+imports each feature artifact by κ (verify-by-re-derivation, the CC-20 machinery),
+places its files into the rootfs at /opt/holospaces/features/<idx>/, and the
+generated /init runs each feature's install.sh before the lifecycle (CC-22), with
+the declared options as uppercased environment variables.
+
+Authorities
+-----------
+Dev Container Features specification — the feature artifact format (an OCI
+  artifact whose layer carries devcontainer-feature.json + install.sh) and the
+  install contract (install.sh runs in the container with the declared options as
+  environment, before the lifecycle commands). The witness's feature
+  (devcontainer-feature.json + install.sh) is authored to that format; the
+  generated /init runs it in spec order (features before the lifecycle).
+
+ext4 on-disk format — e2fsprogs (e2fsck/debugfs) is the oracle that the feature's
+  files are present in the assembled rootfs and read back correctly.
+
+qemu-system-riscv64 — the differential runtime oracle (as in CC-9/CC-14/CC-22):
+  it boots the byte-identical rootfs and produces the same feature-install markers
+  as holospaces' own emulator.
+
+Artifacts
+---------
+vv/artifacts/cc25/feature/ — a real OCI artifact (riscv64/linux) whose tar+gzip
+  layer carries the feature: devcontainer-feature.json (id holospace-demo, a
+  `version` option) + install.sh (echoes FEATURE-INSTALLED:${VERSION} and writes
+  /usr/local/holospace-demo/version — a real, busybox-runnable install). Built
+  reproducibly (fixed mtime/owner/sort; gzip -n). The feature's source files are
+  also kept at vv/artifacts/cc25/{install.sh,devcontainer-feature.json}.
+
+The shell base is the same published BusyBox riscv64 image as CC-22
+(vv/artifacts/cc22/image); the CC-14 kernel is reused for the boot.
+
+Witness — crates/holospaces/tests/cc25_features.rs; suite vv/suites/cc25-features.sh:
+  (1) the config's feature is parsed (CC-4) and honoured — the generated /init
+      runs the feature's install.sh with the option as uppercased env
+      (VERSION='2.0') BEFORE the lifecycle (spec order); the feature is imported
+      by κ and its files are injected into the assembled ext4 rootfs — e2fsck
+      clean, debugfs reads /opt/holospaces/features/0/install.sh +
+      devcontainer-feature.json back;
+  (2) holospaces' own emulator boots the rootfs and the feature's install.sh runs
+      in the OS — FEATURE-INSTALLED:2.0 (the option applied) appears, before the
+      lifecycle command CC25-POSTCREATE:after-features. #[ignore]d (real-OS boot);
+  (3) qemu-system-riscv64 (differential oracle) produces the same markers.
