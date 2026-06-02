@@ -836,18 +836,49 @@ impl fmt::Display for IngestError {
 
 impl core::error::Error for IngestError {}
 
-/// Resolves κ-labels to their bytes, verifying them by re-derivation before
-/// accepting them (Law L5).
+/// Where the L5 re-derivation check is *placed* on a local read (ADR-019).
+///
+/// Law L5 (content is verified by re-deriving its κ) is a **trust-boundary**
+/// invariant, not a per-read tax. The decision of *where* to spend it:
+///
+/// - [`ReadVerify::OnRead`] — re-derive κ and reject a mismatch. Use when the
+///   bytes are crossing into trust: an untrusted gateway (the network read is
+///   the substrate's own [`get_with_fetch`], which verifies *on receipt*), a
+///   *cross-session* reload from durable storage, or any store that is not this
+///   running peer's own. This is also the mode the conformance suite drives — in
+///   V&V every byte is re-derived, so the model is proven in CI.
+/// - [`ReadVerify::Trusted`] — return the stored bytes without re-deriving,
+///   because the [`KappaStore`] *is* the canonical memory and RAM is its cache
+///   (Law L3): content in this peer's in-session store was already verified when
+///   it entered (on receipt, or by `put` construction, which content-addresses
+///   the bytes it is given). Re-deriving it on every read would treat the
+///   canonical store as untrusted — the opposite of the model — and is pure
+///   overhead in the deployed peer. The deployed browser peer reads this way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadVerify {
+    /// Re-derive κ on read and reject a mismatch (trust boundary / V&V).
+    OnRead,
+    /// Trust the canonical in-session store; do not re-derive (Law L3).
+    Trusted,
+}
+
+/// Resolves κ-labels to their bytes, placing the L5 re-derivation check at the
+/// trust boundary (ADR-019).
 ///
 /// Trust is in the math: bytes that do not re-derive to the requested κ are
 /// rejected, which is what makes an untrusted gateway (GitHub Pages, or any
 /// peer) safe to fetch from (quality scenario QS3). The network read path is
 /// the substrate's own [`get_with_fetch`] (local store, else fetch +
-/// verify-on-receipt + cache).
+/// verify-on-receipt + cache). A read from this peer's own in-session store is
+/// trusted (the store is the canonical memory, Law L3) — see [`ReadVerify`].
 pub struct Resolver;
 
 impl Resolver {
-    /// Resolve a κ from a local store only, verifying by re-derivation (L5).
+    /// Resolve a κ from a local store only, re-deriving to verify (L5).
+    ///
+    /// The safe default for a general/boundary caller: verifies on read. An
+    /// in-session caller that trusts its own canonical store reads with
+    /// [`Resolver::resolve_local_with`] and [`ReadVerify::Trusted`] (ADR-019).
     ///
     /// # Errors
     ///
@@ -857,15 +888,35 @@ impl Resolver {
         store: &dyn KappaStore,
         kappa: &Kappa,
     ) -> Result<Option<Bytes>, AccessError> {
+        Self::resolve_local_with(store, kappa, ReadVerify::OnRead)
+    }
+
+    /// Resolve a κ from a local store under an explicit [`ReadVerify`] policy
+    /// (ADR-019). [`ReadVerify::OnRead`] re-derives and rejects a mismatch;
+    /// [`ReadVerify::Trusted`] returns the canonical store's bytes as-is.
+    ///
+    /// # Errors
+    ///
+    /// [`AccessError::VerificationFailed`] if `verify` is [`ReadVerify::OnRead`]
+    /// and the stored bytes do not re-derive to `kappa`;
+    /// [`AccessError::StoreFailure`] on a store error.
+    pub fn resolve_local_with(
+        store: &dyn KappaStore,
+        kappa: &Kappa,
+        verify: ReadVerify,
+    ) -> Result<Option<Bytes>, AccessError> {
         match store.get(kappa).map_err(AccessError::StoreFailure)? {
             None => Ok(None),
-            Some(bytes) => {
-                if verify_kappa(&bytes, kappa).map_err(|_| AccessError::VerificationFailed)? {
-                    Ok(Some(bytes))
-                } else {
-                    Err(AccessError::VerificationFailed)
+            Some(bytes) => match verify {
+                ReadVerify::Trusted => Ok(Some(bytes)),
+                ReadVerify::OnRead => {
+                    if verify_kappa(&bytes, kappa).map_err(|_| AccessError::VerificationFailed)? {
+                        Ok(Some(bytes))
+                    } else {
+                        Err(AccessError::VerificationFailed)
+                    }
                 }
-            }
+            },
         }
     }
 

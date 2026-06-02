@@ -166,17 +166,27 @@ work in it — the Codespaces/Gitpod flow (ADR-010; `CC-12`, `CC-13`).
 
 ## Working in the holospace — extensions and integrations (the GitHub scenario)
 
-The full workbench (ADR-012) connects the browser to a **remote
-extension host running in the devcontainer OS** (ADR-015), so extensions
-and their integrations work exactly as in a Codespace.
+The full workbench (ADR-012) connects to an extension host **matched to
+the peer** (ADR-015), so extensions and their integrations work exactly
+as in a Codespace. On the **browser** peer this is the **web** model
+(`vscode.dev`/`github.dev`): the extension host runs in the browser’s
+web worker, which **boots the holospace in itself** and serves the
+workbench its `virtio-9p` workspace + console — the deployed realization
+(`CC-17` Phase 3). On a **server-capable** peer it is the **remote**
+model described below (the extension host inside the devcontainer OS).
+Either way the backends are the same holospace primitives, so the
+experience is identical.
 
 1.  Entering the holospace loads the κ-verified **VS Code web
-    workbench** in the tab (Law L5; `CC-17`). The workbench opens a
-    connection — VS Code’s **remote protocol** — to a **remote extension
-    host** started **inside the booted devcontainer OS** (`CC-14`),
-    carried over a **substrate channel** between the browser peer and
-    the holospace (publish/subscribe; Law L4), not a control-plane
-    socket.
+    workbench** in the tab (Law L5; `CC-17`). The workbench drives an
+    extension host **matched to the peer**: on the browser peer, the
+    **web** extension host in a web worker that boots the holospace and
+    binds the workbench to its `virtio-9p` workspace + console (the
+    deployed path); on a server-capable peer, a **remote extension
+    host** started **inside the booted devcontainer OS** (`CC-14`) over
+    VS Code’s **remote protocol**, carried over a **substrate channel**
+    between the peer and the holospace (publish/subscribe; Law L4), not
+    a control-plane socket.
 
 2.  The host exposes the holospace through VS Code’s published APIs
     backed by holospaces' primitives: the editor’s `FileSystemProvider`
@@ -203,6 +213,39 @@ and their integrations work exactly as in a Codespace.
     architecture is a Codespace’s — a browser workbench over a remote
     extension host — only the remote is a holospace and the transport is
     the substrate (Laws L1/L3/L4).
+
+## Reconfiguring a running instance from the control panel (ADR-018)
+
+The control panel changes a **running** instance — as a
+Codespaces/Gitpod (Ona) panel does — without calling a server on it. The
+configuration is content; the substrate carries it (`CC-28`).
+
+1.  From the panel the operator reconfigures an instance — a lifecycle
+    action (suspend/resume/terminate), a storage quota, a **forwarded
+    port** for an app preview, or an **access grant** to a collaborator.
+    The Platform Manager’s *Configure* intent (`Manager::configure`)
+    builds a κ-addressed **Configuration** embedding the operator
+    identity and the target instance κ plus the ordered directives,
+    **stores it** (Law L2), and records it as the instance’s current
+    configuration.
+
+2.  The running instance **resolves** that configuration κ over the
+    substrate (`KappaSync`, **verify-by-re-derivation** — Law L5),
+    checks it targets **this** instance and the issuing operator is
+    **authorized** (the owner, or a granted collaborator), and
+    **applies** it. A configuration for another instance, or from an
+    unauthorized operator, is refused — never silently applied.
+
+3.  Applying changes the instance’s state: the effective **capability
+    set** is replaced (storage quota, network authority — a new κ, Law
+    L1), a **lifecycle** directive drives the transition (the same
+    suspend→snapshot→resume machinery), and a **network** directive
+    forwards a port on the **running** machine (`Machine::forward_port`
+    — the `CC-21` ingress dual, a real reachable route bound live, no
+    reboot). The change is reproducible (the same configuration applied
+    to the same instance yields the same resulting state) and auditable
+    (every configuration **is** a κ). Because it is verified content,
+    any of the operator’s peers can issue it (what-not-where).
 
 ## Cold-start from GitHub Pages
 
