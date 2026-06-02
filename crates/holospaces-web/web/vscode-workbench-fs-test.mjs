@@ -129,4 +129,7 @@ try {
   srv.kill("SIGKILL");
   await rm(ws, { recursive: true, force: true }).catch(() => {});
 }
-process.exitCode = failed ? 1 : 0;
+// Force-exit: the spawned @vscode/test-web server / browser can leave lingering
+// handles that keep the event loop alive after the result is printed (the test
+// would otherwise hang). The result line above has already been written.
+process.exit(failed ? 1 : 0);
