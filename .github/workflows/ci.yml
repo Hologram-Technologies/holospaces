@@ -51,7 +51,7 @@ jobs:
       - name: Provision the browser-conformance prerequisites (Playwright + Chromium)
         run: |
           cd crates/holospaces-web/web
-          npm install playwright
+          npm install
           # Install Chromium AND chrome-headless-shell with their system deps once
           # (so the per-suite installs are fast no-ops). The browser CC suites
           # (cc17/cc19) then run for real in this job — they do not skip.
@@ -125,7 +125,7 @@ jobs:
       - name: Install Playwright Chromium
         run: |
           cd crates/holospaces-web/web
-          npm install playwright
+          npm install
           # Install the headed Chromium AND chrome-headless-shell — Playwright's
           # default headless mode (chromium.launch()) runs chrome-headless-shell,
           # a separate download from chromium; omitting it makes launch() fail
