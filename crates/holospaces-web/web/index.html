@@ -127,12 +127,21 @@
         }
       }
 
+      // The control channel to the running instances (ADR-018): a browser-local
+      // substrate-sync analog. The panel publishes a Configuration as content and
+      // broadcasts its κ + bytes; an instance tab resolves it, verifies it by
+      // re-derivation (Law L5), and applies it — no direct call, content only.
+      const control = new BroadcastChannel("holospaces-control");
+
       // Reconfigure an instance from the panel: publish a content-addressed
-      // Configuration (ADR-018; CC-28). The running instance resolves and applies
-      // it over the substrate — the panel does NOT call the instance directly.
+      // Configuration (ADR-018; CC-28), then carry it over the control channel to
+      // the running instance, which resolves + verifies + applies it.
       // Returns the configuration κ (the published content), or throws.
       function configure(k, directives) {
-        return console0.configure(k, JSON.stringify(directives));
+        const cfg = console0.configure(k, JSON.stringify(directives));
+        const bytes = console0.resolve(cfg); // the canonical configuration bytes
+        if (bytes) control.postMessage({ instance: k, kappa: cfg, bytes });
+        return cfg;
       }
 
       function action(act, k) {

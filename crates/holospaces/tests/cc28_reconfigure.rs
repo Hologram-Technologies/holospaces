@@ -21,6 +21,7 @@ use hologram_net_http::live::{serve_addr, HttpKappaSync};
 use hologram_runtime::Runtime;
 use hologram_runtime_wasmtime::WasmtimeEngine;
 use hologram_store_mem::MemKappaStore;
+use holospaces::boot::Phase;
 use holospaces::config::{ConfigError, Directive, LifecycleAction};
 use holospaces::emulator::net::{StdEgress, StdIngress};
 use holospaces::emulator::Emulator;
@@ -170,6 +171,91 @@ fn reconfiguration_is_reproducible_and_authority_scoped() {
             .unwrap_err(),
         ConfigError::UnauthorizedOperator
     );
+}
+
+/// The control plane **actually manages** its instance: `Manager::reconfigure`
+/// publishes a configuration *and drives the running session with it* — the real
+/// lifecycle transitions occur (suspend → κ snapshot, resume, terminate) and a
+/// storage directive replaces the instance's effective capability set (a new κ).
+/// Not a published intent that nothing obeys: the instance state actually changes.
+#[test]
+fn the_control_plane_actually_drives_its_managed_instance() {
+    pollster::block_on(async {
+        let operator = Operator::from_public_key(b"operator-self-sovereign-key");
+        let runtime = Runtime::new(WasmtimeEngine::new(), MemKappaStore::new());
+        let code = runtime
+            .store()
+            .put("blake3", &wat::parse_str(CONTAINER_WAT).unwrap())
+            .unwrap();
+        let peer = Peer::new(runtime.store(), &runtime);
+        let mut manager = Manager::sign_in(peer, operator);
+        let instance = manager
+            .provision(Source::Userland { entry: code }, caps())
+            .expect("provision");
+
+        let mut session = manager.open(&instance).await.expect("open");
+        session.boot().await.expect("boot");
+        assert_eq!(session.phase(), Phase::Running);
+
+        // Suspend FROM THE PANEL — the instance *actually* suspends (κ snapshot).
+        manager
+            .reconfigure(
+                &mut session,
+                vec![Directive::Lifecycle(LifecycleAction::Suspend)],
+            )
+            .await
+            .expect("manage: suspend");
+        assert_eq!(
+            session.phase(),
+            Phase::Suspended,
+            "the instance actually suspended"
+        );
+        assert!(
+            session.snapshot().is_some(),
+            "suspend captured a κ snapshot"
+        );
+
+        // Resume from the panel — the instance actually resumes.
+        manager
+            .reconfigure(
+                &mut session,
+                vec![Directive::Lifecycle(LifecycleAction::Resume)],
+            )
+            .await
+            .expect("manage: resume");
+        assert_eq!(
+            session.phase(),
+            Phase::Running,
+            "the instance actually resumed"
+        );
+
+        // A storage directive replaces the effective capability set (new κ, L1).
+        let before = session.holospace().kappa();
+        manager
+            .reconfigure(&mut session, vec![Directive::SetStorageQuota(4 << 30)])
+            .await
+            .expect("manage: quota");
+        assert_ne!(
+            session.holospace().kappa(),
+            before,
+            "the effective capabilities changed — a new κ (Law L1)"
+        );
+        assert_eq!(session.phase(), Phase::Running);
+
+        // Terminate from the panel — the instance actually ends.
+        manager
+            .reconfigure(
+                &mut session,
+                vec![Directive::Lifecycle(LifecycleAction::Terminate)],
+            )
+            .await
+            .expect("manage: terminate");
+        assert_eq!(
+            session.phase(),
+            Phase::Terminated,
+            "the instance actually terminated"
+        );
+    });
 }
 
 /// The **live network directive** modifies the *running* machine: the control

@@ -132,8 +132,10 @@ impl<'a, R: ContainerRuntime> Peer<'a, R> {
         Ok(resolved)
     }
 
-    /// Begin a lifecycle [`Session`] for a holospace on this peer's runtime.
-    pub fn session(&self, holospace: Holospace) -> Session<'_, R> {
+    /// Begin a lifecycle [`Session`] for a holospace on this peer's runtime. The
+    /// session borrows the runtime (lifetime `'a`), not this `&self`, so the
+    /// control plane can hold a session and still drive it (`Manager::reconfigure`).
+    pub fn session(&self, holospace: Holospace) -> Session<'a, R> {
         Session::provision(self.runtime, holospace)
     }
 }

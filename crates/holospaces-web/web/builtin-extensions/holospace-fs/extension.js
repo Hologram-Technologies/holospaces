@@ -203,6 +203,7 @@ function activate(context) {
       ready();
       out.appendLine("holospace: booted — workspace + terminal are live");
       makeTerminal().show();
+      listenForControl(out);
     })
     .catch((e) => {
       bootError = String(e && e.stack ? e.stack : e);
@@ -210,6 +211,39 @@ function activate(context) {
       out.show(true);
       ready(); // unblock the FS provider (it will report no files)
     });
+}
+
+// The control channel from the Platform Manager (ADR-018; CC-28): the panel
+// publishes a Configuration as content and broadcasts its κ + bytes; this running
+// instance resolves it, *verifies it by re-derivation* (Law L5 — the bytes must
+// re-derive to the broadcast κ, or it is refused), and *applies* it to the live
+// machine (Workspace.reconfigure). The control plane never calls the instance
+// directly — it publishes content, the instance applies it. No server.
+function listenForControl(out) {
+  let control;
+  try {
+    control = new BroadcastChannel("holospaces-control");
+  } catch {
+    return; // no BroadcastChannel (e.g. a non-browser host) — nothing to do
+  }
+  control.onmessage = (ev) => {
+    const msg = ev.data;
+    if (!ws || !msg || !msg.bytes) return;
+    const bytes = msg.bytes instanceof Uint8Array ? msg.bytes : new Uint8Array(msg.bytes);
+    // Law L5: the configuration is applied only if its bytes re-derive to the κ
+    // the panel published — content verified on receipt, regardless of source.
+    if (msg.kappa && wasm.kappa(bytes) !== msg.kappa) {
+      out.appendLine("holospace: refused a configuration — κ mismatch (L5)");
+      return;
+    }
+    try {
+      const applied = ws.reconfigure(bytes);
+      out.appendLine("holospace: applied configuration " + (msg.kappa || "").slice(0, 22) + "… → " + applied);
+    } catch (e) {
+      out.appendLine("holospace: configuration not applicable — " + e);
+    }
+  };
+  out.appendLine("holospace: listening for control-plane configurations (ADR-018)");
 }
 
 function deactivate() {}

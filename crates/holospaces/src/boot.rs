@@ -20,6 +20,7 @@ use hologram_substrate_core::{
     ContainerRuntime, KappaStore, KappaSync, Realization, RuntimeError, StoreError,
 };
 
+use crate::config::{Applied, ConfigError, Configuration, LifecycleAction};
 #[cfg(feature = "std")]
 use crate::realizations::address;
 use crate::realizations::{Holospace, Kappa, Source};
@@ -1034,6 +1035,68 @@ impl<'r, R: ContainerRuntime> Session<'r, R> {
         Ok(())
     }
 
+    /// **Apply a control-plane configuration to this running instance** (ADR-018;
+    /// `CC-28`) — the management primitive the control panel drives. The
+    /// configuration must target *this* instance (`holospace().kappa()`) and name
+    /// an *authorized* operator (the owner, or a granted collaborator); then its
+    /// directives are enacted: the *lifecycle* directive drives the real
+    /// transition (start → [`boot`](Self::boot), suspend → [`suspend`](Self::suspend),
+    /// resume → [`resume`](Self::resume), terminate → [`terminate`](Self::terminate)),
+    /// and the *storage / network* directives replace the effective capability set
+    /// (`base` folded with the directives), so the instance's identity reflects
+    /// its new authority (a new κ, Law L1). The returned [`Applied`] carries the
+    /// live network forwards and account grants for the caller (a machine-holding
+    /// peer enacts `forward_port`s; the manager records grants). The instance
+    /// state is *actually changed* — not just a published intent.
+    ///
+    /// # Errors
+    ///
+    /// [`ReconfigureError::Config`] if the configuration targets another instance
+    /// or the operator is unauthorized; [`ReconfigureError::Lifecycle`] if a
+    /// driven transition is invalid from the current phase or the runtime fails.
+    pub async fn reconfigure(
+        &mut self,
+        config: &Configuration,
+        authorized: &[Kappa],
+        base: &Capabilities,
+    ) -> Result<Applied, ReconfigureError> {
+        let applied = config
+            .apply(&self.holospace.kappa(), authorized, base)
+            .map_err(ReconfigureError::Config)?;
+        if let Some(action) = applied.lifecycle {
+            match action {
+                LifecycleAction::Start => {
+                    if self.phase == Phase::Provisioned {
+                        self.boot().await.map_err(ReconfigureError::Lifecycle)?;
+                    }
+                }
+                LifecycleAction::Suspend => {
+                    if self.phase == Phase::Running {
+                        self.suspend().await.map_err(ReconfigureError::Lifecycle)?;
+                    }
+                }
+                LifecycleAction::Resume => {
+                    if self.phase == Phase::Suspended {
+                        self.resume().await.map_err(ReconfigureError::Lifecycle)?;
+                    }
+                }
+                LifecycleAction::Terminate => {
+                    self.terminate()
+                        .await
+                        .map_err(ReconfigureError::Lifecycle)?;
+                }
+            }
+        }
+        // Replace the effective capability set — the reconfigured instance is a
+        // new effective state by content (Law L1). A subsequent resume spawns
+        // under the new authority (storage quota / network).
+        self.holospace = Holospace::compose(
+            self.holospace.source().clone(),
+            applied.capabilities.clone(),
+        );
+        Ok(applied)
+    }
+
     fn expect(&self, phase: Phase, action: &'static str) -> Result<(), LifecycleError> {
         if self.phase == phase {
             Ok(())
@@ -1045,6 +1108,26 @@ impl<'r, R: ContainerRuntime> Session<'r, R> {
         }
     }
 }
+
+/// A failed reconfiguration ([`Session::reconfigure`]).
+#[derive(Debug)]
+pub enum ReconfigureError {
+    /// The configuration is not applicable (wrong instance / unauthorized).
+    Config(ConfigError),
+    /// A driven lifecycle transition failed.
+    Lifecycle(LifecycleError),
+}
+
+impl fmt::Display for ReconfigureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReconfigureError::Config(e) => write!(f, "configuration not applicable: {e}"),
+            ReconfigureError::Lifecycle(e) => write!(f, "lifecycle transition failed: {e}"),
+        }
+    }
+}
+
+impl core::error::Error for ReconfigureError {}
 
 /// A failed lifecycle transition.
 #[derive(Debug)]
