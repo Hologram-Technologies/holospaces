@@ -69,4 +69,14 @@ fn emulator_boots_real_linux_throughput() {
         "P2 throughput: booted real RISC-V Linux to userspace exit in {secs:.2}s — \
          {instrs} instructions, {mips:.1} MIPS"
     );
+    // Catastrophe floor — not a tight gate (CI-runner speed varies several-fold),
+    // but a guard against a *gross* regression (e.g. the TLB or the RAM fast path
+    // silently disabled, which would drop throughput by an order of magnitude).
+    // The recorded MIPS above is the real signal for tracking; this only trips on
+    // disaster, so it never flakes.
+    assert!(
+        mips > 1.0,
+        "emulator throughput collapsed to {mips:.1} MIPS — a catastrophic (>10×) \
+         regression; the optimization path is likely disabled"
+    );
 }
