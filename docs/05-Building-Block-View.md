@@ -118,7 +118,17 @@ carries the guest’s Ethernet frames into a *userspace TCP/IP NAT* (ARP +
 DHCP + the guest-facing TCP state machine) whose streams flow out over a
 *pluggable egress transport* — a direct host socket natively, a
 WebSocket tunnel to a relay in the browser (no raw NIC in a tab;
-`CC-16`, ADR-014); its running state is a κ snapshot. It is itself a
+`CC-16`, ADR-014); its running state is a κ snapshot, and that snapshot
+has an *inverse* (`restore`) so a suspended machine **resumes
+byte-identically** (`CC-30`) — the substrate primitive a second launch
+resumes from instead of cold-booting. Because the interpreter is the
+deployed peer’s hot loop, it is tuned for **throughput** without
+changing a single observable byte: a software TLB caches address
+translations (no page-table walk per access), a RAM fast path skips the
+device-MMIO range checks for the common case, bulk native-endian memory
+replaces per-byte loops, and redundant interrupt-latch writes are elided
+— so a real Linux boot runs ~2.5× faster while staying byte-identical to
+the `qemu-system-riscv64` oracle (`CC-9`/`CC-14`). It is itself a
 κ-addressed code module satisfying the Execution Surface — imported and
 verified trustlessly (`get_with_fetch`). It computes an arbitrary OS
 image; holospaces starts with Linux.
