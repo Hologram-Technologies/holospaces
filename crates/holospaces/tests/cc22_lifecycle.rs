@@ -26,7 +26,7 @@ use std::process::{Command, Stdio};
 
 use hologram_store_mem::MemKappaStore;
 use hologram_substrate_core::KappaStore;
-use holospaces::assembly::{assemble_ext4_with_init, Layer};
+use holospaces::assembly::{assemble_ext4_bootable, assemble_ext4_with_init, Layer};
 use holospaces::boot::devcontainer::{self, LifecycleHook};
 use holospaces::machine::MachineSpec;
 use holospaces::oci::{ingest_image, IngestedImage, OciError};
@@ -49,6 +49,26 @@ fn assemble_rootfs(store: &MemKappaStore, init: &[u8]) -> Vec<u8> {
         })
         .collect();
     assemble_ext4_with_init(&layers, init).expect("assemble")
+}
+
+/// Assemble the CC-22 busybox rootfs as a **bootable, writable** devcontainer disk
+/// of `disk_bytes` (the deployed path) — `init` injected, free space for the guest.
+fn assemble_bootable_rootfs(store: &MemKappaStore, init: &[u8], disk_bytes: u64) -> Vec<u8> {
+    let img = ingest(store).expect("ingest the CC-22 busybox image");
+    let layers_owned: Vec<(String, Vec<u8>)> = img
+        .layers()
+        .iter()
+        .zip(img.layer_media_types())
+        .map(|(k, mt)| (mt.clone(), store.get(k).unwrap().unwrap().as_ref().to_vec()))
+        .collect();
+    let layers: Vec<Layer> = layers_owned
+        .iter()
+        .map(|(mt, b)| Layer {
+            media_type: mt,
+            blob: b,
+        })
+        .collect();
+    assemble_ext4_bootable(&layers, init, disk_bytes).expect("assemble bootable")
 }
 
 fn cc22_dir() -> PathBuf {
@@ -319,6 +339,70 @@ fn the_holospaces_emulator_runs_the_lifecycle() {
     assert!(
         console.contains("CC22-POSTSTART"),
         "the postStartCommand ran too (lifecycle order); console:\n{console}"
+    );
+}
+
+/// The **deployed** devcontainer boots as a *running* dev environment — not the
+/// boot-and-halt conformance init. The persistent `/init`
+/// ([`machine::DEVCONTAINER_INIT`]) mounts the pseudo filesystems and the shared
+/// `virtio-9p` workspace and execs an interactive shell, so the OS **stays up**
+/// (it does not power off after boot), the shell answers commands, and a file the
+/// holospace places on the workspace is readable at `/workspace`. Also asserts the
+/// machine advertises **no unattached `virtio-mmio` slot** (the empty network slot
+/// is gone), so the guest does not log "Wrong magic value" and stall. Heavy (a
+/// real-OS boot to an interactive shell), so `#[ignore]`d.
+#[test]
+#[ignore]
+fn the_deployed_devcontainer_boots_a_persistent_interactive_shell() {
+    use holospaces::machine::DEVCONTAINER_INIT;
+    let store = MemKappaStore::new();
+    // A bootable, writable disk (as the deployed workbench assembles): room for the
+    // init to mount /workspace, install BusyBox applets, and the user to work.
+    let rootfs = assemble_bootable_rootfs(&store, DEVCONTAINER_INIT, 64 * 1024 * 1024);
+
+    let kernel_gz =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vv/artifacts/cc14/kernel/Image.gz");
+    let kernel = {
+        let raw = std::fs::read(&kernel_gz).unwrap();
+        let mut d = flate2::read::GzDecoder::new(&raw[..]);
+        let mut k = Vec::new();
+        d.read_to_end(&mut k).unwrap();
+        k
+    };
+
+    // Boot as the deployed workbench does: the rootfs over virtio-blk + the shared
+    // virtio-9p workspace (seeded as the holospace seeds WELCOME.md), no network.
+    let mut emu = MachineSpec::devcontainer()
+        .boot_workspace(
+            &kernel,
+            rootfs,
+            &[("WELCOME.md", b"hello from the holospace")],
+        )
+        .expect("boot the persistent devcontainer");
+    emu.run(1_500_000_000);
+    let console = String::from_utf8_lossy(emu.console()).into_owned();
+
+    assert!(
+        console.contains("holospace devcontainer ready"),
+        "the persistent init ran (proc/sys/dev + 9p mounted, shell about to start); console:\n{console}"
+    );
+    assert!(
+        !console.contains("reboot: Power down") && !console.contains("Power off"),
+        "the OS STAYS UP — it does not power off after boot (a running dev environment); console:\n{console}"
+    );
+    assert!(
+        !console.contains("Wrong magic value"),
+        "no unattached virtio-mmio slot is advertised (the empty network node is gone); console:\n{console}"
+    );
+
+    // The shell is interactive and the workspace is mounted: run a command that
+    // reads the file the holospace placed on the shared 9p workspace.
+    emu.feed_console(b"cat /workspace/WELCOME.md\n");
+    emu.run(800_000_000);
+    let console = String::from_utf8_lossy(emu.console()).into_owned();
+    assert!(
+        console.contains("hello from the holospace"),
+        "the interactive shell read the file from the mounted 9p workspace; console:\n{console}"
     );
 }
 

@@ -181,6 +181,29 @@ pub fn assemble_ext4_with_files(
     Ok(ext4::write_image(&tree)?)
 }
 
+/// Assemble a **bootable, writable** devcontainer rootfs: the overlaid `layers`
+/// with `init` injected as `/init` (mode `0755`), sized to a `disk_bytes` disk so
+/// the booted OS has room to work (its init mounts pseudo-filesystems, installs
+/// BusyBox applet symlinks, writes to `/tmp`, and the user creates files). The
+/// disk size is the caller's to choose — the devcontainer's configured storage,
+/// not a hidden cap; the inode count follows ext4's conventional one-inode-per-16
+/// KiB ratio (`mke2fs -i 16384`). `disk_bytes` smaller than the content just
+/// yields a content-sized image (no free space).
+pub fn assemble_ext4_bootable(
+    layers: &[Layer],
+    init: &[u8],
+    disk_bytes: u64,
+) -> Result<Vec<u8>, AssemblyError> {
+    let mut tree = overlay_layers(layers)?;
+    let id = tree.contents.keys().copied().max().map_or(0, |m| m + 1);
+    tree.contents.insert(id, init.to_vec());
+    insert_file_at(&mut tree.root, "init", 0o755, id);
+    // ext4 block size is 4 KiB; the default bytes-per-inode is 16 KiB (mke2fs -i).
+    let min_blocks = disk_bytes / 4096;
+    let min_inodes = u32::try_from(disk_bytes / 16384).unwrap_or(u32::MAX);
+    Ok(ext4::write_image_with_free(&tree, min_inodes, min_blocks)?)
+}
+
 /// Insert a file at `rel` (a `/`-separated path relative to `dir`), creating any
 /// missing intermediate directories (mode `0755`) and replacing a colliding
 /// non-directory along the way. A no-op if `dir` is not a directory.

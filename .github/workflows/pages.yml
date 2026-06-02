@@ -72,10 +72,14 @@ jobs:
           # image's layer. The browser peer assembles the rootfs (the in-crate
           # Layer Assembler, wasm) and boots it over virtio-blk — the devcontainer
           # flow, in the browser.
+          # The deployed devcontainer boots the CC-22 BusyBox base (a static
+          # /bin/busybox), so the injected persistent /init can exec an interactive
+          # shell — a running dev environment, not the boot-and-halt CC-14 test init.
+          # CC-22 reuses the CC-14 kernel.
           cp vv/artifacts/cc14/kernel/Image.gz _site/devcontainer-kernel.gz
-          mfdig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['manifests'][0]['digest'].split(':')[1])" vv/artifacts/cc14/image/index.json)
-          ldig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['layers'][0]['digest'].split(':')[1])" "vv/artifacts/cc14/image/blobs/sha256/$mfdig")
-          cp "vv/artifacts/cc14/image/blobs/sha256/$ldig" _site/devcontainer-layer.tar.gz
+          mfdig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['manifests'][0]['digest'].split(':')[1])" vv/artifacts/cc22/image/index.json)
+          ldig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['layers'][0]['digest'].split(':')[1])" "vv/artifacts/cc22/image/blobs/sha256/$mfdig")
+          cp "vv/artifacts/cc22/image/blobs/sha256/$ldig" _site/devcontainer-layer.tar.gz
           # The networked devcontainer (CC-16): the net-enabled kernel + init layer,
           # so the browser peer boots virtio-net + the userspace NAT and tunnels TCP
           # out over a WebSocket to the egress relay (ADR-014).

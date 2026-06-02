@@ -38,3 +38,13 @@ features = ["WebSocket", "MessageEvent", "BinaryType", "Event", "CloseEvent"]
 # bundle.
 opt-level = 3
 lto = true
+
+[package.metadata.wasm-pack.profile.release]
+# Skip `wasm-opt`: wasm-bindgen now emits a module with more than one table
+# (reference types), which the `wasm-opt` bundled with `wasm-pack` rejects
+# ("Only 1 table definition allowed in MVP"). The module is already optimized by
+# the Rust release profile (opt-level=3 + LTO) and is valid wasm the browser runs
+# directly — `wasm-opt` is only a post-pass size optimizer, so skipping it keeps
+# the build reproducible across environments (it was failing only where the
+# bundled `wasm-opt` was an older, MVP-only build).
+wasm-opt = false

@@ -46,7 +46,17 @@ async function bootHolospace() {
   const layer = await fetchBytes(`${base}/devcontainer-layer.tar.gz`);
   const image = new wasm.DevcontainerImage();
   image.add_layer("application/vnd.oci.image.layer.v1.tar+gzip", layer);
-  const rootfs = image.assemble(); // gunzip + untar + overlay + ext4, in wasm
+  // Assemble a *bootable* rootfs — the persistent devcontainer init is injected,
+  // so the OS comes up as a running dev environment (mounts /workspace, execs a
+  // shell) instead of powering off right after boot — on a disk with room to work.
+  //
+  // The devcontainer's disk size. A real dev environment needs space (BusyBox
+  // installs its applets, /tmp, the files you create), so this is sized rather
+  // than the content-tight minimum. It is the disk a configured holospace would
+  // get from its storage quota; for the deployed demo it defaults here, sized for
+  // the browser peer (the image lives in wasm memory beside the guest's RAM).
+  const DISK_BYTES = 128 * 1024 * 1024;
+  const rootfs = image.assemble_bootable(DISK_BYTES); // gunzip + untar + overlay + ext4 + /init, in wasm
   ws = wasm.Workspace.boot_devcontainer(kernel, rootfs);
   // Seed a welcome note into the shared workspace so the editor and the OS both
   // see it (the editor writes by κ; the OS reads it over 9p).

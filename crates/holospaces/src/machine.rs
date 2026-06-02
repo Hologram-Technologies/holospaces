@@ -24,6 +24,27 @@ use crate::emulator::{
 /// kernel image, which loads at `base + text_offset`).
 const DTB_OFFSET: u64 = 0x0700_0000;
 
+/// The `/init` a **deployed, interactive** devcontainer boots (the workbench's OS
+/// entrypoint). Unlike the `CC-9`/`CC-14` conformance init — which prints a marker
+/// and powers off to make boot-to-userspace deterministic — this one makes the
+/// environment a *running dev environment*: it brings up the core pseudo
+/// filesystems (`proc`/`sys`/`dev` — so `devtmpfs` mounts), mounts the shared
+/// `virtio-9p` workspace at `/workspace`, installs BusyBox's applets so the usual
+/// commands work, and **execs an interactive shell** — so the OS stays up and the
+/// holospace terminal is live, instead of shutting down right after boot. The base
+/// image must provide a static `/bin/busybox` (the `CC-22` BusyBox base).
+pub const DEVCONTAINER_INIT: &[u8] = b"#!/bin/busybox sh\n\
+/bin/busybox mkdir -p /proc /sys /dev /tmp /root /workspace /bin /sbin /usr/bin /usr/sbin\n\
+/bin/busybox mount -t proc proc /proc\n\
+/bin/busybox mount -t sysfs sysfs /sys\n\
+/bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null\n\
+/bin/busybox mount -t 9p -o trans=virtio,version=9p2000.L,msize=65536 hsworkspace /workspace 2>/dev/null\n\
+/bin/busybox --install -s\n\
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin HOME=/root PS1='holospace:$PWD\\$ '\n\
+cd /workspace\n\
+/bin/busybox echo 'holospace devcontainer ready \xe2\x80\x94 /workspace is your shared workspace'\n\
+exec /bin/busybox sh\n";
+
 /// The machine a holospace boots on: a single RV64GC hart over `ram_bytes` of
 /// RAM mapped at `base`, with the CLINT, the PLIC, and one `virtio-mmio` block
 /// device — the device set the [emulator](crate::emulator) implements.
@@ -68,6 +89,17 @@ impl MachineSpec {
     /// memory-map constants (one source of truth).
     #[must_use]
     pub fn device_tree(&self) -> Vec<u8> {
+        // The full device set (both `virtio-9p` and `virtio-net` slots) — the
+        // shape external callers / tests inspect.
+        self.device_tree_for(true, true)
+    }
+
+    /// Generate the device tree, declaring the optional `virtio-9p` (workspace)
+    /// and `virtio-net` slots only when they are actually attached. An *unattached*
+    /// `virtio-mmio` node makes the guest kernel read magic `0` and log a "Wrong
+    /// magic value" error (and stall), so a machine booted without a workspace or
+    /// network must not advertise those slots.
+    fn device_tree_for(&self, has_9p: bool, has_net: bool) -> Vec<u8> {
         let mut fdt = Fdt::new();
         // Phandles referenced by interrupt routing.
         const PH_INTC: u32 = 1; // the hart's local interrupt controller
@@ -141,24 +173,27 @@ impl MachineSpec {
         fdt.prop_u32("interrupts", VIRTIO_IRQ);
         fdt.end_node();
 
-        // The 9P (shared workspace filesystem) virtio-mmio slot (CC-15). Declared
-        // always; if no workspace is attached the device reports no magic and the
-        // kernel skips it.
-        fdt.begin_node(&format!("virtio_mmio@{VIRTIO9P_BASE:x}"));
-        fdt.prop_str("compatible", "virtio,mmio");
-        fdt.prop_reg(VIRTIO9P_BASE, VIRTIO9P_END - VIRTIO9P_BASE);
-        fdt.prop_u32("interrupt-parent", PH_PLIC);
-        fdt.prop_u32("interrupts", VIRTIO9P_IRQ);
-        fdt.end_node();
+        // The 9P (shared workspace filesystem) virtio-mmio slot (CC-15) — only
+        // when a workspace is attached (else the kernel reads magic 0 and errors).
+        if has_9p {
+            fdt.begin_node(&format!("virtio_mmio@{VIRTIO9P_BASE:x}"));
+            fdt.prop_str("compatible", "virtio,mmio");
+            fdt.prop_reg(VIRTIO9P_BASE, VIRTIO9P_END - VIRTIO9P_BASE);
+            fdt.prop_u32("interrupt-parent", PH_PLIC);
+            fdt.prop_u32("interrupts", VIRTIO9P_IRQ);
+            fdt.end_node();
+        }
 
-        // The network virtio-mmio slot (CC-16). Declared always; if no egress is
-        // attached the device reports no magic and the kernel skips it.
-        fdt.begin_node(&format!("virtio_mmio@{VIRTIONET_BASE:x}"));
-        fdt.prop_str("compatible", "virtio,mmio");
-        fdt.prop_reg(VIRTIONET_BASE, VIRTIONET_END - VIRTIONET_BASE);
-        fdt.prop_u32("interrupt-parent", PH_PLIC);
-        fdt.prop_u32("interrupts", VIRTIONET_IRQ);
-        fdt.end_node();
+        // The network virtio-mmio slot (CC-16) — only when a network egress is
+        // attached (else the kernel reads magic 0 and errors + stalls).
+        if has_net {
+            fdt.begin_node(&format!("virtio_mmio@{VIRTIONET_BASE:x}"));
+            fdt.prop_str("compatible", "virtio,mmio");
+            fdt.prop_reg(VIRTIONET_BASE, VIRTIONET_END - VIRTIONET_BASE);
+            fdt.prop_u32("interrupt-parent", PH_PLIC);
+            fdt.prop_u32("interrupts", VIRTIONET_IRQ);
+            fdt.end_node();
+        }
 
         fdt.end_node(); // soc
         fdt.end_node(); // root
@@ -173,7 +208,7 @@ impl MachineSpec {
         let mut emu = Emulator::new(self.base, self.ram_bytes as usize);
         emu.enable_sbi();
         emu.attach_disk(rootfs);
-        let dtb = self.device_tree();
+        let dtb = self.device_tree_for(false, false);
         emu.boot_kernel(kernel, &dtb, self.base + DTB_OFFSET)?;
         Ok(emu)
     }
@@ -193,7 +228,7 @@ impl MachineSpec {
         emu.enable_sbi();
         emu.attach_disk(rootfs);
         emu.attach_workspace(seed);
-        let dtb = self.device_tree();
+        let dtb = self.device_tree_for(true, false);
         emu.boot_kernel(kernel, &dtb, self.base + DTB_OFFSET)?;
         Ok(emu)
     }
@@ -214,7 +249,7 @@ impl MachineSpec {
         emu.enable_sbi();
         emu.attach_disk(rootfs);
         emu.attach_net(egress);
-        let dtb = self.device_tree();
+        let dtb = self.device_tree_for(false, true);
         emu.boot_kernel(kernel, &dtb, self.base + DTB_OFFSET)?;
         Ok(emu)
     }
@@ -234,7 +269,7 @@ impl MachineSpec {
         emu.enable_sbi();
         emu.attach_disk(rootfs);
         emu.attach_net_forward(egress, ingress);
-        let dtb = self.device_tree();
+        let dtb = self.device_tree_for(false, true);
         emu.boot_kernel(kernel, &dtb, self.base + DTB_OFFSET)?;
         Ok(emu)
     }

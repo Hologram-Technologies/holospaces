@@ -152,6 +152,22 @@ struct Inode {
 
 /// Serialize `tree` into a complete ext4 image.
 pub fn write_image(tree: &Tree) -> Result<Vec<u8>, Ext4Error> {
+    write_image_with_free(tree, 0, 0)
+}
+
+/// Serialize `tree` into an ext4 image sized to *at least* `min_inodes` inodes and
+/// `min_blocks` 4 KiB blocks — so the filesystem has free capacity for the guest
+/// to use at runtime. A minimally-sized image (`write_image`) fits the content
+/// exactly with no room to create a single file; a *bootable* devcontainer rootfs
+/// is sized to a requested disk size (its init mounts pseudo-filesystems, installs
+/// BusyBox applet symlinks, writes to `/tmp`, and the user works in it), driven by
+/// the caller's configuration rather than a hidden constant
+/// (see [`super::assemble_ext4_bootable`]).
+pub fn write_image_with_free(
+    tree: &Tree,
+    min_inodes: u32,
+    min_blocks: u64,
+) -> Result<Vec<u8>, Ext4Error> {
     let Node::Dir { .. } = &tree.root else {
         return Err(Ext4Error::RootNotDir);
     };
@@ -236,8 +252,12 @@ pub fn write_image(tree: &Tree) -> Result<Vec<u8>, Ext4Error> {
     let tree_slack = (inodes.len() as u64 / 8).max(8);
 
     // Pass 3 — size the filesystem: choose the inode count and block count, and
-    // the block-group geometry, converging on a fixed point.
-    let geom = Geometry::size(max_ino, data_blocks_needed + tree_slack);
+    // the block-group geometry, converging on a fixed point. Add the requested
+    // spare capacity (extra inodes + blocks left free for the guest to use).
+    let geom = Geometry::size(
+        max_ino.max(min_inodes),
+        (data_blocks_needed + tree_slack).max(min_blocks),
+    );
 
     // Pass 4 — allocate data blocks (per group's data region, as contiguous
     // extents) to each inode, then allocate any extent-tree blocks.

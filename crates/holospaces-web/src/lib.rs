@@ -34,7 +34,7 @@ use hologram_runtime::Runtime;
 use hologram_runtime_bare::BareMetalEngine;
 use hologram_store_mem::MemKappaStore;
 use hologram_substrate_core::{Capabilities, KappaStore, Realization};
-use holospaces::assembly::{assemble_ext4, Layer};
+use holospaces::assembly::{assemble_ext4, assemble_ext4_bootable, Layer};
 use holospaces::boot::{devcontainer, provision, LifecycleError, Resolver, Session};
 use holospaces::config::{Configuration, Directive, LifecycleAction};
 use holospaces::emulator::{Emulator, Halt};
@@ -170,6 +170,32 @@ impl DevcontainerImage {
             })
             .collect();
         assemble_ext4(&layers).map_err(js_err)
+    }
+
+    /// Assemble the layers into a **bootable, interactive, writable** root
+    /// filesystem on a `disk_bytes`-sized disk: the same overlay as
+    /// [`Self::assemble`], plus the persistent devcontainer
+    /// [`/init`](holospaces::machine::DEVCONTAINER_INIT) injected — it mounts the
+    /// pseudo filesystems and the shared `virtio-9p` workspace and execs a shell,
+    /// so the booted OS stays running as a dev environment instead of powering off
+    /// after boot — and sized to `disk_bytes` so the OS has room to work (the
+    /// devcontainer's disk; the caller's to choose, not a hidden cap). The base
+    /// image must provide a static `/bin/busybox`.
+    pub fn assemble_bootable(&self, disk_bytes: f64) -> Result<Vec<u8>, JsValue> {
+        let layers: Vec<Layer> = self
+            .layers
+            .iter()
+            .map(|(mt, b)| Layer {
+                media_type: mt,
+                blob: b,
+            })
+            .collect();
+        assemble_ext4_bootable(
+            &layers,
+            holospaces::machine::DEVCONTAINER_INIT,
+            disk_bytes as u64,
+        )
+        .map_err(js_err)
     }
 }
 
