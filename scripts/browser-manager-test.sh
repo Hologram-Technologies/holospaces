@@ -58,6 +58,9 @@ node workspace-test.mjs
 echo "==> running the devcontainer boot test in Chromium (CC-14/CC-20: assemble OCI image + virtio-blk boot in the browser)"
 node devcontainer-test.mjs
 
+echo "==> running the devcontainer resume test in Chromium (CC-30/CC-31: suspend → κ snapshot → gzip → OPFS → reload → verify(L5) → resume, workspace intact)"
+node resume-test.mjs
+
 echo "==> running the devcontainer network test in Chromium (CC-16: virtio-net + userspace NAT, egress tunnelled over a WebSocket relay)"
 node devcontainer-net-test.mjs
 

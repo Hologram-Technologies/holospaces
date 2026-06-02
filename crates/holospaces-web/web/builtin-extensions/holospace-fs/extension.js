@@ -24,6 +24,8 @@ function deriveBase(extensionUri) {
 
 let wasm = null;
 let ws = null; // the booted holospace Workspace (wasm)
+let out = null; // the "Holospace" output channel (set in activate)
+let resumed = false; // true when this launch resumed from a persisted snapshot
 let bootError = null;
 let ready; // resolves when the holospace has booted
 const readyPromise = new Promise((r) => (ready = r));
@@ -37,11 +39,98 @@ async function gunzip(bytes) {
   const stream = new Response(bytes).body.pipeThrough(new DecompressionStream("gzip"));
   return new Uint8Array(await new Response(stream).arrayBuffer());
 }
+async function gzip(bytes) {
+  const stream = new Response(bytes).body.pipeThrough(new CompressionStream("gzip"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+// ── Resume persistence over OPFS (CC-30/CC-31) ──────────────────────────────
+// A running holospace is content: `Workspace.suspend()` produces a κ snapshot of
+// the whole machine (CPU, RAM, rootfs disk, and the virtio-9p workspace files).
+// We persist it — gzipped, since most of guest RAM is zero — to the Origin
+// Private File System, so the next launch *resumes* from it (no fetch, no rootfs
+// assembly, no cold boot) instead of starting over. OPFS is durable but untrusted
+// storage, so a cross-session reload is a trust boundary: the bytes are verified
+// by re-derivation against the κ recorded beside them before they are trusted
+// (Law L5; ADR-019) — a tampered or corrupt snapshot is refused and we cold-boot.
+const SNAPSHOT_FILE = "holospace-devcontainer.snapshot.gz";
+const SNAPSHOT_KAPPA = "holospace-devcontainer.snapshot.kappa";
+
+async function opfsRoot() {
+  if (!navigator.storage || !navigator.storage.getDirectory) return null;
+  try {
+    return await navigator.storage.getDirectory();
+  } catch {
+    return null;
+  }
+}
+
+// Load + verify a persisted snapshot. Returns the raw snapshot bytes, or null if
+// none / unreadable / failing re-derivation (in which case the caller cold-boots).
+async function loadSnapshot() {
+  const root = await opfsRoot();
+  if (!root) return null;
+  try {
+    const gzHandle = await root.getFileHandle(SNAPSHOT_FILE);
+    const kHandle = await root.getFileHandle(SNAPSHOT_KAPPA);
+    const gzBytes = new Uint8Array(await (await gzHandle.getFile()).arrayBuffer());
+    const recordedKappa = await (await kHandle.getFile()).text();
+    const snapshot = await gunzip(gzBytes);
+    // Law L5: trust the durable-but-untrusted bytes only if they re-derive to the
+    // κ we recorded when we wrote them — the same verify-on-receipt the substrate
+    // applies at any boundary (ADR-019).
+    if (wasm.kappa(snapshot) !== recordedKappa) {
+      out && out.appendLine("holospace: persisted snapshot failed κ re-derivation — cold-booting");
+      return null;
+    }
+    return snapshot;
+  } catch {
+    return null; // no snapshot yet, or storage unavailable
+  }
+}
+
+let persisting = false;
+async function saveSnapshot() {
+  if (!ws || ws.halted || persisting) return;
+  const root = await opfsRoot();
+  if (!root) return;
+  persisting = true;
+  try {
+    const snapshot = ws.suspend(); // the κ snapshot of the whole machine
+    const kappa = wasm.kappa(snapshot); // its content address (recorded beside it)
+    const gzBytes = await gzip(snapshot);
+    const gzHandle = await root.getFileHandle(SNAPSHOT_FILE, { create: true });
+    const gw = await gzHandle.createWritable();
+    await gw.write(gzBytes);
+    await gw.close();
+    const kHandle = await root.getFileHandle(SNAPSHOT_KAPPA, { create: true });
+    const kw = await kHandle.createWritable();
+    await kw.write(kappa);
+    await kw.close();
+  } catch (e) {
+    out && out.appendLine("holospace: snapshot persist failed — " + e);
+  } finally {
+    persisting = false;
+  }
+}
 
 // Boot the holospace in the extension host (the web model's backend).
 async function bootHolospace() {
   wasm = await import(`${base}/pkg/holospaces_web.js`);
   await wasm.default(`${base}/pkg/holospaces_web_bg.wasm`);
+
+  // Resume path (CC-30): if a verified κ snapshot is persisted from a previous
+  // session, restore the whole machine from it — the running OS, its disk, and
+  // the workspace files come back exactly. This skips the kernel fetch, the
+  // rootfs assembly, and the cold boot entirely.
+  const persisted = await loadSnapshot();
+  if (persisted) {
+    ws = wasm.Workspace.resume_devcontainer(persisted);
+    resumed = true;
+    out && out.appendLine("holospace: resumed from a persisted κ snapshot — no cold boot");
+    return;
+  }
+
   const kernel = await gunzip(await fetchBytes(`${base}/devcontainer-kernel.gz`));
   const layer = await fetchBytes(`${base}/devcontainer-layer.tar.gz`);
   const image = new wasm.DevcontainerImage();
@@ -205,15 +294,25 @@ function activate(context) {
 
   // Boot the holospace in the background; surface failures in an output channel
   // so a load is never silently empty.
-  const out = vscode.window.createOutputChannel("Holospace");
+  out = vscode.window.createOutputChannel("Holospace");
   context.subscriptions.push(out);
   out.appendLine("holospace: booting the devcontainer in the extension host…");
   bootHolospace()
     .then(() => {
       ready();
-      out.appendLine("holospace: booted — workspace + terminal are live");
+      out.appendLine(
+        resumed
+          ? "holospace: resumed — workspace + terminal are live"
+          : "holospace: booted — workspace + terminal are live",
+      );
       makeTerminal().show();
       listenForControl(out);
+      // Persist the running machine to OPFS periodically (CC-30/CC-31), so the
+      // next launch resumes from it instead of cold-booting. The extension host
+      // is a worker (no `document` visibility events), so a timer is the portable
+      // suspend trigger; `saveSnapshot` no-ops while a previous save is in flight.
+      const timer = setInterval(saveSnapshot, 120000);
+      context.subscriptions.push(new vscode.Disposable(() => clearInterval(timer)));
     })
     .catch((e) => {
       bootError = String(e && e.stack ? e.stack : e);
