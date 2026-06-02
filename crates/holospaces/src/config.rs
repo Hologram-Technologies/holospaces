@@ -6,16 +6,17 @@
 //! Codespaces/Gitpod control panel reconfigures a *running* environment across
 //! four operation classes — **lifecycle, storage, network, account/user**.
 //! holospaces does this UOR-native: when the operator configures an instance,
-//! the panel produces a [`Configuration`] — a hologram [`Realization`] embedding
-//! the issuing *operator* identity (Law L3) and the *target instance* κ, plus an
-//! ordered set of [`Directive`]s. The control plane publishes it over the
+//! the panel produces a [`Configuration`](crate::config::Configuration) — a
+//! hologram [`Realization`](hologram_substrate_core::Realization) embedding the
+//! issuing *operator* identity (Law L3) and the *target instance* κ, plus an
+//! ordered set of [`Directive`](crate::config::Directive)s. The control plane publishes it over the
 //! substrate (content-addressed, like a roster); the running instance *resolves*
 //! it (verify-by-re-derivation, Law L5), checks it targets *this* instance and
 //! the operator is authorized, and *applies* it — its state changes. No
 //! server, no control-plane→instance RPC: the configuration is content, the
 //! substrate carries it (ADR-018; `CC-28`).
 //!
-//! A [`Configuration`] is itself a κ, so the same configuration applied to the
+//! A [`Configuration`](crate::config::Configuration) is itself a κ, so the same configuration applied to the
 //! same instance yields the same resulting state (Law L1) — reconfiguration is
 //! reproducible and auditable, and any of the operator's peers can issue it
 //! (what-not-where).
@@ -31,8 +32,8 @@ use alloc::{vec, vec::Vec};
 use core::fmt;
 
 /// A lifecycle transition the control plane drives on an instance — the panel's
-/// stop/suspend/resume/terminate controls (`CC-28`; the [`Session`] state
-/// machine in [`crate::boot`] realizes the transition).
+/// stop/suspend/resume/terminate controls (`CC-28`; the [`Session`](crate::boot::Session)
+/// state machine in [`crate::boot`] realizes the transition).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LifecycleAction {
     /// Boot a provisioned instance (panel "start").
