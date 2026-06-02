@@ -26,8 +26,9 @@ use crate::assembly::{
     assemble_ext4, assemble_ext4_with_files, find_devcontainer_json, read_archive_file, Layer,
 };
 use crate::boot::devcontainer::{self, ImageSource};
-use crate::dockerfile;
 use crate::oci::{ingest_image, IngestedImage, OciError};
+use crate::{compose, dockerfile};
+use alloc::collections::BTreeMap;
 
 /// The default Dev Container base image, used when a repository declares no
 /// `devcontainer.json` (the Dev Container spec's fallback). A real, multi-arch
@@ -429,52 +430,54 @@ pub fn import_devcontainer(
             // build, `CC-26`), never silently falling back to the default.
             let dc = devcontainer::parse(&cfg)
                 .map_err(|e| ImportError::BadContent(format!("devcontainer.json: {e}")))?;
+            let archive_layer = Layer {
+                media_type: "application/gzip",
+                blob: &archive,
+            };
             let (image, build) = match &dc.image_source {
                 ImageSource::Image(r) => (pull_image(store, &parse_image_ref(r)?)?, None),
                 ImageSource::Build(bc) => {
-                    let archive_layer = Layer {
-                        media_type: "application/gzip",
-                        blob: &archive,
-                    };
-                    let df_bytes = read_build_file(&archive_layer, &bc.context, &bc.dockerfile)?
-                        .ok_or_else(|| {
+                    let (img, plan) = resolve_build(
+                        store,
+                        &archive_layer,
+                        &bc.context,
+                        &bc.dockerfile,
+                        &bc.args,
+                    )?;
+                    (img, Some(plan))
+                }
+                ImageSource::Compose(cc) => {
+                    // Read the compose file from the repository and resolve the
+                    // devcontainer's `service` to its image / build (`CC-27`).
+                    let file = cc.files.first().ok_or_else(|| {
+                        ImportError::BadContent("compose file path missing".into())
+                    })?;
+                    let compose_bytes =
+                        read_build_file(&archive_layer, "", file)?.ok_or_else(|| {
                             ImportError::BadContent(format!(
-                                "build dockerfile `{}` not found in the repository",
-                                bc.dockerfile
+                                "compose file `{file}` not found in the repository"
                             ))
                         })?;
-                    let df = dockerfile::parse(&df_bytes, &bc.args)
-                        .map_err(|e| ImportError::BadContent(format!("Dockerfile: {e}")))?;
-                    let image = pull_image(store, &parse_image_ref(&df.from)?)?;
-                    // Resolve the COPY sources from the build context (never dropped).
-                    let mut copy_files = Vec::new();
-                    for (src, dst) in df.copies() {
-                        let bytes = read_build_file(&archive_layer, &bc.context, src)?.ok_or_else(
-                            || {
-                                ImportError::BadContent(format!(
-                                    "COPY source `{src}` not found in the build context"
-                                ))
-                            },
-                        )?;
-                        copy_files.push((dst.trim_start_matches('/').to_owned(), bytes));
+                    match compose::resolve_service(&compose_bytes, cc.service.as_deref())
+                        .map_err(|e| ImportError::BadContent(format!("compose: {e}")))?
+                    {
+                        compose::ServiceSource::Image(r) => {
+                            (pull_image(store, &parse_image_ref(&r)?)?, None)
+                        }
+                        compose::ServiceSource::Build {
+                            context,
+                            dockerfile,
+                            args,
+                        } => {
+                            let (img, plan) =
+                                resolve_build(store, &archive_layer, &context, &dockerfile, &args)?;
+                            (img, Some(plan))
+                        }
                     }
-                    (
-                        image,
-                        Some(BuildPlan {
-                            init: df.build_init(None),
-                            copy_files,
-                        }),
-                    )
                 }
-                // Compose resolution is `CC-27`; the config is retained. For now a
-                // compose devcontainer provisions on the default base (explicit, in
-                // `used_default`), not a silent image mismatch.
-                ImageSource::Compose(_) | ImageSource::Default => (pull_default(store)?, None),
+                ImageSource::Default => (pull_default(store)?, None),
             };
-            let used_default = matches!(
-                dc.image_source,
-                ImageSource::Default | ImageSource::Compose(_)
-            );
+            let used_default = matches!(dc.image_source, ImageSource::Default);
             (cfg, used_default, image, build)
         }
         None => {
@@ -515,6 +518,44 @@ fn read_build_file(
         }
     }
     Ok(None)
+}
+
+/// Resolve a Dockerfile build (`CC-26`) from a repository `archive`: read the
+/// Dockerfile from the build `context`, pull its `FROM` as the base image, and
+/// resolve its `COPY` sources from the context — a missing Dockerfile or `COPY`
+/// source is an explicit error, never a silent drop. Shared by `build` and a
+/// compose service whose source is a build (`CC-27`).
+fn resolve_build(
+    store: &dyn KappaStore,
+    archive: &Layer,
+    context: &str,
+    dockerfile: &str,
+    args: &BTreeMap<String, String>,
+) -> Result<(IngestedImage, BuildPlan), ImportError> {
+    let df_bytes = read_build_file(archive, context, dockerfile)?.ok_or_else(|| {
+        ImportError::BadContent(format!(
+            "build dockerfile `{dockerfile}` not found in the repository"
+        ))
+    })?;
+    let df = dockerfile::parse(&df_bytes, args)
+        .map_err(|e| ImportError::BadContent(format!("Dockerfile: {e}")))?;
+    let image = pull_image(store, &parse_image_ref(&df.from)?)?;
+    let mut copy_files = Vec::new();
+    for (src, dst) in df.copies() {
+        let bytes = read_build_file(archive, context, src)?.ok_or_else(|| {
+            ImportError::BadContent(format!(
+                "COPY source `{src}` not found in the build context"
+            ))
+        })?;
+        copy_files.push((dst.trim_start_matches('/').to_owned(), bytes));
+    }
+    Ok((
+        image,
+        BuildPlan {
+            init: df.build_init(None),
+            copy_files,
+        },
+    ))
 }
 
 /// Import a devcontainer from a repository URL and assemble its bootable `ext4`

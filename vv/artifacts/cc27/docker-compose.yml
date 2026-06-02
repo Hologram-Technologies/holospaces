@@ -1,0 +1,7 @@
+services:
+  app:
+    image: holospaces/busybox:latest
+    ports:
+      - "3000:3000"
+  db:
+    image: postgres:16
