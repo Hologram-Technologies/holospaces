@@ -1,0 +1,43 @@
+CC-26 — Dockerfile-build devcontainer authority artifacts.
+
+A devcontainer.json may declare its container as a Dockerfile build
+("build": { "dockerfile": "Dockerfile", "context": ".", "args": {...} }) instead
+of a prebuilt image. holospaces honours it the substrate-native way — no Docker
+daemon: it parses the Dockerfile (holospaces::dockerfile), the FROM image is
+pulled + assembled as the base rootfs (CC-20/CC-10), the COPY sources from the
+build context are injected into the rootfs, and the RUN instructions run IN the
+devcontainer OS during the build phase, with the build ARGs and ENVs in scope
+(CC-22/CC-25 machinery). ENV becomes the container environment, WORKDIR the
+working directory. The result is the built rootfs.
+
+Authorities
+-----------
+Dockerfile reference — the instruction semantics (FROM / ARG / ENV / WORKDIR /
+  COPY / RUN; line continuations; $VAR / ${VAR} substitution in the
+  substituted instructions; RUN expanded by the shell at run time, not parse
+  time). The parser implements this subset; an unknown instruction is an explicit
+  error, never a silent drop.
+
+Dev Container spec — `build.dockerfile` / `build.context` / `build.args`.
+
+ext4 on-disk format — e2fsprogs (the COPY source is in the rootfs); differential
+  runtime oracle qemu-system-riscv64.
+
+Artifacts
+---------
+vv/artifacts/cc26/Dockerfile + setup.sh — the witness's Dockerfile and its build
+  context (the COPY source). The FROM base is the CC-22 BusyBox image; the CC-14
+  kernel is reused for the boot. (Synthesized in the witness; kept here for
+  provenance.)
+
+Witness — crates/holospaces/tests/cc26_build.rs (+ holospaces::dockerfile unit
+  tests); suite vv/suites/cc26-build.sh:
+  unit — the Dockerfile parser resolves FROM with the ARG (build.args override
+    the ARG default), ENV/WORKDIR/COPY, RUN (shell + exec form); no FROM is an
+    error; an unknown instruction is an explicit error (never dropped);
+  (1) the build /init runs the RUN steps with the ENV exported and the WORKDIR
+    entered, the COPY source is injected into the rootfs at its destination, and
+    FROM is the pulled base — e2fsck clean, debugfs reads the COPY'd script back;
+  (2) holospaces' own emulator runs the build in the OS — BUILD-START, SETUP-RAN
+    (the COPY'd script ran), BUILD-RAN:cc26 (the RUN expanded the ENV), BUILD-DONE;
+  (3) qemu-system-riscv64 produces the same markers.

@@ -110,13 +110,39 @@ pub mod devcontainer {
     pub enum ImageSource {
         /// A prebuilt OCI image reference (`"image"`).
         Image(String),
-        /// A Dockerfile build (`"build"`).
-        Build,
-        /// A Docker Compose service (`"dockerComposeFile"`).
-        Compose,
+        /// A Dockerfile build (`"build"`) — the Dockerfile path + context + args
+        /// the config declares, *honoured* (built on the substrate, `CC-26`), not
+        /// dropped.
+        Build(BuildConfig),
+        /// A Docker Compose service (`"dockerComposeFile"`) — the compose file(s)
+        /// and the selected `service`, honoured by resolving the service's image
+        /// or build (`CC-27`).
+        Compose(ComposeConfig),
         /// No image source declared — the default base image (e.g. a
         /// features-only configuration, as in Codespaces).
         Default,
+    }
+
+    /// A Dockerfile build source (`"build"`): the `dockerfile` path (relative to
+    /// the config), the build `context`, and the `args`.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct BuildConfig {
+        /// The Dockerfile path (default `"Dockerfile"`), relative to the context.
+        pub dockerfile: String,
+        /// The build context directory (default `"."`), relative to the config.
+        pub context: String,
+        /// The `build.args` the config declares (`ARG` overrides for the build).
+        pub args: BTreeMap<String, String>,
+    }
+
+    /// A Docker Compose source (`"dockerComposeFile"` + `"service"`): the compose
+    /// file path(s) and the service that is the devcontainer.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct ComposeConfig {
+        /// The compose file path(s) (relative to the config), in order.
+        pub files: Vec<String>,
+        /// The compose `service` that is the devcontainer (its image/build is used).
+        pub service: Option<String>,
     }
 
     /// A validated dev container configuration (the spec-relevant projection).
@@ -341,9 +367,62 @@ pub mod devcontainer {
                     .to_owned(),
             )
         } else if has_build {
-            ImageSource::Build
+            // `build` is an object (the spec) or, leniently, a string (the
+            // Dockerfile path). Retained + honoured (CC-26), never dropped.
+            let bc = match &obj["build"] {
+                Value::String(s) => BuildConfig {
+                    dockerfile: s.clone(),
+                    context: ".".to_owned(),
+                    args: BTreeMap::new(),
+                },
+                Value::Object(o) => {
+                    let mut args = BTreeMap::new();
+                    if let Some(a) = o.get("args").and_then(Value::as_object) {
+                        for (k, v) in a {
+                            args.insert(
+                                k.clone(),
+                                scalar_string(v)
+                                    .ok_or(DevcontainerError::MalformedProperty("build"))?,
+                            );
+                        }
+                    }
+                    BuildConfig {
+                        dockerfile: o
+                            .get("dockerfile")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Dockerfile")
+                            .to_owned(),
+                        context: o
+                            .get("context")
+                            .and_then(Value::as_str)
+                            .unwrap_or(".")
+                            .to_owned(),
+                        args,
+                    }
+                }
+                _ => return Err(DevcontainerError::MalformedProperty("build")),
+            };
+            ImageSource::Build(bc)
         } else if has_compose {
-            ImageSource::Compose
+            let files = match &obj["dockerComposeFile"] {
+                Value::String(s) => vec![s.clone()],
+                Value::Array(a) => a
+                    .iter()
+                    .map(|v| {
+                        v.as_str()
+                            .map(str::to_owned)
+                            .ok_or(DevcontainerError::MalformedProperty("dockerComposeFile"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                _ => return Err(DevcontainerError::MalformedProperty("dockerComposeFile")),
+            };
+            ImageSource::Compose(ComposeConfig {
+                files,
+                service: obj
+                    .get("service")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            })
         } else {
             ImageSource::Default
         };
