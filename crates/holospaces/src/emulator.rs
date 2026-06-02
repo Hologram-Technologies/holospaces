@@ -532,7 +532,15 @@ mod ninep {
     const TGETATTR: u8 = 24;
     const TSETATTR: u8 = 26;
     const TREADDIR: u8 = 40;
+    const TRENAMEAT: u8 = 74;
+    const TUNLINKAT: u8 = 76;
     const TMKDIR: u8 = 72;
+
+    // `Tsetattr.valid` bits (9P2000.L) — which attributes the request changes.
+    const SETATTR_MODE: u32 = 0x0000_0001;
+    const SETATTR_SIZE: u32 = 0x0000_0008;
+    // The mode's file-type bits (preserved when only permissions change).
+    const S_IFMT: u32 = 0xf000;
     const TVERSION: u8 = 100;
     const TATTACH: u8 = 104;
     const TFLUSH: u8 = 108;
@@ -661,6 +669,69 @@ mod ninep {
                 },
             );
             id
+        }
+
+        /// Recursively drop an inode and its whole subtree (a removed directory's
+        /// descendants), so an unlinked tree leaves no orphaned inodes.
+        fn free_subtree(&mut self, id: u64) {
+            if let Some(node) = self.inodes.remove(&id) {
+                for child in node.children.values() {
+                    self.free_subtree(*child);
+                }
+            }
+        }
+
+        /// Delete a root entry (and its subtree) — the editor removing a file or
+        /// folder from the shared workspace (`FileSystemProvider.delete`, `CC-17`),
+        /// the host-side dual of `Tunlinkat`. `true` if it existed.
+        pub fn delete_file(&mut self, name: &str) -> bool {
+            let Some(id) = self
+                .inodes
+                .get_mut(&1)
+                .and_then(|r| r.children.remove(name))
+            else {
+                return false;
+            };
+            self.free_subtree(id);
+            true
+        }
+
+        /// Rename a root entry — the editor moving a file or folder in the shared
+        /// workspace (`FileSystemProvider.rename`, `CC-17`), the host-side dual of
+        /// `Trenameat`. `true` if the source existed.
+        pub fn rename(&mut self, from: &str, to: &str) -> bool {
+            let Some(id) = self
+                .inodes
+                .get_mut(&1)
+                .and_then(|r| r.children.remove(from))
+            else {
+                return false;
+            };
+            if let Some(displaced) = self
+                .inodes
+                .get_mut(&1)
+                .and_then(|r| r.children.insert(to.into(), id))
+            {
+                self.free_subtree(displaced);
+            }
+            true
+        }
+
+        /// Create a root directory — the editor making a new folder in the shared
+        /// workspace (`FileSystemProvider.createDirectory`, `CC-17`), the host-side
+        /// dual of `Tmkdir`. A no-op if a directory of that name already exists.
+        pub fn make_dir(&mut self, name: &str) {
+            if let Some(&id) = self.inodes.get(&1).and_then(|r| r.children.get(name)) {
+                if self.inodes.get(&id).is_some_and(|n| n.is_dir) {
+                    return;
+                }
+            }
+            let id = self.alloc(true, S_IFDIR | 0o755);
+            self.inodes
+                .get_mut(&1)
+                .unwrap()
+                .children
+                .insert(name.into(), id);
         }
     }
 
@@ -984,8 +1055,84 @@ mod ninep {
                 envelope(TSTATFS + 1, tag, &w.0)
             }
             TSETATTR => {
-                // Accept (and ignore) attribute changes — our FS has no perms.
+                // Apply the attribute change so it persists (a guest `chmod +x`
+                // on a workspace file is honoured, not silently dropped): update
+                // the mode's permission bits and/or truncate to the new size, as
+                // the `valid` mask selects.
+                let fid = r.u32();
+                let valid = r.u32();
+                let mode = r.u32();
+                let _uid = r.u32();
+                let _gid = r.u32();
+                let size = r.u64();
+                let Some(&id) = fids.get(&fid) else {
+                    return rlerror(tag, ENOENT);
+                };
+                if let Some(n) = fs.inodes.get_mut(&id) {
+                    if valid & SETATTR_MODE != 0 {
+                        n.mode = (n.mode & S_IFMT) | (mode & 0o7777);
+                    }
+                    if valid & SETATTR_SIZE != 0 && !n.is_dir {
+                        n.data.resize(size as usize, 0);
+                    }
+                }
                 envelope(TSETATTR + 1, tag, &[])
+            }
+            TUNLINKAT => {
+                // Remove `name` from the directory `dfid` (a guest `rm` / `rmdir`
+                // on the workspace) — honoured, not dropped.
+                let dfid = r.u32();
+                let name = r.str();
+                let _flags = r.u32();
+                let Some(&dir) = fids.get(&dfid) else {
+                    return rlerror(tag, ENOENT);
+                };
+                let child = fs
+                    .inodes
+                    .get(&dir)
+                    .and_then(|d| d.children.get(&name).copied());
+                match child {
+                    Some(cid) => {
+                        if let Some(d) = fs.inodes.get_mut(&dir) {
+                            d.children.remove(&name);
+                        }
+                        fs.free_subtree(cid);
+                        envelope(TUNLINKAT + 1, tag, &[])
+                    }
+                    None => rlerror(tag, ENOENT),
+                }
+            }
+            TRENAMEAT => {
+                // Move `oldname` under `olddirfid` to `newname` under `newdirfid`
+                // (a guest `mv` on the workspace) — honoured, not dropped.
+                let olddir = r.u32();
+                let oldname = r.str();
+                let newdir = r.u32();
+                let newname = r.str();
+                let (Some(&od), Some(&nd)) = (fids.get(&olddir), fids.get(&newdir)) else {
+                    return rlerror(tag, ENOENT);
+                };
+                let child = fs
+                    .inodes
+                    .get(&od)
+                    .and_then(|d| d.children.get(&oldname).copied());
+                match child {
+                    Some(cid) => {
+                        if let Some(d) = fs.inodes.get_mut(&od) {
+                            d.children.remove(&oldname);
+                        }
+                        // Replace any existing target so a `mv -f` is faithful.
+                        let displaced = fs
+                            .inodes
+                            .get_mut(&nd)
+                            .and_then(|d| d.children.insert(newname, cid));
+                        if let Some(old) = displaced {
+                            fs.free_subtree(old);
+                        }
+                        envelope(TRENAMEAT + 1, tag, &[])
+                    }
+                    None => rlerror(tag, ENOENT),
+                }
             }
             TFLUSH => envelope(TFLUSH + 1, tag, &[]),
             _ => rlerror(tag, EOPNOTSUPP),
@@ -996,6 +1143,116 @@ mod ninep {
         match name {
             "." => None, // handled by the caller's current fid
             _ => dir.children.get(name).copied(),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // Build a T-message envelope (`size[4] type[1] tag[2] body`).
+        fn msg(ttype: u8, tag: u16, body: &[u8]) -> Vec<u8> {
+            let size = 7 + body.len() as u32;
+            let mut m = size.to_le_bytes().to_vec();
+            m.push(ttype);
+            m.extend_from_slice(&tag.to_le_bytes());
+            m.extend_from_slice(body);
+            m
+        }
+        fn rtype(reply: &[u8]) -> u8 {
+            reply[4]
+        }
+
+        // Attach (root fid=1) and walk fid=1 → newfid=2 to a named root child.
+        fn attach_and_walk(fs: &mut Fs9p, fids: &mut BTreeMap<u32, u64>, name: &str) {
+            let mut att = W::new();
+            att.u32(1); // fid
+            att.u32(0); // afid
+            att.str("u");
+            att.str("");
+            att.u32(0);
+            handle(fs, fids, &msg(TATTACH, 0, &att.0));
+            let mut wlk = W::new();
+            wlk.u32(1); // fid (root)
+            wlk.u32(2); // newfid
+            wlk.u16(1); // nwname
+            wlk.str(name);
+            handle(fs, fids, &msg(TWALK, 0, &wlk.0));
+        }
+
+        #[test]
+        fn tsetattr_persists_a_mode_change() {
+            let mut fs = Fs9p::new();
+            fs.seed_file("script.sh", b"#!/bin/sh\n");
+            let mut fids = BTreeMap::new();
+            attach_and_walk(&mut fs, &mut fids, "script.sh");
+            // chmod 0755 on fid 2.
+            let mut b = W::new();
+            b.u32(2); // fid
+            b.u32(SETATTR_MODE); // valid: mode only
+            b.u32(0o755); // mode
+            b.u32(0); // uid
+            b.u32(0); // gid
+            b.u64(0); // size
+            for _ in 0..4 {
+                b.u64(0); // atime/mtime sec+nsec
+            }
+            let reply = handle(&mut fs, &mut fids, &msg(TSETATTR, 0, &b.0));
+            assert_eq!(rtype(&reply), TSETATTR + 1);
+            // Tgetattr: mode is at body offset 8 (valid u64) + 13 (qid) = 21.
+            let mut g = W::new();
+            g.u32(2);
+            g.u64(0x07ff);
+            let attr = handle(&mut fs, &mut fids, &msg(TGETATTR, 0, &g.0));
+            let mode_off = 7 + 8 + 13;
+            let mode = u32::from_le_bytes(attr[mode_off..mode_off + 4].try_into().unwrap());
+            assert_eq!(mode & 0o7777, 0o755, "the chmod persisted (not dropped)");
+            assert_eq!(mode & S_IFMT, S_IFREG, "the file-type bits are preserved");
+        }
+
+        #[test]
+        fn tunlinkat_removes_a_root_entry() {
+            let mut fs = Fs9p::new();
+            fs.seed_file("gone.txt", b"x");
+            let mut fids = BTreeMap::new();
+            attach_and_walk(&mut fs, &mut fids, "gone.txt"); // also attaches root fid 1
+            let mut b = W::new();
+            b.u32(1); // dfid = root
+            b.str("gone.txt");
+            b.u32(0); // flags
+            let reply = handle(&mut fs, &mut fids, &msg(TUNLINKAT, 0, &b.0));
+            assert_eq!(rtype(&reply), TUNLINKAT + 1);
+            assert!(fs.read_file("gone.txt").is_none(), "the file was removed");
+        }
+
+        #[test]
+        fn trenameat_moves_a_root_entry() {
+            let mut fs = Fs9p::new();
+            fs.seed_file("old.txt", b"data");
+            let mut fids = BTreeMap::new();
+            attach_and_walk(&mut fs, &mut fids, "old.txt");
+            let mut b = W::new();
+            b.u32(1); // olddirfid = root
+            b.str("old.txt");
+            b.u32(1); // newdirfid = root
+            b.str("new.txt");
+            let reply = handle(&mut fs, &mut fids, &msg(TRENAMEAT, 0, &b.0));
+            assert_eq!(rtype(&reply), TRENAMEAT + 1);
+            assert!(fs.read_file("old.txt").is_none());
+            assert_eq!(fs.read_file("new.txt"), Some(&b"data"[..]));
+        }
+
+        #[test]
+        fn host_side_duals_match_the_wire_ops() {
+            let mut fs = Fs9p::new();
+            fs.make_dir("src");
+            assert!(fs.list_root().iter().any(|(n, d, _)| n == "src" && *d));
+            fs.seed_file("a", b"1");
+            assert!(fs.rename("a", "b"));
+            assert_eq!(fs.read_file("b"), Some(&b"1"[..]));
+            assert!(fs.delete_file("b"));
+            assert!(fs.read_file("b").is_none());
+            assert!(!fs.delete_file("missing"));
         }
     }
 }
@@ -1077,6 +1334,34 @@ impl Emulator {
     pub fn workspace_write(&mut self, name: &str, data: &[u8]) {
         if let Some(d) = self.virtio9p.as_mut() {
             d.fs.write_file(name, data);
+        }
+    }
+
+    /// Delete a file or folder from the shared workspace — the editor's
+    /// `FileSystemProvider.delete` over the running holospace (`CC-17`). `true` if
+    /// it existed. No-op (and `false`) if no workspace is attached.
+    pub fn workspace_delete(&mut self, name: &str) -> bool {
+        self.virtio9p
+            .as_mut()
+            .map(|d| d.fs.delete_file(name))
+            .unwrap_or(false)
+    }
+
+    /// Rename a file or folder in the shared workspace — the editor's
+    /// `FileSystemProvider.rename` over the running holospace (`CC-17`). `true` if
+    /// the source existed.
+    pub fn workspace_rename(&mut self, from: &str, to: &str) -> bool {
+        self.virtio9p
+            .as_mut()
+            .map(|d| d.fs.rename(from, to))
+            .unwrap_or(false)
+    }
+
+    /// Create a folder in the shared workspace — the editor's
+    /// `FileSystemProvider.createDirectory` over the running holospace (`CC-17`).
+    pub fn workspace_mkdir(&mut self, name: &str) {
+        if let Some(d) = self.virtio9p.as_mut() {
+            d.fs.make_dir(name);
         }
     }
 

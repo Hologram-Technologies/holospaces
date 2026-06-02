@@ -137,11 +137,11 @@ where
             return Err(OciError::UnexpectedMediaType(mt.to_owned()));
         }
     }
-    let manifest_desc = index
+    let manifests = index
         .get("manifests")
         .and_then(Value::as_array)
-        .and_then(|m| m.first())
         .ok_or(OciError::NoManifest)?;
+    let manifest_desc = select_manifest(manifests)?;
     let manifest_digest = descriptor_digest(manifest_desc)?;
     expect_media(manifest_desc, media::MANIFEST)?;
 
@@ -207,6 +207,59 @@ where
     }
     let k = store.put("blake3", &bytes).map_err(OciError::Store)?;
     Ok((bytes, k))
+}
+
+/// The platform the system emulator (`CC-9`) runs: a 64-bit RISC-V Linux guest.
+/// An OCI image *index* (multi-platform) must carry a manifest for it — selecting
+/// the wrong architecture would assemble an unrunnable rootfs, so a mismatch is an
+/// explicit error, never a silent first-match default.
+const TARGET_OS: &str = "linux";
+const TARGET_ARCH: &str = "riscv64";
+
+/// Select the image manifest from an index's `manifests` descriptors. A single
+/// image manifest is unambiguous (the registry served one image); among several
+/// (a multi-platform index) the one matching the emulator's `linux/riscv64` is
+/// chosen, and a missing match is an explicit [`OciError::NoMatchingPlatform`]
+/// listing what was available — never a silently wrong architecture.
+fn select_manifest(manifests: &[Value]) -> Result<&Value, OciError> {
+    // Image manifests only — an index may also carry attestation descriptors.
+    let images: Vec<&Value> = manifests
+        .iter()
+        .filter(|d| d.get("mediaType").and_then(Value::as_str) == Some(media::MANIFEST))
+        .collect();
+    match images.as_slice() {
+        [] => Err(OciError::NoManifest),
+        [only] => Ok(only),
+        many => many
+            .iter()
+            .copied()
+            .find(|d| platform_matches(d))
+            .ok_or_else(|| OciError::NoMatchingPlatform {
+                want: format!("{TARGET_OS}/{TARGET_ARCH}"),
+                have: many.iter().map(|d| platform_label(d)).collect(),
+            }),
+    }
+}
+
+/// True if a manifest descriptor's `platform` is the emulator's `linux/riscv64`.
+fn platform_matches(desc: &Value) -> bool {
+    let Some(p) = desc.get("platform") else {
+        return false;
+    };
+    p.get("os").and_then(Value::as_str) == Some(TARGET_OS)
+        && p.get("architecture").and_then(Value::as_str) == Some(TARGET_ARCH)
+}
+
+/// A descriptor's platform as `os/arch` (for a diagnostic listing of an index).
+fn platform_label(desc: &Value) -> String {
+    let p = desc.get("platform");
+    let f = |k| {
+        p.and_then(|p| p.get(k))
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+            .to_owned()
+    };
+    format!("{}/{}", f("os"), f("architecture"))
 }
 
 /// An OCI descriptor's `digest` field (`"sha256:…"`).
@@ -281,6 +334,14 @@ pub enum OciError {
     BadIndex,
     /// The index declares no image manifest.
     NoManifest,
+    /// A multi-platform index carries no manifest for the emulator's platform
+    /// (`want`); `have` lists the `os/arch` platforms it does offer.
+    NoMatchingPlatform {
+        /// The platform the emulator needs (`linux/riscv64`).
+        want: String,
+        /// The platforms the index actually offers.
+        have: Vec<String>,
+    },
     /// An image manifest is malformed (missing config/layers/digest).
     BadManifest,
     /// A descriptor's media type is not the expected OCI type.
@@ -301,6 +362,13 @@ impl core::fmt::Display for OciError {
             OciError::BadLayout => f.write_str("oci-layout marker missing or unsupported version"),
             OciError::BadIndex => f.write_str("index.json is malformed"),
             OciError::NoManifest => f.write_str("OCI index declares no image manifest"),
+            OciError::NoMatchingPlatform { want, have } => {
+                write!(
+                    f,
+                    "OCI index has no manifest for {want}; available: {}",
+                    have.join(", ")
+                )
+            }
             OciError::BadManifest => f.write_str("OCI image manifest is malformed"),
             OciError::UnexpectedMediaType(mt) => write!(f, "unexpected OCI media type '{mt}'"),
             OciError::MissingBlob(d) => write!(f, "OCI blob {d} is absent from the layout"),
@@ -393,6 +461,52 @@ mod tests {
         let store = MemKappaStore::new();
         let err = ingest_image(&store, &layout, &index, |_| None).unwrap_err();
         assert!(matches!(err, OciError::MissingBlob(_)));
+    }
+
+    fn manifest_desc(arch: Option<&str>) -> Value {
+        match arch {
+            Some(a) => serde_json::json!({
+                "mediaType": media::MANIFEST,
+                "digest": "sha256:00",
+                "platform": { "os": "linux", "architecture": a }
+            }),
+            None => serde_json::json!({ "mediaType": media::MANIFEST, "digest": "sha256:00" }),
+        }
+    }
+
+    #[test]
+    fn a_multi_platform_index_selects_the_emulators_architecture() {
+        // A real multi-arch index: pick linux/riscv64, not the first (amd64).
+        let manifests = vec![
+            manifest_desc(Some("amd64")),
+            manifest_desc(Some("riscv64")),
+            manifest_desc(Some("arm64")),
+        ];
+        let sel = select_manifest(&manifests).unwrap();
+        assert_eq!(
+            sel.get("platform").unwrap().get("architecture").unwrap(),
+            "riscv64"
+        );
+    }
+
+    #[test]
+    fn a_single_manifest_index_is_unambiguous() {
+        // One image manifest (no platform tag) — the registry served one image.
+        let manifests = vec![manifest_desc(None)];
+        assert!(select_manifest(&manifests).is_ok());
+    }
+
+    #[test]
+    fn an_index_without_the_emulators_platform_is_an_explicit_error() {
+        let manifests = vec![manifest_desc(Some("amd64")), manifest_desc(Some("arm64"))];
+        let err = select_manifest(&manifests).unwrap_err();
+        match err {
+            OciError::NoMatchingPlatform { want, have } => {
+                assert_eq!(want, "linux/riscv64");
+                assert_eq!(have, vec!["linux/amd64", "linux/arm64"]);
+            }
+            other => panic!("expected NoMatchingPlatform, got {other:?}"),
+        }
     }
 
     #[test]

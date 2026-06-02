@@ -158,3 +158,39 @@ fn a_server_in_the_devcontainer_is_reachable_through_a_forwarded_port() {
         "a host client reached the guest server through the forwarded port (CC-21); console:\n{console}"
     );
 }
+
+/// The config's `forwardPorts` is honoured end-to-end: parsing it yields a real
+/// bound forward per declared port (a host listener bridged to the guest port),
+/// never a parsed-and-dropped field. Light (no OS boot) — it witnesses the
+/// config → ingress wiring [`DevContainer::port_forwards`] establishes.
+#[test]
+fn declared_forward_ports_are_honoured_from_the_config() {
+    use holospaces::boot::devcontainer;
+
+    let cfg = br#"{"image":"busybox","forwardPorts":[8080, 9090]}"#;
+    let dc = devcontainer::parse(cfg).expect("the config parses");
+    assert_eq!(
+        dc.forward_ports,
+        vec![8080, 9090],
+        "both declared ports are parsed"
+    );
+
+    let (ingress, bound) = dc.port_forwards().expect("the forwards bind");
+    assert_eq!(
+        bound.len(),
+        2,
+        "every declared forwardPorts entry is honoured (none dropped)"
+    );
+    assert_eq!(
+        bound.iter().map(|(_, g)| *g).collect::<Vec<_>>(),
+        vec![8080, 9090],
+        "each forward targets its declared guest port"
+    );
+    // Each forward is a *real* bound host listener: a connection to the host port
+    // is accepted (the forward exists even before the guest server is up).
+    for (host_port, _guest) in &bound {
+        TcpStream::connect(("127.0.0.1", *host_port))
+            .expect("the forwarded host port is a live listener");
+    }
+    drop(ingress);
+}

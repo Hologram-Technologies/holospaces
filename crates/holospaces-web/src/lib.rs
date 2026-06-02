@@ -644,4 +644,23 @@ impl Workspace {
         self.machine.workspace_write(name, content);
         address(content).as_str().to_owned()
     }
+
+    /// Delete a file or folder from the shared workspace (the workbench
+    /// `FileSystemProvider.delete`) — the editor removing content the OS sees
+    /// over `virtio-9p`. `true` if it existed.
+    pub fn ws_delete(&mut self, name: &str) -> bool {
+        self.machine.workspace_delete(name)
+    }
+
+    /// Rename a file or folder in the shared workspace (the workbench
+    /// `FileSystemProvider.rename`). `true` if the source existed.
+    pub fn ws_rename(&mut self, from: &str, to: &str) -> bool {
+        self.machine.workspace_rename(from, to)
+    }
+
+    /// Create a folder in the shared workspace (the workbench
+    /// `FileSystemProvider.createDirectory`).
+    pub fn ws_mkdir(&mut self, name: &str) {
+        self.machine.workspace_mkdir(name);
+    }
 }

@@ -46,6 +46,8 @@ pub enum AssemblyError {
     UnsupportedMediaType(String),
     /// The gzip stream is malformed (bad magic / method / truncated).
     BadGzip(String),
+    /// The zstd stream is malformed (bad frame / truncated).
+    BadZstd(String),
     /// The tar stream is malformed (bad header / truncated / bad numeric field).
     BadTar(String),
     /// A whiteout or entry names a path that escapes the root (`..` / absolute).
@@ -61,6 +63,7 @@ impl core::fmt::Display for AssemblyError {
                 write!(f, "unsupported layer media type: {m}")
             }
             AssemblyError::BadGzip(m) => write!(f, "malformed gzip: {m}"),
+            AssemblyError::BadZstd(m) => write!(f, "malformed zstd: {m}"),
             AssemblyError::BadTar(m) => write!(f, "malformed tar: {m}"),
             AssemblyError::BadPath(m) => write!(f, "path escapes root: {m}"),
             AssemblyError::Ext4(e) => write!(f, "ext4 serialization: {e}"),
@@ -302,21 +305,44 @@ pub fn overlay_layers(layers: &[Layer]) -> Result<Tree, AssemblyError> {
 }
 
 /// Decompress a layer (or repository archive) blob to its raw tar bytes. The
-/// codec is chosen from the gzip magic first (authoritative), then the media
-/// type — so an OCI `tar+gzip` layer, a bare `application/gzip` repository
-/// archive, and a plain `tar` all work.
+/// codec is chosen from the compression magic first (authoritative — gzip's
+/// `1f 8b`, zstd's `28 b5 2f fd`), then the media type — so an OCI `tar+gzip`
+/// layer, a `tar+zstd` layer, a bare `application/gzip` repository archive, and a
+/// plain `tar` all work.
 fn decompress(layer: &Layer) -> Result<Vec<u8>, AssemblyError> {
-    let gz = layer.blob.len() >= 2 && layer.blob[0] == 0x1f && layer.blob[1] == 0x8b;
+    let b = layer.blob;
+    let gz = b.len() >= 2 && b[0] == 0x1f && b[1] == 0x8b;
+    let zst = b.len() >= 4 && b[0] == 0x28 && b[1] == 0xb5 && b[2] == 0x2f && b[3] == 0xfd;
     let mt = layer.media_type;
     if gz || mt.contains("gzip") {
-        gunzip(layer.blob)
-    } else if mt.contains("zstd") {
-        Err(AssemblyError::UnsupportedMediaType(mt.to_string()))
+        gunzip(b)
+    } else if zst || mt.contains("zstd") {
+        unzstd(b, mt)
     } else if mt.contains("tar") || mt.is_empty() {
-        Ok(layer.blob.to_vec()) // plain (uncompressed) tar
+        Ok(b.to_vec()) // plain (uncompressed) tar
     } else {
         Err(AssemblyError::UnsupportedMediaType(mt.to_string()))
     }
+}
+
+/// Decode a Zstandard frame (RFC 8878) to bytes — OCI `tar+zstd` layers. A `std`
+/// surface (the realized ingestion peers build with std); the bare-metal core
+/// reports it unsupported rather than silently mis-reading the layer.
+#[cfg(feature = "std")]
+fn unzstd(data: &[u8], _mt: &str) -> Result<Vec<u8>, AssemblyError> {
+    use std::io::Read;
+    let mut dec = ruzstd::StreamingDecoder::new(data)
+        .map_err(|e| AssemblyError::BadZstd(alloc::format!("{e}")))?;
+    let mut out = Vec::new();
+    dec.read_to_end(&mut out)
+        .map_err(|e| AssemblyError::BadZstd(alloc::format!("{e}")))?;
+    Ok(out)
+}
+
+#[cfg(not(feature = "std"))]
+fn unzstd(_data: &[u8], mt: &str) -> Result<Vec<u8>, AssemblyError> {
+    // The bare-metal peer core links no zstd decoder; report it loudly.
+    Err(AssemblyError::UnsupportedMediaType(mt.to_string()))
 }
 
 /// Inflate a gzip member (RFC 1952 framing + RFC 1951 DEFLATE) to bytes.
@@ -853,6 +879,45 @@ mod tests {
             0xc9, 0xe7, 0x02, 0x00, 0x20, 0x30, 0x3a, 0x36, 0x06, 0x00, 0x00, 0x00,
         ];
         assert_eq!(gunzip(gz).unwrap(), b"hello\n");
+    }
+
+    #[test]
+    fn decompresses_a_real_zstd_layer() {
+        // A real Zstandard frame of "hello zstd layer\n" (produced by zstd(1)).
+        // OCI `tar+zstd` layers (BuildKit / modern registries) must decode, not
+        // be rejected. Detection is by magic (`28 b5 2f fd`) and by media type.
+        let frame: &[u8] = &[
+            0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x58, 0x89, 0x00, 0x00, 0x68, 0x65, 0x6c, 0x6c, 0x6f,
+            0x20, 0x7a, 0x73, 0x74, 0x64, 0x20, 0x6c, 0x61, 0x79, 0x65, 0x72, 0x0a, 0x59, 0xd0,
+            0x02, 0xda,
+        ];
+        let by_magic = decompress(&Layer {
+            media_type: "application/octet-stream",
+            blob: frame,
+        })
+        .unwrap();
+        assert_eq!(by_magic, b"hello zstd layer\n");
+        let by_media = decompress(&Layer {
+            media_type: "application/vnd.oci.image.layer.v1.tar+zstd",
+            blob: frame,
+        })
+        .unwrap();
+        assert_eq!(by_media, b"hello zstd layer\n");
+    }
+
+    #[test]
+    fn a_name_over_255_bytes_is_an_explicit_error_not_truncated() {
+        // ext4's directory-entry name length is one byte; a 300-byte name cannot
+        // be represented and must be reported loudly, not truncated to a collision.
+        let long = "x".repeat(300);
+        let err = assemble_ext4_with_files(&[], &[(long.as_str(), 0o644, b"data")]).unwrap_err();
+        match err {
+            AssemblyError::Ext4(ext4::Ext4Error::NameTooLong(n)) => assert_eq!(n.len(), 300),
+            other => panic!("expected NameTooLong, got {other:?}"),
+        }
+        // A 255-byte name is at the limit and is accepted.
+        let ok = "y".repeat(255);
+        assert!(assemble_ext4_with_files(&[], &[(ok.as_str(), 0o644, b"data")]).is_ok());
     }
 
     #[test]

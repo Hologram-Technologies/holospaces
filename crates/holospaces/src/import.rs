@@ -389,8 +389,9 @@ fn sha256_digest(bytes: &[u8]) -> String {
 pub struct ImportedDevcontainer {
     /// The `devcontainer.json` bytes (the repository's, or a synthesized default).
     pub config: Vec<u8>,
-    /// Whether the default image was used (the repository had no devcontainer, or
-    /// a compose source whose service resolution is not yet wired — `CC-27`).
+    /// Whether the default image was used (the repository declares no
+    /// devcontainer). A declared `image`, `build`, or `dockerComposeFile` is
+    /// always honoured — never silently defaulted.
     pub used_default: bool,
     /// The ingested, verified base image (the `image`, or a Dockerfile build's
     /// `FROM`).
