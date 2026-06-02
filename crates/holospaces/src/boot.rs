@@ -238,7 +238,7 @@ pub mod devcontainer {
         /// from outside (`CC-21`, the running-app preview). The declared number is
         /// the *guest* port; it is forwarded from the equal host port where free,
         /// else an ephemeral one. Returns the ingress (to
-        /// [attach to the machine](crate::emulator::Machine::attach_net_forward))
+        /// [attach to the machine](crate::emulator::Emulator::attach_net_forward))
         /// and the `(host_port, guest_port)` pairs actually bound — so the
         /// operator's UI can show each forwarded URL. The config's `forwardPorts`
         /// is thereby honoured end-to-end, never parsed and dropped.

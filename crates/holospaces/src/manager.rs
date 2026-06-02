@@ -238,7 +238,7 @@ impl<'a, R: ContainerRuntime> Manager<'a, R> {
     /// **driving the real lifecycle transition** (start/suspend/resume/terminate)
     /// and replacing the effective capability set. The instance's state actually
     /// changes; the panel is not just publishing intent. Returns the published
-    /// configuration κ. The returned [`Applied`]'s grants are recorded so a
+    /// configuration κ. The returned [`Applied`](crate::config::Applied)'s grants are recorded so a
     /// granted collaborator can manage the instance thereafter.
     ///
     /// # Errors
