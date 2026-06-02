@@ -385,6 +385,65 @@ fn store_le(ram: &mut [u8], o: usize, width: usize, value: u64) {
     }
 }
 
+/// A malformed [`Emulator::snapshot`] could not be [restored](Emulator::restore)
+/// — the bytes ended before a field could be read (never a valid snapshot this
+/// emulator produced).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotError {
+    /// The snapshot bytes were truncated mid-field.
+    Truncated,
+}
+
+impl core::fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            SnapshotError::Truncated => write!(f, "snapshot is truncated"),
+        }
+    }
+}
+
+impl core::error::Error for SnapshotError {}
+
+/// A little-endian cursor over [`Emulator::snapshot`] bytes — the deserialization
+/// dual of the `to_le_bytes` writes `snapshot` performs, in the same order.
+struct SnapshotReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> SnapshotReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+    fn take(&mut self, n: usize) -> Result<&'a [u8], SnapshotError> {
+        let end = self.pos.checked_add(n).ok_or(SnapshotError::Truncated)?;
+        let slice = self
+            .bytes
+            .get(self.pos..end)
+            .ok_or(SnapshotError::Truncated)?;
+        self.pos = end;
+        Ok(slice)
+    }
+    fn u8(&mut self) -> Result<u8, SnapshotError> {
+        Ok(self.take(1)?[0])
+    }
+    fn u16(&mut self) -> Result<u16, SnapshotError> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+    }
+    fn u32(&mut self) -> Result<u32, SnapshotError> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn u64(&mut self) -> Result<u64, SnapshotError> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    fn bytes(&mut self, n: usize) -> Result<&'a [u8], SnapshotError> {
+        self.take(n)
+    }
+    fn rest(&self) -> &'a [u8] {
+        &self.bytes[self.pos..]
+    }
+}
+
 /// The RISC-V **PLIC** — priority per source, a pending latch, per-context
 /// enable bits and a priority threshold, and the claim/complete handshake
 /// (RISC-V PLIC spec). Only the sources holospaces wires (the VirtIO IRQ) are
@@ -1949,6 +2008,11 @@ impl Emulator {
             Some(dev) => {
                 out.push(1);
                 out.extend_from_slice(&dev.status.to_le_bytes());
+                out.extend_from_slice(&dev.device_features_sel.to_le_bytes());
+                out.extend_from_slice(&dev.driver_features_sel.to_le_bytes());
+                out.extend_from_slice(&dev.driver_features[0].to_le_bytes());
+                out.extend_from_slice(&dev.driver_features[1].to_le_bytes());
+                out.extend_from_slice(&dev.queue_sel.to_le_bytes());
                 out.extend_from_slice(&dev.queue_num.to_le_bytes());
                 out.extend_from_slice(&dev.queue_ready.to_le_bytes());
                 out.extend_from_slice(&dev.desc_addr.to_le_bytes());
@@ -1956,12 +2020,101 @@ impl Emulator {
                 out.extend_from_slice(&dev.used_addr.to_le_bytes());
                 out.extend_from_slice(&dev.last_avail.to_le_bytes());
                 out.extend_from_slice(&dev.interrupt_status.to_le_bytes());
+                out.push(u8::from(dev.irq_pending));
                 out.extend_from_slice(&(dev.disk.len() as u64).to_le_bytes());
                 out.extend_from_slice(&dev.disk);
             }
         }
         out.extend_from_slice(&self.ram);
         out
+    }
+
+    /// Restore a machine from the bytes [`Emulator::snapshot`] produced — the
+    /// inverse that makes suspend/resume a round trip (`CC-30`). `base` is the
+    /// machine's RAM base (the construction parameter; not part of the content
+    /// snapshot). The reconstructed machine re-snapshots to the *same* bytes and
+    /// continues execution byte-identically to the machine that was suspended
+    /// (Law L1). The software TLB is a pure cache and is rebuilt empty.
+    ///
+    /// # Errors
+    ///
+    /// [`SnapshotError`] if the bytes are truncated or internally inconsistent
+    /// (a malformed snapshot, never a valid one this emulator produced).
+    pub fn restore(base: u64, bytes: &[u8]) -> Result<Self, SnapshotError> {
+        let mut r = SnapshotReader::new(bytes);
+        let mut emu = Self::new(base, 0);
+        emu.hart.pc = r.u64()?;
+        for x in &mut emu.hart.x {
+            *x = r.u64()?;
+        }
+        for f in &mut emu.hart.f {
+            *f = r.u64()?;
+        }
+        let csr_count = r.u32()?;
+        emu.csrs.clear();
+        for _ in 0..csr_count {
+            let csr = r.u32()?;
+            let value = r.u64()?;
+            emu.csrs.insert(csr, value);
+        }
+        emu.priv_level = r.u8()?;
+        emu.provide_sbi = r.u8()? != 0;
+        emu.msip = r.u8()? != 0;
+        let reservation = r.u64()?;
+        emu.reservation = (reservation != u64::MAX).then_some(reservation);
+        emu.mtime = r.u64()?;
+        emu.mtimecmp = r.u64()?;
+        let console_in_len = r.u64()? as usize;
+        emu.console_in = r.bytes(console_in_len)?.to_vec();
+        emu.in_cursor = r.u64()? as usize;
+        for p in &mut emu.plic.priority {
+            *p = r.u32()?;
+        }
+        emu.plic.pending = r.u32()?;
+        for e in &mut emu.plic.enable {
+            *e = r.u32()?;
+        }
+        for t in &mut emu.plic.threshold {
+            *t = r.u32()?;
+        }
+        emu.virtio = match r.u8()? {
+            0 => None,
+            _ => {
+                let status = r.u32()?;
+                let device_features_sel = r.u32()?;
+                let driver_features_sel = r.u32()?;
+                let driver_features = [r.u32()?, r.u32()?];
+                let queue_sel = r.u32()?;
+                let queue_num = r.u32()?;
+                let queue_ready = r.u32()?;
+                let desc_addr = r.u64()?;
+                let avail_addr = r.u64()?;
+                let used_addr = r.u64()?;
+                let last_avail = r.u16()?;
+                let interrupt_status = r.u32()?;
+                let irq_pending = r.u8()? != 0;
+                let disk_len = r.u64()? as usize;
+                let disk = r.bytes(disk_len)?.to_vec();
+                Some(VirtioBlk {
+                    disk,
+                    status,
+                    device_features_sel,
+                    driver_features_sel,
+                    driver_features,
+                    queue_sel,
+                    queue_num,
+                    queue_ready,
+                    desc_addr,
+                    avail_addr,
+                    used_addr,
+                    last_avail,
+                    interrupt_status,
+                    irq_pending,
+                })
+            }
+        };
+        emu.ram = r.rest().to_vec();
+        Ok(emu)
     }
 
     /// Run until the guest exits, traps, or `max_steps` is reached.
