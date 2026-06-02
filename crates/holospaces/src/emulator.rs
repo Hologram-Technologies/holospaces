@@ -275,6 +275,77 @@ pub(crate) const VIRTIONET_IRQ: u32 = 3;
 /// PLIC contexts for a single hart: M-mode (0) and S-mode (1).
 const PLIC_CONTEXTS: usize = 2;
 
+/// The top of the device-MMIO window: every memory-mapped device region above
+/// lies strictly below this. A physical access at or above this address cannot
+/// be a device, so the load/store fast path routes it straight to RAM without
+/// the per-access device range checks (the booting kernel's RAM is at
+/// `0x8000_0000`, far above the devices, so this is the overwhelmingly common
+/// case). The `const` assertion below pins the invariant: if a device is ever
+/// mapped at or above this address, the build fails rather than silently
+/// mis-routing it to RAM.
+const DEVICE_MMIO_END: u64 = VIRTIONET_END;
+const _: () = assert!(
+    CLINT_END <= DEVICE_MMIO_END
+        && PLIC_END <= DEVICE_MMIO_END
+        && VIRTIO_END <= DEVICE_MMIO_END
+        && VIRTIO9P_END <= DEVICE_MMIO_END
+        && VIRTIONET_END <= DEVICE_MMIO_END,
+    "every device MMIO window must lie below DEVICE_MMIO_END for the RAM fast path to be correct",
+);
+
+/// Read a little-endian integer of `width` bytes from `ram[o..]`. The caller has
+/// already bounds-checked `o + width <= ram.len()` (via `Emulator::offset`).
+/// RISC-V memory accesses are 1/2/4/8 bytes; any other width falls back to a
+/// byte loop. This replaces a per-byte shift-and-or with a single native read —
+/// bit-identical to it, since `from_le_bytes` is endianness-defined regardless
+/// of the host.
+#[inline]
+fn load_le(ram: &[u8], o: usize, width: usize) -> u64 {
+    match width {
+        1 => u64::from(ram[o]),
+        2 => u64::from(u16::from_le_bytes([ram[o], ram[o + 1]])),
+        4 => u64::from(u32::from_le_bytes([
+            ram[o],
+            ram[o + 1],
+            ram[o + 2],
+            ram[o + 3],
+        ])),
+        8 => u64::from_le_bytes([
+            ram[o],
+            ram[o + 1],
+            ram[o + 2],
+            ram[o + 3],
+            ram[o + 4],
+            ram[o + 5],
+            ram[o + 6],
+            ram[o + 7],
+        ]),
+        _ => {
+            let mut v = 0u64;
+            for i in 0..width {
+                v |= u64::from(ram[o + i]) << (8 * i);
+            }
+            v
+        }
+    }
+}
+
+/// Write the low `width` bytes of `value` little-endian into `ram[o..]`. The
+/// caller has already bounds-checked `o + width <= ram.len()`. Bit-identical to
+/// the per-byte shift-and-store it replaces.
+#[inline]
+fn store_le(ram: &mut [u8], o: usize, width: usize, value: u64) {
+    let bytes = value.to_le_bytes();
+    match width {
+        1 | 2 | 4 | 8 => ram[o..o + width].copy_from_slice(&bytes[..width]),
+        _ => {
+            for (i, b) in bytes.iter().enumerate().take(width) {
+                ram[o + i] = *b;
+            }
+        }
+    }
+}
+
 /// The RISC-V **PLIC** — priority per source, a pending latch, per-context
 /// enable bits and a priority threshold, and the claim/complete handshake
 /// (RISC-V PLIC spec). Only the sources holospaces wires (the VirtIO IRQ) are
@@ -1865,6 +1936,15 @@ impl Emulator {
     }
 
     fn load_phys(&mut self, addr: u64, width: usize) -> Result<u64, Trap> {
+        // Fast path: an access at or above the top of the device window cannot be
+        // a device, so route straight to RAM. This is the overwhelmingly common
+        // case (RAM sits at 0x8000_0000, far above every device). Semantics are
+        // identical to the device-check chain below, which falls through to RAM
+        // for exactly these addresses.
+        if addr >= DEVICE_MMIO_END {
+            let o = self.offset(addr, width)?;
+            return Ok(load_le(&self.ram, o, width));
+        }
         if (CLINT_BASE..CLINT_END).contains(&addr) {
             return Ok(self.clint_read(addr));
         }
@@ -1880,15 +1960,17 @@ impl Emulator {
         if (VIRTIONET_BASE..VIRTIONET_END).contains(&addr) {
             return Ok(self.virtionet_read(addr));
         }
+        // A sub-device-window address that matched no device — RAM (or a fault).
         let o = self.offset(addr, width)?;
-        let mut v = 0u64;
-        for i in 0..width {
-            v |= (self.ram[o + i] as u64) << (8 * i);
-        }
-        Ok(v)
+        Ok(load_le(&self.ram, o, width))
     }
 
     fn store_phys(&mut self, addr: u64, width: usize, value: u64) -> Result<(), Trap> {
+        if addr >= DEVICE_MMIO_END {
+            let o = self.offset(addr, width)?;
+            store_le(&mut self.ram, o, width, value);
+            return Ok(());
+        }
         if (CLINT_BASE..CLINT_END).contains(&addr) {
             self.clint_write(addr, value);
             return Ok(());
@@ -1910,9 +1992,7 @@ impl Emulator {
             return Ok(());
         }
         let o = self.offset(addr, width)?;
-        for i in 0..width {
-            self.ram[o + i] = (value >> (8 * i)) as u8;
-        }
+        store_le(&mut self.ram, o, width, value);
         Ok(())
     }
 
@@ -2163,27 +2243,25 @@ impl Emulator {
         match req_type {
             VIRTIO_BLK_T_IN => {
                 for (addr, len, _flags) in data {
-                    if disk_off + *len as usize > dev.disk.len() {
+                    let n = *len as usize;
+                    if disk_off + n > dev.disk.len() {
                         status = VIRTIO_BLK_S_IOERR;
                         break;
                     }
-                    for i in 0..*len as usize {
-                        self.wr8(addr + i as u64, dev.disk[disk_off + i]);
-                    }
-                    disk_off += *len as usize;
+                    self.write_phys_bytes(*addr, &dev.disk[disk_off..disk_off + n]);
+                    disk_off += n;
                     written += *len;
                 }
             }
             VIRTIO_BLK_T_OUT => {
                 for (addr, len, _flags) in data {
-                    if disk_off + *len as usize > dev.disk.len() {
+                    let n = *len as usize;
+                    if disk_off + n > dev.disk.len() {
                         status = VIRTIO_BLK_S_IOERR;
                         break;
                     }
-                    for i in 0..*len as usize {
-                        dev.disk[disk_off + i] = self.rd8(addr + i as u64);
-                    }
-                    disk_off += *len as usize;
+                    self.read_phys_bytes(*addr, &mut dev.disk[disk_off..disk_off + n]);
+                    disk_off += n;
                 }
             }
             VIRTIO_BLK_T_GET_ID => {
@@ -2225,6 +2303,35 @@ impl Emulator {
     }
     fn wr32(&mut self, a: u64, v: u32) {
         let _ = self.store_phys(a, 4, u64::from(v));
+    }
+
+    /// Copy `src` into guest physical memory at `addr`. Bulk-copies when
+    /// `[addr, addr+len)` lies wholly in RAM (the common case for a virtqueue
+    /// buffer), otherwise falls back to per-byte [`Emulator::wr8`] — preserving
+    /// its fault-swallowing semantics for a buffer that runs out of RAM or aims
+    /// at a device (identical result, just byte-at-a-time).
+    fn write_phys_bytes(&mut self, addr: u64, src: &[u8]) {
+        if let Ok(o) = self.offset(addr, src.len()) {
+            self.ram[o..o + src.len()].copy_from_slice(src);
+        } else {
+            for (i, b) in src.iter().enumerate() {
+                self.wr8(addr + i as u64, *b);
+            }
+        }
+    }
+
+    /// Read `dst.len()` bytes from guest physical memory at `addr` into `dst`.
+    /// Bulk-reads when `[addr, addr+len)` lies wholly in RAM, otherwise falls
+    /// back to per-byte [`Emulator::rd8`] (which reads 0 outside RAM) — identical
+    /// result, byte-at-a-time.
+    fn read_phys_bytes(&mut self, addr: u64, dst: &mut [u8]) {
+        if let Ok(o) = self.offset(addr, dst.len()) {
+            dst.copy_from_slice(&self.ram[o..o + dst.len()]);
+        } else {
+            for (i, b) in dst.iter_mut().enumerate() {
+                *b = self.rd8(addr + i as u64);
+            }
+        }
     }
 
     // ── VirtIO 9P device (the shared workspace filesystem; CC-15) ──
