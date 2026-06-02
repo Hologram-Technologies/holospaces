@@ -52,6 +52,12 @@ libm                    = "0.2"
 # `tar+gzip` layers — pure-Rust, alloc-only (no std), so it compiles into the
 # portable peer core alongside the κ-disk.
 miniz_oxide             = { version = "0.8", default-features = false, features = ["with-alloc"] }
+# The pure-Rust Zstandard decoder the Layer Assembler uses to decompress OCI
+# `tar+zstd` layers (BuildKit / modern registries serve these). A `std` surface
+# (the realized ingestion peers — the host importer and the browser wasm — both
+# build with std); the bare-metal core reports zstd unsupported rather than
+# silently mis-reading it.
+ruzstd                  = "0.7"
 
 # Quality commitments enforced from the beginning (arc42 ch.10). CI runs clippy
 # with `-D warnings`, so every workspace member upholds these.

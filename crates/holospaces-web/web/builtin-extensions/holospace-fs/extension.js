@@ -101,9 +101,29 @@ class HolospaceFS {
     ws.ws_write(nameOf(uri), content);
     this._emitter.fire([{ type: vscode.FileChangeType.Changed, uri }]);
   }
-  createDirectory() {}
-  delete() {}
-  rename() {}
+  // The mutating operations are the host-side duals of the 9P backend's
+  // Tmkdir / Tunlinkat / Trenameat — the editor changing the *same* workspace
+  // content the running OS sees over virtio-9p (one content, Law L1).
+  async createDirectory(uri) {
+    await readyPromise;
+    ws.ws_mkdir(nameOf(uri));
+    this._emitter.fire([{ type: vscode.FileChangeType.Created, uri }]);
+  }
+  async delete(uri) {
+    await readyPromise;
+    if (!ws.ws_delete(nameOf(uri))) throw FileSystemError.FileNotFound(uri);
+    this._emitter.fire([{ type: vscode.FileChangeType.Deleted, uri }]);
+  }
+  async rename(oldUri, newUri) {
+    await readyPromise;
+    if (!ws.ws_rename(nameOf(oldUri), nameOf(newUri))) {
+      throw FileSystemError.FileNotFound(oldUri);
+    }
+    this._emitter.fire([
+      { type: vscode.FileChangeType.Deleted, uri: oldUri },
+      { type: vscode.FileChangeType.Created, uri: newUri },
+    ]);
+  }
 }
 
 // ── The integrated terminal over the OS console (CC-11) ─────────────────────

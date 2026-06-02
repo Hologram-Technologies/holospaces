@@ -162,7 +162,8 @@ pub mod devcontainer {
         /// Ports the config forwards (`forwardPorts`) — a server the devcontainer
         /// runs on one of these is reachable from outside as a forwarded port /
         /// app preview (`CC-21`). Each is a TCP port number (the `host:port`
-        /// string form keeps the port).
+        /// string form keeps the port). Honoured by [`DevContainer::port_forwards`],
+        /// which binds a live host listener per port — never parsed and dropped.
         pub forward_ports: Vec<u16>,
         /// The lifecycle commands the config declares, in spec run-order
         /// (`onCreateCommand`, `updateContentCommand`, `postCreateCommand`,
@@ -224,6 +225,38 @@ pub mod devcontainer {
     }
 
     impl DevContainer {
+        /// Build the forwarded-port ingress this devcontainer declares
+        /// (`forwardPorts`) — a host listener per declared port, bridged to the
+        /// guest's listening port, so a server the devcontainer runs is reachable
+        /// from outside (`CC-21`, the running-app preview). The declared number is
+        /// the *guest* port; it is forwarded from the equal host port where free,
+        /// else an ephemeral one. Returns the ingress (to
+        /// [attach to the machine](crate::emulator::Machine::attach_net_forward))
+        /// and the `(host_port, guest_port)` pairs actually bound — so the
+        /// operator's UI can show each forwarded URL. The config's `forwardPorts`
+        /// is thereby honoured end-to-end, never parsed and dropped.
+        ///
+        /// # Errors
+        ///
+        /// An [`std::io::Error`] if a declared port cannot be bound to any host
+        /// port (the listener cannot be opened).
+        pub fn port_forwards(
+            &self,
+        ) -> std::io::Result<(crate::emulator::net::StdIngress, Vec<(u16, u16)>)> {
+            let mut ingress = crate::emulator::net::StdIngress::new();
+            let mut bound = Vec::with_capacity(self.forward_ports.len());
+            for &guest in &self.forward_ports {
+                // Prefer the same host port (Codespaces parity); on conflict take
+                // an ephemeral one rather than dropping the forward.
+                let host = match ingress.forward(guest, guest) {
+                    Ok(p) => p,
+                    Err(_) => ingress.forward(0, guest)?,
+                };
+                bound.push((host, guest));
+            }
+            Ok((ingress, bound))
+        }
+
         /// Build the `/init` the Boot Orchestrator injects to run this
         /// devcontainer's lifecycle commands in the booted OS (`CC-22`): a busybox
         /// shell script that exports the config's `remoteEnv`, runs each lifecycle

@@ -80,6 +80,10 @@ pub enum Ext4Error {
     /// (≈1360 — only reachable by a multi-hundred-TB maximally-fragmented file).
     /// Reported loudly rather than silently truncated.
     TooManyExtents(u32),
+    /// A directory-entry name exceeds ext4's 255-byte limit. Reported loudly
+    /// rather than silently truncated to a colliding name (the field is one
+    /// byte; a longer name cannot be represented and must not be corrupted).
+    NameTooLong(String),
 }
 
 impl core::fmt::Display for Ext4Error {
@@ -89,8 +93,35 @@ impl core::fmt::Display for Ext4Error {
             Ext4Error::TooManyExtents(ino) => {
                 write!(f, "inode {ino} needs a deeper extent tree than implemented")
             }
+            Ext4Error::NameTooLong(name) => {
+                write!(
+                    f,
+                    "directory entry name exceeds ext4's 255-byte limit ({} bytes): {name}",
+                    name.len()
+                )
+            }
         }
     }
+}
+
+/// ext4's directory-entry name length field is one byte: a component longer than
+/// 255 bytes cannot be represented and must be reported, never truncated.
+const MAX_NAME_LEN: usize = 255;
+
+/// Reject any directory-entry name longer than [`MAX_NAME_LEN`] anywhere in the
+/// tree (ext4's per-component limit) before serialization — so a too-long name
+/// is an explicit [`Ext4Error::NameTooLong`], never a silent one-byte truncation
+/// that would collide two distinct files onto one entry.
+fn check_names(node: &Node) -> Result<(), Ext4Error> {
+    if let Node::Dir { children, .. } = node {
+        for (name, child) in children {
+            if name.len() > MAX_NAME_LEN {
+                return Err(Ext4Error::NameTooLong(name.clone()));
+            }
+            check_names(child)?;
+        }
+    }
+    Ok(())
 }
 
 // ── The flattened inode model ──────────────────────────────────────────────
@@ -124,6 +155,7 @@ pub fn write_image(tree: &Tree) -> Result<Vec<u8>, Ext4Error> {
     let Node::Dir { .. } = &tree.root else {
         return Err(Ext4Error::RootNotDir);
     };
+    check_names(&tree.root)?;
 
     // Pass 1 — assign inode numbers and build the inode list (root=2, lost+found
     // =11, the rest 12..). Hard links (files sharing a content id) share one
