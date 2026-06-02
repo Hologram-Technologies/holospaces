@@ -1,0 +1,36 @@
+CC-27 — Docker Compose devcontainer authority artifacts.
+
+A devcontainer.json may declare its container with a `dockerComposeFile` and a
+`service` (the service that IS the devcontainer). holospaces honours it: it reads
+the compose file from the repository and resolves the named service's image
+source — its `image` (a prebuilt image, pulled like CC-20) or its `build` (a
+Dockerfile build, CC-26) — and provisions from it. A missing or ambiguous service
+is an explicit error, never a silent default. Multi-service orchestration (the
+other services) is out of scope for a single devcontainer.
+
+Authorities
+-----------
+Compose specification — the services.<name>.{image | build} model (block style).
+  holospaces::compose parses the subset a devcontainer uses and resolves the
+  selected service; a service with neither image nor build, or a missing/ambiguous
+  service, is an explicit error.
+
+Dev Container spec — `dockerComposeFile` (one or more files) + `service`.
+
+Artifacts
+---------
+vv/artifacts/cc27/repo.tar.gz — a hermetic repository archive declaring a compose
+  devcontainer (.devcontainer/{devcontainer.json with dockerComposeFile+service,
+  docker-compose.yml with an `app` and a `db` service}); the compose file is also
+  kept at vv/artifacts/cc27/docker-compose.yml.
+
+Witness — crates/holospaces/tests/cc27_compose.rs + the holospaces::compose unit
+  tests; suite vv/suites/cc27-compose.sh:
+  unit — resolve_service resolves the named service's image; a build service to a
+    Build (context/dockerfile/args); a missing service is ServiceNotFound; multiple
+    services with no selection is AmbiguousService — never a silent default;
+  (import) — from the repository archive, holospaces finds the devcontainer.json,
+    parses it to a Compose source (the file path + service retained), reads the
+    compose file from the repository, and resolves the `app` service to its image
+    (holospaces/busybox:latest) — not the `db` service, not the default; an
+    undeclared service is refused.

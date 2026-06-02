@@ -87,6 +87,10 @@ extern crate alloc;
 /// no_std + alloc — part of the portable peer core, like the κ-disk it feeds.
 pub mod assembly;
 pub mod boot;
+/// Docker Compose service resolution for a `dockerComposeFile` Dev Container
+/// (`CC-27`); a host-side provisioning surface, `std` only.
+#[cfg(feature = "std")]
+pub mod compose;
 pub mod disk;
 /// Dockerfile parsing + substrate-native build of a `build.dockerfile` Dev
 /// Container (`CC-26`); a host-side provisioning surface, `std` only.
