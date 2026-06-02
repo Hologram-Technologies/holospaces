@@ -73,21 +73,32 @@ try {
 
   // The workbench called the served FileSystemProvider's readDirectory and
   // presents the holospace's workspace tree (the supported mechanism delivered
-  // the holospace's files to the real workbench — not an embedder hack).
-  // Focus the Explorer (in case the workbench restored another viewlet) so the
-  // folders tree renders, then poll a generous window — a real, fatal assertion.
+  // the holospace's files to the real workbench — not an embedder hack). Assert
+  // the *actual files we placed* render — README.md / main.rs / src — (when a
+  // single folder is opened the rows are its contents, not the "mount" root
+  // label). Focus the Explorer first, poll a generous window — a real, fatal
+  // assertion of file delivery.
   await page.keyboard.press("Control+Shift+E").catch(() => {});
+  const WANT = "mount|README\\.md|main\\.rs|(^|[^a-z])src([^a-z]|$)";
   const mounted = await page
     .waitForFunction(
-      () => {
+      (re) => {
         const rows = [...document.querySelectorAll(".explorer-folders-view .monaco-list-row")];
-        return rows.length > 0 && rows.some((r) => /mount/.test(r.textContent || ""));
+        return rows.some((r) => new RegExp(re).test(r.textContent || ""));
       },
-      null,
+      WANT,
       { timeout: 90000, polling: 500 },
     )
     .then(() => true)
     .catch(() => false);
+  if (!mounted) {
+    // Make a genuine miss legible (never a silent failure): dump what the
+    // explorer actually rendered.
+    const rows = await page.evaluate(() =>
+      [...document.querySelectorAll(".explorer-folders-view .monaco-list-row")].map((r) => r.textContent),
+    );
+    console.error("  explorer rows rendered:", JSON.stringify(rows));
+  }
   check(mounted, "the workbench rendered the holospace workspace from the FileSystemProvider (its readDirectory reached the real editor)");
 
   // Best-effort: open a file and render its content (the explorer's nested
