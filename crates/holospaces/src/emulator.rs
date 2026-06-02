@@ -168,7 +168,7 @@ pub enum Trap {
 
 /// The kind of guest memory access (selects the page-table permission bit and
 /// the page-fault cause).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Access {
     Fetch,
     Load,
@@ -235,6 +235,18 @@ pub struct Emulator {
     /// The VirtIO network device + userspace TCP/IP NAT, when networking is
     /// attached (`CC-16`); `None` for an offline machine.
     virtionet: Option<VirtioNet>,
+    /// A software TLB over [`Emulator::translate`]: a direct-mapped cache (per
+    /// access class) of virtual-page → physical-frame translations, so a hot loop
+    /// does not re-walk the page table on every fetch/load/store. Flushed (by
+    /// bumping `tlb_gen`) on every change to the translation context — SFENCE.VMA,
+    /// a `satp` write, a translation-relevant `mstatus`/`sstatus` change, and
+    /// every privilege transition — so a hit is always valid for the current
+    /// context. It is a pure cache, reconstructable from the page tables, so it is
+    /// deliberately *not* part of the κ snapshot (and a resumed machine rebuilds
+    /// it from a clean flush).
+    tlb: Box<[[TlbEntry; TLB_SETS]; 3]>,
+    /// The current TLB generation; an entry is live iff its `gen` matches.
+    tlb_gen: u64,
 }
 
 /// The CLINT memory-mapped region (one hart): `msip` at +0, `mtimecmp` at
@@ -274,6 +286,166 @@ pub(crate) const VIRTIONET_END: u64 = 0x1000_4000;
 pub(crate) const VIRTIONET_IRQ: u32 = 3;
 /// PLIC contexts for a single hart: M-mode (0) and S-mode (1).
 const PLIC_CONTEXTS: usize = 2;
+
+/// The top of the device-MMIO window: every memory-mapped device region above
+/// lies strictly below this. A physical access at or above this address cannot
+/// be a device, so the load/store fast path routes it straight to RAM without
+/// the per-access device range checks (the booting kernel's RAM is at
+/// `0x8000_0000`, far above the devices, so this is the overwhelmingly common
+/// case). The `const` assertion below pins the invariant: if a device is ever
+/// mapped at or above this address, the build fails rather than silently
+/// mis-routing it to RAM.
+const DEVICE_MMIO_END: u64 = VIRTIONET_END;
+const _: () = assert!(
+    CLINT_END <= DEVICE_MMIO_END
+        && PLIC_END <= DEVICE_MMIO_END
+        && VIRTIO_END <= DEVICE_MMIO_END
+        && VIRTIO9P_END <= DEVICE_MMIO_END
+        && VIRTIONET_END <= DEVICE_MMIO_END,
+    "every device MMIO window must lie below DEVICE_MMIO_END for the RAM fast path to be correct",
+);
+
+/// Software-TLB geometry: a direct-mapped translation cache per access class
+/// (fetch/load/store), `TLB_SETS` sets each. A power of two so the set index is
+/// a mask. 256 sets per class covers a large working set while staying small.
+const TLB_SETS: usize = 256;
+const TLB_MASK: u64 = TLB_SETS as u64 - 1;
+
+/// `mstatus` bits that change address translation — MPRV (17), SUM (18),
+/// MXR (19), and MPP (12:11). A write that touches any of these invalidates the
+/// TLB; one that does not (e.g. the FS dirty bits an FP op sets) does not, so the
+/// hot path is not flushed for unrelated `mstatus` traffic.
+const MSTATUS_XLATE_BITS: u64 = (1 << 17) | (1 << 18) | (1 << 19) | (3 << 11);
+
+/// One software-TLB entry: a cached virtual-page → physical-frame translation.
+/// Valid iff `gen` equals the emulator's current `tlb_gen` (a generation bump is
+/// a whole-TLB flush — see [`Emulator::tlb_flush`]).
+#[derive(Clone, Copy)]
+struct TlbEntry {
+    /// The virtual page number (`vaddr >> 12`) this entry translates.
+    tag: u64,
+    /// The physical 4 KiB frame base (low 12 bits zero); the full address is
+    /// `frame | (vaddr & 0xfff)` — correct for any page size, since the low 12
+    /// bits always pass through.
+    frame: u64,
+    /// The generation this entry was filled in; stale once `tlb_gen` moves on.
+    gen: u64,
+}
+
+/// Read a little-endian integer of `width` bytes from `ram[o..]`. The caller has
+/// already bounds-checked `o + width <= ram.len()` (via `Emulator::offset`).
+/// RISC-V memory accesses are 1/2/4/8 bytes; any other width falls back to a
+/// byte loop. This replaces a per-byte shift-and-or with a single native read —
+/// bit-identical to it, since `from_le_bytes` is endianness-defined regardless
+/// of the host.
+#[inline]
+fn load_le(ram: &[u8], o: usize, width: usize) -> u64 {
+    match width {
+        1 => u64::from(ram[o]),
+        2 => u64::from(u16::from_le_bytes([ram[o], ram[o + 1]])),
+        4 => u64::from(u32::from_le_bytes([
+            ram[o],
+            ram[o + 1],
+            ram[o + 2],
+            ram[o + 3],
+        ])),
+        8 => u64::from_le_bytes([
+            ram[o],
+            ram[o + 1],
+            ram[o + 2],
+            ram[o + 3],
+            ram[o + 4],
+            ram[o + 5],
+            ram[o + 6],
+            ram[o + 7],
+        ]),
+        _ => {
+            let mut v = 0u64;
+            for i in 0..width {
+                v |= u64::from(ram[o + i]) << (8 * i);
+            }
+            v
+        }
+    }
+}
+
+/// Write the low `width` bytes of `value` little-endian into `ram[o..]`. The
+/// caller has already bounds-checked `o + width <= ram.len()`. Bit-identical to
+/// the per-byte shift-and-store it replaces.
+#[inline]
+fn store_le(ram: &mut [u8], o: usize, width: usize, value: u64) {
+    let bytes = value.to_le_bytes();
+    match width {
+        1 | 2 | 4 | 8 => ram[o..o + width].copy_from_slice(&bytes[..width]),
+        _ => {
+            for (i, b) in bytes.iter().enumerate().take(width) {
+                ram[o + i] = *b;
+            }
+        }
+    }
+}
+
+/// A malformed [`Emulator::snapshot`] could not be [restored](Emulator::restore)
+/// — the bytes ended before a field could be read (never a valid snapshot this
+/// emulator produced).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotError {
+    /// The snapshot bytes were truncated mid-field.
+    Truncated,
+    /// A field held an invalid value (e.g. a non-UTF-8 9P path name).
+    Malformed,
+}
+
+impl core::fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            SnapshotError::Truncated => write!(f, "snapshot is truncated"),
+            SnapshotError::Malformed => write!(f, "snapshot field is malformed"),
+        }
+    }
+}
+
+impl core::error::Error for SnapshotError {}
+
+/// A little-endian cursor over [`Emulator::snapshot`] bytes — the deserialization
+/// dual of the `to_le_bytes` writes `snapshot` performs, in the same order.
+struct SnapshotReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> SnapshotReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+    fn take(&mut self, n: usize) -> Result<&'a [u8], SnapshotError> {
+        let end = self.pos.checked_add(n).ok_or(SnapshotError::Truncated)?;
+        let slice = self
+            .bytes
+            .get(self.pos..end)
+            .ok_or(SnapshotError::Truncated)?;
+        self.pos = end;
+        Ok(slice)
+    }
+    fn u8(&mut self) -> Result<u8, SnapshotError> {
+        Ok(self.take(1)?[0])
+    }
+    fn u16(&mut self) -> Result<u16, SnapshotError> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+    }
+    fn u32(&mut self) -> Result<u32, SnapshotError> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn u64(&mut self) -> Result<u64, SnapshotError> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    fn bytes(&mut self, n: usize) -> Result<&'a [u8], SnapshotError> {
+        self.take(n)
+    }
+    fn rest(&self) -> &'a [u8] {
+        &self.bytes[self.pos..]
+    }
+}
 
 /// The RISC-V **PLIC** — priority per source, a pending latch, per-context
 /// enable bits and a priority threshold, and the claim/complete handshake
@@ -631,6 +803,66 @@ mod ninep {
                 }
             }
             out
+        }
+
+        /// Serialize the filesystem into a machine snapshot — every inode (the
+        /// `BTreeMap` iterates in id order, and each inode's children in name
+        /// order, so the bytes are deterministic and the snapshot κ reproducible,
+        /// Law L1). The dual of [`Fs9p::restore`].
+        pub fn snapshot_into(&self, out: &mut Vec<u8>) {
+            out.extend_from_slice(&self.next.to_le_bytes());
+            out.extend_from_slice(&(self.inodes.len() as u64).to_le_bytes());
+            for (id, node) in &self.inodes {
+                out.extend_from_slice(&id.to_le_bytes());
+                out.push(u8::from(node.is_dir));
+                out.extend_from_slice(&node.mode.to_le_bytes());
+                out.extend_from_slice(&(node.data.len() as u64).to_le_bytes());
+                out.extend_from_slice(&node.data);
+                out.extend_from_slice(&(node.children.len() as u64).to_le_bytes());
+                for (name, child) in &node.children {
+                    out.extend_from_slice(&(name.len() as u64).to_le_bytes());
+                    out.extend_from_slice(name.as_bytes());
+                    out.extend_from_slice(&child.to_le_bytes());
+                }
+            }
+        }
+
+        /// Reconstruct a filesystem from snapshot bytes (the inverse of
+        /// [`Fs9p::snapshot_into`]).
+        ///
+        /// # Errors
+        ///
+        /// [`super::SnapshotError`] if the bytes are truncated or a path name is
+        /// not valid UTF-8.
+        pub fn restore(r: &mut super::SnapshotReader) -> Result<Self, super::SnapshotError> {
+            let next = r.u64()?;
+            let count = r.u64()?;
+            let mut inodes = BTreeMap::new();
+            for _ in 0..count {
+                let id = r.u64()?;
+                let is_dir = r.u8()? != 0;
+                let mode = r.u32()?;
+                let data_len = r.u64()? as usize;
+                let data = r.bytes(data_len)?.to_vec();
+                let nchild = r.u64()?;
+                let mut children = BTreeMap::new();
+                for _ in 0..nchild {
+                    let name_len = r.u64()? as usize;
+                    let name = String::from_utf8(r.bytes(name_len)?.to_vec())
+                        .map_err(|_| super::SnapshotError::Malformed)?;
+                    children.insert(name, r.u64()?);
+                }
+                inodes.insert(
+                    id,
+                    Inode {
+                        is_dir,
+                        mode,
+                        data,
+                        children,
+                    },
+                );
+            }
+            Ok(Fs9p { inodes, next })
         }
 
         /// Write a root file (update in place, or create) — the editor saving
@@ -1292,6 +1524,16 @@ impl Emulator {
             virtio: None,
             virtio9p: None,
             virtionet: None,
+            // Entries default to gen 0; starting `tlb_gen` at 1 means no entry is
+            // live until it is filled (no false hit on a zeroed slot).
+            tlb: Box::new(
+                [[TlbEntry {
+                    tag: 0,
+                    frame: 0,
+                    gen: 0,
+                }; TLB_SETS]; 3],
+            ),
+            tlb_gen: 1,
         }
     }
 
@@ -1447,9 +1689,19 @@ impl Emulator {
     fn csr_write(&mut self, csr: u32, value: u64) {
         match csr {
             csr::SSTATUS => {
-                let m =
-                    (self.raw_csr(csr::MSTATUS) & !csr::SSTATUS_MASK) | (value & csr::SSTATUS_MASK);
+                let old = self.raw_csr(csr::MSTATUS);
+                let m = (old & !csr::SSTATUS_MASK) | (value & csr::SSTATUS_MASK);
                 self.csrs.insert(csr::MSTATUS, m);
+                if (old ^ m) & MSTATUS_XLATE_BITS != 0 {
+                    self.tlb_flush();
+                }
+            }
+            csr::MSTATUS => {
+                let old = self.raw_csr(csr::MSTATUS);
+                self.csrs.insert(csr::MSTATUS, value);
+                if (old ^ value) & MSTATUS_XLATE_BITS != 0 {
+                    self.tlb_flush();
+                }
             }
             csr::SIE => {
                 let m = (self.raw_csr(csr::MIE) & !csr::S_INT_MASK) | (value & csr::S_INT_MASK);
@@ -1495,6 +1747,8 @@ impl Emulator {
                     value & !(0xfu64 << 60)
                 };
                 self.csrs.insert(0x180, v);
+                // A new root page table / ASID: the whole TLB is now stale.
+                self.tlb_flush();
             }
             _ => {
                 self.csrs.insert(csr, value);
@@ -1611,6 +1865,9 @@ impl Emulator {
             self.priv_level = PRIV_M;
             self.hart.pc = trap_vector(self.csr_read(csr::MTVEC), is_int, code);
         }
+        // A trap changes the privilege level (and `mstatus`), so the effective
+        // translation context changes — invalidate the TLB.
+        self.tlb_flush();
     }
 
     /// Return from a machine-mode trap (`mret`).
@@ -1624,6 +1881,7 @@ impl Emulator {
         self.csrs.insert(csr::MSTATUS, st);
         self.priv_level = mpp as u8;
         self.hart.pc = self.csr_read(csr::MEPC);
+        self.tlb_flush();
     }
 
     /// Return from a supervisor-mode trap (`sret`).
@@ -1637,6 +1895,7 @@ impl Emulator {
         self.csrs.insert(csr::MSTATUS, st);
         self.priv_level = spp as u8;
         self.hart.pc = self.csr_read(csr::SEPC);
+        self.tlb_flush();
     }
 
     /// Load a flat guest image at `base` and set the reset PC there.
@@ -1812,6 +2071,11 @@ impl Emulator {
             Some(dev) => {
                 out.push(1);
                 out.extend_from_slice(&dev.status.to_le_bytes());
+                out.extend_from_slice(&dev.device_features_sel.to_le_bytes());
+                out.extend_from_slice(&dev.driver_features_sel.to_le_bytes());
+                out.extend_from_slice(&dev.driver_features[0].to_le_bytes());
+                out.extend_from_slice(&dev.driver_features[1].to_le_bytes());
+                out.extend_from_slice(&dev.queue_sel.to_le_bytes());
                 out.extend_from_slice(&dev.queue_num.to_le_bytes());
                 out.extend_from_slice(&dev.queue_ready.to_le_bytes());
                 out.extend_from_slice(&dev.desc_addr.to_le_bytes());
@@ -1819,12 +2083,179 @@ impl Emulator {
                 out.extend_from_slice(&dev.used_addr.to_le_bytes());
                 out.extend_from_slice(&dev.last_avail.to_le_bytes());
                 out.extend_from_slice(&dev.interrupt_status.to_le_bytes());
+                out.push(u8::from(dev.irq_pending));
                 out.extend_from_slice(&(dev.disk.len() as u64).to_le_bytes());
                 out.extend_from_slice(&dev.disk);
             }
         }
+        // The VirtIO 9P device: its transport state, the fid table, the mount
+        // tag, and the shared workspace filesystem itself (the user's files) —
+        // so a suspended *workspace* resumes with its content intact (`CC-15`).
+        match &self.virtio9p {
+            None => out.push(0),
+            Some(dev) => {
+                out.push(1);
+                out.extend_from_slice(&dev.status.to_le_bytes());
+                out.extend_from_slice(&dev.device_features_sel.to_le_bytes());
+                out.extend_from_slice(&dev.driver_features_sel.to_le_bytes());
+                out.extend_from_slice(&dev.driver_features[0].to_le_bytes());
+                out.extend_from_slice(&dev.driver_features[1].to_le_bytes());
+                out.extend_from_slice(&dev.queue_num.to_le_bytes());
+                out.extend_from_slice(&dev.queue_ready.to_le_bytes());
+                out.extend_from_slice(&dev.desc_addr.to_le_bytes());
+                out.extend_from_slice(&dev.avail_addr.to_le_bytes());
+                out.extend_from_slice(&dev.used_addr.to_le_bytes());
+                out.extend_from_slice(&dev.last_avail.to_le_bytes());
+                out.extend_from_slice(&dev.interrupt_status.to_le_bytes());
+                out.push(u8::from(dev.irq_pending));
+                out.extend_from_slice(&(dev.tag.len() as u64).to_le_bytes());
+                out.extend_from_slice(dev.tag.as_bytes());
+                out.extend_from_slice(&(dev.fids.len() as u64).to_le_bytes());
+                for (fid, ino) in &dev.fids {
+                    out.extend_from_slice(&fid.to_le_bytes());
+                    out.extend_from_slice(&ino.to_le_bytes());
+                }
+                dev.fs.snapshot_into(&mut out);
+            }
+        }
+        // VirtIO networking is deliberately *not* snapshotted: its egress/ingress
+        // are live, external transports (a host socket, or a WebSocket to a relay)
+        // that cannot be frozen into content. A resumed machine re-establishes its
+        // network — connections reset, exactly as a host does on wake.
         out.extend_from_slice(&self.ram);
         out
+    }
+
+    /// Restore a machine from the bytes [`Emulator::snapshot`] produced — the
+    /// inverse that makes suspend/resume a round trip (`CC-30`). `base` is the
+    /// machine's RAM base (the construction parameter; not part of the content
+    /// snapshot). The reconstructed machine re-snapshots to the *same* bytes and
+    /// continues execution byte-identically to the machine that was suspended
+    /// (Law L1). The software TLB is a pure cache and is rebuilt empty.
+    ///
+    /// # Errors
+    ///
+    /// [`SnapshotError`] if the bytes are truncated or internally inconsistent
+    /// (a malformed snapshot, never a valid one this emulator produced).
+    pub fn restore(base: u64, bytes: &[u8]) -> Result<Self, SnapshotError> {
+        let mut r = SnapshotReader::new(bytes);
+        let mut emu = Self::new(base, 0);
+        emu.hart.pc = r.u64()?;
+        for x in &mut emu.hart.x {
+            *x = r.u64()?;
+        }
+        for f in &mut emu.hart.f {
+            *f = r.u64()?;
+        }
+        let csr_count = r.u32()?;
+        emu.csrs.clear();
+        for _ in 0..csr_count {
+            let csr = r.u32()?;
+            let value = r.u64()?;
+            emu.csrs.insert(csr, value);
+        }
+        emu.priv_level = r.u8()?;
+        emu.provide_sbi = r.u8()? != 0;
+        emu.msip = r.u8()? != 0;
+        let reservation = r.u64()?;
+        emu.reservation = (reservation != u64::MAX).then_some(reservation);
+        emu.mtime = r.u64()?;
+        emu.mtimecmp = r.u64()?;
+        let console_in_len = r.u64()? as usize;
+        emu.console_in = r.bytes(console_in_len)?.to_vec();
+        emu.in_cursor = r.u64()? as usize;
+        for p in &mut emu.plic.priority {
+            *p = r.u32()?;
+        }
+        emu.plic.pending = r.u32()?;
+        for e in &mut emu.plic.enable {
+            *e = r.u32()?;
+        }
+        for t in &mut emu.plic.threshold {
+            *t = r.u32()?;
+        }
+        emu.virtio = match r.u8()? {
+            0 => None,
+            _ => {
+                let status = r.u32()?;
+                let device_features_sel = r.u32()?;
+                let driver_features_sel = r.u32()?;
+                let driver_features = [r.u32()?, r.u32()?];
+                let queue_sel = r.u32()?;
+                let queue_num = r.u32()?;
+                let queue_ready = r.u32()?;
+                let desc_addr = r.u64()?;
+                let avail_addr = r.u64()?;
+                let used_addr = r.u64()?;
+                let last_avail = r.u16()?;
+                let interrupt_status = r.u32()?;
+                let irq_pending = r.u8()? != 0;
+                let disk_len = r.u64()? as usize;
+                let disk = r.bytes(disk_len)?.to_vec();
+                Some(VirtioBlk {
+                    disk,
+                    status,
+                    device_features_sel,
+                    driver_features_sel,
+                    driver_features,
+                    queue_sel,
+                    queue_num,
+                    queue_ready,
+                    desc_addr,
+                    avail_addr,
+                    used_addr,
+                    last_avail,
+                    interrupt_status,
+                    irq_pending,
+                })
+            }
+        };
+        emu.virtio9p = match r.u8()? {
+            0 => None,
+            _ => {
+                let status = r.u32()?;
+                let device_features_sel = r.u32()?;
+                let driver_features_sel = r.u32()?;
+                let driver_features = [r.u32()?, r.u32()?];
+                let queue_num = r.u32()?;
+                let queue_ready = r.u32()?;
+                let desc_addr = r.u64()?;
+                let avail_addr = r.u64()?;
+                let used_addr = r.u64()?;
+                let last_avail = r.u16()?;
+                let interrupt_status = r.u32()?;
+                let irq_pending = r.u8()? != 0;
+                let tag_len = r.u64()? as usize;
+                let tag = alloc::string::String::from_utf8(r.bytes(tag_len)?.to_vec())
+                    .map_err(|_| SnapshotError::Malformed)?;
+                let nfids = r.u64()?;
+                let mut fids = BTreeMap::new();
+                for _ in 0..nfids {
+                    let fid = r.u32()?;
+                    fids.insert(fid, r.u64()?);
+                }
+                let fs = ninep::Fs9p::restore(&mut r)?;
+                Some(Virtio9p {
+                    fs,
+                    fids,
+                    tag,
+                    status,
+                    device_features_sel,
+                    driver_features_sel,
+                    driver_features,
+                    queue_num,
+                    queue_ready,
+                    desc_addr,
+                    avail_addr,
+                    used_addr,
+                    last_avail,
+                    interrupt_status,
+                    irq_pending,
+                })
+            }
+        };
+        emu.ram = r.rest().to_vec();
+        Ok(emu)
     }
 
     /// Run until the guest exits, traps, or `max_steps` is reached.
@@ -1865,6 +2296,15 @@ impl Emulator {
     }
 
     fn load_phys(&mut self, addr: u64, width: usize) -> Result<u64, Trap> {
+        // Fast path: an access at or above the top of the device window cannot be
+        // a device, so route straight to RAM. This is the overwhelmingly common
+        // case (RAM sits at 0x8000_0000, far above every device). Semantics are
+        // identical to the device-check chain below, which falls through to RAM
+        // for exactly these addresses.
+        if addr >= DEVICE_MMIO_END {
+            let o = self.offset(addr, width)?;
+            return Ok(load_le(&self.ram, o, width));
+        }
         if (CLINT_BASE..CLINT_END).contains(&addr) {
             return Ok(self.clint_read(addr));
         }
@@ -1880,15 +2320,17 @@ impl Emulator {
         if (VIRTIONET_BASE..VIRTIONET_END).contains(&addr) {
             return Ok(self.virtionet_read(addr));
         }
+        // A sub-device-window address that matched no device — RAM (or a fault).
         let o = self.offset(addr, width)?;
-        let mut v = 0u64;
-        for i in 0..width {
-            v |= (self.ram[o + i] as u64) << (8 * i);
-        }
-        Ok(v)
+        Ok(load_le(&self.ram, o, width))
     }
 
     fn store_phys(&mut self, addr: u64, width: usize, value: u64) -> Result<(), Trap> {
+        if addr >= DEVICE_MMIO_END {
+            let o = self.offset(addr, width)?;
+            store_le(&mut self.ram, o, width, value);
+            return Ok(());
+        }
         if (CLINT_BASE..CLINT_END).contains(&addr) {
             self.clint_write(addr, value);
             return Ok(());
@@ -1910,9 +2352,7 @@ impl Emulator {
             return Ok(());
         }
         let o = self.offset(addr, width)?;
-        for i in 0..width {
-            self.ram[o + i] = (value >> (8 * i)) as u8;
-        }
+        store_le(&mut self.ram, o, width, value);
         Ok(())
     }
 
@@ -2163,27 +2603,25 @@ impl Emulator {
         match req_type {
             VIRTIO_BLK_T_IN => {
                 for (addr, len, _flags) in data {
-                    if disk_off + *len as usize > dev.disk.len() {
+                    let n = *len as usize;
+                    if disk_off + n > dev.disk.len() {
                         status = VIRTIO_BLK_S_IOERR;
                         break;
                     }
-                    for i in 0..*len as usize {
-                        self.wr8(addr + i as u64, dev.disk[disk_off + i]);
-                    }
-                    disk_off += *len as usize;
+                    self.write_phys_bytes(*addr, &dev.disk[disk_off..disk_off + n]);
+                    disk_off += n;
                     written += *len;
                 }
             }
             VIRTIO_BLK_T_OUT => {
                 for (addr, len, _flags) in data {
-                    if disk_off + *len as usize > dev.disk.len() {
+                    let n = *len as usize;
+                    if disk_off + n > dev.disk.len() {
                         status = VIRTIO_BLK_S_IOERR;
                         break;
                     }
-                    for i in 0..*len as usize {
-                        dev.disk[disk_off + i] = self.rd8(addr + i as u64);
-                    }
-                    disk_off += *len as usize;
+                    self.read_phys_bytes(*addr, &mut dev.disk[disk_off..disk_off + n]);
+                    disk_off += n;
                 }
             }
             VIRTIO_BLK_T_GET_ID => {
@@ -2225,6 +2663,35 @@ impl Emulator {
     }
     fn wr32(&mut self, a: u64, v: u32) {
         let _ = self.store_phys(a, 4, u64::from(v));
+    }
+
+    /// Copy `src` into guest physical memory at `addr`. Bulk-copies when
+    /// `[addr, addr+len)` lies wholly in RAM (the common case for a virtqueue
+    /// buffer), otherwise falls back to per-byte [`Emulator::wr8`] — preserving
+    /// its fault-swallowing semantics for a buffer that runs out of RAM or aims
+    /// at a device (identical result, just byte-at-a-time).
+    fn write_phys_bytes(&mut self, addr: u64, src: &[u8]) {
+        if let Ok(o) = self.offset(addr, src.len()) {
+            self.ram[o..o + src.len()].copy_from_slice(src);
+        } else {
+            for (i, b) in src.iter().enumerate() {
+                self.wr8(addr + i as u64, *b);
+            }
+        }
+    }
+
+    /// Read `dst.len()` bytes from guest physical memory at `addr` into `dst`.
+    /// Bulk-reads when `[addr, addr+len)` lies wholly in RAM, otherwise falls
+    /// back to per-byte [`Emulator::rd8`] (which reads 0 outside RAM) — identical
+    /// result, byte-at-a-time.
+    fn read_phys_bytes(&mut self, addr: u64, dst: &mut [u8]) {
+        if let Ok(o) = self.offset(addr, dst.len()) {
+            dst.copy_from_slice(&self.ram[o..o + dst.len()]);
+        } else {
+            for (i, b) in dst.iter_mut().enumerate() {
+                *b = self.rd8(addr + i as u64);
+            }
+        }
     }
 
     // ── VirtIO 9P device (the shared workspace filesystem; CC-15) ──
@@ -2605,6 +3072,7 @@ impl Emulator {
     fn tick(&mut self) {
         self.mtime = self.mtime.wrapping_add(1);
         let mut mip = self.raw_csr(csr::MIP);
+        let orig_mip = mip;
         // The timer interrupt: in firmware (SBI) mode the SEE delivers it to the
         // supervisor (STIP) — what an S-mode kernel handles; otherwise it is the
         // machine timer (MTIP), as the conformance tests expect.
@@ -2642,7 +3110,14 @@ impl Emulator {
                 mip &= !(1 << csr::MEIP);
             }
         }
-        self.csrs.insert(csr::MIP, mip);
+        // Write back only when the pending bits actually changed — most
+        // instructions leave `mip` untouched, so this skips a BTreeMap
+        // write-traversal. The map ends in the same state either way, so the κ
+        // snapshot stays byte-identical (re-storing an unchanged value is a no-op
+        // for the serialized form).
+        if mip != orig_mip {
+            self.csrs.insert(csr::MIP, mip);
+        }
     }
 
     /// Take the highest-priority enabled+pending interrupt, if any (RISC-V
@@ -2723,11 +3198,65 @@ impl Emulator {
         self.store_phys(pa2, width - first, value >> (8 * first))
     }
 
+    /// Invalidate the whole software TLB by moving to a new generation — O(1).
+    /// Called on every change to the translation context (SFENCE.VMA, `satp`, a
+    /// translation-relevant `mstatus`/`sstatus` write, a privilege transition).
+    #[inline]
+    fn tlb_flush(&mut self) {
+        self.tlb_gen = self.tlb_gen.wrapping_add(1);
+    }
+
+    /// Record a virtual-page → physical-frame translation for `access`. Called by
+    /// [`Emulator::translate_walk`] only at a successful *paging* leaf — by which
+    /// point the walk has already set the PTE's Accessed bit (and Dirty, for a
+    /// store), so a later hit may legitimately skip the A/D write-back (it would
+    /// be a no-op: the bit is already set). Keying on the access class keeps the
+    /// fetch/load/store permission and A/D semantics distinct.
+    #[inline]
+    fn tlb_fill(&mut self, vaddr: u64, access: Access, pa: u64) {
+        let vpn = vaddr >> 12;
+        let set = (vpn & TLB_MASK) as usize;
+        self.tlb[access as usize][set] = TlbEntry {
+            tag: vpn,
+            frame: pa & !0xfff,
+            gen: self.tlb_gen,
+        };
+    }
+
+    /// Translate a guest virtual address to physical, through the software TLB.
+    /// A hit returns immediately with no CSR reads and no page-table walk; a miss
+    /// (or bare/M-mode, which the walker passes through and does not cache) falls
+    /// to [`Emulator::translate_walk`]. A hit is always valid for the current
+    /// context because every context change flushes the TLB ([`Emulator::tlb_flush`]).
+    fn translate(&mut self, vaddr: u64, access: Access) -> Result<u64, Trap> {
+        let vpn = vaddr >> 12;
+        let class = access as usize;
+        let set = (vpn & TLB_MASK) as usize;
+        let slot = self.tlb[class][set]; // `TlbEntry: Copy` — no borrow held
+        if slot.gen == self.tlb_gen && slot.tag == vpn {
+            let pa = slot.frame | (vaddr & 0xfff);
+            // Shadow-verify (debug builds only): the full walk must agree with the
+            // cached entry. If a flush site is ever missed, this fires immediately
+            // under the CC-9/CC-14 differential suites (heavy paging). `translate_walk`
+            // is idempotent for A/D (the bits are already set on a cached page), so
+            // re-running it here has no observable effect.
+            #[cfg(debug_assertions)]
+            debug_assert_eq!(
+                self.translate_walk(vaddr, access),
+                Ok(pa),
+                "TLB diverged from the page-table walk at va={vaddr:#x} {access:?}"
+            );
+            return Ok(pa);
+        }
+        self.translate_walk(vaddr, access)
+    }
+
     /// Translate a virtual address through Sv39/Sv48/Sv57 paging (RISC-V Privileged ISA
     /// §4.3-4.6) when `satp.MODE` selects Sv39/Sv48/Sv57 and the effective privilege is below
     /// machine; otherwise the address is physical (bare mode). Sets the
-    /// accessed/dirty bits and enforces the page permissions and U/SUM/MXR.
-    fn translate(&mut self, vaddr: u64, access: Access) -> Result<u64, Trap> {
+    /// accessed/dirty bits and enforces the page permissions and U/SUM/MXR. On a
+    /// successful paging translation it fills the software TLB ([`Emulator::tlb_fill`]).
+    fn translate_walk(&mut self, vaddr: u64, access: Access) -> Result<u64, Trap> {
         let satp = self.raw_csr(0x180);
         // Sv39/Sv48/Sv57 differ only in the page-table depth (3/4/5 levels); a
         // modern kernel probes for the deepest the hart accepts, so all three are
@@ -2806,7 +3335,9 @@ impl Emulator {
                     self.store_phys(pte_addr, 8, npte)?;
                 }
                 let mask = (1u64 << (12 + 9 * level)) - 1;
-                return Ok(((ppn << 12) & !mask) | (vaddr & mask));
+                let pa = ((ppn << 12) & !mask) | (vaddr & mask);
+                self.tlb_fill(vaddr, access, pa);
+                return Ok(pa);
             }
             a = ((pte >> 10) & 0xfff_ffff_ffff) << 12;
             level -= 1;
@@ -3147,12 +3678,17 @@ impl Emulator {
                         }
                     }
                     _ if (inst >> 25) == 0x09 => {
-                        // SFENCE.VMA — no TLB to flush, but it traps in S-mode
-                        // when mstatus.TVM is set (RISC-V Privileged ISA §3.1.6.5).
+                        // SFENCE.VMA traps in S-mode when mstatus.TVM is set
+                        // (RISC-V Privileged ISA §3.1.6.5).
                         if self.priv_level == PRIV_S && (self.raw_csr(csr::MSTATUS) >> 20) & 1 == 1
                         {
                             return Err(Halt::Trap(Trap::IllegalInstruction(inst)));
                         }
+                        // The guest edited page tables and is ordering the cached
+                        // translations to be discarded. A full flush is always a
+                        // spec-legal superset of any rs1/rs2-selective flush, so we
+                        // flush the whole software TLB regardless of the operands.
+                        self.tlb_flush();
                     }
                     _ => return Err(Halt::Trap(Trap::IllegalInstruction(inst))),
                 }
