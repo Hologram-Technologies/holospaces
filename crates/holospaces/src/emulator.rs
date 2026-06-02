@@ -168,7 +168,7 @@ pub enum Trap {
 
 /// The kind of guest memory access (selects the page-table permission bit and
 /// the page-fault cause).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Access {
     Fetch,
     Load,
@@ -235,6 +235,18 @@ pub struct Emulator {
     /// The VirtIO network device + userspace TCP/IP NAT, when networking is
     /// attached (`CC-16`); `None` for an offline machine.
     virtionet: Option<VirtioNet>,
+    /// A software TLB over [`Emulator::translate`]: a direct-mapped cache (per
+    /// access class) of virtual-page → physical-frame translations, so a hot loop
+    /// does not re-walk the page table on every fetch/load/store. Flushed (by
+    /// bumping `tlb_gen`) on every change to the translation context — SFENCE.VMA,
+    /// a `satp` write, a translation-relevant `mstatus`/`sstatus` change, and
+    /// every privilege transition — so a hit is always valid for the current
+    /// context. It is a pure cache, reconstructable from the page tables, so it is
+    /// deliberately *not* part of the κ snapshot (and a resumed machine rebuilds
+    /// it from a clean flush).
+    tlb: Box<[[TlbEntry; TLB_SETS]; 3]>,
+    /// The current TLB generation; an entry is live iff its `gen` matches.
+    tlb_gen: u64,
 }
 
 /// The CLINT memory-mapped region (one hart): `msip` at +0, `mtimecmp` at
@@ -292,6 +304,33 @@ const _: () = assert!(
         && VIRTIONET_END <= DEVICE_MMIO_END,
     "every device MMIO window must lie below DEVICE_MMIO_END for the RAM fast path to be correct",
 );
+
+/// Software-TLB geometry: a direct-mapped translation cache per access class
+/// (fetch/load/store), `TLB_SETS` sets each. A power of two so the set index is
+/// a mask. 256 sets per class covers a large working set while staying small.
+const TLB_SETS: usize = 256;
+const TLB_MASK: u64 = TLB_SETS as u64 - 1;
+
+/// `mstatus` bits that change address translation — MPRV (17), SUM (18),
+/// MXR (19), and MPP (12:11). A write that touches any of these invalidates the
+/// TLB; one that does not (e.g. the FS dirty bits an FP op sets) does not, so the
+/// hot path is not flushed for unrelated `mstatus` traffic.
+const MSTATUS_XLATE_BITS: u64 = (1 << 17) | (1 << 18) | (1 << 19) | (3 << 11);
+
+/// One software-TLB entry: a cached virtual-page → physical-frame translation.
+/// Valid iff `gen` equals the emulator's current `tlb_gen` (a generation bump is
+/// a whole-TLB flush — see [`Emulator::tlb_flush`]).
+#[derive(Clone, Copy)]
+struct TlbEntry {
+    /// The virtual page number (`vaddr >> 12`) this entry translates.
+    tag: u64,
+    /// The physical 4 KiB frame base (low 12 bits zero); the full address is
+    /// `frame | (vaddr & 0xfff)` — correct for any page size, since the low 12
+    /// bits always pass through.
+    frame: u64,
+    /// The generation this entry was filled in; stale once `tlb_gen` moves on.
+    gen: u64,
+}
 
 /// Read a little-endian integer of `width` bytes from `ram[o..]`. The caller has
 /// already bounds-checked `o + width <= ram.len()` (via `Emulator::offset`).
@@ -1363,6 +1402,16 @@ impl Emulator {
             virtio: None,
             virtio9p: None,
             virtionet: None,
+            // Entries default to gen 0; starting `tlb_gen` at 1 means no entry is
+            // live until it is filled (no false hit on a zeroed slot).
+            tlb: Box::new(
+                [[TlbEntry {
+                    tag: 0,
+                    frame: 0,
+                    gen: 0,
+                }; TLB_SETS]; 3],
+            ),
+            tlb_gen: 1,
         }
     }
 
@@ -1518,9 +1567,19 @@ impl Emulator {
     fn csr_write(&mut self, csr: u32, value: u64) {
         match csr {
             csr::SSTATUS => {
-                let m =
-                    (self.raw_csr(csr::MSTATUS) & !csr::SSTATUS_MASK) | (value & csr::SSTATUS_MASK);
+                let old = self.raw_csr(csr::MSTATUS);
+                let m = (old & !csr::SSTATUS_MASK) | (value & csr::SSTATUS_MASK);
                 self.csrs.insert(csr::MSTATUS, m);
+                if (old ^ m) & MSTATUS_XLATE_BITS != 0 {
+                    self.tlb_flush();
+                }
+            }
+            csr::MSTATUS => {
+                let old = self.raw_csr(csr::MSTATUS);
+                self.csrs.insert(csr::MSTATUS, value);
+                if (old ^ value) & MSTATUS_XLATE_BITS != 0 {
+                    self.tlb_flush();
+                }
             }
             csr::SIE => {
                 let m = (self.raw_csr(csr::MIE) & !csr::S_INT_MASK) | (value & csr::S_INT_MASK);
@@ -1566,6 +1625,8 @@ impl Emulator {
                     value & !(0xfu64 << 60)
                 };
                 self.csrs.insert(0x180, v);
+                // A new root page table / ASID: the whole TLB is now stale.
+                self.tlb_flush();
             }
             _ => {
                 self.csrs.insert(csr, value);
@@ -1682,6 +1743,9 @@ impl Emulator {
             self.priv_level = PRIV_M;
             self.hart.pc = trap_vector(self.csr_read(csr::MTVEC), is_int, code);
         }
+        // A trap changes the privilege level (and `mstatus`), so the effective
+        // translation context changes — invalidate the TLB.
+        self.tlb_flush();
     }
 
     /// Return from a machine-mode trap (`mret`).
@@ -1695,6 +1759,7 @@ impl Emulator {
         self.csrs.insert(csr::MSTATUS, st);
         self.priv_level = mpp as u8;
         self.hart.pc = self.csr_read(csr::MEPC);
+        self.tlb_flush();
     }
 
     /// Return from a supervisor-mode trap (`sret`).
@@ -1708,6 +1773,7 @@ impl Emulator {
         self.csrs.insert(csr::MSTATUS, st);
         self.priv_level = spp as u8;
         self.hart.pc = self.csr_read(csr::SEPC);
+        self.tlb_flush();
     }
 
     /// Load a flat guest image at `base` and set the reset PC there.
@@ -2712,6 +2778,7 @@ impl Emulator {
     fn tick(&mut self) {
         self.mtime = self.mtime.wrapping_add(1);
         let mut mip = self.raw_csr(csr::MIP);
+        let orig_mip = mip;
         // The timer interrupt: in firmware (SBI) mode the SEE delivers it to the
         // supervisor (STIP) — what an S-mode kernel handles; otherwise it is the
         // machine timer (MTIP), as the conformance tests expect.
@@ -2749,7 +2816,14 @@ impl Emulator {
                 mip &= !(1 << csr::MEIP);
             }
         }
-        self.csrs.insert(csr::MIP, mip);
+        // Write back only when the pending bits actually changed — most
+        // instructions leave `mip` untouched, so this skips a BTreeMap
+        // write-traversal. The map ends in the same state either way, so the κ
+        // snapshot stays byte-identical (re-storing an unchanged value is a no-op
+        // for the serialized form).
+        if mip != orig_mip {
+            self.csrs.insert(csr::MIP, mip);
+        }
     }
 
     /// Take the highest-priority enabled+pending interrupt, if any (RISC-V
@@ -2830,11 +2904,65 @@ impl Emulator {
         self.store_phys(pa2, width - first, value >> (8 * first))
     }
 
+    /// Invalidate the whole software TLB by moving to a new generation — O(1).
+    /// Called on every change to the translation context (SFENCE.VMA, `satp`, a
+    /// translation-relevant `mstatus`/`sstatus` write, a privilege transition).
+    #[inline]
+    fn tlb_flush(&mut self) {
+        self.tlb_gen = self.tlb_gen.wrapping_add(1);
+    }
+
+    /// Record a virtual-page → physical-frame translation for `access`. Called by
+    /// [`Emulator::translate_walk`] only at a successful *paging* leaf — by which
+    /// point the walk has already set the PTE's Accessed bit (and Dirty, for a
+    /// store), so a later hit may legitimately skip the A/D write-back (it would
+    /// be a no-op: the bit is already set). Keying on the access class keeps the
+    /// fetch/load/store permission and A/D semantics distinct.
+    #[inline]
+    fn tlb_fill(&mut self, vaddr: u64, access: Access, pa: u64) {
+        let vpn = vaddr >> 12;
+        let set = (vpn & TLB_MASK) as usize;
+        self.tlb[access as usize][set] = TlbEntry {
+            tag: vpn,
+            frame: pa & !0xfff,
+            gen: self.tlb_gen,
+        };
+    }
+
+    /// Translate a guest virtual address to physical, through the software TLB.
+    /// A hit returns immediately with no CSR reads and no page-table walk; a miss
+    /// (or bare/M-mode, which the walker passes through and does not cache) falls
+    /// to [`Emulator::translate_walk`]. A hit is always valid for the current
+    /// context because every context change flushes the TLB ([`Emulator::tlb_flush`]).
+    fn translate(&mut self, vaddr: u64, access: Access) -> Result<u64, Trap> {
+        let vpn = vaddr >> 12;
+        let class = access as usize;
+        let set = (vpn & TLB_MASK) as usize;
+        let slot = self.tlb[class][set]; // `TlbEntry: Copy` — no borrow held
+        if slot.gen == self.tlb_gen && slot.tag == vpn {
+            let pa = slot.frame | (vaddr & 0xfff);
+            // Shadow-verify (debug builds only): the full walk must agree with the
+            // cached entry. If a flush site is ever missed, this fires immediately
+            // under the CC-9/CC-14 differential suites (heavy paging). `translate_walk`
+            // is idempotent for A/D (the bits are already set on a cached page), so
+            // re-running it here has no observable effect.
+            #[cfg(debug_assertions)]
+            debug_assert_eq!(
+                self.translate_walk(vaddr, access),
+                Ok(pa),
+                "TLB diverged from the page-table walk at va={vaddr:#x} {access:?}"
+            );
+            return Ok(pa);
+        }
+        self.translate_walk(vaddr, access)
+    }
+
     /// Translate a virtual address through Sv39/Sv48/Sv57 paging (RISC-V Privileged ISA
     /// §4.3-4.6) when `satp.MODE` selects Sv39/Sv48/Sv57 and the effective privilege is below
     /// machine; otherwise the address is physical (bare mode). Sets the
-    /// accessed/dirty bits and enforces the page permissions and U/SUM/MXR.
-    fn translate(&mut self, vaddr: u64, access: Access) -> Result<u64, Trap> {
+    /// accessed/dirty bits and enforces the page permissions and U/SUM/MXR. On a
+    /// successful paging translation it fills the software TLB ([`Emulator::tlb_fill`]).
+    fn translate_walk(&mut self, vaddr: u64, access: Access) -> Result<u64, Trap> {
         let satp = self.raw_csr(0x180);
         // Sv39/Sv48/Sv57 differ only in the page-table depth (3/4/5 levels); a
         // modern kernel probes for the deepest the hart accepts, so all three are
@@ -2913,7 +3041,9 @@ impl Emulator {
                     self.store_phys(pte_addr, 8, npte)?;
                 }
                 let mask = (1u64 << (12 + 9 * level)) - 1;
-                return Ok(((ppn << 12) & !mask) | (vaddr & mask));
+                let pa = ((ppn << 12) & !mask) | (vaddr & mask);
+                self.tlb_fill(vaddr, access, pa);
+                return Ok(pa);
             }
             a = ((pte >> 10) & 0xfff_ffff_ffff) << 12;
             level -= 1;
@@ -3254,12 +3384,17 @@ impl Emulator {
                         }
                     }
                     _ if (inst >> 25) == 0x09 => {
-                        // SFENCE.VMA — no TLB to flush, but it traps in S-mode
-                        // when mstatus.TVM is set (RISC-V Privileged ISA §3.1.6.5).
+                        // SFENCE.VMA traps in S-mode when mstatus.TVM is set
+                        // (RISC-V Privileged ISA §3.1.6.5).
                         if self.priv_level == PRIV_S && (self.raw_csr(csr::MSTATUS) >> 20) & 1 == 1
                         {
                             return Err(Halt::Trap(Trap::IllegalInstruction(inst)));
                         }
+                        // The guest edited page tables and is ordering the cached
+                        // translations to be discarded. A full flush is always a
+                        // spec-legal superset of any rs1/rs2-selective flush, so we
+                        // flush the whole software TLB regardless of the operands.
+                        self.tlb_flush();
                     }
                     _ => return Err(Halt::Trap(Trap::IllegalInstruction(inst))),
                 }
