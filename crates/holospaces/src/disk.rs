@@ -21,15 +21,23 @@
 //! that a real on-disk ext4 filesystem round-trips byte-for-byte.
 
 pub use hologram_bare_hal::{BlockDevice, DeviceError};
-use hologram_substrate_core::KappaStore;
+use hologram_substrate_core::{Bytes, KappaStore};
 
 use crate::realizations::{address, empty_kappa, Kappa};
 
+use alloc::collections::BTreeMap;
 // `async_trait` emits an unqualified `Box`; in `no_std` it must be in scope
 // (under `std` it is in the prelude).
 #[cfg(not(feature = "std"))]
 #[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
+
+/// Working-set bound for the read-through cache (distinct sector *contents*).
+/// RAM is a cache of the canonical store (Law L3), not a second medium (Law L4) —
+/// it is transient and bounded; the κ-store remains the source of truth. Capped
+/// so a large disk cannot make the cache grow without limit; on overflow the
+/// cache is cleared (a cold working set simply re-fills from the store).
+const CACHE_CAPACITY: usize = 4096;
 
 use spin::Mutex;
 
@@ -50,6 +58,11 @@ pub struct KappaDisk<'a> {
     sector_size: u32,
     sector_count: u64,
     index: Mutex<Vec<Kappa>>,
+    /// A read-through working-set cache: decoded sector contents keyed by their
+    /// κ-label (so content-identical sectors — the dedup case — share one entry).
+    /// RAM caching the canonical store (Law L3); a hit returns the same bytes a
+    /// `store.get` would, so the device's observable behaviour is unchanged.
+    cache: Mutex<BTreeMap<Kappa, Bytes>>,
     uuid: [u8; 16],
 }
 
@@ -69,6 +82,7 @@ impl<'a> KappaDisk<'a> {
             sector_size,
             sector_count,
             index: Mutex::new(index),
+            cache: Mutex::new(BTreeMap::new()),
             uuid,
         }
     }
@@ -154,6 +168,17 @@ fn geometry_uuid(sector_size: u32, sector_count: u64) -> [u8; 16] {
     uuid
 }
 
+/// Insert a decoded sector into the read-through cache, keeping it bounded
+/// ([`CACHE_CAPACITY`]). The cache is a transient accelerator over the canonical
+/// store (Law L3), so dropping entries on overflow is always safe — a missed
+/// content re-fetches from the store.
+fn cache_insert(cache: &mut BTreeMap<Kappa, Bytes>, kappa: Kappa, bytes: Bytes) {
+    if cache.len() >= CACHE_CAPACITY && !cache.contains_key(&kappa) {
+        cache.clear();
+    }
+    cache.insert(kappa, bytes);
+}
+
 #[async_trait::async_trait]
 impl BlockDevice for KappaDisk<'_> {
     fn sector_size(&self) -> u32 {
@@ -169,12 +194,21 @@ impl BlockDevice for KappaDisk<'_> {
         let ss = self.sector_size as usize;
         let blank = empty_kappa();
         let index = self.index.lock();
+        let mut cache = self.cache.lock();
         for i in 0..sectors as u64 {
             let kappa = index[(lba + i) as usize];
             let slot = &mut buffer[i as usize * ss..(i as usize + 1) * ss];
             if kappa == blank {
                 // A never-written sector reads back as zeros (sparse).
                 slot.fill(0);
+                continue;
+            }
+            // Read-through cache (Law L3): serve the sector's content from RAM if
+            // we have already decoded this κ; otherwise fetch it from the
+            // canonical store and remember it. Identical sectors share a κ, so the
+            // cache is keyed by content — a repeated read never re-hits the store.
+            if let Some(bytes) = cache.get(&kappa) {
+                slot.copy_from_slice(bytes.as_ref());
                 continue;
             }
             let bytes = self
@@ -186,6 +220,7 @@ impl BlockDevice for KappaDisk<'_> {
                 return Err(DeviceError::HardwareFault(3));
             }
             slot.copy_from_slice(bytes.as_ref());
+            cache_insert(&mut cache, kappa, bytes);
         }
         Ok(())
     }
@@ -194,6 +229,7 @@ impl BlockDevice for KappaDisk<'_> {
         self.sector_range(lba, sectors, buffer.len())?;
         let ss = self.sector_size as usize;
         let mut index = self.index.lock();
+        let mut cache = self.cache.lock();
         for i in 0..sectors as usize {
             let slot = &buffer[i * ss..(i + 1) * ss];
             // Content-address the sector through the store (idempotent: identical
@@ -203,6 +239,9 @@ impl BlockDevice for KappaDisk<'_> {
                 .put("blake3", slot)
                 .map_err(|_| DeviceError::HardwareFault(4))?;
             index[lba as usize + i] = kappa;
+            // Write-through: a just-written sector is immediately readable from
+            // the cache without re-hitting the store.
+            cache_insert(&mut cache, kappa, Bytes::from(slot.to_vec()));
         }
         Ok(())
     }

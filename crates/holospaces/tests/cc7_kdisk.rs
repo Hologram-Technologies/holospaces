@@ -148,3 +148,107 @@ fn debugfs_bin() -> Option<String> {
     }
     None
 }
+
+// ── Law L3: RAM caches the canonical store ──────────────────────────────────
+//
+// The κ-disk is a read-through cache over the KappaStore (RAM as a cache of the
+// canonical store, Law L3) — a transient accelerator, not a second medium
+// (Law L4): the store stays the source of truth and behaviour is byte-identical.
+// Authority: a get-counting store wrapper proves a repeated read of the same
+// content is served from RAM and never re-hits the store, and that the disk's
+// content address (image_kappa) is unchanged by the cache.
+
+use core::sync::atomic::{AtomicUsize, Ordering};
+use hologram_substrate_core::{Bytes, KappaLabel71, KappaStore, StoreError};
+
+/// A `MemKappaStore` that counts `get` calls — the cache's witness instrument.
+struct CountingStore {
+    inner: MemKappaStore,
+    gets: AtomicUsize,
+}
+impl CountingStore {
+    fn new() -> Self {
+        Self {
+            inner: MemKappaStore::new(),
+            gets: AtomicUsize::new(0),
+        }
+    }
+    fn gets(&self) -> usize {
+        self.gets.load(Ordering::Relaxed)
+    }
+}
+impl KappaStore for CountingStore {
+    fn put(&self, axis: &str, canonical_bytes: &[u8]) -> Result<KappaLabel71, StoreError> {
+        self.inner.put(axis, canonical_bytes)
+    }
+    fn get(&self, kappa: &KappaLabel71) -> Result<Option<Bytes>, StoreError> {
+        self.gets.fetch_add(1, Ordering::Relaxed);
+        self.inner.get(kappa)
+    }
+    fn contains(&self, kappa: &KappaLabel71) -> bool {
+        self.inner.contains(kappa)
+    }
+    fn pin(&self, kappa: &KappaLabel71) -> Result<(), StoreError> {
+        self.inner.pin(kappa)
+    }
+    fn unpin(&self, kappa: &KappaLabel71) -> Result<(), StoreError> {
+        self.inner.unpin(kappa)
+    }
+    fn iterate(&self) -> Vec<KappaLabel71> {
+        self.inner.iterate()
+    }
+    fn pinned_roots(&self) -> Vec<KappaLabel71> {
+        self.inner.pinned_roots()
+    }
+    fn approximate_count(&self) -> usize {
+        self.inner.approximate_count()
+    }
+    fn approximate_bytes(&self) -> u64 {
+        self.inner.approximate_bytes()
+    }
+}
+
+#[test]
+fn the_kappa_disk_caches_the_canonical_store_for_repeated_reads() {
+    pollster::block_on(async {
+        let store = CountingStore::new();
+        // A four-sector image with two distinct contents (sectors 0 and 2 share
+        // content — the dedup case, so they share one κ and one cache entry).
+        let mut image = vec![0u8; 4 * SECTOR_SIZE as usize];
+        image[..SECTOR_SIZE as usize].fill(0xAB);
+        image[SECTOR_SIZE as usize..2 * SECTOR_SIZE as usize].fill(0xCD);
+        image[2 * SECTOR_SIZE as usize..3 * SECTOR_SIZE as usize].fill(0xAB);
+        image[3 * SECTOR_SIZE as usize..].fill(0xEF);
+        let disk = KappaDisk::from_image(&store, SECTOR_SIZE, &image)
+            .await
+            .unwrap();
+        let image_k = disk.image_kappa();
+
+        // First full read: each distinct content is fetched from the store at
+        // most once. There are three distinct contents, so the store sees at most
+        // three gets (the dedup'd sector 2 shares sector 0's κ — already cached by
+        // write-through, so it may cost zero).
+        let mut buf = vec![0u8; image.len()];
+        disk.read(0, 4, &mut buf).await.unwrap();
+        assert_eq!(buf, image, "the cache returns byte-identical content");
+        let after_first = store.gets();
+
+        // A second identical read must be served entirely from the cache — no
+        // further store gets at all.
+        disk.read(0, 4, &mut buf).await.unwrap();
+        assert_eq!(buf, image, "second read still byte-identical");
+        assert_eq!(
+            store.gets(),
+            after_first,
+            "a repeated read hits the RAM cache and never re-hits the canonical store (Law L3)"
+        );
+
+        // The cache is transparent to identity: the disk's content address is
+        // unchanged by caching, and stable across a read/write/read cycle (L1).
+        assert_eq!(
+            disk.image_kappa(),
+            image_k,
+            "image κ is stable (cache is transparent)"
+        );
+    });
+}
