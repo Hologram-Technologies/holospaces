@@ -20,6 +20,7 @@ use hologram_substrate_core::{
 };
 
 use crate::boot::{ProvisionError, Session};
+use crate::config::{Configuration, Directive};
 use crate::identity::{Operator, Roster};
 use crate::peer::Peer;
 use crate::realizations::{Holospace, Kappa, Source};
@@ -48,6 +49,10 @@ pub struct Manager<'a, R: ContainerRuntime> {
     peer: Peer<'a, R>,
     operator: Operator,
     holospaces: Vec<Kappa>,
+    /// The latest configuration published per instance — `(instance κ, config κ,
+    /// next seq)`. The control plane's record of what it has reconfigured each
+    /// instance to (ADR-018).
+    configs: Vec<(Kappa, Kappa, u64)>,
 }
 
 impl<'a, R: ContainerRuntime> Manager<'a, R> {
@@ -58,6 +63,7 @@ impl<'a, R: ContainerRuntime> Manager<'a, R> {
             peer,
             operator,
             holospaces: Vec::new(),
+            configs: Vec::new(),
         }
     }
 
@@ -148,6 +154,74 @@ impl<'a, R: ContainerRuntime> Manager<'a, R> {
         }
         self.persist_roster()?;
         Ok(synced)
+    }
+
+    /// *Intent: configure.* Reconfigure a running instance from the control
+    /// panel (ADR-018). Builds a [`Configuration`] issued by this operator for
+    /// `instance` (the next sequence number), stores it as content (Law L2), and
+    /// records it as the instance's current configuration. Returns the
+    /// configuration κ — the content the instance resolves and applies over the
+    /// substrate (no server, no RPC; `CC-28`). The directives span the four
+    /// operation classes: lifecycle / storage / network / account-user.
+    ///
+    /// # Errors
+    ///
+    /// [`ManagerError::Store`] if the configuration cannot be persisted.
+    pub fn configure(
+        &mut self,
+        instance: &Kappa,
+        directives: Vec<Directive>,
+    ) -> Result<Kappa, ManagerError> {
+        let seq = match self.configs.iter().find(|(i, _, _)| i == instance) {
+            Some((_, _, next)) => *next,
+            None => 0,
+        };
+        let config = Configuration::new(*self.operator.identity(), *instance, seq, directives);
+        let kappa = config.kappa();
+        self.peer
+            .store()
+            .put("blake3", &config.canonicalize())
+            .map_err(|e| ManagerError::Store(format!("{e:?}")))?;
+        match self.configs.iter_mut().find(|(i, _, _)| i == instance) {
+            Some(entry) => {
+                entry.1 = kappa;
+                entry.2 = seq + 1;
+            }
+            None => self.configs.push((*instance, kappa, seq + 1)),
+        }
+        Ok(kappa)
+    }
+
+    /// The κ of the latest configuration this control plane published for
+    /// `instance`, if any — what the instance resolves to reconfigure itself.
+    #[must_use]
+    pub fn configuration_of(&self, instance: &Kappa) -> Option<Kappa> {
+        self.configs
+            .iter()
+            .find(|(i, _, _)| i == instance)
+            .map(|(_, k, _)| *k)
+    }
+
+    /// *Intent: resolve a configuration.* Resolve a [`Configuration`] κ over the
+    /// substrate (fetch + verify-by-re-derivation, Law L5) and decode it — the
+    /// instance side of reconfiguration: it picks up the control plane's
+    /// published configuration as *content* and is then applied via
+    /// [`Configuration::apply`]. Mirrors [`Self::open`] (`CC-28`, ADR-018).
+    ///
+    /// # Errors
+    ///
+    /// [`ManagerError::NotFound`] if the configuration cannot be resolved, or a
+    /// resolution / decode error.
+    pub async fn resolve_configuration(
+        &self,
+        config: &Kappa,
+    ) -> Result<Configuration, ManagerError> {
+        let bytes = self
+            .peer
+            .resolve(config)
+            .await?
+            .ok_or(ManagerError::NotFound)?;
+        Ok(Configuration::from_canonical(&bytes)?)
     }
 
     fn persist_roster(&self) -> Result<(), ManagerError> {

@@ -1396,6 +1396,17 @@ impl Emulator {
         self.virtionet = Some(VirtioNet::new(egress, ingress));
     }
 
+    /// **Live** network reconfiguration (ADR-018, `CC-28`): begin forwarding
+    /// `guest_port` on the *running* machine — the control plane's network
+    /// directive applied to an instance after boot, without a reboot. Returns the
+    /// host port the new route is reachable on, or `None` if the machine has no
+    /// network device or its ingress transport cannot add a forward live.
+    pub fn forward_port(&mut self, guest_port: u16) -> Option<u16> {
+        self.virtionet
+            .as_mut()
+            .and_then(|n| n.ingress.add_forward(guest_port))
+    }
+
     /// Run the emulator as the M-mode firmware (SEE), servicing supervisor SBI
     /// calls (console / timer / shutdown) — the mode a real S-mode OS kernel
     /// boots under (the conformance tests run with this off).

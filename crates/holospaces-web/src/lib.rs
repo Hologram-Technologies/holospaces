@@ -36,6 +36,7 @@ use hologram_store_mem::MemKappaStore;
 use hologram_substrate_core::{Capabilities, KappaStore, Realization};
 use holospaces::assembly::{assemble_ext4, Layer};
 use holospaces::boot::{devcontainer, provision, LifecycleError, Resolver, Session};
+use holospaces::config::{Configuration, Directive, LifecycleAction};
 use holospaces::emulator::{Emulator, Halt};
 use holospaces::identity::{Operator, Roster};
 use holospaces::machine::MachineSpec;
@@ -185,6 +186,9 @@ pub struct Console {
     runtime: Runtime<BareMetalEngine, MemKappaStore>,
     operator: Option<Operator>,
     holospaces: Vec<Kappa>,
+    /// The latest configuration published per instance — `(instance κ, config κ,
+    /// next seq)` (ADR-018; the control plane's reconfiguration record).
+    configs: Vec<(Kappa, Kappa, u64)>,
 }
 
 impl Default for Console {
@@ -204,6 +208,7 @@ impl Console {
             runtime: Runtime::new(BareMetalEngine::new(), MemKappaStore::new()),
             operator: None,
             holospaces: Vec::new(),
+            configs: Vec::new(),
         }
     }
 
@@ -388,6 +393,80 @@ impl Console {
         }
         Ok(())
     }
+
+    /// *Control panel: configure.* Reconfigure a running instance from the panel
+    /// (ADR-018; `CC-28`). `directives_json` is a JSON array of operations across
+    /// the four classes, e.g. `[{"lifecycle":"suspend"}, {"forwardPort":8080},
+    /// {"unforwardPort":8080}, {"network":{"fetch":true,"announce":false}},
+    /// {"quota":1073741824}, {"grant":"blake3:…"}]`. The panel builds a
+    /// content-addressed [`Configuration`] issued by the signed-in operator,
+    /// stores it (Law L2), and returns its κ — the content the running instance
+    /// resolves and applies over the substrate (no server, no RPC).
+    pub fn configure(&mut self, instance: &str, directives_json: &str) -> Result<String, JsValue> {
+        let operator = self
+            .operator
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("sign in before configuring an instance"))?
+            .identity()
+            .to_owned();
+        let instance = parse_kappa(instance)?;
+        let directives = parse_directives(directives_json)?;
+        let seq = self
+            .configs
+            .iter()
+            .find(|(i, _, _)| *i == instance)
+            .map_or(0, |(_, _, next)| *next);
+        let config = Configuration::new(operator, instance, seq, directives);
+        let kappa = config.kappa();
+        self.runtime
+            .store()
+            .put("blake3", &config.canonicalize())
+            .map_err(js_err)?;
+        match self.configs.iter_mut().find(|(i, _, _)| *i == instance) {
+            Some(entry) => {
+                entry.1 = kappa;
+                entry.2 = seq + 1;
+            }
+            None => self.configs.push((instance, kappa, seq + 1)),
+        }
+        Ok(kappa.as_str().to_owned())
+    }
+}
+
+/// Parse the control panel's directive JSON (`Console::configure`).
+fn parse_directives(json: &str) -> Result<Vec<Directive>, JsValue> {
+    let arr: Vec<serde_json::Value> =
+        serde_json::from_str(json).map_err(|e| JsValue::from_str(&format!("directives: {e}")))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for d in &arr {
+        let directive = if let Some(a) = d.get("lifecycle").and_then(|v| v.as_str()) {
+            let action = match a {
+                "start" => LifecycleAction::Start,
+                "suspend" => LifecycleAction::Suspend,
+                "resume" => LifecycleAction::Resume,
+                "terminate" => LifecycleAction::Terminate,
+                other => return Err(JsValue::from_str(&format!("unknown lifecycle: {other}"))),
+            };
+            Directive::Lifecycle(action)
+        } else if let Some(p) = d.get("forwardPort").and_then(serde_json::Value::as_u64) {
+            Directive::ForwardPort(u16::try_from(p).map_err(|_| JsValue::from_str("bad port"))?)
+        } else if let Some(p) = d.get("unforwardPort").and_then(serde_json::Value::as_u64) {
+            Directive::UnforwardPort(u16::try_from(p).map_err(|_| JsValue::from_str("bad port"))?)
+        } else if let Some(n) = d.get("network") {
+            Directive::SetNetwork {
+                fetch: n.get("fetch").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                announce: n.get("announce").and_then(serde_json::Value::as_bool).unwrap_or(false),
+            }
+        } else if let Some(q) = d.get("quota").and_then(serde_json::Value::as_u64) {
+            Directive::SetStorageQuota(q)
+        } else if let Some(op) = d.get("grant").and_then(|v| v.as_str()) {
+            Directive::GrantAccess(parse_kappa(op)?)
+        } else {
+            return Err(JsValue::from_str("unrecognized directive"));
+        };
+        out.push(directive);
+    }
+    Ok(out)
 }
 
 /// A **workspace** over a running holospace, in the browser tab — the
@@ -662,5 +741,49 @@ impl Workspace {
     /// `FileSystemProvider.createDirectory`).
     pub fn ws_mkdir(&mut self, name: &str) {
         self.machine.workspace_mkdir(name);
+    }
+
+    /// **Apply a configuration** the control plane published (ADR-018; `CC-28`):
+    /// decode the κ-addressed [`Configuration`] bytes (resolved + verified over
+    /// the substrate by the caller, Law L5) and enact its live directives on the
+    /// *running* machine — each `forwardPort` begins forwarding on the running
+    /// instance, without a reboot. Returns a JSON summary of what was applied
+    /// (`{ "forwarded": [{ "guest": 8080, "host": 8080 }], "lifecycle": "…",
+    /// "unsupported": [...] }`). The instance state changes from the panel's
+    /// configuration, carried as content over the substrate — no RPC.
+    pub fn reconfigure(&mut self, config_bytes: &[u8]) -> Result<String, JsValue> {
+        let config = Configuration::from_canonical(config_bytes).map_err(js_err)?;
+        let mut forwarded = Vec::new();
+        let mut unsupported = Vec::new();
+        let mut lifecycle: Option<&str> = None;
+        for d in config.directives() {
+            match d {
+                Directive::ForwardPort(guest) => match self.machine.forward_port(*guest) {
+                    Some(host) => forwarded
+                        .push(serde_json::json!({ "guest": guest, "host": host })),
+                    // This peer's forwarded-port transport cannot bind live (the
+                    // browser uses a relay route, ADR-016) — reported, not dropped.
+                    None => unsupported.push(serde_json::json!({ "forwardPort": guest })),
+                },
+                Directive::Lifecycle(a) => {
+                    lifecycle = Some(match a {
+                        LifecycleAction::Start => "start",
+                        LifecycleAction::Suspend => "suspend",
+                        LifecycleAction::Resume => "resume",
+                        LifecycleAction::Terminate => "terminate",
+                    });
+                }
+                // Network/storage authority and account grants change the
+                // instance's capability set (its identity, Law L1); the panel
+                // records them — they are not live-machine effects.
+                other => unsupported.push(serde_json::json!({ "deferred": format!("{other:?}") })),
+            }
+        }
+        Ok(serde_json::json!({
+            "forwarded": forwarded,
+            "lifecycle": lifecycle,
+            "unsupported": unsupported,
+        })
+        .to_string())
     }
 }

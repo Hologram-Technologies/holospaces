@@ -111,6 +111,14 @@ pub trait Ingress {
     fn send(&mut self, id: u32, data: &[u8]);
     /// Close connection `id`.
     fn close(&mut self, id: u32);
+    /// Begin forwarding `guest_port` *after boot* — the live network
+    /// reconfiguration the control plane drives (ADR-018, `CC-28`): the panel
+    /// forwards a port and the *running* instance starts forwarding it. Returns
+    /// the host port the new route is reachable on, or `None` if this transport
+    /// cannot add a forward live. Default: unsupported.
+    fn add_forward(&mut self, _guest_port: u16) -> Option<u16> {
+        None
+    }
 }
 
 /// A no-op ingress — the default when no port is forwarded (the machine has no
@@ -1121,6 +1129,14 @@ impl Ingress for StdIngress {
 
     fn close(&mut self, id: u32) {
         self.conns.remove(&id);
+    }
+
+    fn add_forward(&mut self, guest_port: u16) -> Option<u16> {
+        // Live forward (ADR-018): bind a new host listener for `guest_port` —
+        // the same host port for Codespaces parity, else an ephemeral one.
+        self.forward(guest_port, guest_port)
+            .or_else(|_| self.forward(0, guest_port))
+            .ok()
     }
 }
 
