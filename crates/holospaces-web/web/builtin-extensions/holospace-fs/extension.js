@@ -226,19 +226,28 @@ class HolospaceFS {
 }
 
 // ── The integrated terminal over the OS console (CC-11) ─────────────────────
+// A *real* terminal over the devcontainer OS console (CC-11). The OS console is
+// already a proper tty: the guest echoes typed characters, the shell does its own
+// line editing (backspace, history, arrows), and Ctrl-C raises SIGINT — so the
+// terminal must get out of the way and pass *raw bytes both directions*:
+//   • input  — every keystroke (incl. control bytes 0x03/0x04 and arrow escapes,
+//     and xterm's own replies like the `\x1b[6n` cursor-position report the
+//     shell's line editor asks for) goes straight to the guest via `feed_input`;
+//   • output — `terminal_delta()` returns only the newly-produced bytes since the
+//     last frame (O(new), not O(total) like re-reading the whole buffer), written
+//     verbatim — the guest's tty already emits CRLF (ONLCR), so we do not re-wrap.
+// No JS line buffer, no local echo: the OS owns the line discipline, as a Codespace
+// terminal's remote does.
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
 function makeTerminal() {
   const writeEmitter = new EventEmitter();
-  let lastLen = 0;
-  let line = "";
   let running = true;
   const pump = () => {
     if (!ws || !running) return;
     if (!ws.halted) ws.run(8_000_000);
-    const full = ws.terminal();
-    if (full.length > lastLen) {
-      writeEmitter.fire(full.slice(lastLen).replace(/\n/g, "\r\n"));
-      lastLen = full.length;
-    }
+    const delta = ws.terminal_delta(); // only the bytes produced since last frame
+    if (delta.length) writeEmitter.fire(decoder.decode(delta));
     setTimeout(pump, 40);
   };
   const pty = {
@@ -255,25 +264,12 @@ function makeTerminal() {
     close: () => {
       running = false;
     },
+    // Raw input: the bytes the user typed go straight to the guest console; the OS
+    // tty echoes and edits them, and Ctrl-C (0x03) reaches the foreground process
+    // as SIGINT. This also carries xterm's automatic replies to terminal queries
+    // (e.g. the cursor-position report), which the shell's line editor relies on.
     handleInput: (data) => {
-      for (const ch of data) {
-        if (ch === "\r") {
-          writeEmitter.fire("\r\n");
-          if (ws) {
-            const out = ws.type_line(line);
-            if (out) writeEmitter.fire(out.replace(/\n/g, "\r\n"));
-          }
-          line = "";
-        } else if (ch === "\x7f") {
-          if (line.length) {
-            line = line.slice(0, -1);
-            writeEmitter.fire("\b \b");
-          }
-        } else {
-          line += ch;
-          writeEmitter.fire(ch);
-        }
-      }
+      if (ws) ws.feed_input(encoder.encode(data));
     },
   };
   return vscode.window.createTerminal({ name: "holospace", pty });

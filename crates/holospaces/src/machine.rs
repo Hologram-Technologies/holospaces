@@ -30,9 +30,21 @@ const DTB_OFFSET: u64 = 0x0700_0000;
 /// environment a *running dev environment*: it brings up the core pseudo
 /// filesystems (`proc`/`sys`/`dev` — so `devtmpfs` mounts), mounts the shared
 /// `virtio-9p` workspace at `/workspace`, installs BusyBox's applets so the usual
-/// commands work, and **execs an interactive shell** — so the OS stays up and the
-/// holospace terminal is live, instead of shutting down right after boot. The base
-/// image must provide a static `/bin/busybox` (the `CC-22` BusyBox base).
+/// commands work, sets a sensible terminal size, and **execs an interactive shell
+/// on a controlling terminal** — so the OS stays up and the holospace terminal is
+/// live, instead of shutting down right after boot.
+///
+/// The shell is started with `setsid -c` so it becomes a *session leader with the
+/// console (`/dev/hvc0`) as its controlling terminal*. Without this, PID 1 has no
+/// session (`SID 0`) and the console has no foreground process group, so the tty's
+/// `^C` produces a SIGINT with nowhere to go — Ctrl-C would not interrupt a running
+/// command. `setsid -c` gives the console a foreground process group, so Ctrl-C
+/// (and job control, Ctrl-Z) reach the foreground command, exactly as a real
+/// terminal. (`exec setsid` is safe from PID 1 here: PID 1 is not a process-group
+/// leader, so BusyBox `setsid` does not fork — it cannot orphan init.)
+///
+/// The base image must provide a static `/bin/busybox` with the `setsid`/`stty`
+/// applets (the `CC-22` BusyBox base).
 pub const DEVCONTAINER_INIT: &[u8] = b"#!/bin/busybox sh\n\
 /bin/busybox mkdir -p /proc /sys /dev /tmp /root /workspace /bin /sbin /usr/bin /usr/sbin\n\
 /bin/busybox mount -t proc proc /proc\n\
@@ -41,9 +53,10 @@ pub const DEVCONTAINER_INIT: &[u8] = b"#!/bin/busybox sh\n\
 /bin/busybox mount -t 9p -o trans=virtio,version=9p2000.L,msize=65536 hsworkspace /workspace 2>/dev/null\n\
 /bin/busybox --install -s\n\
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin HOME=/root PS1='holospace:$PWD\\$ '\n\
+/bin/busybox stty rows 24 cols 80 2>/dev/null\n\
 cd /workspace\n\
 /bin/busybox echo 'holospace devcontainer ready \xe2\x80\x94 /workspace is your shared workspace'\n\
-exec /bin/busybox sh\n";
+exec /bin/busybox setsid -c /bin/busybox sh\n";
 
 /// The machine a holospace boots on: a single RV64GC hart over `ram_bytes` of
 /// RAM mapped at `base`, with the CLINT, the PLIC, and one `virtio-mmio` block
