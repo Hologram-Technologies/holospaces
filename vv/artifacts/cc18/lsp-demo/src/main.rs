@@ -11,7 +11,7 @@
 //! in the devcontainer OS; the workbench speaks LSP to it (ADR-012/015).
 
 use std::collections::BTreeSet;
-use std::io::{self, BufRead, BufReader, Read, StdinLock, Write};
+use std::io::{self, BufRead, BufReader, Write};
 
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionOptions, CompletionResponse, Diagnostic,
@@ -22,16 +22,51 @@ use lsp_types::{
 use serde_json::{json, Value};
 
 fn main() {
-    let stdin = io::stdin();
-    let mut reader = BufReader::new(stdin.lock());
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
+    // The default transport is stdio — the `CC-18` witness drives
+    // `lsp-demo < session.lsp`. `--listen <port>` serves the SAME LSP loop over a
+    // TCP socket, which the workbench reaches over the in-process substrate bridge
+    // (ADR-020, `CC-33`): the language server running in the devcontainer OS
+    // (ADR-015), giving the browser workbench real language intelligence with no
+    // Node extension host.
+    let mut port: Option<u16> = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == "--listen" {
+            port = args.next().and_then(|p| p.parse().ok());
+        } else if let Some(p) = a.strip_prefix("--listen=") {
+            port = p.parse().ok();
+        }
+    }
 
+    if let Some(port) = port {
+        let listener = std::net::TcpListener::bind(("0.0.0.0", port))
+            .unwrap_or_else(|e| panic!("lsp-demo: bind :{port}: {e}"));
+        // A console marker the boot/witness waits on (as `CC-21`'s server does).
+        eprintln!("LSP-LISTENING:{port}");
+        // Serve one editor session at a time over the SAME document intelligence.
+        for stream in listener.incoming().flatten() {
+            let _ = stream.set_nodelay(true);
+            let Ok(read_half) = stream.try_clone() else {
+                continue;
+            };
+            serve(&mut BufReader::new(read_half), &mut &stream);
+        }
+    } else {
+        let stdin = io::stdin();
+        let stdout = io::stdout();
+        serve(&mut BufReader::new(stdin.lock()), &mut stdout.lock());
+    }
+}
+
+/// The LSP message loop over any base-protocol transport — stdio (the `CC-18`
+/// witness) or a TCP socket (the bridged workbench, ADR-020). The document
+/// intelligence is identical; only the transport differs.
+fn serve<R: BufRead, W: Write>(reader: &mut R, out: &mut W) {
     // The currently-open document (uri, text) — the source the workbench opened.
     let mut doc: Option<(Url, String)> = None;
     let mut shutting_down = false;
 
-    while let Some(msg) = read_message(&mut reader) {
+    while let Some(msg) = read_message(reader) {
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
         let id = msg.get("id").cloned();
         match method {
@@ -46,7 +81,7 @@ fn main() {
                     ..Default::default()
                 };
                 respond(
-                    &mut out,
+                    out,
                     id,
                     json!({
                         "capabilities": caps,
@@ -63,7 +98,7 @@ fn main() {
                     ) {
                         if let Ok(url) = Url::parse(uri) {
                             // Real diagnostics: flag a TODO in the opened source.
-                            publish_diagnostics(&mut out, &url, text);
+                            publish_diagnostics(out, &url, text);
                             doc = Some((url, text.to_owned()));
                         }
                     }
@@ -84,7 +119,7 @@ fn main() {
                         serde_json::to_value(hover).unwrap()
                     })
                     .unwrap_or(Value::Null);
-                respond(&mut out, id, result);
+                respond(out, id, result);
             }
             "textDocument/completion" => {
                 let items: Vec<CompletionItem> = doc
@@ -92,7 +127,7 @@ fn main() {
                     .map(|(_, text)| completions(text))
                     .unwrap_or_default();
                 respond(
-                    &mut out,
+                    out,
                     id,
                     serde_json::to_value(CompletionResponse::Array(items)).unwrap(),
                 );
@@ -106,16 +141,16 @@ fn main() {
                         Some(serde_json::to_value(Location { uri: uri.clone(), range }).unwrap())
                     })
                     .unwrap_or(Value::Null);
-                respond(&mut out, id, result);
+                respond(out, id, result);
             }
             "shutdown" => {
                 shutting_down = true;
-                respond(&mut out, id, Value::Null);
+                respond(out, id, Value::Null);
             }
             "exit" => break,
             _ => {
                 if id.is_some() {
-                    respond_error(&mut out, id, -32601, "method not found");
+                    respond_error(out, id, -32601, "method not found");
                 }
             }
         }
@@ -127,7 +162,7 @@ fn main() {
 
 /// Read one LSP base-protocol message (`Content-Length` header + JSON body).
 /// Returns `None` at end of stream.
-fn read_message(reader: &mut BufReader<StdinLock<'static>>) -> Option<Value> {
+fn read_message<R: BufRead>(reader: &mut R) -> Option<Value> {
     let mut content_length: usize = 0;
     loop {
         let mut line = String::new();
