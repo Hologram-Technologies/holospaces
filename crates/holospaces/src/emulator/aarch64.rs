@@ -370,9 +370,1070 @@ impl Cpu {
             // Data Processing -- Register (op0 = x101).
             self.dp_register(inst, next).map_err(Halt::Trap)
         } else {
-            // Scalar FP / Advanced SIMD (op0 = x111) and anything unallocated are
-            // outside the CC-35 integer core.
-            Err(Halt::Trap(Trap::Illegal(inst)))
+            // Scalar FP / Advanced SIMD (op0 = x111).
+            match self.simd_fp(inst) {
+                Ok(()) => {
+                    self.pc = next;
+                    Ok(())
+                }
+                Err(t) => Err(Halt::Trap(t)),
+            }
+        }
+    }
+
+    /// Scalar Floating-Point and Advanced SIMD (Arm-ARM C4.1.6). The PC is *not*
+    /// advanced here — the caller advances on `Ok(())`.
+    ///
+    /// This is the SIMD&FP execution unit the integer-userspace ecosystem needs:
+    /// AArch64 mandates Advanced SIMD (there is no "no-NEON" AArch64 glibc), so a
+    /// stock `linux-arm64` binary's baseline `memcpy`/`memset`/`strlen`/… run
+    /// NEON unconditionally. Dispatch follows the C4.1.6 family tables (vector
+    /// forms have bit 31 = 0; the per-family masks fix the distinguishing bits).
+    fn simd_fp(&mut self, inst: u32) -> Result<(), Trap> {
+        // Scalar floating-point (FP compare / data-proc / convert / select /
+        // immediate): bits[28:24] = 11110 with bits[30:29] = 00. bit 31 is `M`
+        // (0) for the FP data-processing forms but `sf` for the FP↔integer
+        // conversions (so it is *not* constrained here); bits[30:29] = 00 is what
+        // separates scalar FP from the Advanced-SIMD *scalar* forms (bit 30 = 1).
+        if (inst >> 24) & 0x1f == 0b1_1110 && (inst >> 29) & 0x3 == 0 {
+            return self.fp_scalar(inst);
+        }
+        // Advanced SIMD (vector: bit 31 = 0; scalar: bits[31:30] = 01).
+        if inst & 0x9f20_8400 == 0x0e00_0400 {
+            self.asimd_copy(inst, false)
+        } else if inst & 0xdf20_8400 == 0x5e00_0400 {
+            self.asimd_copy(inst, true)
+        } else if inst & 0x9f3e_0c00 == 0x0e20_0800 {
+            self.asimd_two_reg_misc(inst, false)
+        } else if inst & 0xdf3e_0c00 == 0x5e20_0800 {
+            self.asimd_two_reg_misc(inst, true)
+        } else if inst & 0x9f3e_0c00 == 0x0e30_0800 {
+            self.asimd_across_lanes(inst)
+        } else if inst & 0xdf3e_0c00 == 0x5e30_0800 {
+            self.asimd_scalar_pairwise(inst)
+        } else if inst & 0x9f20_0c00 == 0x0e20_0000 {
+            self.asimd_three_different(inst)
+        } else if inst & 0x9f20_0400 == 0x0e20_0400 {
+            self.asimd_three_same(inst, false)
+        } else if inst & 0xdf20_0400 == 0x5e20_0400 {
+            self.asimd_three_same(inst, true)
+        } else if inst & 0xbf20_8c00 == 0x0e00_0000 {
+            self.asimd_tbl(inst)
+        } else if inst & 0xbf20_8c00 == 0x0e00_0800 {
+            self.asimd_permute(inst)
+        } else if inst & 0xbf20_8400 == 0x2e00_0000 {
+            self.asimd_ext(inst)
+        } else if inst & 0x9f80_0400 == 0x0f00_0400 {
+            // immh==0 → modified immediate; immh!=0 → shift by immediate.
+            if (inst >> 19) & 0xf == 0 {
+                self.asimd_modified_imm(inst)
+            } else {
+                self.asimd_shift_imm(inst, false)
+            }
+        } else if inst & 0xdf80_0400 == 0x5f00_0400 && (inst >> 19) & 0xf != 0 {
+            self.asimd_shift_imm(inst, true)
+        } else if inst & 0x9f00_0400 == 0x0f00_0000 {
+            self.asimd_indexed(inst, false)
+        } else if inst & 0xdf00_0400 == 0x5f00_0000 {
+            self.asimd_indexed(inst, true)
+        } else {
+            Err(Trap::Illegal(inst))
+        }
+    }
+
+    // ── Advanced SIMD: register-file access (little-endian lane layout) ──────
+
+    /// Write `val` to `Vd`, zeroing the upper 64 bits when the form is 64-bit
+    /// (`Q == 0`) — every AArch64 SIMD writer clears the unused top half.
+    fn write_vreg(&mut self, rd: u32, val: u128, q: bool) {
+        self.v[rd as usize] = if q { val } else { val & (u64::MAX as u128) };
+    }
+
+    /// AdvSIMD copy: `DUP` (element/general), `INS` (element/general), `UMOV`,
+    /// `SMOV` — the lane↔general and lane-broadcast moves glibc's string routines
+    /// use (`DUP Vd.16b,Wn` for `memset`; `UMOV`/`INS` for tail handling).
+    fn asimd_copy(&mut self, inst: u32, scalar: bool) -> Result<(), Trap> {
+        let q = inst & (1 << 30) != 0;
+        let op = inst & (1 << 29) != 0;
+        let imm5 = (inst >> 16) & 0x1f;
+        let imm4 = (inst >> 11) & 0xf;
+        let rn = (inst >> 5) & 0x1f;
+        let rd = inst & 0x1f;
+        // `size` = position of the lowest set bit of imm5 (B=0,H=1,S=2,D=3).
+        let size = imm5.trailing_zeros();
+        if size > 3 || imm5 == 0 {
+            return Err(Trap::Illegal(inst));
+        }
+        let esize = 8u32 << size;
+        let idx = (imm5 >> (size + 1)) as usize; // element index within the source
+        if scalar {
+            // Scalar DUP (DUP Dd, Vn.D[i]) — extract one element into a scalar V.
+            let v = lane(self.v[rn as usize], size, idx);
+            self.write_vreg(rd, v as u128, false);
+            return Ok(());
+        }
+        if !op && imm4 == 0b0000 {
+            // DUP (element): broadcast Vn.T[idx] across Vd.
+            let elt = lane(self.v[rn as usize], size, idx);
+            let mut out = 0u128;
+            let lanes = (if q { 128 } else { 64 }) / esize;
+            for i in 0..lanes as usize {
+                set_lane(&mut out, size, i, elt);
+            }
+            self.write_vreg(rd, out, q);
+            Ok(())
+        } else if !op && imm4 == 0b0001 {
+            // DUP (general): broadcast Xn/Wn across Vd.
+            let elt = self.rx(rn) & mask_bits(esize);
+            let mut out = 0u128;
+            let lanes = (if q { 128 } else { 64 }) / esize;
+            for i in 0..lanes as usize {
+                set_lane(&mut out, size, i, elt);
+            }
+            self.write_vreg(rd, out, q);
+            Ok(())
+        } else if !op && imm4 == 0b0101 {
+            // SMOV: sign-extend Vn.T[idx] into Xd/Wd.
+            let elt = lane(self.v[rn as usize], size, idx);
+            let val = sign_extend(elt, esize);
+            // Q selects 64-bit (X) vs 32-bit (W) destination.
+            self.wx_sz(rd, val, q);
+            Ok(())
+        } else if !op && imm4 == 0b0111 {
+            // UMOV: zero-extend Vn.T[idx] into Xd/Wd (a.k.a. MOV Wd,Vn.S[i]).
+            let elt = lane(self.v[rn as usize], size, idx);
+            self.wx_sz(rd, elt, q);
+            Ok(())
+        } else if !op && imm4 == 0b0011 {
+            // INS (general): Vd.Ts[idx] = Xn/Wn (op = 0, imm4 = 0011).
+            let mut out = self.v[rd as usize];
+            set_lane(&mut out, size, idx, self.rx(rn) & mask_bits(esize));
+            self.v[rd as usize] = out;
+            Ok(())
+        } else if op {
+            // INS (element): Vd.Ts[idx] = Vn.Ts[idx2] (op = 1).
+            let idx2 = (imm4 >> size) as usize;
+            let elt = lane(self.v[rn as usize], size, idx2);
+            let mut out = self.v[rd as usize];
+            set_lane(&mut out, size, idx, elt);
+            self.v[rd as usize] = out;
+            Ok(())
+        } else {
+            Err(Trap::Illegal(inst))
+        }
+    }
+
+    /// AdvSIMD three-same (integer + the FP forms): the bulk of NEON compute —
+    /// bitwise logic (`AND`/`ORR`/`EOR`/`BIC`/`ORN`/`BSL`/`BIT`/`BIF`), `ADD`/`SUB`,
+    /// the comparisons (`CMEQ`/`CMGT`/`CMGE`/`CMHI`/`CMHS`/`CMTST`), `MIN`/`MAX`,
+    /// `MUL`, pairwise (`ADDP`/`MAXP`/`MINP`), and the shifts (`USHL`/`SSHL`).
+    fn asimd_three_same(&mut self, inst: u32, scalar: bool) -> Result<(), Trap> {
+        let q = inst & (1 << 30) != 0;
+        let u = inst & (1 << 29) != 0;
+        let size = (inst >> 22) & 0x3;
+        let opcode = (inst >> 11) & 0x1f;
+        let rm = (inst >> 16) & 0x1f;
+        let rn = (inst >> 5) & 0x1f;
+        let rd = inst & 0x1f;
+        let a = self.v[rn as usize];
+        let b = self.v[rm as usize];
+
+        // Logical ops (opcode 0b00011) select on size/U, not element size.
+        if opcode == 0b00011 {
+            let r = match (u, size) {
+                (false, 0b00) => a & b,                                                 // AND
+                (false, 0b01) => a & !b,                                                // BIC
+                (false, 0b10) => a | b,  // ORR (MOV when Rn==Rm)
+                (false, 0b11) => a | !b, // ORN
+                (true, 0b00) => a ^ b,   // EOR
+                (true, 0b01) => (self.v[rd as usize] & !b) | (a & b), // BSL
+                (true, 0b10) => self.v[rd as usize] ^ ((a ^ self.v[rd as usize]) & b), // BIT
+                (true, 0b11) => self.v[rd as usize] ^ ((a ^ self.v[rd as usize]) & !b), // BIF
+                _ => unreachable!(),
+            };
+            self.write_vreg(rd, r, q);
+            return Ok(());
+        }
+
+        // FP three-same (opcode 0b11x067 region, bit 11 set) — handled separately.
+        if opcode >= 0b11000 {
+            return self.asimd_three_same_fp(inst, scalar);
+        }
+
+        let esize = 8u32 << size;
+        let elems = if scalar {
+            1
+        } else {
+            (if q { 128 } else { 64 }) / esize
+        } as usize;
+        let mut out = 0u128;
+        // Pairwise ops read the concatenation of Vn:Vm; handle them up front.
+        let pairwise = matches!(opcode, 0b10111 | 0b10100 | 0b10101);
+        if pairwise {
+            let total = elems;
+            for i in 0..total {
+                let (x, y) = if i < total / 2 {
+                    (lane(a, size, 2 * i), lane(a, size, 2 * i + 1))
+                } else {
+                    let j = i - total / 2;
+                    (lane(b, size, 2 * j), lane(b, size, 2 * j + 1))
+                };
+                let r = match opcode {
+                    0b10111 => x.wrapping_add(y) & mask_bits(esize), // ADDP
+                    0b10100 => {
+                        if u {
+                            x.max(y)
+                        } else {
+                            smax(x, y, esize)
+                        }
+                    } // UMAXP/SMAXP
+                    0b10101 => {
+                        if u {
+                            x.min(y)
+                        } else {
+                            smin(x, y, esize)
+                        }
+                    } // UMINP/SMINP
+                    _ => unreachable!(),
+                };
+                set_lane(&mut out, size, i, r & mask_bits(esize));
+            }
+            self.write_vreg(rd, out, q);
+            return Ok(());
+        }
+        for i in 0..elems {
+            let x = lane(a, size, i);
+            let y = lane(b, size, i);
+            let r: u64 = match opcode {
+                0b10000 => {
+                    if u {
+                        x.wrapping_sub(y)
+                    } else {
+                        x.wrapping_add(y)
+                    }
+                } // SUB / ADD
+                0b10001 => {
+                    if u {
+                        bool_lane(x & mask_bits(esize) == y & mask_bits(esize))
+                    } else {
+                        bool_lane(x & y & mask_bits(esize) != 0)
+                    }
+                } // CMEQ / CMTST
+                0b00110 => {
+                    if u {
+                        bool_lane(x & mask_bits(esize) > y & mask_bits(esize))
+                    } else {
+                        bool_lane(scmp(x, y, esize) == core::cmp::Ordering::Greater)
+                    }
+                } // CMHI / CMGT
+                0b00111 => {
+                    if u {
+                        bool_lane(x & mask_bits(esize) >= y & mask_bits(esize))
+                    } else {
+                        bool_lane(scmp(x, y, esize) != core::cmp::Ordering::Less)
+                    }
+                } // CMHS / CMGE
+                0b01100 => {
+                    if u {
+                        (x & mask_bits(esize)).max(y & mask_bits(esize))
+                    } else {
+                        smax(x, y, esize)
+                    }
+                } // UMAX / SMAX
+                0b01101 => {
+                    if u {
+                        (x & mask_bits(esize)).min(y & mask_bits(esize))
+                    } else {
+                        smin(x, y, esize)
+                    }
+                } // UMIN / SMIN
+                0b01110 => {
+                    if u {
+                        (x & mask_bits(esize)).abs_diff(y & mask_bits(esize))
+                    } else {
+                        sabd(x, y, esize)
+                    }
+                } // UABD / SABD
+                0b10011 => {
+                    if u {
+                        pmul(x, y, esize)
+                    } else {
+                        x.wrapping_mul(y)
+                    }
+                } // PMUL / MUL
+                0b10010 => {
+                    let p = x.wrapping_mul(y);
+                    let acc = lane(self.v[rd as usize], size, i);
+                    if u {
+                        acc.wrapping_sub(p)
+                    } else {
+                        acc.wrapping_add(p)
+                    }
+                } // MLS / MLA
+                0b01000 => ushl_sshl(x, y, esize, u), // USHL / SSHL
+                0b00000 => {
+                    // SHADD / UHADD (halving add)
+                    if u {
+                        ((x & mask_bits(esize)) + (y & mask_bits(esize))) >> 1
+                    } else {
+                        let xs = sign_extend(x, esize) as i64;
+                        let ys = sign_extend(y, esize) as i64;
+                        ((xs + ys) >> 1) as u64
+                    }
+                }
+                0b00001 => uqadd_sqadd(x, y, esize, u), // UQADD / SQADD
+                0b00101 => uqsub_sqsub(x, y, esize, u), // UQSUB / SQSUB
+                _ => return Err(Trap::Illegal(inst)),
+            };
+            set_lane(&mut out, size, i, r & mask_bits(esize));
+        }
+        self.write_vreg(rd, out, q);
+        Ok(())
+    }
+
+    /// AdvSIMD three-same, floating-point forms (`FADD`/`FSUB`/`FMUL`/`FDIV`,
+    /// `FMAX`/`FMIN`, `FCMEQ`/`FCMGE`/`FCMGT`, `FMLA`/`FMLS`, `FABD`).
+    fn asimd_three_same_fp(&mut self, inst: u32, scalar: bool) -> Result<(), Trap> {
+        let q = inst & (1 << 30) != 0;
+        let u = inst & (1 << 29) != 0;
+        let sz = (inst >> 22) & 1; // 0 = f32, 1 = f64
+        let opcode = (inst >> 11) & 0x1f;
+        let rm = (inst >> 16) & 0x1f;
+        let rn = (inst >> 5) & 0x1f;
+        let rd = inst & 0x1f;
+        let ebytes: u32 = if sz == 1 { 8 } else { 4 };
+        let size = if sz == 1 { 3 } else { 2 };
+        let elems = if scalar {
+            1
+        } else {
+            (if q { 128 } else { 64 }) / (ebytes * 8)
+        } as usize;
+        let a = self.v[rn as usize];
+        let b = self.v[rm as usize];
+        let mut out = 0u128;
+        for i in 0..elems {
+            let x = lane(a, size, i);
+            let y = lane(b, size, i);
+            let o1 = (inst >> 23) & 1 == 1;
+            let r = fp3(
+                opcode,
+                u,
+                o1,
+                sz == 1,
+                x,
+                y,
+                lane(self.v[rd as usize], size, i),
+            );
+            let Some(bits) = r else {
+                return Err(Trap::Illegal(inst));
+            };
+            set_lane(&mut out, size, i, bits);
+        }
+        self.write_vreg(rd, out, q);
+        Ok(())
+    }
+
+    /// AdvSIMD two-register miscellaneous: `REV*`, `CLZ`/`CLS`, `CNT`, `NOT`,
+    /// `RBIT`, the compare-to-zero forms, `ABS`/`NEG`, `XTN`, the pairwise-long
+    /// adds — the lane-reshaping ops glibc's `strlen`/`memchr` use.
+    fn asimd_two_reg_misc(&mut self, inst: u32, scalar: bool) -> Result<(), Trap> {
+        let q = inst & (1 << 30) != 0;
+        let u = inst & (1 << 29) != 0;
+        let size = (inst >> 22) & 0x3;
+        let opcode = (inst >> 12) & 0x1f;
+        let rn = (inst >> 5) & 0x1f;
+        let rd = inst & 0x1f;
+        let esize = 8u32 << size;
+        let datasize = if q { 128 } else { 64 };
+        let a = self.v[rn as usize];
+
+        // REV64/REV32/REV16: reverse the `esize`-byte chunks within each
+        // container (64/32/16-bit). `size` is the chunk (sub-element) size.
+        if opcode == 0b00000 || opcode == 0b00001 {
+            let container: u32 = match (opcode, u) {
+                (0b00000, false) => 64, // REV64
+                (0b00000, true) => 32,  // REV32
+                (0b00001, false) => 16, // REV16
+                _ => return Err(Trap::Illegal(inst)),
+            };
+            let mut out = 0u128;
+            let cbytes = (container / esize) as usize; // chunks per container
+            let containers = (datasize / container) as usize;
+            for c in 0..containers {
+                for k in 0..cbytes {
+                    let src = lane(a, size, c * cbytes + k);
+                    set_lane(&mut out, size, c * cbytes + (cbytes - 1 - k), src);
+                }
+            }
+            self.write_vreg(rd, out, q);
+            return Ok(());
+        }
+
+        // Narrowing XTN/XTN2 (and the saturating SQXTN/UQXTN, treated as XTN for
+        // the values glibc produces): write `esize`-byte halves of `2*esize`
+        // source elements. XTN2 (Q) fills the high half, preserving the low.
+        if opcode == 0b10010 || opcode == 0b10100 {
+            let ssize = size + 1;
+            let selems = (64 / esize) as usize; // 64-bit worth of narrowed elements
+            let mut out = if q { self.v[rd as usize] } else { 0 };
+            for i in 0..selems {
+                let s = lane(a, ssize, i) & mask(esize);
+                set_lane(&mut out, size, if q { selems + i } else { i }, s);
+            }
+            self.v[rd as usize] = if q { out } else { out & (u64::MAX as u128) };
+            return Ok(());
+        }
+
+        let elems = if scalar {
+            1
+        } else {
+            (datasize / esize) as usize
+        };
+        let mut out = 0u128;
+        for i in 0..elems {
+            let x = lane(a, size, i);
+            let r: u64 = match (opcode, u) {
+                (0b00100, false) => clsz(x, esize, false), // CLS
+                (0b00100, true) => clsz(x, esize, true),   // CLZ
+                (0b00101, false) => (x & mask(esize)).count_ones() as u64, // CNT
+                (0b00101, true) if size == 0 => !x,        // NOT (MVN)
+                (0b00101, true) if size == 1 => rbit(x, esize), // RBIT
+                (0b01000, false) => bool_lane(scmp(x, 0, esize) == core::cmp::Ordering::Greater), // CMGT #0
+                (0b01000, true) => bool_lane(scmp(x, 0, esize) != core::cmp::Ordering::Less), // CMGE #0
+                (0b01001, false) => bool_lane(x & mask(esize) == 0), // CMEQ #0
+                (0b01001, true) => bool_lane(scmp(x, 0, esize) != core::cmp::Ordering::Greater), // CMLE #0
+                (0b01010, false) => bool_lane(scmp(x, 0, esize) == core::cmp::Ordering::Less), // CMLT #0
+                (0b01011, false) => (sign_extend(x, esize) as i64).unsigned_abs(), // ABS
+                (0b01011, true) => 0u64.wrapping_sub(x),                           // NEG
+                _ => return Err(Trap::Illegal(inst)),
+            };
+            set_lane(&mut out, size, i, r & mask(esize));
+        }
+        self.write_vreg(rd, out, q);
+        Ok(())
+    }
+
+    /// AdvSIMD across lanes: `ADDV`, `UMAXV`/`UMINV`/`SMAXV`/`SMINV`,
+    /// `UADDLV`/`SADDLV` — the horizontal reductions that collapse a vector to a
+    /// single element (glibc's `strlen`/`memchr` use them to test a whole chunk).
+    fn asimd_across_lanes(&mut self, inst: u32) -> Result<(), Trap> {
+        let q = inst & (1 << 30) != 0;
+        let u = inst & (1 << 29) != 0;
+        let size = (inst >> 22) & 0x3;
+        let opcode = (inst >> 12) & 0x1f;
+        let rn = (inst >> 5) & 0x1f;
+        let rd = inst & 0x1f;
+        let esize = 8u32 << size;
+        let a = self.v[rn as usize];
+        let elems = ((if q { 128 } else { 64 }) / esize) as usize;
+        // Across-lanes opcodes: 00011 SADDLV/UADDLV, 01010 SMAXV/UMAXV,
+        // 11010 SMINV/UMINV, 11011 ADDV.
+        let mut acc = match opcode {
+            0b11011 | 0b00011 => 0u64,
+            _ => lane(a, size, 0),
+        };
+        for i in 0..elems {
+            let x = lane(a, size, i);
+            match opcode {
+                0b11011 => acc = acc.wrapping_add(x), // ADDV
+                0b00011 => {
+                    acc = acc.wrapping_add(if u {
+                        x & mask(esize)
+                    } else {
+                        sign_extend(x, esize)
+                    });
+                } // UADDLV / SADDLV
+                0b01010 => {
+                    acc = if u {
+                        acc.max(x & mask(esize))
+                    } else if scmp(x, acc, esize) == core::cmp::Ordering::Greater {
+                        x
+                    } else {
+                        acc
+                    };
+                } // UMAXV / SMAXV
+                0b11010 => {
+                    acc = if u {
+                        acc.min(x & mask(esize))
+                    } else if scmp(x, acc, esize) == core::cmp::Ordering::Less {
+                        x
+                    } else {
+                        acc
+                    };
+                } // UMINV / SMINV
+                _ => return Err(Trap::Illegal(inst)),
+            }
+        }
+        // The destination element is `esize` (or 2*esize for the long add).
+        let dsize = if opcode == 0b00011 { size + 1 } else { size };
+        let mut out = 0u128;
+        set_lane(&mut out, dsize, 0, acc & mask(8u32 << dsize));
+        self.write_vreg(rd, out, false);
+        Ok(())
+    }
+
+    /// AdvSIMD scalar pairwise (`ADDP Dd, Vn.2D` and friends) — the final
+    /// reduction step a few routines use.
+    fn asimd_scalar_pairwise(&mut self, inst: u32) -> Result<(), Trap> {
+        let size = (inst >> 22) & 0x3;
+        let opcode = (inst >> 12) & 0x1f;
+        let rn = (inst >> 5) & 0x1f;
+        let rd = inst & 0x1f;
+        let a = self.v[rn as usize];
+        if opcode == 0b11011 {
+            // ADDP (scalar): Dd = Vn.D[0] + Vn.D[1]
+            let r = lane(a, size, 0).wrapping_add(lane(a, size, 1));
+            let mut out = 0u128;
+            set_lane(&mut out, size, 0, r & mask(8u32 << size));
+            self.write_vreg(rd, out, false);
+            Ok(())
+        } else {
+            Err(Trap::Illegal(inst))
+        }
+    }
+
+    /// AdvSIMD three-different (widening): `SMULL`/`UMULL`, `SMLAL`/`UMLAL`,
+    /// `SADDL`/`UADDL`, `SSUBL`/`USUBL`, `ADDHN`/`SUBHN` — the long-arithmetic
+    /// forms.
+    fn asimd_three_different(&mut self, inst: u32) -> Result<(), Trap> {
+        let q = inst & (1 << 30) != 0;
+        let u = inst & (1 << 29) != 0;
+        let size = (inst >> 22) & 0x3;
+        let opcode = (inst >> 12) & 0xf;
+        let rm = (inst >> 16) & 0x1f;
+        let rn = (inst >> 5) & 0x1f;
+        let rd = inst & 0x1f;
+        let esize = 8u32 << size;
+        let dsize = size + 1;
+        let part = if q { 1 } else { 0 }; // _2 forms read the high half
+        let a = self.v[rn as usize];
+        let b = self.v[rm as usize];
+        let delems = (128 / (esize * 2)) as usize;
+        let mut out = 0u128;
+        for i in 0..delems {
+            let xi = part * delems + i;
+            let x = lane(a, size, xi);
+            let y = lane(b, size, xi);
+            let r: u64 = match opcode {
+                0b1100 => {
+                    if u {
+                        (x & mask(esize)).wrapping_mul(y & mask(esize))
+                    } else {
+                        (sign_extend(x, esize)).wrapping_mul(sign_extend(y, esize))
+                    }
+                } // UMULL / SMULL
+                0b1000 | 0b1010 => {
+                    let p = if u {
+                        (x & mask(esize)).wrapping_mul(y & mask(esize))
+                    } else {
+                        (sign_extend(x, esize)).wrapping_mul(sign_extend(y, esize))
+                    };
+                    let acc = lane(self.v[rd as usize], dsize, i);
+                    if opcode == 0b1000 {
+                        acc.wrapping_add(p)
+                    } else {
+                        acc.wrapping_sub(p)
+                    }
+                } // UMLAL/SMLAL (1000) UMLSL/SMLSL (1010)
+                0b0000 => {
+                    if u {
+                        (x & mask(esize)).wrapping_add(y & mask(esize))
+                    } else {
+                        sign_extend(x, esize).wrapping_add(sign_extend(y, esize))
+                    }
+                } // UADDL / SADDL
+                0b0010 => {
+                    if u {
+                        (x & mask(esize)).wrapping_sub(y & mask(esize))
+                    } else {
+                        sign_extend(x, esize).wrapping_sub(sign_extend(y, esize))
+                    }
+                } // USUBL / SSUBL
+                _ => return Err(Trap::Illegal(inst)),
+            };
+            set_lane(&mut out, dsize, i, r & mask(8u32 << dsize));
+        }
+        self.write_vreg(rd, out, true);
+        Ok(())
+    }
+
+    /// AdvSIMD table lookup: `TBL`/`TBX` — gather bytes from a 1–4 register table
+    /// by an index vector (used by some `memchr`/charset routines).
+    fn asimd_tbl(&mut self, inst: u32) -> Result<(), Trap> {
+        let q = inst & (1 << 30) != 0;
+        let len = ((inst >> 13) & 0x3) as usize + 1; // 1..4 table registers
+        let is_tbx = inst & (1 << 12) != 0;
+        let rm = (inst >> 16) & 0x1f;
+        let rn = (inst >> 5) & 0x1f;
+        let rd = inst & 0x1f;
+        let idx = self.v[rm as usize];
+        let bytes = if q { 16 } else { 8 };
+        let mut out = if is_tbx { self.v[rd as usize] } else { 0 };
+        for i in 0..bytes {
+            let sel = ((idx >> (i * 8)) & 0xff) as usize;
+            if sel < len * 16 {
+                let treg = (rn as usize + sel / 16) % 32;
+                let b = (self.v[treg] >> ((sel % 16) * 8)) & 0xff;
+                out = (out & !(0xffu128 << (i * 8))) | (b << (i * 8));
+            } else if !is_tbx {
+                out &= !(0xffu128 << (i * 8)); // TBL: out-of-range → 0
+            }
+        }
+        self.write_vreg(rd, out, q);
+        Ok(())
+    }
+
+    /// AdvSIMD permute: `ZIP1`/`ZIP2`, `UZP1`/`UZP2`, `TRN1`/`TRN2`.
+    fn asimd_permute(&mut self, inst: u32) -> Result<(), Trap> {
+        let q = inst & (1 << 30) != 0;
+        let size = (inst >> 22) & 0x3;
+        let opcode = (inst >> 12) & 0x7;
+        let rm = (inst >> 16) & 0x1f;
+        let rn = (inst >> 5) & 0x1f;
+        let rd = inst & 0x1f;
+        let a = self.v[rn as usize];
+        let b = self.v[rm as usize];
+        let elems = ((if q { 128 } else { 64 }) / (8u32 << size)) as usize;
+        let mut out = 0u128;
+        let half = elems / 2;
+        for i in 0..elems {
+            let v = match opcode {
+                0b011 | 0b111 => {
+                    // ZIP1 (011) / ZIP2 (111)
+                    let base = if opcode == 0b111 { half } else { 0 };
+                    let p = i / 2 + base;
+                    if i % 2 == 0 {
+                        lane(a, size, p)
+                    } else {
+                        lane(b, size, p)
+                    }
+                }
+                0b001 | 0b101 => {
+                    // UZP1 (001) / UZP2 (101)
+                    let odd = if opcode == 0b101 { 1 } else { 0 };
+                    let src = 2 * i + odd;
+                    if src < elems {
+                        lane(a, size, src)
+                    } else {
+                        lane(b, size, src - elems)
+                    }
+                }
+                0b010 | 0b110 => {
+                    // TRN1 (010) / TRN2 (110)
+                    let off = if opcode == 0b110 { 1 } else { 0 };
+                    let p = (i & !1) + off;
+                    if i % 2 == 0 {
+                        lane(a, size, p)
+                    } else {
+                        lane(b, size, p)
+                    }
+                }
+                _ => return Err(Trap::Illegal(inst)),
+            };
+            set_lane(&mut out, size, i, v);
+        }
+        self.write_vreg(rd, out, q);
+        Ok(())
+    }
+
+    /// AdvSIMD extract: `EXT Vd, Vn, Vm, #imm` — byte-granular concatenation, the
+    /// misalignment primitive glibc's `memcpy`/`strcmp` tails use.
+    fn asimd_ext(&mut self, inst: u32) -> Result<(), Trap> {
+        let q = inst & (1 << 30) != 0;
+        let rm = (inst >> 16) & 0x1f;
+        let imm4 = (inst >> 11) & 0xf;
+        let rn = (inst >> 5) & 0x1f;
+        let rd = inst & 0x1f;
+        let bytes = if q { 16 } else { 8 };
+        let pos = imm4 as usize;
+        if pos >= bytes {
+            return Err(Trap::Illegal(inst));
+        }
+        let a = self.v[rn as usize];
+        let b = self.v[rm as usize];
+        let mut out = 0u128;
+        for i in 0..bytes {
+            let src = pos + i;
+            let byte = if src < bytes {
+                (a >> (src * 8)) & 0xff
+            } else {
+                (b >> ((src - bytes) * 8)) & 0xff
+            };
+            out |= byte << (i * 8);
+        }
+        self.write_vreg(rd, out, q);
+        Ok(())
+    }
+
+    /// AdvSIMD modified immediate: `MOVI`/`MVNI`, the immediate `ORR`/`BIC`, and
+    /// `FMOV` (vector immediate) — `memset` builds its fill byte with `MOVI`.
+    fn asimd_modified_imm(&mut self, inst: u32) -> Result<(), Trap> {
+        let q = inst & (1 << 30) != 0;
+        let op = inst & (1 << 29) != 0;
+        let cmode = (inst >> 12) & 0xf;
+        let abc = (inst >> 16) & 0x7;
+        let defgh = (inst >> 5) & 0x1f;
+        let rd = inst & 0x1f;
+        let imm8 = (abc << 5) | defgh;
+        let (imm, is_mvni, is_logical) = adv_simd_expand_imm(cmode, op, imm8 as u8);
+        let val = if q { imm } else { imm & (u64::MAX as u128) };
+        let r = if is_logical {
+            // ORR/BIC immediate accumulate into Vd.
+            let cur = self.v[rd as usize];
+            if op {
+                cur & !val // BIC
+            } else {
+                cur | val // ORR
+            }
+        } else if is_mvni {
+            !val
+        } else {
+            val
+        };
+        self.write_vreg(rd, r, q);
+        Ok(())
+    }
+
+    /// AdvSIMD shift by immediate: `SHL`, `USHR`/`SSHR`, `SHRN`, `SSHLL`/`USHLL`,
+    /// `SLI`/`SRI` — including the `SHRN v.8b, v.8h, #4` nibble-narrowing that
+    /// glibc's `strlen` uses to compress a 16-byte compare to a 64-bit word.
+    fn asimd_shift_imm(&mut self, inst: u32, scalar: bool) -> Result<(), Trap> {
+        let q = inst & (1 << 30) != 0;
+        let u = inst & (1 << 29) != 0;
+        let immh = (inst >> 19) & 0xf;
+        let immb = (inst >> 16) & 0x7;
+        let opcode = (inst >> 11) & 0x1f;
+        let rn = (inst >> 5) & 0x1f;
+        let rd = inst & 0x1f;
+        // size = highest set bit position of immh (B/H/S/D), shift derived per form.
+        let size = (31 - immh.leading_zeros()).min(3);
+        let esize = 8u32 << size;
+        let imm = (immh << 3) | immb;
+        let a = self.v[rn as usize];
+
+        // Narrowing forms (SHRN/RSHRN): dest element is half, source is 2*esize.
+        if opcode == 0b10000 {
+            let shift = 2 * esize - imm;
+            let dsize = size; // narrow output element
+            let ssize = size + 1;
+            let delems = (128 / (esize * 2)) as usize;
+            let mut out = if q { self.v[rd as usize] } else { 0 };
+            for i in 0..delems {
+                let s = lane(a, ssize, i);
+                let r = (s >> shift) & mask(esize);
+                set_lane(&mut out, dsize, if q { delems + i } else { i }, r);
+            }
+            self.write_vreg(rd, out, true);
+            if !q {
+                self.write_vreg(rd, out & (u64::MAX as u128), false);
+            }
+            return Ok(());
+        }
+
+        // Widening forms (SSHLL/USHLL, a.k.a. SXTL/UXTL when shift==0).
+        if opcode == 0b10100 {
+            let shift = imm - esize;
+            let dsize = size + 1;
+            let delems = (128 / (esize * 2)) as usize;
+            let part = if q { delems } else { 0 };
+            let mut out = 0u128;
+            for i in 0..delems {
+                let s = lane(a, size, part + i);
+                let ext = if u {
+                    s & mask(esize)
+                } else {
+                    sign_extend(s, esize)
+                };
+                set_lane(
+                    &mut out,
+                    dsize,
+                    i,
+                    ext.wrapping_shl(shift) & mask(8u32 << dsize),
+                );
+            }
+            self.write_vreg(rd, out, true);
+            return Ok(());
+        }
+
+        let elems = if scalar {
+            1
+        } else {
+            (if q { 128 } else { 64 }) / esize
+        } as usize;
+        // SLI/SRI insert into the existing destination; the others overwrite.
+        let insert = matches!(opcode, 0b01000) || (opcode == 0b01010 && u);
+        let mut out = if insert { self.v[rd as usize] } else { 0 };
+        let right = 2 * esize - imm; // right-shift amount (for the SHR family)
+        let left = imm - esize; // left-shift amount (for SHL/SLI)
+        for i in 0..elems {
+            let x = lane(a, size, i);
+            let em = mask(esize);
+            let val: u64 = match (opcode, u) {
+                (0b00000, true) => (x & em) >> right, // USHR
+                (0b00000, false) => ((sign_extend(x, esize) as i64) >> right) as u64, // SSHR
+                (0b00010, _) => {
+                    let shifted = if u {
+                        (x & em) >> right
+                    } else {
+                        ((sign_extend(x, esize) as i64) >> right) as u64
+                    };
+                    lane(self.v[rd as usize], size, i).wrapping_add(shifted)
+                } // USRA / SSRA
+                (0b01010, false) => x.wrapping_shl(left), // SHL
+                (0b01010, true) => {
+                    // SLI: shift left, insert (keep the low `left` bits of Vd).
+                    let keep = mask(left);
+                    (lane(self.v[rd as usize], size, i) & keep) | ((x << left) & em)
+                }
+                (0b01000, true) => {
+                    // SRI: shift right, insert (keep the high `right` bits of Vd).
+                    let shifted = (x & em) >> right;
+                    let keep = if right == 0 { 0 } else { (em << right) & em };
+                    (lane(self.v[rd as usize], size, i) & keep) | shifted
+                }
+                _ => return Err(Trap::Illegal(inst)),
+            };
+            set_lane(&mut out, size, i, val & em);
+        }
+        self.write_vreg(rd, out, q);
+        Ok(())
+    }
+
+    /// AdvSIMD vector × indexed element: `MUL`/`MLA`/`MLS` and the `FMUL`/`FMLA`
+    /// by-element forms.
+    fn asimd_indexed(&mut self, inst: u32, _scalar: bool) -> Result<(), Trap> {
+        let q = inst & (1 << 30) != 0;
+        let size = (inst >> 22) & 0x3;
+        let opcode = (inst >> 12) & 0xf;
+        let l = (inst >> 21) & 1;
+        let m = (inst >> 20) & 1;
+        let rmlo = (inst >> 16) & 0xf;
+        let h = (inst >> 11) & 1;
+        let rn = (inst >> 5) & 0x1f;
+        let rd = inst & 0x1f;
+        let esize = 8u32 << size;
+        // Integer MUL/MLA/MLS by element (opcode 1000=MLA,0100=MLS,1000? ; 1000? ).
+        let (rm, index) = match size {
+            0b01 => (rmlo, (h << 2) | (l << 1) | m), // H elements: Vm in 0..15
+            0b10 => ((m << 4) | rmlo, (h << 1) | l), // S elements
+            _ => return Err(Trap::Illegal(inst)),
+        };
+        let velt = lane(self.v[rm as usize], size, index as usize);
+        let a = self.v[rn as usize];
+        let elems = ((if q { 128 } else { 64 }) / esize) as usize;
+        let mut out = 0u128;
+        for i in 0..elems {
+            let x = lane(a, size, i);
+            let p = x.wrapping_mul(velt);
+            let r = match opcode {
+                0b1000 => p,                                                  // MUL
+                0b0000 => lane(self.v[rd as usize], size, i).wrapping_add(p), // MLA
+                0b0100 => lane(self.v[rd as usize], size, i).wrapping_sub(p), // MLS
+                _ => return Err(Trap::Illegal(inst)),
+            };
+            set_lane(&mut out, size, i, r & mask(esize));
+        }
+        self.write_vreg(rd, out, q);
+        Ok(())
+    }
+
+    // ── Scalar floating-point ───────────────────────────────────────────────
+
+    /// Scalar floating-point (Arm-ARM C4.1.6): `FMOV` (register/immediate and
+    /// the general↔SIMD moves `strlen` uses), `FCVT`, the data-processing ops
+    /// (`FADD`/`FSUB`/`FMUL`/`FDIV`/`FABS`/`FNEG`/`FMAX`/`FMIN`), `FCMP`, `FCSEL`,
+    /// and the integer/fixed-point conversions (`SCVTF`/`UCVTF`/`FCVTZS`/…).
+    fn fp_scalar(&mut self, inst: u32) -> Result<(), Trap> {
+        let ftype = (inst >> 22) & 0x3;
+        let rn = (inst >> 5) & 0x1f;
+        let rd = inst & 0x1f;
+        if (inst >> 21) & 1 == 0 {
+            // FP↔fixed-point conversion (scale in bits[15:10]).
+            return self.fp_fixed_convert(inst);
+        }
+        let lo = (inst >> 10) & 0x3f;
+        if lo == 0b000000 {
+            return self.fp_int_convert(inst);
+        }
+        if lo & 0x1f == 0b10000 {
+            // FP data-processing (1 source).
+            let opcode = (inst >> 15) & 0x3f;
+            let x = self.v[rn as usize];
+            let r: u128 = match (ftype, opcode) {
+                (_, 0b000000) => fp_bits(ftype, self.fval(rn, ftype)), // FMOV (register)
+                (_, 0b000001) => fp_map(ftype, x, |v| v.abs()),        // FABS
+                (_, 0b000010) => fp_map(ftype, x, |v| -v),             // FNEG
+                (0b00, 0b000101) => fp_bits(0b01, self.fval(rn, 0b00)), // FCVT S→D
+                (0b01, 0b000100) => fp_bits(0b00, self.fval(rn, 0b01)), // FCVT D→S
+                (_, 0b001000) => fp_round(ftype, x, Round::Nearest),   // FRINTN
+                (_, 0b001111) => fp_round(ftype, x, Round::Zero),      // FRINTZ ? (variant)
+                _ => return Err(Trap::Illegal(inst)),
+            };
+            self.v[rd as usize] = r;
+            return Ok(());
+        }
+        match lo & 0x3 {
+            0b10 => {
+                // FP data-processing (2 source).
+                let opcode = (inst >> 12) & 0xf;
+                let rm = (inst >> 16) & 0x1f;
+                let a = self.fval(rn, ftype);
+                let b = self.fval(rm, ftype);
+                let r = match opcode {
+                    0b0000 => a * b,
+                    0b0001 => a / b,
+                    0b0010 => a + b,
+                    0b0011 => a - b,
+                    0b0100 => a.max(b), // FMAX
+                    0b0101 => a.min(b), // FMIN
+                    0b0110 => a.max(b), // FMAXNM
+                    0b0111 => a.min(b), // FMINNM
+                    0b1000 => -(a * b), // FNMUL
+                    _ => return Err(Trap::Illegal(inst)),
+                };
+                self.v[rd as usize] = fp_bits(ftype, r);
+                Ok(())
+            }
+            0b00 if (lo >> 2) & 0x3 == 0b10 => {
+                // FP compare (bits[13:10]=1000).
+                let rm = (inst >> 16) & 0x1f;
+                let opc = (inst >> 14) & 0x3;
+                let a = self.fval(rn, ftype);
+                let b = if opc & 0b10 != 0 {
+                    0.0
+                } else {
+                    self.fval(rm, ftype)
+                };
+                self.flags = fp_compare(a, b);
+                Ok(())
+            }
+            0b00 if (lo >> 2) & 0x1 == 1 => {
+                // FP immediate (bits[12:10]=100).
+                let imm8 = ((inst >> 13) & 0xff) as u8;
+                self.v[rd as usize] = fp_bits(ftype, vfp_expand_imm(imm8, ftype));
+                Ok(())
+            }
+            0b11 => {
+                // FP conditional select (FCSEL).
+                let rm = (inst >> 16) & 0x1f;
+                let cond = (inst >> 12) & 0xf;
+                let src = if self.cond_holds(cond) { rn } else { rm };
+                self.v[rd as usize] = self.v[src as usize];
+                Ok(())
+            }
+            _ => Err(Trap::Illegal(inst)),
+        }
+    }
+
+    /// Read SIMD register `i` as an f64 (the value of its low element at `ftype`
+    /// precision, widened to f64 for the host computation).
+    fn fval(&self, i: u32, ftype: u32) -> f64 {
+        match ftype {
+            0b00 => f32::from_bits(self.v[i as usize] as u32) as f64,
+            0b01 => f64::from_bits(self.v[i as usize] as u64),
+            _ => f64::NAN,
+        }
+    }
+
+    /// FP↔integer conversion + the general↔SIMD `FMOV`s.
+    fn fp_int_convert(&mut self, inst: u32) -> Result<(), Trap> {
+        let sf = inst & (1 << 31) != 0;
+        let ftype = (inst >> 22) & 0x3;
+        let rmode = (inst >> 19) & 0x3;
+        let opcode = (inst >> 16) & 0x7;
+        let rn = (inst >> 5) & 0x1f;
+        let rd = inst & 0x1f;
+        match opcode {
+            0b110 => {
+                // FMOV to general register (Xd/Wd ← Vn).
+                let v = if ftype == 0b01 {
+                    self.v[rn as usize] as u64
+                } else {
+                    (self.v[rn as usize] as u32) as u64
+                };
+                self.wx_sz(rd, v, sf);
+                Ok(())
+            }
+            0b111 => {
+                // FMOV from general register (Vd ← Xn/Wn).
+                let g = self.rx(rn);
+                self.v[rd as usize] = if ftype == 0b01 {
+                    g as u128
+                } else {
+                    (g as u32) as u128
+                };
+                Ok(())
+            }
+            0b010 | 0b011 => {
+                // SCVTF (010) / UCVTF (011): integer → float.
+                let g = self.rx(rn);
+                let val = if opcode == 0b010 {
+                    if sf {
+                        g as i64 as f64
+                    } else {
+                        g as i32 as f64
+                    }
+                } else if sf {
+                    g as f64
+                } else {
+                    (g as u32) as f64
+                };
+                self.v[rd as usize] = fp_bits(ftype, val);
+                Ok(())
+            }
+            0b000 | 0b001 | 0b100 | 0b101 => {
+                // FCVT{N,P,M,Z,A}{S,U}: float → integer with a rounding mode.
+                let f = self.fval(rn, ftype);
+                let round = match rmode {
+                    0b00 => Round::Nearest,
+                    0b01 => Round::Plus,
+                    0b10 => Round::Minus,
+                    _ => Round::Zero,
+                };
+                let signed = opcode & 1 == 0;
+                let r = fp_to_int(f, round, signed, sf);
+                self.wx_sz(rd, r, sf);
+                Ok(())
+            }
+            _ => Err(Trap::Illegal(inst)),
+        }
+    }
+
+    /// FP↔fixed-point conversion (`SCVTF`/`UCVTF`/`FCVTZS`/`FCVTZU` with a scale).
+    fn fp_fixed_convert(&mut self, inst: u32) -> Result<(), Trap> {
+        let sf = inst & (1 << 31) != 0;
+        let ftype = (inst >> 22) & 0x3;
+        let opcode = (inst >> 16) & 0x7;
+        let scale = 64 - ((inst >> 10) & 0x3f);
+        let rn = (inst >> 5) & 0x1f;
+        let rd = inst & 0x1f;
+        let factor = (2.0_f64).powi(scale as i32);
+        match opcode {
+            0b010 | 0b011 => {
+                // SCVTF / UCVTF (fixed → float).
+                let g = self.rx(rn);
+                let base = if opcode == 0b010 {
+                    if sf {
+                        g as i64 as f64
+                    } else {
+                        g as i32 as f64
+                    }
+                } else if sf {
+                    g as f64
+                } else {
+                    (g as u32) as f64
+                };
+                self.v[rd as usize] = fp_bits(ftype, base / factor);
+                Ok(())
+            }
+            0b000 | 0b001 => {
+                // FCVTZS / FCVTZU (float → fixed, round to zero).
+                let f = self.fval(rn, ftype) * factor;
+                let r = fp_to_int(f, Round::Zero, opcode == 0b000, sf);
+                self.wx_sz(rd, r, sf);
+                Ok(())
+            }
+            _ => Err(Trap::Illegal(inst)),
         }
     }
 
@@ -871,6 +1932,12 @@ impl Cpu {
         if inst & 0x3f00_0000 == 0x0800_0000 {
             return self.ldst_exclusive(inst, next);
         }
+        // Advanced SIMD load/store structures (LD1..LD4 / ST1..ST4, multiple +
+        // single-element, no-offset + post-index) — glibc's string routines load
+        // a chunk with `LD1 {v.16b},[x]` and broadcast with `LD1R`.
+        if inst & 0xbe00_0000 == 0x0c00_0000 {
+            return self.asimd_ldst_structures(inst, next);
+        }
         // Load register (literal) — integer (V=0) and SIMD&FP (V=1).
         if inst & 0x3b00_0000 == 0x1800_0000 {
             let opc = (inst >> 30) & 0x3;
@@ -1098,6 +2165,112 @@ impl Cpu {
         Ok(())
     }
 
+    /// Advanced SIMD load/store structures (`LD1`–`LD4` / `ST1`–`ST4`, both the
+    /// multiple-register and single-element forms, no-offset + post-index). The
+    /// vector loads glibc's `memcpy`/`strlen`/`memset` use: `LD1 {v.16b},[x]`,
+    /// the `LD1R` broadcast, and the single-lane tail moves. Follows the Arm-ARM
+    /// `LDST*` pseudocode (de-interleaving for `selem > 1`).
+    fn asimd_ldst_structures(&mut self, inst: u32, next: u64) -> Result<(), Trap> {
+        let q = inst & (1 << 30) != 0;
+        let l = inst & (1 << 22) != 0; // load
+        let single = inst & (1 << 24) != 0;
+        let post = inst & (1 << 23) != 0;
+        let rm = (inst >> 16) & 0x1f;
+        let rn = (inst >> 5) & 0x1f;
+        let rt = inst & 0x1f;
+        let base = self.rx_sp(rn);
+        let mut addr = base;
+
+        let bytes: u64 = if !single {
+            let opcode = (inst >> 12) & 0xf;
+            let (rpt, selem): (u32, u32) = match opcode {
+                0b0000 => (1, 4), // LD/ST4
+                0b0010 => (4, 1), // LD/ST1 (4 regs)
+                0b0100 => (1, 3), // LD/ST3
+                0b0110 => (3, 1), // LD/ST1 (3 regs)
+                0b0111 => (1, 1), // LD/ST1 (1 reg)
+                0b1000 => (1, 2), // LD/ST2
+                0b1010 => (2, 1), // LD/ST1 (2 regs)
+                _ => return Err(Trap::Illegal(inst)),
+            };
+            let size = (inst >> 10) & 0x3;
+            let ebytes = 1usize << size;
+            let elements = (if q { 16 } else { 8 }) / ebytes;
+            for r in 0..rpt {
+                for e in 0..elements {
+                    for s in 0..selem {
+                        let tt = ((rt + r * selem + s) % 32) as usize;
+                        if l {
+                            let v = self.read(addr, ebytes, Access::Load)?;
+                            let mut reg = self.v[tt];
+                            set_lane(&mut reg, size, e, v);
+                            self.v[tt] = reg;
+                        } else {
+                            let v = lane(self.v[tt], size, e);
+                            self.write(addr, ebytes, v)?;
+                        }
+                        addr = addr.wrapping_add(ebytes as u64);
+                    }
+                }
+            }
+            if l && !q {
+                // Each loaded 64-bit register clears its upper half.
+                for k in 0..rpt * selem {
+                    let tt = ((rt + k) % 32) as usize;
+                    self.v[tt] &= u64::MAX as u128;
+                }
+            }
+            (rpt * selem * elements as u32 * ebytes as u32) as u64
+        } else {
+            // Single-element structures: opcode<2:1> = scale, S = bit12,
+            // selem = (opcode<0>:R)+1, with scale==3 → LD1R replicate.
+            let opcode = (inst >> 13) & 0x7;
+            let s_bit = (inst >> 12) & 1;
+            let size = (inst >> 10) & 0x3;
+            let r_bit = (inst >> 21) & 1;
+            let selem = ((opcode & 1) << 1 | r_bit) + 1;
+            let scale = opcode >> 1;
+            let (ebytes, index, replicate) = match scale {
+                0 => (1usize, (q as u32) << 3 | s_bit << 2 | size, false),
+                1 => (2usize, (q as u32) << 2 | s_bit << 1 | (size >> 1), false),
+                2 if size & 1 == 0 => (4usize, (q as u32) << 1 | s_bit, false),
+                2 => (8usize, q as u32, false), // D element (scale becomes 3)
+                3 => (1usize << size, 0, true), // LD1R/LD2R… replicate
+                _ => return Err(Trap::Illegal(inst)),
+            };
+            for s in 0..selem {
+                let tt = ((rt + s) % 32) as usize;
+                if replicate {
+                    // Load one element and broadcast across all lanes of Vt.
+                    let v = self.read(addr, ebytes, Access::Load)?;
+                    let mut reg = 0u128;
+                    let lanes = (if q { 16 } else { 8 }) / ebytes;
+                    for e in 0..lanes {
+                        set_lane(&mut reg, size, e, v);
+                    }
+                    self.v[tt] = reg;
+                } else if l {
+                    let v = self.read(addr, ebytes, Access::Load)?;
+                    let mut reg = self.v[tt];
+                    set_lane(&mut reg, size, index as usize, v);
+                    self.v[tt] = reg;
+                } else {
+                    let v = lane(self.v[tt], size, index as usize);
+                    self.write(addr, ebytes, v)?;
+                }
+                addr = addr.wrapping_add(ebytes as u64);
+            }
+            (selem as usize * ebytes) as u64
+        };
+
+        if post {
+            let off = if rm == 31 { bytes } else { self.rx(rm) };
+            self.wx_sp(rn, base.wrapping_add(off));
+        }
+        self.pc = next;
+        Ok(())
+    }
+
     fn ldst_pair(&mut self, inst: u32, next: u64) -> Result<(), Trap> {
         if inst & 0x0400_0000 != 0 {
             return Err(Trap::Illegal(inst)); // V==1 → SIMD/FP
@@ -1257,6 +2430,475 @@ fn sign_extend(v: u64, bits: u32) -> u64 {
     }
     let shift = 64 - bits;
     (((v << shift) as i64) >> shift) as u64
+}
+
+// ── Advanced SIMD lane + element primitives ─────────────────────────────────
+
+/// The low `bits` set, where `bits = 8 << size` — an alias of [`mask`] used by
+/// the SIMD lane code where the width comes from an element size.
+#[inline]
+fn mask_bits(bits: u32) -> u64 {
+    mask(bits)
+}
+
+/// Read element `idx` (size `1 << size_log2` bytes, i.e. `8 << size_log2` bits)
+/// from the little-endian 128-bit register value `v`.
+#[inline]
+fn lane(v: u128, size_log2: u32, idx: usize) -> u64 {
+    let bits = 8u32 << size_log2;
+    let shift = idx * bits as usize;
+    if bits >= 128 {
+        v as u64
+    } else {
+        ((v >> shift) & ((1u128 << bits) - 1)) as u64
+    }
+}
+
+/// Write element `idx` (size `8 << size_log2` bits) of `v`, leaving the rest.
+#[inline]
+fn set_lane(v: &mut u128, size_log2: u32, idx: usize, x: u64) {
+    let bits = 8u32 << size_log2;
+    let shift = idx * bits as usize;
+    let em: u128 = if bits >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << bits) - 1
+    };
+    *v = (*v & !(em << shift)) | (((x as u128) & em) << shift);
+}
+
+/// A per-element boolean result: all-ones (later masked to the element) or zero,
+/// matching NEON's compare convention.
+#[inline]
+fn bool_lane(b: bool) -> u64 {
+    if b {
+        u64::MAX
+    } else {
+        0
+    }
+}
+
+/// Signed comparison of two `esize`-bit lane values.
+#[inline]
+fn scmp(x: u64, y: u64, esize: u32) -> core::cmp::Ordering {
+    (sign_extend(x, esize) as i64).cmp(&(sign_extend(y, esize) as i64))
+}
+
+/// Signed max/min of two `esize`-bit lane values, returning the winning bits.
+#[inline]
+fn smax(x: u64, y: u64, esize: u32) -> u64 {
+    if scmp(x, y, esize) != core::cmp::Ordering::Less {
+        x
+    } else {
+        y
+    }
+}
+#[inline]
+fn smin(x: u64, y: u64, esize: u32) -> u64 {
+    if scmp(x, y, esize) == core::cmp::Ordering::Less {
+        x
+    } else {
+        y
+    }
+}
+
+/// Signed absolute difference of two `esize`-bit lanes.
+#[inline]
+fn sabd(x: u64, y: u64, esize: u32) -> u64 {
+    let a = sign_extend(x, esize) as i64;
+    let b = sign_extend(y, esize) as i64;
+    a.abs_diff(b)
+}
+
+/// Polynomial (carry-less) multiply of two `esize`-bit lanes (`PMUL`).
+#[inline]
+fn pmul(x: u64, y: u64, esize: u32) -> u64 {
+    let mut r = 0u64;
+    for k in 0..esize {
+        if (y >> k) & 1 == 1 {
+            r ^= x << k;
+        }
+    }
+    r & mask(esize)
+}
+
+/// `USHL`/`SSHL` — shift each lane by the signed amount in the low byte of the
+/// corresponding `Vm` lane (positive = left, negative = right).
+#[inline]
+fn ushl_sshl(x: u64, y: u64, esize: u32, unsigned: bool) -> u64 {
+    let em = mask(esize);
+    let sh = (y as i8) as i32; // SSHL/USHL take the signed low byte
+    if sh >= 0 {
+        let s = sh as u32;
+        if s >= esize {
+            0
+        } else {
+            (x << s) & em
+        }
+    } else {
+        let s = (-sh) as u32;
+        if s >= esize {
+            if unsigned {
+                0
+            } else if sign_extend(x, esize) as i64 != 0 && (x >> (esize - 1)) & 1 == 1 {
+                em
+            } else {
+                0
+            }
+        } else if unsigned {
+            (x & em) >> s
+        } else {
+            (((sign_extend(x, esize) as i64) >> s) as u64) & em
+        }
+    }
+}
+
+/// Saturating add/sub of two `esize`-bit lanes (`UQADD`/`SQADD`, `UQSUB`/`SQSUB`).
+#[inline]
+fn uqadd_sqadd(x: u64, y: u64, esize: u32, unsigned: bool) -> u64 {
+    let em = mask(esize);
+    if unsigned {
+        ((x & em) + (y & em)).min(em)
+    } else {
+        let maxv = (em >> 1) as i64;
+        let minv = -(maxv + 1);
+        let s = (sign_extend(x, esize) as i64) + (sign_extend(y, esize) as i64);
+        (s.clamp(minv, maxv) as u64) & em
+    }
+}
+#[inline]
+fn uqsub_sqsub(x: u64, y: u64, esize: u32, unsigned: bool) -> u64 {
+    let em = mask(esize);
+    if unsigned {
+        (x & em).saturating_sub(y & em)
+    } else {
+        let maxv = (em >> 1) as i64;
+        let minv = -(maxv + 1);
+        let s = (sign_extend(x, esize) as i64) - (sign_extend(y, esize) as i64);
+        (s.clamp(minv, maxv) as u64) & em
+    }
+}
+
+/// Count leading zeros (`CLZ`) or leading sign bits (`CLS`) within `esize` bits.
+#[inline]
+fn clsz(x: u64, esize: u32, leading_zeros: bool) -> u64 {
+    let v = x & mask(esize);
+    if leading_zeros {
+        if v == 0 {
+            esize as u64
+        } else {
+            (v << (64 - esize)).leading_zeros() as u64
+        }
+    } else {
+        let top = (v >> (esize - 1)) & 1;
+        let mut count = 0u64;
+        for k in (0..esize - 1).rev() {
+            if (v >> k) & 1 == top {
+                count += 1;
+            } else {
+                break;
+            }
+        }
+        count
+    }
+}
+
+// ── Advanced SIMD / scalar floating-point numeric helpers ───────────────────
+
+/// Rounding mode for floating-point → integer conversion.
+#[derive(Clone, Copy)]
+enum Round {
+    Nearest,
+    Zero,
+    Plus,
+    Minus,
+}
+
+/// One floating-point three-same lane op. `xb`/`yb`/`accb` are the element bit
+/// patterns; returns the result element bits, or `None` for an unimplemented
+/// encoding.
+fn fp3(opcode: u32, u: bool, o1: bool, is_f64: bool, xb: u64, yb: u64, accb: u64) -> Option<u64> {
+    let rd = |f: f64| -> u64 {
+        if is_f64 {
+            f.to_bits()
+        } else {
+            (f as f32).to_bits() as u64
+        }
+    };
+    let to_f = |b: u64| -> f64 {
+        if is_f64 {
+            f64::from_bits(b)
+        } else {
+            f32::from_bits(b as u32) as f64
+        }
+    };
+    let a = to_f(xb);
+    let b = to_f(yb);
+    let cmp_true = if is_f64 { u64::MAX } else { u32::MAX as u64 };
+    Some(match (opcode, u) {
+        (0b11010, false) => rd(if o1 { a - b } else { a + b }), // FSUB / FADD
+        (0b11010, true) => rd((a - b).abs()),                   // FABD
+        (0b11011, false) => rd(a * b),                          // FMULX (≈ FMUL here)
+        (0b11011, true) => rd(a * b),                           // FMUL
+        (0b11111, true) => rd(a / b),                           // FDIV
+        (0b11000, false) => rd(if o1 { a.min(b) } else { a.max(b) }), // FMINNM / FMAXNM
+        (0b11110, false) => rd(if o1 { a.min(b) } else { a.max(b) }), // FMIN / FMAX
+        (0b11001, false) => rd(if o1 {
+            accb_sub(accb, a, b, is_f64)
+        } else {
+            accb_add(accb, a, b, is_f64)
+        }), // FMLS / FMLA
+        (0b11100, false) => {
+            if a == b {
+                cmp_true
+            } else {
+                0
+            }
+        } // FCMEQ
+        (0b11100, true) => {
+            if a >= b {
+                cmp_true
+            } else {
+                0
+            }
+        } // FCMGE
+        _ => return None,
+    })
+}
+
+#[inline]
+fn accb_add(accb: u64, a: f64, b: f64, is_f64: bool) -> f64 {
+    let acc = if is_f64 {
+        f64::from_bits(accb)
+    } else {
+        f32::from_bits(accb as u32) as f64
+    };
+    acc + a * b
+}
+#[inline]
+fn accb_sub(accb: u64, a: f64, b: f64, is_f64: bool) -> f64 {
+    let acc = if is_f64 {
+        f64::from_bits(accb)
+    } else {
+        f32::from_bits(accb as u32) as f64
+    };
+    acc - a * b
+}
+
+/// `AdvSIMDExpandImm` (Arm-ARM) — expand the `MOVI`/`MVNI`/`ORR`/`BIC`/`FMOV`
+/// 8-bit modified immediate into the 128-bit pattern, with flags for whether the
+/// op negates (`MVNI`) or accumulates logically (`ORR`/`BIC`).
+fn adv_simd_expand_imm(cmode: u32, op: bool, imm8: u8) -> (u128, bool, bool) {
+    let i = imm8 as u64;
+    let rep32 = |w: u64| (w & 0xffff_ffff) * 0x0000_0001_0000_0001;
+    let rep16 = |h: u64| (h & 0xffff) * 0x0001_0001_0001_0001;
+    let rep8 = |b: u64| (b & 0xff) * 0x0101_0101_0101_0101;
+    let imm64: u64 = match (cmode >> 1) & 0x7 {
+        0b000 => rep32(i),
+        0b001 => rep32(i << 8),
+        0b010 => rep32(i << 16),
+        0b011 => rep32(i << 24),
+        0b100 => rep16(i),
+        0b101 => rep16(i << 8),
+        0b110 => {
+            if cmode & 1 == 0 {
+                rep32((i << 8) | 0xff)
+            } else {
+                rep32((i << 16) | 0xffff)
+            }
+        }
+        _ => {
+            // cmode == 111x
+            if cmode & 1 == 0 && !op {
+                rep8(i) // MOVI 8-bit
+            } else if cmode & 1 == 0 && op {
+                // MOVI 64-bit: each bit of imm8 expands to a byte 0x00/0xff.
+                let mut v = 0u64;
+                for k in 0..8 {
+                    if (i >> k) & 1 == 1 {
+                        v |= 0xffu64 << (k * 8);
+                    }
+                }
+                v
+            } else if cmode & 1 == 1 && !op {
+                // FMOV vector single-precision immediate, replicated.
+                rep32(vfp_imm32(imm8) as u64)
+            } else {
+                // FMOV vector double-precision immediate.
+                vfp_expand_imm(imm8, 0b01).to_bits()
+            }
+        }
+    };
+    let val = (imm64 as u128) | ((imm64 as u128) << 64);
+    let is_logical = (cmode & 1 == 1) && ((cmode >> 2) & 0x3 != 0x3);
+    let is_mvni = op && !is_logical && cmode != 0b1110 && cmode != 0b1111;
+    (val, is_mvni, is_logical)
+}
+
+/// Bits of the single-precision `FMOV` 8-bit immediate.
+fn vfp_imm32(imm8: u8) -> u32 {
+    let i = imm8 as u32;
+    let sign = (i >> 7) & 1;
+    let b = (i >> 6) & 1;
+    let frac = i & 0x3f;
+    // The 8-bit exponent field is NOT(b) : b*5 : imm8<5:4>.
+    let exp_field = ((!b & 1) << 7) | (replicate_bit(b, 5) << 2) | ((i >> 4) & 0x3);
+    (sign << 31) | (exp_field << 23) | (frac << 17)
+}
+
+/// Replicate bit `b` `n` times into the low bits.
+#[inline]
+fn replicate_bit(b: u32, n: u32) -> u32 {
+    if b & 1 == 1 {
+        (1u32 << n) - 1
+    } else {
+        0
+    }
+}
+
+/// `VFPExpandImm` (Arm-ARM) — the scalar `FMOV` 8-bit immediate as an f64
+/// (single-precision values widen exactly).
+fn vfp_expand_imm(imm8: u8, ftype: u32) -> f64 {
+    if ftype == 0b00 {
+        f32::from_bits(vfp_imm32(imm8)) as f64
+    } else {
+        let i = imm8 as u64;
+        let sign = (i >> 7) & 1;
+        let b = (i >> 6) & 1;
+        let frac = i & 0x3f;
+        let exp_field = ((!b & 1) << 10) | (replicate_bit_u64(b, 8) << 2) | ((i >> 4) & 0x3);
+        let bits = (sign << 63) | (exp_field << 52) | (frac << 46);
+        f64::from_bits(bits)
+    }
+}
+#[inline]
+fn replicate_bit_u64(b: u64, n: u32) -> u64 {
+    if b & 1 == 1 {
+        (1u64 << n) - 1
+    } else {
+        0
+    }
+}
+
+/// Pack an f64 result back into a SIMD register low element at `ftype` precision.
+#[inline]
+fn fp_bits(ftype: u32, val: f64) -> u128 {
+    if ftype == 0b01 {
+        val.to_bits() as u128
+    } else {
+        (val as f32).to_bits() as u128
+    }
+}
+
+/// Apply a unary f64 op to a scalar element and repack (`FABS`/`FNEG`).
+#[inline]
+fn fp_map(ftype: u32, xbits: u128, f: impl Fn(f64) -> f64) -> u128 {
+    let v = if ftype == 0b01 {
+        f64::from_bits(xbits as u64)
+    } else {
+        f32::from_bits(xbits as u32) as f64
+    };
+    fp_bits(ftype, f(v))
+}
+
+/// Round a scalar FP value to an integral FP value (`FRINT*`).
+#[inline]
+fn fp_round(ftype: u32, xbits: u128, mode: Round) -> u128 {
+    let v = if ftype == 0b01 {
+        f64::from_bits(xbits as u64)
+    } else {
+        f32::from_bits(xbits as u32) as f64
+    };
+    fp_bits(ftype, round_f64(v, mode))
+}
+
+/// FCMP — set NZCV from a floating-point comparison (Arm-ARM `FPCompare`).
+fn fp_compare(a: f64, b: f64) -> Nzcv {
+    use core::cmp::Ordering::*;
+    match a.partial_cmp(&b) {
+        Some(Less) => Nzcv {
+            n: true,
+            z: false,
+            c: false,
+            v: false,
+        },
+        Some(Equal) => Nzcv {
+            n: false,
+            z: true,
+            c: true,
+            v: false,
+        },
+        Some(Greater) => Nzcv {
+            n: false,
+            z: false,
+            c: true,
+            v: false,
+        },
+        None => Nzcv {
+            n: false,
+            z: false,
+            c: true,
+            v: true,
+        }, // unordered
+    }
+}
+
+/// Round `f` to an integral value per `mode`, using only `core` float ops.
+fn round_f64(f: f64, mode: Round) -> f64 {
+    if f.is_nan() || f.is_infinite() {
+        return f;
+    }
+    let t = if f.abs() < 9.0e18 {
+        (f as i64) as f64
+    } else {
+        f
+    }; // truncate toward zero
+    let diff = f - t;
+    match mode {
+        Round::Zero => t,
+        Round::Minus => {
+            if diff < 0.0 {
+                t - 1.0
+            } else {
+                t
+            }
+        }
+        Round::Plus => {
+            if diff > 0.0 {
+                t + 1.0
+            } else {
+                t
+            }
+        }
+        Round::Nearest => {
+            let ad = diff.abs();
+            if ad < 0.5 {
+                t
+            } else if ad > 0.5 {
+                t + if diff < 0.0 { -1.0 } else { 1.0 }
+            } else {
+                // tie → round to even
+                let up = t + if diff < 0.0 { -1.0 } else { 1.0 };
+                if (t as i64) % 2 == 0 {
+                    t
+                } else {
+                    up
+                }
+            }
+        }
+    }
+}
+
+/// Convert a float to an integer with rounding + saturation (`FCVT*`). Rust's
+/// `as` casts already saturate out-of-range and map NaN→0.
+fn fp_to_int(f: f64, mode: Round, signed: bool, is64: bool) -> u64 {
+    let r = round_f64(f, mode);
+    match (signed, is64) {
+        (true, true) => r as i64 as u64,
+        (true, false) => (r as i32 as u32) as u64,
+        (false, true) => r as u64,
+        (false, false) => (r as u32) as u64,
+    }
 }
 
 /// Rotate the low `width` bits of `x` right by `shift` (Arm-ARM `ROR`).
@@ -2472,8 +4114,26 @@ impl Cpu {
                     Some(pa) => self.sys_mut().par_el1 = pa & 0x0000_ffff_ffff_f000,
                     None => self.sys_mut().par_el1 = 1, // F bit: translation aborted
                 }
+            } else if crn == 0x7 && crm == 0x4 && op2 == 1 {
+                // DC ZVA — Data Cache Zero by VA. Unlike the other cache ops this
+                // *writes memory*: it zeroes the DCZID-block (64-byte, BS=4)
+                // containing the address in Xt. The ecosystem's `memset` and the
+                // kernel's `clear_page` use it on the fast path (DCZID.DZP=0), so
+                // it MUST zero — a no-op leaves heap/.bss/stack pages full of
+                // garbage and corrupts stack canaries (CC-37).
+                let base = self.rx(rt) & !63;
+                for i in 0..8u64 {
+                    if let Err(t) = self.write(base.wrapping_add(i * 8), 8, 0) {
+                        // Fault on an unmapped page → take the data abort; the
+                        // kernel demand-pages and re-executes DC ZVA.
+                        let far = self.sys().fault.map_or(base, |(f, _)| f);
+                        self.take_mem_abort(self.pc, far, false, true);
+                        let _ = t;
+                        return Ok(());
+                    }
+                }
             }
-            // IC/DC cache ops are no-ops on a coherent interpreter.
+            // Remaining IC/DC cache ops are no-ops on a coherent interpreter.
             self.pc = next;
             return Ok(());
         }
@@ -2527,7 +4187,7 @@ impl Cpu {
             SR_ID_AA64ISAR0 => 0,           // no LSE atomics → LL/SC locks
             SR_ID_AA64MMFR0 => 0x0000_1122, // 40-bit PA, 16-bit ASID, 4 KiB granule
             SR_CTR => 0x8444_8004,          // cache type (Cortex-A57)
-            SR_DCZID => 0x10,               // DC ZVA prohibited (DZP=1)
+            SR_DCZID => 0x4, // DC ZVA permitted (DZP=0), block = 4<<4 = 64 bytes (BS=4, Cortex-A57)
             SR_SCTLR => self.sys().sctlr_el1,
             SR_TTBR0 => self.sys().ttbr0_el1,
             SR_TTBR1 => self.sys().ttbr1_el1,
@@ -2692,6 +4352,22 @@ fn arm64_virt_dtb(ram_base: u64, ram_size: u64, bootargs: &str, has_blk: bool) -
     f.begin_node("chosen");
     f.prop_str("bootargs", bootargs);
     f.prop_str("stdout-path", "/pl011@9000000");
+    // Seed the kernel entropy pool (the bootloader's job): without it the boot
+    // CRNG is all-zero, so `get_random_bytes` (AT_RANDOM, the stack-canary seed)
+    // returns zeros — a 0 canary that any buffer write trips. A real bootloader
+    // (qemu included) passes /chosen/rng-seed; we pass a fixed seed so the boot
+    // is deterministic AND the canary/ASLR machinery is correctly initialised.
+    let seed: [u8; 64] = {
+        let mut s = [0u8; 64];
+        let mut i = 0;
+        while i < 64 {
+            // a fixed, non-zero, well-mixed pattern (deterministic entropy seed)
+            s[i] = (0x9eu32.wrapping_mul(i as u32 + 1) ^ 0x37) as u8;
+            i += 1;
+        }
+        s
+    };
+    f.prop("rng-seed", &seed);
     f.end_node();
 
     f.begin_node("psci");
