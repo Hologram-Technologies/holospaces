@@ -53,8 +53,52 @@ async function gzip(bytes) {
 // storage, so a cross-session reload is a trust boundary: the bytes are verified
 // by re-derivation against the κ recorded beside them before they are trusted
 // (Law L5; ADR-019) — a tampered or corrupt snapshot is refused and we cold-boot.
-const SNAPSHOT_FILE = "holospace-devcontainer.snapshot.gz";
-const SNAPSHOT_KAPPA = "holospace-devcontainer.snapshot.kappa";
+//
+// CRITICAL — the persisted state is keyed by the holospace's IDENTITY (its κ),
+// never a single global slot. OPFS is per-origin, shared by every workbench tab,
+// so a fixed filename would make every holospace read and write the *same*
+// snapshot: launching holospace B would resume A's machine (A's files, A's idle
+// shell), and a deleted holospace's remnants would bleed into a new one. Keying
+// by κ (identity is what-not-where, Law L1) gives each holospace its own slot —
+// the same holospace resumes its own state across sessions; distinct holospaces
+// never collide. `holoKey` is set in `activate` from the workspace folder κ.
+let holoKey = "default"; // sanitized holospace identity; the OPFS namespace key
+// Sanitize a holospace identity (its κ) to a safe OPFS filename component. The
+// Platform Manager's delete/terminate cleanup (index.html `holoKeyOf`) MUST use
+// the same mapping, or it would fail to clear what the workbench wrote. An empty
+// identity (the single-holospace demo) is the lone "default" slot.
+function sanitizeHoloKey(authority) {
+  return String(authority || "").replace(/[^A-Za-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "default";
+}
+// The OPFS filenames for a holospace key — every durable per-instance artifact is
+// namespaced by the identity, so distinct holospaces never share a slot.
+function namesFor(key) {
+  return {
+    snapshot: `holospace.${key}.snapshot.gz`,
+    kappa: `holospace.${key}.snapshot.kappa`,
+    scrollback: `holospace.${key}.scrollback.gz`,
+  };
+}
+function snapshotFile() {
+  return namesFor(holoKey).snapshot;
+}
+function snapshotKappaFile() {
+  return namesFor(holoKey).kappa;
+}
+function scrollbackFile() {
+  return namesFor(holoKey).scrollback;
+}
+// Derive the OPFS namespace key from the launched holospace's κ — carried in the
+// workspace folder URI authority (`holospace://<κ>/workspace`, set by
+// build-workbench from `?id=<κ>`).
+function deriveHoloKey() {
+  try {
+    const folder = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0];
+    return sanitizeHoloKey(folder && folder.uri && folder.uri.authority);
+  } catch {
+    return "default";
+  }
+}
 
 async function opfsRoot() {
   if (!navigator.storage || !navigator.storage.getDirectory) return null;
@@ -65,14 +109,23 @@ async function opfsRoot() {
   }
 }
 
-// Load + verify a persisted snapshot. Returns the raw snapshot bytes, or null if
-// none / unreadable / failing re-derivation (in which case the caller cold-boots).
+// The terminal scrollback captured beside the last snapshot, for replay on resume
+// (set by loadSnapshot). The machine snapshot is κ-pure — it does NOT carry the
+// console output buffer (a projection of the past, not future-affecting machine
+// state), so a freshly restored machine's console is empty. Without this, a
+// resumed *idle* shell (the steady state when the periodic snapshot is taken)
+// would show a blank terminal — the OS is live but silent until you type. The
+// terminal layer, not the machine, restores what the user was looking at.
+let resumeScrollback = null;
+
+// Load + verify a persisted snapshot for THIS holospace. Returns the raw snapshot
+// bytes, or null if none / unreadable / failing re-derivation (caller cold-boots).
 async function loadSnapshot() {
   const root = await opfsRoot();
   if (!root) return null;
   try {
-    const gzHandle = await root.getFileHandle(SNAPSHOT_FILE);
-    const kHandle = await root.getFileHandle(SNAPSHOT_KAPPA);
+    const gzHandle = await root.getFileHandle(snapshotFile());
+    const kHandle = await root.getFileHandle(snapshotKappaFile());
     const gzBytes = new Uint8Array(await (await gzHandle.getFile()).arrayBuffer());
     const recordedKappa = await (await kHandle.getFile()).text();
     const snapshot = await gunzip(gzBytes);
@@ -83,10 +136,24 @@ async function loadSnapshot() {
       out && out.appendLine("holospace: persisted snapshot failed κ re-derivation — cold-booting");
       return null;
     }
+    // Best-effort: load the scrollback saved beside it (resume the visible terminal).
+    try {
+      const sbHandle = await root.getFileHandle(scrollbackFile());
+      resumeScrollback = await gunzip(new Uint8Array(await (await sbHandle.getFile()).arrayBuffer()));
+    } catch {
+      resumeScrollback = null;
+    }
     return snapshot;
   } catch {
     return null; // no snapshot yet, or storage unavailable
   }
+}
+
+async function writeOpfs(root, name, bytes) {
+  const handle = await root.getFileHandle(name, { create: true });
+  const w = await handle.createWritable();
+  await w.write(bytes);
+  await w.close();
 }
 
 let persisting = false;
@@ -98,15 +165,16 @@ async function saveSnapshot() {
   try {
     const snapshot = ws.suspend(); // the κ snapshot of the whole machine
     const kappa = wasm.kappa(snapshot); // its content address (recorded beside it)
-    const gzBytes = await gzip(snapshot);
-    const gzHandle = await root.getFileHandle(SNAPSHOT_FILE, { create: true });
-    const gw = await gzHandle.createWritable();
-    await gw.write(gzBytes);
-    await gw.close();
-    const kHandle = await root.getFileHandle(SNAPSHOT_KAPPA, { create: true });
-    const kw = await kHandle.createWritable();
-    await kw.write(kappa);
-    await kw.close();
+    await writeOpfs(root, snapshotFile(), await gzip(snapshot));
+    await writeOpfs(root, snapshotKappaFile(), new TextEncoder().encode(kappa));
+    // The visible terminal scrollback, gzipped, beside the snapshot — replayed on
+    // resume so the user comes back to the session they left, not a blank screen.
+    // Bounded to a recent tail: enough to restore context, not a whole session's
+    // history (the machine state is the snapshot; this is just what's on screen).
+    const SCROLLBACK_TAIL = 128 * 1024;
+    const full = ws.terminal();
+    const tail = full.length > SCROLLBACK_TAIL ? full.slice(full.length - SCROLLBACK_TAIL) : full;
+    await writeOpfs(root, scrollbackFile(), await gzip(new TextEncoder().encode(tail)));
   } catch (e) {
     out && out.appendLine("holospace: snapshot persist failed — " + e);
   } finally {
@@ -253,11 +321,20 @@ function makeTerminal() {
   const pty = {
     onDidWrite: writeEmitter.event,
     open: async () => {
-      writeEmitter.fire("holospace — booting the devcontainer OS…\r\n");
+      writeEmitter.fire(
+        resumed ? "holospace — resuming your devcontainer…\r\n" : "holospace — booting the devcontainer OS…\r\n",
+      );
       await readyPromise;
       if (bootError) {
         writeEmitter.fire("boot failed: " + bootError.replace(/\n/g, "\r\n") + "\r\n");
         return;
+      }
+      // Resume the *visible* session: the machine snapshot is κ-pure (no console
+      // output buffer), so replay the scrollback persisted beside it — the user
+      // comes back to the prompt they left, not a blank screen. Consumed once.
+      if (resumeScrollback && resumeScrollback.length) {
+        writeEmitter.fire(decoder.decode(resumeScrollback));
+        resumeScrollback = null;
       }
       pump();
     },
@@ -277,6 +354,10 @@ function makeTerminal() {
 
 function activate(context) {
   base = deriveBase(context.extensionUri);
+  // This launch's holospace identity (its κ), carried in the workspace folder
+  // authority. All durable per-instance state (the OPFS resume snapshot +
+  // scrollback) is namespaced by it, so distinct holospaces never bleed (Law L1).
+  holoKey = deriveHoloKey();
   // The workspace FileSystemProvider is the virtio-9p share.
   context.subscriptions.push(
     vscode.workspace.registerFileSystemProvider("holospace", new HolospaceFS(), {
@@ -354,3 +435,6 @@ function listenForControl(out) {
 function deactivate() {}
 
 module.exports = { activate, deactivate };
+// Exposed for the keying witness (snapshot-keying-test): the pure identity→OPFS
+// mapping that keeps distinct holospaces from sharing a slot (CC-31 regression).
+module.exports._keying = { sanitizeHoloKey, namesFor };
