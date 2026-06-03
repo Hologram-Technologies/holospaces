@@ -19,9 +19,12 @@
 //! Authorities: RFC 826 (ARP), RFC 791 (IPv4), RFC 768 (UDP), RFC 2131 (DHCP),
 //! RFC 9293 (TCP).
 
+use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
+use alloc::rc::Rc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
+use core::cell::RefCell;
 
 /// The IPv4 address the NAT leases the guest (slirp's default). The same address
 /// `qemu-system-riscv64 -netdev user` hands out, so the oracle and the emulator
@@ -1140,6 +1143,179 @@ impl Ingress for StdIngress {
     }
 }
 
+/// A no-op **egress** — the guest opens no outbound connections (e.g. a
+/// devcontainer that only *listens*, reached over the [`LoopbackIngress`]). The
+/// NAT still needs an egress; this one refuses every connect, so a guest that
+/// tries to dial out simply sees the connection fail (the DHCP lease and the
+/// guest's own TCP stack are the NAT's, not the egress's, so the guest still gets
+/// its IP and can accept inbound connections).
+pub struct NoEgress;
+
+impl Egress for NoEgress {
+    fn connect(&mut self, _ip: [u8; 4], _port: u16) -> u32 {
+        0
+    }
+    fn status(&mut self, _id: u32) -> EgressStatus {
+        EgressStatus::Closed
+    }
+    fn recv(&mut self, _id: u32) -> Vec<u8> {
+        Vec::new()
+    }
+    fn send(&mut self, _id: u32, _data: &[u8]) {}
+    fn close(&mut self, _id: u32) {}
+}
+
+/// One in-process loopback connection's buffers, shared between the host side
+/// ([`LoopbackHandle`]) and the NAT side ([`LoopbackIngress`]).
+struct LoopConn {
+    /// Host → guest: bytes the workbench wrote, which the NAT drains in `recv`
+    /// and delivers into the guest's listening socket.
+    to_guest: VecDeque<u8>,
+    /// Guest → host: the guest server's reply, which the NAT appends in `send`
+    /// and the host drains via [`LoopbackHandle::recv`].
+    from_guest: VecDeque<u8>,
+    /// The host side closed (no more bytes will be written; the NAT should FIN
+    /// the guest).
+    host_closed: bool,
+    /// The guest side closed (the NAT delivered the guest's FIN).
+    guest_closed: bool,
+}
+
+#[derive(Default)]
+struct LoopbackInner {
+    next_id: u32,
+    /// Dialed connections awaiting `poll_accept` (the NAT opens toward the guest).
+    pending: VecDeque<(u32, u16)>,
+    conns: BTreeMap<u32, LoopConn>,
+}
+
+/// The **in-process loopback ingress** (ADR-020, `CC-33`). The "outside client"
+/// is the workbench in the same process as the emulator (the browser peer's
+/// extension-host worker, or a host witness), so reaching a server *inside* the
+/// guest is not a network round trip — it is an in-process ingress connection
+/// into the emulator's own TCP stack. The host drives it through a
+/// [`LoopbackHandle`] (`dial`/`send`/`recv`/`close`); the NAT services it through
+/// the [`Ingress`] trait exactly as it services a native host-listener
+/// ([`StdIngress`]). The two share one set of per-connection buffers; no relay,
+/// no socket, no server (Law L4). This is the transport the VS Code remote
+/// extension host runs over (ADR-015/ADR-020): the workbench's remote-protocol
+/// connection *is* this bridge.
+pub struct LoopbackIngress {
+    inner: Rc<RefCell<LoopbackInner>>,
+}
+
+/// The host-side handle to a [`LoopbackIngress`]'s shared state — the
+/// workbench/witness side of the bridge. Cheaply cloneable (it shares the same
+/// connection table); the emulator keeps one and exposes `dial`/`send`/`recv`/
+/// `close` through it.
+#[derive(Clone)]
+pub struct LoopbackHandle {
+    inner: Rc<RefCell<LoopbackInner>>,
+}
+
+impl LoopbackIngress {
+    /// Create a loopback ingress and its paired host handle (they share the
+    /// connection buffers). Attach the ingress to the emulator's network device;
+    /// keep the handle to dial guest listeners from the host side.
+    #[must_use]
+    pub fn new() -> (LoopbackIngress, LoopbackHandle) {
+        let inner = Rc::new(RefCell::new(LoopbackInner {
+            next_id: 1,
+            ..LoopbackInner::default()
+        }));
+        (
+            LoopbackIngress {
+                inner: Rc::clone(&inner),
+            },
+            LoopbackHandle { inner },
+        )
+    }
+}
+
+impl LoopbackHandle {
+    /// Dial a connection to the guest's listening `guest_port`. Returns the
+    /// connection id; the NAT opens toward the guest's socket on the next pump.
+    pub fn dial(&self, guest_port: u16) -> u32 {
+        let mut s = self.inner.borrow_mut();
+        let id = s.next_id;
+        s.next_id += 1;
+        s.conns.insert(
+            id,
+            LoopConn {
+                to_guest: VecDeque::new(),
+                from_guest: VecDeque::new(),
+                host_closed: false,
+                guest_closed: false,
+            },
+        );
+        s.pending.push_back((id, guest_port));
+        id
+    }
+
+    /// Write host bytes toward the guest server on connection `id`.
+    pub fn send(&self, id: u32, data: &[u8]) {
+        if let Some(c) = self.inner.borrow_mut().conns.get_mut(&id) {
+            c.to_guest.extend(data.iter().copied());
+        }
+    }
+
+    /// Drain the guest server's reply bytes on connection `id` (empty if none).
+    pub fn recv(&self, id: u32) -> Vec<u8> {
+        match self.inner.borrow_mut().conns.get_mut(&id) {
+            Some(c) => c.from_guest.drain(..).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Close the host side of connection `id` (the NAT will FIN the guest).
+    pub fn close(&self, id: u32) {
+        if let Some(c) = self.inner.borrow_mut().conns.get_mut(&id) {
+            c.host_closed = true;
+        }
+    }
+
+    /// Whether connection `id` is still usable — either the guest has not closed
+    /// it, or it has but the host has not yet drained the guest's final bytes.
+    #[must_use]
+    pub fn is_open(&self, id: u32) -> bool {
+        match self.inner.borrow().conns.get(&id) {
+            Some(c) => !c.guest_closed || !c.from_guest.is_empty(),
+            None => false,
+        }
+    }
+}
+
+impl Ingress for LoopbackIngress {
+    fn poll_accept(&mut self) -> Option<(u32, u16)> {
+        self.inner.borrow_mut().pending.pop_front()
+    }
+    fn status(&mut self, id: u32) -> EgressStatus {
+        match self.inner.borrow().conns.get(&id) {
+            Some(c) if c.host_closed => EgressStatus::Closed,
+            Some(_) => EgressStatus::Open,
+            None => EgressStatus::Closed,
+        }
+    }
+    fn recv(&mut self, id: u32) -> Vec<u8> {
+        // Host → guest: deliver the bytes the host wrote into the guest socket.
+        match self.inner.borrow_mut().conns.get_mut(&id) {
+            Some(c) => c.to_guest.drain(..).collect(),
+            None => Vec::new(),
+        }
+    }
+    fn send(&mut self, id: u32, data: &[u8]) {
+        // Guest → host: the guest server's reply, drained by the host via `recv`.
+        if let Some(c) = self.inner.borrow_mut().conns.get_mut(&id) {
+            c.from_guest.extend(data.iter().copied());
+        }
+    }
+    fn close(&mut self, id: u32) {
+        if let Some(c) = self.inner.borrow_mut().conns.get_mut(&id) {
+            c.guest_closed = true;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1357,5 +1533,54 @@ mod tests {
             got.windows(body.len()).any(|w| w == body) || got == body,
             "the HTTP response reached the guest; got {got:?}"
         );
+    }
+
+    /// The in-process loopback bridge's transport semantics (ADR-020, `CC-33`):
+    /// the host side dials and the NAT side accepts the same connection, and the
+    /// two byte directions are wired correctly — what the host writes is what the
+    /// NAT delivers to the guest (`recv`), and what the guest emits (`send`) is
+    /// what the host reads. No NAT/OS needed — this pins the bridge's plumbing.
+    #[test]
+    fn the_loopback_bridge_carries_both_byte_directions_to_the_right_side() {
+        let (mut ingress, host) = LoopbackIngress::new();
+
+        // The host dials a guest port; the NAT side accepts exactly that.
+        let id = host.dial(8080);
+        assert_eq!(
+            ingress.poll_accept(),
+            Some((id, 8080)),
+            "the dialed connection is the one the NAT opens toward the guest"
+        );
+        assert!(ingress.poll_accept().is_none(), "no spurious second accept");
+        assert_eq!(ingress.status(id), EgressStatus::Open);
+
+        // Host → guest: what the host writes is what the NAT delivers (its `recv`).
+        host.send(id, b"GET / HTTP/1.0\r\n\r\n");
+        assert_eq!(ingress.recv(id), b"GET / HTTP/1.0\r\n\r\n".to_vec());
+        assert!(ingress.recv(id).is_empty(), "bytes are consumed once");
+
+        // Guest → host: what the guest emits (the NAT's `send`) is what the host reads.
+        ingress.send(id, b"HTTP/1.0 200 OK\r\n\r\nHELLO");
+        assert_eq!(host.recv(id), b"HTTP/1.0 200 OK\r\n\r\nHELLO".to_vec());
+        assert!(host.recv(id).is_empty(), "bytes are consumed once");
+
+        // The guest closing leaves the connection readable until drained, then done.
+        ingress.send(id, b"tail");
+        ingress.close(id);
+        assert!(
+            host.is_open(id),
+            "unread guest bytes keep the connection open"
+        );
+        assert_eq!(host.recv(id), b"tail".to_vec());
+        assert!(
+            !host.is_open(id),
+            "after the guest closes and bytes are drained, it is done"
+        );
+
+        // The host closing is visible to the NAT as a closed ingress connection.
+        let id2 = host.dial(9000);
+        let _ = ingress.poll_accept();
+        host.close(id2);
+        assert_eq!(ingress.status(id2), EgressStatus::Closed);
     }
 }

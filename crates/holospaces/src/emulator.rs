@@ -235,6 +235,10 @@ pub struct Emulator {
     /// The VirtIO network device + userspace TCP/IP NAT, when networking is
     /// attached (`CC-16`); `None` for an offline machine.
     virtionet: Option<VirtioNet>,
+    /// The host side of the in-process loopback ingress (ADR-020, `CC-33`), when
+    /// the workbench dials guest listeners over the substrate bridge; `None` until
+    /// [`Emulator::enable_loopback`] attaches it.
+    loopback: Option<net::LoopbackHandle>,
     /// A software TLB over [`Emulator::translate`]: a direct-mapped cache (per
     /// access class) of virtual-page → physical-frame translations, so a hot loop
     /// does not re-walk the page table on every fetch/load/store. Flushed (by
@@ -1524,6 +1528,7 @@ impl Emulator {
             virtio: None,
             virtio9p: None,
             virtionet: None,
+            loopback: None,
             // Entries default to gen 0; starting `tlb_gen` at 1 means no entry is
             // live until it is filled (no false hit on a zeroed slot).
             tlb: Box::new(
@@ -1636,6 +1641,61 @@ impl Emulator {
         ingress: Box<dyn net::Ingress>,
     ) {
         self.virtionet = Some(VirtioNet::new(egress, ingress));
+    }
+
+    /// Enable the **in-process loopback ingress** (ADR-020, `CC-33`) on the
+    /// already-attached network device: the workbench (in the same process as the
+    /// emulator) can `dial`/`send`/`recv`/`close` a connection to a server
+    /// *inside* the guest, the inward in-process dual of the egress relay. Keeps
+    /// the existing egress (so the guest can still reach the internet). Returns
+    /// `false` if no network device is attached. The host side is driven through
+    /// the emulator's `dial_guest`/`guest_send`/`guest_recv`/`guest_close`.
+    pub fn enable_loopback(&mut self) -> bool {
+        let Some(net) = self.virtionet.as_mut() else {
+            return false;
+        };
+        let (ingress, handle) = net::LoopbackIngress::new();
+        net.ingress = Box::new(ingress);
+        self.loopback = Some(handle);
+        true
+    }
+
+    /// Dial an in-process connection to the guest's listening `guest_port` over
+    /// the loopback bridge (`CC-33`). Returns the connection id, or `None` if the
+    /// loopback ingress is not enabled. Pump the machine (`run`) so the NAT opens
+    /// the connection toward the guest and the byte stream flows.
+    pub fn dial_guest(&mut self, guest_port: u16) -> Option<u32> {
+        self.loopback.as_ref().map(|h| h.dial(guest_port))
+    }
+
+    /// Write host bytes toward the guest server on a loopback connection.
+    pub fn guest_send(&mut self, id: u32, data: &[u8]) {
+        if let Some(h) = self.loopback.as_ref() {
+            h.send(id, data);
+        }
+    }
+
+    /// Drain the guest server's reply bytes on a loopback connection (empty if
+    /// none have arrived yet — pump the machine to advance the stream).
+    pub fn guest_recv(&mut self, id: u32) -> Vec<u8> {
+        self.loopback
+            .as_ref()
+            .map(|h| h.recv(id))
+            .unwrap_or_default()
+    }
+
+    /// Close the host side of a loopback connection.
+    pub fn guest_close(&mut self, id: u32) {
+        if let Some(h) = self.loopback.as_ref() {
+            h.close(id);
+        }
+    }
+
+    /// Whether a loopback connection is still usable (the guest has not closed it,
+    /// or has but unread bytes remain).
+    #[must_use]
+    pub fn guest_is_open(&self, id: u32) -> bool {
+        self.loopback.as_ref().is_some_and(|h| h.is_open(id))
     }
 
     /// **Live** network reconfiguration (ADR-018, `CC-28`): begin forwarding
