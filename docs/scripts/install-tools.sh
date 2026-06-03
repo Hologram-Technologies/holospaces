@@ -240,7 +240,24 @@ ARC42_TEMPLATE_DIR="$REPO_ROOT/vendor/arc42-generator/arc42-template"
 CURRENT=$( cd "$ARC42_TEMPLATE_DIR" && git rev-parse HEAD )
 if [ "$CURRENT" != "$ARC42_TEMPLATE_PIN" ]; then
     info "checking out arc42-template at pinned SHA $ARC42_TEMPLATE_PIN"
-    ( cd "$ARC42_TEMPLATE_DIR" && git fetch --quiet origin && git checkout --quiet "$ARC42_TEMPLATE_PIN" )
+    # Retry around git index.lock contention. A leftover lock is almost
+    # always stale — an earlier provisioning run (e.g. an interrupted
+    # devcontainer rebuild) that died mid-checkout — and it persists in
+    # .git/modules across rebuilds, so without clearing it every later run
+    # fails here. Give any genuinely in-flight git op a moment to release the
+    # lock, then clear the stale lock and retry.
+    checkout_ok=
+    for attempt in 1 2 3; do
+        if ( cd "$ARC42_TEMPLATE_DIR" && git fetch --quiet origin && git checkout --quiet "$ARC42_TEMPLATE_PIN" ); then
+            checkout_ok=1
+            break
+        fi
+        info "arc42-template checkout failed (attempt $attempt); clearing any stale git lock and retrying"
+        sleep 1
+        ( cd "$ARC42_TEMPLATE_DIR" && rm -f "$(git rev-parse --git-path index.lock)" )
+    done
+    [ -n "$checkout_ok" ] \
+        || { err "could not check out arc42-template at $ARC42_TEMPLATE_PIN (persistent git lock contention or fetch failure)"; exit 1; }
 fi
 [ -f "$ARC42_TEMPLATE_DIR/EN/adoc/01_introduction_and_goals.adoc" ] \
     || { err "$ARC42_TEMPLATE_DIR/EN/adoc/ layout not found at pinned SHA — pin may be too old"; exit 1; }
