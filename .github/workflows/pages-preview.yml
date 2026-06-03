@@ -1,0 +1,45 @@
+name: pages-preview
+
+# A GitHub Pages deployment **per pull request** (ADR-003 docs-as-code review):
+# every PR gets its own isolated Platform Manager at
+#   https://hologram-technologies.github.io/holospaces/pr-preview/pr-<N>/
+# so the PR's browser peer can be reviewed live — without ever touching the
+# production site (which is served from the gh-pages root, deployed only from
+# `main` by pages.yml). The preview lives in the `pr-preview/pr-<N>/` subfolder
+# of the same `gh-pages` branch; it is created/updated as the PR is pushed and
+# torn down automatically when the PR closes (rossjrw/pr-preview-action). The
+# build is the exact same `build-site` composite the production deploy uses, so
+# the preview is byte-identical to what would ship.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, closed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: pages-preview-${{ github.event.number }}
+  cancel-in-progress: true
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    # Same-repo PRs only: a fork has no access to the `HOLOGRAM` build secret, so
+    # it cannot build the wasm bundle (and must not push to gh-pages). Fork PRs
+    # simply get no preview rather than a failed run.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the Platform Manager site
+        if: github.event.action != 'closed'
+        uses: ./.github/actions/build-site
+        with:
+          hologram-token: ${{ secrets.HOLOGRAM }}
+      - name: Deploy the per-PR preview (and tear it down on close)
+        uses: rossjrw/pr-preview-action@v1
+        with:
+          source-dir: _site
+          preview-branch: gh-pages
+          umbrella-dir: pr-preview

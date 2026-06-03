@@ -1,0 +1,105 @@
+name: Build the Platform Manager site
+description: >
+  Build the holospaces browser peer (the Hologram Platform Manager) into a
+  static `_site` directory — the κ-addressed, content-verified operator console
+  served from GitHub Pages. Shared by the production deploy (`pages.yml`) and the
+  per-PR preview deploy (`pages-preview.yml`) so both build byte-identically.
+
+inputs:
+  hologram-token:
+    description: >
+      The org `HOLOGRAM` token (Contents:read on Hologram-Technologies/hologram)
+      so Cargo's git-fetch-with-cli can resolve the private substrate dependency.
+    required: true
+  out-dir:
+    description: The directory the assembled site is written to.
+    required: false
+    default: _site
+
+runs:
+  using: composite
+  steps:
+    - name: Configure git for the hologram substrate dependency
+      shell: bash
+      env:
+        HOLOGRAM_TOKEN: ${{ inputs.hologram-token }}
+      run: git config --global url."https://x-access-token:${HOLOGRAM_TOKEN}@github.com/Hologram-Technologies/".insteadOf "https://github.com/Hologram-Technologies/"
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: wasm32-unknown-unknown
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: crates/holospaces-web
+    - uses: jetli/wasm-pack-action@v0.4.0
+    - name: Generate the in-browser fixtures (.holo + recompiled userland)
+      shell: bash
+      run: cargo run -q -p holospaces --example holo_fixture -- crates/holospaces-web/web
+    - name: Build the Platform Manager (wasm32)
+      shell: bash
+      run: wasm-pack build crates/holospaces-web --release --target web --out-dir web/pkg
+    - name: Assemble the site
+      shell: bash
+      env:
+        SITE: ${{ inputs.out-dir }}
+      run: |
+        mkdir -p "$SITE"
+        cp crates/holospaces-web/web/index.html "$SITE"/        # the management console
+        cp crates/holospaces-web/web/workspace.html "$SITE"/    # the VS Code workspace IDE
+        cp crates/holospaces-web/web/fixture.holo "$SITE"/
+        cp crates/holospaces-web/web/fixture-userland.wasm "$SITE"/
+        cp -r crates/holospaces-web/web/pkg "$SITE"/pkg
+        # Trim wasm-pack's dev-only emissions from the production artifact: the
+        # browser loads only holospaces_web.js + holospaces_web_bg.wasm (see
+        # index.html / the holospace-fs extension). The TypeScript declarations,
+        # the package.json, and the .gitignore are build/tooling files with no
+        # runtime role — they have no place in the deployed site.
+        rm -f "$SITE"/pkg/*.d.ts "$SITE"/pkg/package.json "$SITE"/pkg/.gitignore
+        # The workspace devcontainer OS: a real RISC-V Linux kernel + device tree
+        # (the pinned CC-11 image; provenance in vv/artifacts/cc11). Booted on the
+        # system emulator — CC-9 / CC-11.
+        cp vv/artifacts/cc11/Image.gz "$SITE"/workspace-kernel.gz
+        cp vv/artifacts/cc9/linux/holospaces.dtb "$SITE"/workspace.dtb
+        # The real VS Code components (Monaco + xterm.js; pinned CC-13 vendor set).
+        # The workspace imports them by κ and verifies by re-derivation (CC-13).
+        cp -r vv/artifacts/cc13/vendor "$SITE"/vendor
+        # The devcontainer (CC-14 / CC-20): the virtio-mmio kernel + the OCI
+        # image's layer. The browser peer assembles the rootfs (the in-crate
+        # Layer Assembler, wasm) and boots it over virtio-blk — the devcontainer
+        # flow, in the browser.
+        # The deployed devcontainer boots the CC-22 BusyBox base (a static
+        # /bin/busybox), so the injected persistent /init can exec an interactive
+        # shell — a running dev environment, not the boot-and-halt CC-14 test init.
+        # CC-22 reuses the CC-14 kernel.
+        cp vv/artifacts/cc14/kernel/Image.gz "$SITE"/devcontainer-kernel.gz
+        mfdig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['manifests'][0]['digest'].split(':')[1])" vv/artifacts/cc22/image/index.json)
+        ldig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['layers'][0]['digest'].split(':')[1])" "vv/artifacts/cc22/image/blobs/sha256/$mfdig")
+        cp "vv/artifacts/cc22/image/blobs/sha256/$ldig" "$SITE"/devcontainer-layer.tar.gz
+        # The networked devcontainer (CC-16): the net-enabled kernel + init layer,
+        # so the browser peer boots virtio-net + the userspace NAT and tunnels TCP
+        # out over a WebSocket to the egress relay (ADR-014).
+        cp vv/artifacts/cc16/kernel/Image.gz "$SITE"/devcontainer-net-kernel.gz
+        nmfdig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['manifests'][0]['digest'].split(':')[1])" vv/artifacts/cc16/image/index.json)
+        nldig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['layers'][0]['digest'].split(':')[1])" "vv/artifacts/cc16/image/blobs/sha256/$nmfdig")
+        cp "vv/artifacts/cc16/image/blobs/sha256/$nldig" "$SITE"/devcontainer-net-layer.tar.gz
+        # The deployed devcontainer (CC-18 over ADR-020): the CC-18 base image
+        # layer (BusyBox + the lsp-demo language server) booted on the CC-16 net
+        # kernel with the in-process loopback bridge. The workbench reaches the
+        # in-OS language server over the bridge (CC-33) for real language
+        # intelligence with no Node.
+        lmfdig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['manifests'][0]['digest'].split(':')[1])" vv/artifacts/cc18/image/index.json)
+        lldig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['layers'][0]['digest'].split(':')[1])" "vv/artifacts/cc18/image/blobs/sha256/$lmfdig")
+        cp "vv/artifacts/cc18/image/blobs/sha256/$lldig" "$SITE"/devcontainer-lsp-layer.tar.gz
+    - uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+    # The REAL VS Code web workbench (CC-17 Phase 3, ADR-012): holospaces serves
+    # Microsoft's κ-verified executable core BYTE-IDENTICAL (Law L5) and composes
+    # it with the supported web `create()` bootstrap + the `holospace-fs` builtin
+    # extension that boots the holospace in the extension-host worker and binds
+    # the workbench to its virtio-9p workspace (CC-15) + console (CC-11), wired to
+    # the open gallery (Open VSX — CC-19). Writes <site>/workbench.html +
+    # <site>/workbench/ (the dist) + <site>/ext/holospace-fs/. The Manager enters
+    # this; workspace.html (Monaco, CC-13) remains the documented fallback.
+    - name: Compose the real VS Code workbench (CC-17 Phase 3)
+      shell: bash
+      run: node crates/holospaces-web/web/build-workbench.mjs ${{ inputs.out-dir }}
