@@ -26,3 +26,12 @@ cargo test --manifest-path "$ROOT/Cargo.toml" -p holospaces --release \
 cargo test --manifest-path "$ROOT/Cargo.toml" -p holospaces --release \
     --test cc18_lsp -- --ignored --nocapture \
     the_in_os_language_server_speaks_lsp || exit 1
+
+# (3) the DEPLOYED delivery (ADR-020): the SAME language server runs as a TCP
+# service in the OS (lsp-demo --listen) and the workbench drives a full LSP
+# session to it over the in-process substrate bridge (CC-33) — every response
+# (capabilities, hover, completion, definition, diagnostics) conforms to the LSP
+# spec via lsp-types. Real language intelligence in the browser tab, no Node.
+cargo test --manifest-path "$ROOT/Cargo.toml" -p holospaces --release \
+    --test cc18_lsp_bridge -- --ignored --nocapture \
+    the_in_os_language_server_serves_the_workbench_over_the_bridge || exit 1

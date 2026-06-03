@@ -44,12 +44,19 @@ vv/artifacts/cc18/lsp-demo/ — the language server's SOURCE (a self-contained R
   spec and every body is an lsp-types value.
 
 vv/artifacts/cc18/image/ — a real OCI image (riscv64/linux) whose tar+gzip layer
-  (digest sha256:ae280fa3d1bb28c22ab3905f58d4ec0e8bc5c076c3aedac364698d3cd505fb8f)
+  (digest sha256:72b381733e90c02cfff259c4e13bed01739c135f6b584f7f314baaaab6d3130d)
   provides /usr/bin/lsp-demo (the language server) over /bin/busybox (the shell,
-  the SAME BusyBox v1.37.0 riscv64 as CC-22). Reuses the CC-14 kernel.
+  the SAME BusyBox v1.37.0 riscv64 as CC-22). Reuses the CC-14 kernel (CC-18
+  stdio witness) and the CC-16 net kernel (CC-18 deployed-bridge witness).
+  Repackage with `python3 vv/artifacts/cc18/pack-image.py` after rebuilding the
+  binary (it embeds the new binary deterministically and rewrites the digests).
 
-lsp-demo binary — sha256 9f9abac3d8671163715310da1ffc084d0941d9f03fe32ecaf1d251169148d17a,
-  1067336 bytes, ELF riscv64 statically-linked (glibc, crt-static).
+lsp-demo binary — sha256 cf8c862ebb7167c59f57c9dff3b03122c46a5228dff93ff6c903c592db24a37e,
+  1263976 bytes, ELF riscv64 statically-linked (glibc, crt-static).
+  Transports: stdio (the default — the CC-18 stdio witness drives `lsp-demo <
+  session.lsp`) and TCP (`lsp-demo --listen <port>` — the deployed delivery the
+  workbench reaches over the in-process substrate bridge, ADR-020 / CC-33). The
+  document intelligence is identical; only the transport differs.
 
 Build (lsp-demo, riscv64 static):
   cd vv/artifacts/cc18/lsp-demo

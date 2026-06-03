@@ -1,1 +1,0 @@
-{"architecture":"riscv64","os":"linux","config":{"Cmd":["/init"]},"rootfs":{"type":"layers","diff_ids":["sha256:47f3a4776854d9cdddd176c1a5d878ccf6c00120ce91c2c23e31bad664cc6c3b"]}}

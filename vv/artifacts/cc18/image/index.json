@@ -1,1 +1,1 @@
-{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:fcfd3e1c2ee6602a5aeb6efd396595fb062ec396f641626017be720594cc4c88","size":405,"platform":{"architecture":"riscv64","os":"linux"}}]}
+{"manifests":[{"digest":"sha256:45387d438a0a4bc14b019162d3d8c98ea3bba1a2f24a8ff6fd3042ad795b7b4c","mediaType":"application/vnd.oci.image.manifest.v1+json","size":405}],"mediaType":"application/vnd.oci.image.index.v1+json","schemaVersion":2}
