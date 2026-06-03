@@ -118,16 +118,36 @@ try {
     const snapshot = c.boot_userland(userland, 4 * 1024 * 1024);
 
     // The Codespaces scenario (arc42 ch.1): import a devcontainer and run it in
-    // the browser tab — its config selects the κ-addressed Wasm userland.
+    // the browser tab — its config selects the κ-addressed Wasm userland. The
+    // operator selects the guest **architecture** before provisioning (the
+    // Manager's arch picker; ADR-021) — riscv64 or aarch64. The selection is part
+    // of the holospace's content-addressed identity, so it is fixed for the
+    // holospace's lifetime: provisioning the *same* devcontainer under two
+    // architectures yields two *distinct* holospaces in the roster.
     const config = new TextEncoder().encode('{"name":"app","image":"debian:12"}');
+    const archBefore = JSON.parse(c.view()).holospaces.length;
     const devcontainerSnapshot = c.run_devcontainer(
       "https://github.com/example/cool-project.git",
       "main",
       ".devcontainer/devcontainer.json",
       config,
       userland,
+      "aarch64", // the operator's architecture selection
       64 * 1024 * 1024,
     );
+    // The same devcontainer under a *different* architecture is a *different*
+    // holospace (the arch is immutable, enforced by content-addressing).
+    c.run_devcontainer(
+      "https://github.com/example/cool-project.git",
+      "main",
+      ".devcontainer/devcontainer.json",
+      config,
+      userland,
+      "riscv64",
+      64 * 1024 * 1024,
+    );
+    const archAfter = JSON.parse(c.view()).holospaces.length;
+    const archSelectionDistinguishesHolospaces = archAfter === archBefore + 2;
 
     // A module that reaches for an ambient `env` host is rejected by the surface.
     const ambient = Uint8Array.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0xff]);
@@ -143,6 +163,7 @@ try {
       listed: view.holospaces,
       snapshot,
       devcontainerSnapshot,
+      archSelectionDistinguishesHolospaces,
       rejected,
     };
   });
@@ -160,6 +181,10 @@ try {
     typeof surface.devcontainerSnapshot === "string" &&
       surface.devcontainerSnapshot.startsWith("blake3:"),
     `imported + ran a devcontainer in-browser, no Docker/VM (κ ${surface.devcontainerSnapshot})`,
+  );
+  check(
+    surface.archSelectionDistinguishesHolospaces,
+    "the operator's architecture selection (aarch64 vs riscv64) is part of the holospace identity — the same devcontainer under two ISAs is two distinct holospaces (ADR-021; arch fixed at provisioning)",
   );
   check(surface.rejected, "an invalid/ambient userland module is refused (closed host surface)");
 

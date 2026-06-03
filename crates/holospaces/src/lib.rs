@@ -28,11 +28,18 @@
 //!   `BlockDevice` (hologram's HAL), an operating-system image as κ-addressed
 //!   content the [execution surface](surface) reads (ADR-009). Conformance:
 //!   `CC-7`.
-//! - [`emulator`] — the *system emulator* core: a real RISC-V machine
-//!   (RV64GC = IMAFDC + Zicsr, machine/supervisor traps, Sv39/Sv48/Sv57 paging, CLINT
-//!   interrupts, SBI) verified against the official RISC-V conformance suite, which the
-//!   emulator codemodule wraps to boot an arbitrary OS image (ADR-009).
-//!   Conformance: `CC-9`.
+//! - [`emulator`] — the *system emulator* core, with **two ISA targets**
+//!   (ADR-021) over a shared substrate-backed device bus (the κ-disk/9p/NAT
+//!   `virtio` servicing, used by both ISAs with no per-ISA re-implementation): a real
+//!   **RISC-V** machine (RV64GC = IMAFDC + Zicsr, machine/supervisor traps,
+//!   Sv39/Sv48/Sv57 paging, CLINT interrupts, SBI) verified against the official
+//!   RISC-V conformance suite (`CC-9`); and a real **AArch64** machine
+//!   ([`aarch64`](emulator::aarch64) — the A64 ISA + the EL0/EL1 exception model,
+//!   VMSAv8-64 paging, the ARM `virt` platform: GICv2, the generic timer, PSCI, a
+//!   PL011 console) that boots a real `arm64` Linux to userspace, verified against
+//!   `qemu-system-aarch64` (`CC-35`/`CC-36`/`CC-37`). The emulator codemodule
+//!   wraps either core to boot an arbitrary OS image on its selected
+//!   architecture (ADR-009).
 //! - [`peer`] — a [`Peer`](peer::Peer) that composes the substrate for an
 //!   environment (storage · network · runtime) and supplies the boot
 //!   operations, incl. reachability-closure migration (arc42 chapter 7).
@@ -140,5 +147,6 @@ pub mod substrate {
     };
 }
 
+pub use emulator::Arch;
 pub use realizations::{address, verify, Axis, Holospace, Kappa, Source};
 pub use substrate::Capabilities;

@@ -741,6 +741,7 @@ pub fn ingest_devcontainer(
     config_path: impl Into<String>,
     config_json: &[u8],
     userland: Kappa,
+    arch: crate::Arch,
     capabilities: hologram_substrate_core::Capabilities,
 ) -> Result<Holospace, IngestError> {
     let repo = repo.into();
@@ -752,12 +753,15 @@ pub fn ingest_devcontainer(
         return Err(IngestError::EmptyField("config_path"));
     }
     devcontainer::parse(config_json).map_err(IngestError::Devcontainer)?;
+    // The operator's architecture selection (ADR-021) becomes part of the
+    // holospace's identity — fixed for its lifetime by content-addressing.
     let source = Source::Devcontainer {
         repo,
         reference: reference.into(),
         config_path,
         config: address(config_json),
         userland,
+        arch,
     };
     Ok(Holospace::compose(source, capabilities))
 }
@@ -1238,6 +1242,7 @@ mod tests {
             ".devcontainer/devcontainer.json",
             cfg,
             userland,
+            crate::Arch::Riscv64,
             caps(),
         )
         .unwrap();
@@ -1247,6 +1252,7 @@ mod tests {
             ".devcontainer/devcontainer.json",
             cfg,
             userland,
+            crate::Arch::Riscv64,
             caps(),
         )
         .unwrap();
@@ -1261,6 +1267,7 @@ mod tests {
             ".devcontainer/devcontainer.json",
             br#"{"image":"debian:12","build":{"dockerfile":"Dockerfile"}}"#,
             userland,
+            crate::Arch::Riscv64,
             caps(),
         )
         .unwrap_err();
@@ -1279,6 +1286,7 @@ mod tests {
                 config_path: ".devcontainer/devcontainer.json".to_owned(),
                 config: address(br#"{"image":"debian:12"}"#),
                 userland: address(b"userland"),
+                arch: crate::Arch::Riscv64,
             },
             caps(),
         )

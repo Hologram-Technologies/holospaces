@@ -239,6 +239,7 @@ fn operator_boots_a_devcontainer_holospace() {
                 config_path: ".devcontainer/devcontainer.json".to_string(),
                 config,
                 userland,
+                arch: holospaces::Arch::Riscv64,
             },
             caps(),
         )

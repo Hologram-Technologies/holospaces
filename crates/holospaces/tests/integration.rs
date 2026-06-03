@@ -38,6 +38,7 @@ fn provision() -> holospaces::Holospace {
         ".devcontainer/devcontainer.json",
         CONFIG,
         userland(),
+        holospaces::Arch::Riscv64,
         caps(),
     )
     .expect("ingest")
@@ -85,6 +86,7 @@ fn capability_change_changes_identity_end_to_end() {
         ".devcontainer/devcontainer.json",
         CONFIG,
         userland(),
+        holospaces::Arch::Riscv64,
         scoped_caps,
     )
     .unwrap();

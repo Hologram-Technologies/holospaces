@@ -48,7 +48,13 @@ fn blob_bytes(digest: &str) -> Option<Vec<u8>> {
 fn ingest(store: &MemKappaStore) -> Result<IngestedImage, OciError> {
     let layout = std::fs::read(cc18_dir().join("image/oci-layout")).unwrap();
     let index = std::fs::read(cc18_dir().join("image/index.json")).unwrap();
-    ingest_image(store, &layout, &index, blob_bytes)
+    ingest_image(
+        store,
+        &layout,
+        &index,
+        holospaces::Arch::Riscv64,
+        blob_bytes,
+    )
 }
 fn have(tool: &str) -> bool {
     Command::new(tool)

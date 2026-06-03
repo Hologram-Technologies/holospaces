@@ -176,6 +176,7 @@ fn devcontainer_holospace_is_reproducible_from_its_source() {
             ".devcontainer/devcontainer.json",
             c,
             userland,
+            holospaces::Arch::Riscv64,
             caps(),
         )
         .unwrap()

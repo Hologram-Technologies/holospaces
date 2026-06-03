@@ -57,7 +57,7 @@ fn ingest_busybox(store: &MemKappaStore) -> Result<IngestedImage, OciError> {
         let hex = digest.strip_prefix("sha256:")?;
         std::fs::read(dir.join("blobs/sha256").join(hex)).ok()
     };
-    ingest_image(store, &layout, &index, blob)
+    ingest_image(store, &layout, &index, holospaces::Arch::Riscv64, blob)
 }
 fn have(tool: &str) -> bool {
     Command::new(tool)

@@ -46,10 +46,16 @@ fn boot_deployed_devcontainer() -> Emulator {
     let store = MemKappaStore::new();
     let layout = std::fs::read(cc22_dir().join("image/oci-layout")).unwrap();
     let index = std::fs::read(cc22_dir().join("image/index.json")).unwrap();
-    let img = ingest_image(&store, &layout, &index, |digest| {
-        let hex = digest.strip_prefix("sha256:")?;
-        std::fs::read(cc22_dir().join("image/blobs/sha256").join(hex)).ok()
-    })
+    let img = ingest_image(
+        &store,
+        &layout,
+        &index,
+        holospaces::Arch::Riscv64,
+        |digest| {
+            let hex = digest.strip_prefix("sha256:")?;
+            std::fs::read(cc22_dir().join("image/blobs/sha256").join(hex)).ok()
+        },
+    )
     .expect("ingest the CC-22 BusyBox image");
     let owned: Vec<(String, Vec<u8>)> = img
         .layers()

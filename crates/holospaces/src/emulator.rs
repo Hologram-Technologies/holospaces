@@ -41,6 +41,84 @@ use hologram_substrate_core::{KappaLabel71, KappaStore};
 
 pub mod net;
 
+/// The **AArch64 (ARMv8-A) core** — the system emulator's second ISA target
+/// (ADR-021). The A64 integer instruction set, then (CC-36) the EL0/EL1
+/// privileged model + VMSAv8-64 paging + the ARM `virt` platform, reusing this
+/// module's `virtio`/9p/net/κ-disk device substrate unchanged. Conformance:
+/// `CC-35`/`CC-36`/`CC-37`.
+pub mod aarch64;
+
+/// The shared virtio-mmio device bus: the substrate-backed `virtio` devices and
+/// their split-virtqueue servicing, used by **both** the RISC-V and AArch64
+/// machines (one κ-disk/9p/NAT implementation, two thin MMIO transports).
+mod devbus;
+
+/// The instruction-set architecture a holospace's guest runs (ADR-021). The
+/// system emulator is one of two ISA targets — the RISC-V `RV64GC` core (this
+/// module, `CC-9`) or the AArch64 `ARMv8-A` core ([`aarch64`], `CC-35`/`CC-36`).
+///
+/// An architecture is **fixed at provisioning**: the OCI image
+/// (`platform.architecture`), the guest kernel, and the machine's device tree
+/// are all ISA-specific, so it is selected in the Platform Manager *before* a
+/// devcontainer is created (`CC-37`) and cannot change afterward — while every
+/// other holospace parameter stays reconfigurable over the substrate (`CC-28`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Arch {
+    /// 64-bit RISC-V (`RV64GC`) — the default target (`CC-9`).
+    #[default]
+    Riscv64,
+    /// 64-bit ARM (`AArch64`, ARMv8-A) — `CC-35`/`CC-36`/`CC-37`.
+    Aarch64,
+}
+
+impl Arch {
+    /// The OCI image `platform.architecture` this ISA selects from a multi-arch
+    /// index (`linux/<arch>`), matched at the import boundary (`CC-10`/`CC-20`).
+    #[must_use]
+    pub fn oci_arch(self) -> &'static str {
+        match self {
+            Arch::Riscv64 => "riscv64",
+            Arch::Aarch64 => "arm64",
+        }
+    }
+
+    /// The stable identifier used in holospace configs and the Manager UI.
+    #[must_use]
+    pub fn id(self) -> &'static str {
+        match self {
+            Arch::Riscv64 => "riscv64",
+            Arch::Aarch64 => "aarch64",
+        }
+    }
+
+    /// Parse an architecture id (a Manager selection or a config field); `None`
+    /// for an unknown id. Accepts both the canonical id and the OCI spelling.
+    #[must_use]
+    pub fn from_id(s: &str) -> Option<Self> {
+        match s {
+            "riscv64" | "rv64" | "rv64gc" => Some(Arch::Riscv64),
+            "aarch64" | "arm64" => Some(Arch::Aarch64),
+            _ => None,
+        }
+    }
+
+    /// A human label for the Manager console's architecture selector.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Arch::Riscv64 => "RISC-V (RV64GC)",
+            Arch::Aarch64 => "ARM (AArch64)",
+        }
+    }
+
+    /// Every architecture the Manager offers — the selection list, in default
+    /// order (the default architecture first).
+    #[must_use]
+    pub fn all() -> &'static [Arch] {
+        &[Arch::Riscv64, Arch::Aarch64]
+    }
+}
+
 /// The Linux RISC-V syscall numbers the emulator's `ecall` boundary recognises
 /// (a guest passes the number in `a7`). A real statically-linked binary that
 /// only writes and exits runs unmodified — the path toward "a real binary's
@@ -2639,73 +2717,17 @@ impl Emulator {
 
     /// Read a VirtIO-MMIO register or the block-config space.
     fn virtio_read(&self, addr: u64, _width: usize) -> u64 {
-        let Some(dev) = self.virtio.as_ref() else {
-            return 0;
-        };
-        let off = addr - VIRTIO_BASE;
-        match off {
-            0x000 => 0x7472_6976, // MagicValue "virt"
-            0x004 => 2,           // Version (modern)
-            0x008 => 2,           // DeviceID = block
-            0x00c => 0x554d_4551, // VendorID "QEMU"
-            0x010 => {
-                // DeviceFeatures: we offer only VIRTIO_F_VERSION_1 (bit 32).
-                match dev.device_features_sel {
-                    1 => 1, // bit 32 = bit 0 of word 1
-                    _ => 0,
-                }
-            }
-            0x034 => 1024, // QueueNumMax
-            0x044 => u64::from(dev.queue_ready),
-            0x060 => u64::from(dev.interrupt_status),
-            0x070 => u64::from(dev.status),
-            0x0fc => 0,                                    // ConfigGeneration
-            0x100 => dev.capacity_sectors() & 0xffff_ffff, // config.capacity lo
-            0x104 => dev.capacity_sectors() >> 32,         // config.capacity hi
-            _ => 0,
-        }
+        devbus::blk_mmio_read(self.virtio.as_ref(), addr - VIRTIO_BASE)
     }
 
     /// Write a VirtIO-MMIO register; a write to `QueueNotify` runs the queue.
     fn virtio_write(&mut self, addr: u64, value: u32) {
         let off = addr - VIRTIO_BASE;
-        if self.virtio.is_none() {
-            return;
-        }
-        // Borrow the device for register writes; queue processing needs the
-        // machine's memory, so it temporarily moves the device out (below).
-        {
-            let dev = self.virtio.as_mut().unwrap();
-            match off {
-                0x014 => dev.device_features_sel = value,
-                0x020 => {
-                    let w = dev.driver_features_sel.min(1) as usize;
-                    dev.driver_features[w] = value;
-                }
-                0x024 => dev.driver_features_sel = value,
-                0x030 => dev.queue_sel = value,
-                0x038 => dev.queue_num = value,
-                0x044 => dev.queue_ready = value,
-                0x064 => dev.interrupt_status &= !value, // InterruptACK
-                0x070 => {
-                    dev.status = value;
-                    if value == 0 {
-                        // Reset: clear the negotiated queue state, *keeping* the
-                        // κ-disk content (move the backing out, re-wrap it fresh).
-                        let disk = core::mem::replace(&mut dev.disk, KappaBacking::from_image(&[]));
-                        *dev = VirtioBlk::with_backing(disk);
-                    }
-                }
-                0x080 => dev.desc_addr = (dev.desc_addr & !0xffff_ffff) | u64::from(value),
-                0x084 => dev.desc_addr = (dev.desc_addr & 0xffff_ffff) | (u64::from(value) << 32),
-                0x090 => dev.avail_addr = (dev.avail_addr & !0xffff_ffff) | u64::from(value),
-                0x094 => dev.avail_addr = (dev.avail_addr & 0xffff_ffff) | (u64::from(value) << 32),
-                0x0a0 => dev.used_addr = (dev.used_addr & !0xffff_ffff) | u64::from(value),
-                0x0a4 => dev.used_addr = (dev.used_addr & 0xffff_ffff) | (u64::from(value) << 32),
-                _ => {}
-            }
-        }
-        if off == 0x050 {
+        let notify = match self.virtio.as_mut() {
+            Some(dev) => devbus::blk_mmio_write(dev, off, value),
+            None => return,
+        };
+        if notify {
             self.virtio_process_queue();
         }
     }
@@ -2716,130 +2738,15 @@ impl Emulator {
     /// split virtqueue; §5.2 block device).
     fn virtio_process_queue(&mut self) {
         let mut dev = self.virtio.take().unwrap();
-        let qsz = dev.queue_num as u16;
-        if dev.queue_ready == 0 || qsz == 0 {
-            self.virtio = Some(dev);
-            return;
-        }
-        // avail.idx is at avail_addr + 2 (after the 2-byte flags).
-        let avail_idx = self.rd16(dev.avail_addr + 2);
-        while dev.last_avail != avail_idx {
-            let slot = dev.last_avail % qsz;
-            // avail.ring[slot] at avail_addr + 4 + 2*slot
-            let head = self.rd16(dev.avail_addr + 4 + 2 * u64::from(slot));
-            let written = self.virtio_service_chain(&mut dev, head);
-            // used.ring[used.idx % qsz] = { id: head, len: written }
-            let used_idx = self.rd16(dev.used_addr + 2);
-            let ring = dev.used_addr + 4 + 8 * u64::from(used_idx % qsz);
-            self.wr32(ring, u32::from(head));
-            self.wr32(ring + 4, written);
-            self.wr16(dev.used_addr + 2, used_idx.wrapping_add(1));
-            dev.last_avail = dev.last_avail.wrapping_add(1);
-            dev.interrupt_status |= 1;
-            dev.irq_pending = true;
-        }
-        let raise = dev.irq_pending;
-        dev.irq_pending = false;
+        let mut mem = devbus::GuestRam {
+            ram: &mut self.ram,
+            base: self.base,
+        };
+        let raise = devbus::blk_service_queue(&mut mem, &mut dev);
         self.virtio = Some(dev);
         if raise {
             self.plic.raise(VIRTIO_IRQ);
         }
-    }
-
-    /// Service one request descriptor chain; returns the number of bytes the
-    /// device wrote into guest-writable buffers (the used-ring length).
-    fn virtio_service_chain(&mut self, dev: &mut VirtioBlk, head: u16) -> u32 {
-        const VIRTQ_DESC_F_NEXT: u16 = 1;
-        const VIRTQ_DESC_F_WRITE: u16 = 2;
-        // Collect the chain's descriptors (addr, len, flags).
-        let mut chain: Vec<(u64, u32, u16)> = Vec::new();
-        let mut idx = head;
-        loop {
-            let d = dev.desc_addr + 16 * u64::from(idx);
-            let addr = self.rd64(d);
-            let len = self.rd32(d + 8);
-            let flags = self.rd16(d + 12);
-            let next = self.rd16(d + 14);
-            chain.push((addr, len, flags));
-            if flags & VIRTQ_DESC_F_NEXT == 0 {
-                break;
-            }
-            idx = next;
-            if chain.len() > dev.queue_num as usize {
-                break; // malformed/looping chain guard
-            }
-        }
-        if chain.is_empty() {
-            return 0;
-        }
-        // Descriptor 0 is the request header: type (u32), reserved, sector (u64).
-        let (haddr, _, _) = chain[0];
-        let req_type = self.rd32(haddr);
-        let sector = self.rd64(haddr + 8);
-        // The last descriptor is the status byte (device-writable).
-        let status_desc = *chain.last().unwrap();
-        // Data descriptors are everything between header and status.
-        let data = &chain[1..chain.len() - 1];
-
-        let mut written = 0u32;
-        let mut disk_off = (sector * 512) as usize;
-        const VIRTIO_BLK_T_IN: u32 = 0; // read from disk → guest
-        const VIRTIO_BLK_T_OUT: u32 = 1; // write guest → disk
-        const VIRTIO_BLK_T_GET_ID: u32 = 8; // report the device id string
-        const VIRTIO_BLK_S_OK: u8 = 0;
-        const VIRTIO_BLK_S_IOERR: u8 = 1;
-        // A fixed-capacity block device (the spec): an access beyond the backing
-        // image is an I/O error, not a silent disk-resize. This matches the
-        // κ-disk HAL ([`crate::disk`]), which likewise refuses out-of-range I/O.
-        let mut status = VIRTIO_BLK_S_OK;
-        match req_type {
-            VIRTIO_BLK_T_IN => {
-                for (addr, len, _flags) in data {
-                    let n = *len as usize;
-                    if disk_off + n > dev.disk.len() {
-                        status = VIRTIO_BLK_S_IOERR;
-                        break;
-                    }
-                    // Read the sectors out of the κ-disk (the substrate) into a
-                    // buffer, then scatter to guest memory.
-                    let mut buf = vec![0u8; n];
-                    dev.disk.read_into(disk_off, &mut buf);
-                    self.write_phys_bytes(*addr, &buf);
-                    disk_off += n;
-                    written += *len;
-                }
-            }
-            VIRTIO_BLK_T_OUT => {
-                for (addr, len, _flags) in data {
-                    let n = *len as usize;
-                    if disk_off + n > dev.disk.len() {
-                        status = VIRTIO_BLK_S_IOERR;
-                        break;
-                    }
-                    // Gather from guest memory, then content-address the sectors
-                    // into the κ-disk (write-through to the store).
-                    let mut buf = vec![0u8; n];
-                    self.read_phys_bytes(*addr, &mut buf);
-                    dev.disk.write_from(disk_off, &buf);
-                    disk_off += n;
-                }
-            }
-            VIRTIO_BLK_T_GET_ID => {
-                // Answer with the device id (a 20-byte serial), padded with NUL —
-                // not an empty ack a `blkid`/`udev` probe would read as garbage.
-                const ID: &[u8] = b"holospaces-rootfs";
-                for (addr, len, _flags) in data {
-                    for i in 0..*len as usize {
-                        self.wr8(addr + i as u64, ID.get(i).copied().unwrap_or(0));
-                    }
-                    written += *len;
-                }
-            }
-            _ => {} // FLUSH and others: ack OK with no data.
-        }
-        let _ = VIRTQ_DESC_F_WRITE;
-        self.wr8(status_desc.0, status);
-        written + 1 // + the status byte
     }
 
     // Little-endian guest-physical helpers for virtqueue structures.
@@ -2863,35 +2770,6 @@ impl Emulator {
     }
     fn wr32(&mut self, a: u64, v: u32) {
         let _ = self.store_phys(a, 4, u64::from(v));
-    }
-
-    /// Copy `src` into guest physical memory at `addr`. Bulk-copies when
-    /// `[addr, addr+len)` lies wholly in RAM (the common case for a virtqueue
-    /// buffer), otherwise falls back to per-byte [`Emulator::wr8`] — preserving
-    /// its fault-swallowing semantics for a buffer that runs out of RAM or aims
-    /// at a device (identical result, just byte-at-a-time).
-    fn write_phys_bytes(&mut self, addr: u64, src: &[u8]) {
-        if let Ok(o) = self.offset(addr, src.len()) {
-            self.ram[o..o + src.len()].copy_from_slice(src);
-        } else {
-            for (i, b) in src.iter().enumerate() {
-                self.wr8(addr + i as u64, *b);
-            }
-        }
-    }
-
-    /// Read `dst.len()` bytes from guest physical memory at `addr` into `dst`.
-    /// Bulk-reads when `[addr, addr+len)` lies wholly in RAM, otherwise falls
-    /// back to per-byte [`Emulator::rd8`] (which reads 0 outside RAM) — identical
-    /// result, byte-at-a-time.
-    fn read_phys_bytes(&mut self, addr: u64, dst: &mut [u8]) {
-        if let Ok(o) = self.offset(addr, dst.len()) {
-            dst.copy_from_slice(&self.ram[o..o + dst.len()]);
-        } else {
-            for (i, b) in dst.iter_mut().enumerate() {
-                *b = self.rd8(addr + i as u64);
-            }
-        }
     }
 
     // ── VirtIO 9P device (the shared workspace filesystem; CC-15) ──

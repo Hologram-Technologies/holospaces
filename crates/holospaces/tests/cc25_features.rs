@@ -39,7 +39,7 @@ fn ingest_at(store: &MemKappaStore, image_dir: &Path) -> Result<IngestedImage, O
         let hex = digest.strip_prefix("sha256:")?;
         std::fs::read(image_dir.join("blobs/sha256").join(hex)).ok()
     };
-    ingest_image(store, &layout, &index, blob)
+    ingest_image(store, &layout, &index, holospaces::Arch::Riscv64, blob)
 }
 fn layers_of<'a>(
     store: &MemKappaStore,
