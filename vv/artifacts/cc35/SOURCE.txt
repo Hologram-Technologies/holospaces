@@ -1,0 +1,40 @@
+CC-35 — AArch64 (A64) integer-ISA conformance authority artifacts.
+
+The external authority is the Arm Architecture Reference Manual (ARM DDI 0487)
+for the A64 base instruction set and the PSTATE.NZCV condition flags, with
+qemu-system-aarch64 / qemu-aarch64 as the differential oracle. Each *.s is a
+real A64 program that exercises an instruction group and self-checks every
+result against its Arm-ARM-defined value, in the self-checking style of
+riscv-tests (https://github.com/riscv-software-src/riscv-tests): on full
+success it writes "PASS\n" to fd 1 and exits 0 (SVC #0, x8=93, x0=0); on the
+first failing check it writes "FAIL\n" and exits 1. The emulator
+(holospaces::emulator::aarch64) must reproduce the A64 semantics exactly to
+yield "PASS\n" + status 0 — byte-identical to qemu-aarch64 running the same
+machine code.
+
+The *.bin are flat binaries (the .text section, loaded at the emulator's reset
+PC), assembled from *.s by LLVM's real AArch64 backend — the external
+assembler, not hand-encoded:
+  llvm-mc -triple=aarch64-linux-gnu -filetype=obj <f>.s -o <f>.o
+  llvm-objcopy -O binary --only-section=.text <f>.o <f>.bin
+(GNU aarch64-linux-gnu-as is an equivalent fallback; see build.sh.) The batteries
+are position-independent (no absolute addresses, scratch on the stack, messages
+reached by ADR), so the *same* machine code runs both as a flat image on the
+holospaces core and as a static _start ELF under qemu-aarch64.
+
+Coverage:
+  arith    — data-processing: MOVZ/MOVK/MOVN, ADD/SUB immediate (+ LSL #12) and
+             the NZCV flags, ADD/SUB shifted + extended register, the logical
+             register + immediate group (ORR/AND/BIC), MUL/MADD/UMULH/SDIV, the
+             variable shift / bitfield (UBFX) / EXTR group, CLZ/RBIT, CSEL.
+  memory   — the load/store family: LDR/STR unsigned-offset, STRB+LDRSB and
+             STRH+LDRH extension, pre/post-index writeback, register-offset
+             addressing with LSL, and the LDP/STP pair.
+  control  — the branch family: a CBNZ countdown loop computing sum(1..=100)=5050,
+             a BL/RET subroutine call, and the TBNZ/TBZ/CBZ bit-test branches,
+             with the NZCV condition codes via B.cond.
+
+Witness: crates/holospaces/tests/cc35_aarch64.rs (the core runs each real binary
+to "PASS\n" + status 0); the qemu-aarch64 differential is run by
+vv/suites/cc35-aarch64-core.sh when the toolchain + qemu are present.
+Reproduce: ./build.sh  (and WITH_ELF=1 ./build.sh for the qemu oracle ELFs).

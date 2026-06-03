@@ -70,6 +70,18 @@ jobs:
           key: doc-tools-${{ hashFiles('docs/tools/checksums.txt', 'docs/scripts/install-tools.sh') }}
       - name: Provision the pinned doc toolchain
         run: docs/scripts/install-tools.sh
+      - name: Provision the differential oracles (QEMU) + cross assemblers
+        # The CC component suites validate the holospaces emulator against QEMU as
+        # the differential oracle — qemu-system-riscv64 (CC-9/14/15/16/…) and
+        # qemu-system-aarch64 + qemu-aarch64 (CC-35/36/37) — and assemble the
+        # CC-35 A64 batteries with LLVM's cross assembler. Installing them here
+        # makes the differentials run for real (strict V&V) rather than fall back
+        # to the committed pins; each suite is SKIP-aware if an oracle is absent.
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            qemu-system-arm qemu-system-misc qemu-user \
+            binutils-aarch64-linux-gnu binutils-riscv64-linux-gnu llvm
       - name: V&V (CS + CC, without release performance gate)
         if: github.event_name != 'release'
         env:

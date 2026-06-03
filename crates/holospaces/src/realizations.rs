@@ -286,6 +286,14 @@ pub enum Source {
         /// The κ-label of the Wasm userland the config selects — the entry
         /// module the runtime boots (the execution surface, ADR-008).
         userland: Kappa,
+        /// The guest **architecture** the operator selected at provisioning
+        /// (ADR-021): `riscv64` or `aarch64`. Because it is part of the source,
+        /// it is part of the holospace's content-addressed identity (Law L1) —
+        /// so it is **fixed for the life of the holospace**: changing it would
+        /// mint a *different* holospace κ, never mutate this one. Other guest
+        /// parameters (lifecycle/storage/network/account) are reconfigured at
+        /// runtime as `CC-28` directives, which carry no architecture.
+        arch: crate::Arch,
     },
 }
 
@@ -308,6 +316,7 @@ impl Source {
                 config_path,
                 config,
                 userland,
+                arch,
             } => {
                 p.push(1u8);
                 p.extend_from_slice(config.as_array());
@@ -316,6 +325,12 @@ impl Source {
                     p.extend_from_slice(&(s.len() as u32).to_le_bytes());
                     p.extend_from_slice(s.as_bytes());
                 }
+                // The architecture is part of the identity (Law L1) — appended so
+                // a holospace's κ commits to its ISA.
+                p.push(match arch {
+                    crate::Arch::Riscv64 => 0,
+                    crate::Arch::Aarch64 => 1,
+                });
             }
         }
         p
@@ -339,12 +354,19 @@ impl Source {
                 let repo = read_str(payload, &mut cur)?;
                 let reference = read_str(payload, &mut cur)?;
                 let config_path = read_str(payload, &mut cur)?;
+                // The architecture byte (appended); absent in a legacy payload →
+                // the default RISC-V target.
+                let arch = match payload.get(cur).copied() {
+                    Some(1) => crate::Arch::Aarch64,
+                    _ => crate::Arch::Riscv64,
+                };
                 Ok(Source::Devcontainer {
                     repo,
                     reference,
                     config_path,
                     config,
                     userland,
+                    arch,
                 })
             }
             _ => Err(RealizationError::Malformed),
@@ -363,6 +385,18 @@ impl Source {
             Source::Userland { entry } => *entry,
             // The devcontainer boots the userland its config selects.
             Source::Devcontainer { userland, .. } => *userland,
+        }
+    }
+
+    /// The guest **architecture** this source provisions (ADR-021). A
+    /// devcontainer carries the operator's selection (part of the identity, so
+    /// fixed for the holospace's lifetime); the other forms are the default
+    /// RISC-V target.
+    #[must_use]
+    pub fn arch(&self) -> crate::Arch {
+        match self {
+            Source::Devcontainer { arch, .. } => *arch,
+            _ => crate::Arch::Riscv64,
         }
     }
 }
@@ -515,6 +549,7 @@ mod tests {
             config_path: ".devcontainer/devcontainer.json".to_owned(),
             config: address(br#"{"image":"debian:12"}"#),
             userland: address(b"the recompiled userland the config selects"),
+            arch: crate::Arch::Riscv64,
         }
     }
 
@@ -530,6 +565,42 @@ mod tests {
         assert_eq!(k.sigma_axis(), Some("blake3"));
         assert!(verify(b"holospace-canonical-bytes", &k).unwrap());
         assert!(!verify(b"tampered", &k).unwrap());
+    }
+
+    /// The architecture an operator selects at provisioning (ADR-021) is part of
+    /// the holospace's content-addressed identity, so it is **fixed for the
+    /// holospace's lifetime**: two holospaces that differ only in their guest
+    /// architecture have *different* κ — you cannot mutate a holospace's ISA, only
+    /// mint a different holospace (Law L1). The selection round-trips through the
+    /// source payload, and [`Source::arch`] reads it back.
+    #[test]
+    fn the_architecture_is_part_of_the_holospace_identity() {
+        let dc = |arch| Source::Devcontainer {
+            repo: "https://example.invalid/app.git".to_owned(),
+            reference: "main".to_owned(),
+            config_path: ".devcontainer/devcontainer.json".to_owned(),
+            config: address(br#"{"image":"debian:12"}"#),
+            userland: address(b"the recompiled userland the config selects"),
+            arch,
+        };
+        let rv = dc(crate::Arch::Riscv64);
+        let arm = dc(crate::Arch::Aarch64);
+        // Same everything but the arch ⇒ a different holospace κ (immutable ISA).
+        assert_ne!(
+            Holospace::compose(rv.clone(), caps()).kappa(),
+            Holospace::compose(arm.clone(), caps()).kappa(),
+            "the guest architecture is part of the holospace identity (Law L1)"
+        );
+        assert_eq!(rv.arch(), crate::Arch::Riscv64);
+        assert_eq!(arm.arch(), crate::Arch::Aarch64);
+        // The selection round-trips through the source payload (encode → decode).
+        let decoded = Source::decode_payload(&arm.encode_payload()).unwrap();
+        assert_eq!(decoded.arch(), crate::Arch::Aarch64);
+        // The same arch is reproducible (QS1 still holds within an architecture).
+        assert_eq!(
+            Holospace::compose(arm.clone(), caps()).kappa(),
+            Holospace::compose(arm, caps()).kappa(),
+        );
     }
 
     #[test]

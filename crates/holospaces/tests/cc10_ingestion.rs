@@ -39,7 +39,13 @@ fn blob_bytes(digest: &str) -> Option<Vec<u8>> {
 fn ingest(store: &MemKappaStore) -> Result<IngestedImage, OciError> {
     let layout = std::fs::read(image_dir().join("oci-layout")).expect("oci-layout");
     let index = std::fs::read(image_dir().join("index.json")).expect("index.json");
-    ingest_image(store, &layout, &index, blob_bytes)
+    ingest_image(
+        store,
+        &layout,
+        &index,
+        holospaces::Arch::Riscv64,
+        blob_bytes,
+    )
 }
 
 /// The real OCI image ingests: every blob is verified by re-derivation against
@@ -85,9 +91,13 @@ fn a_forged_image_blob_is_refused() {
     let layout = std::fs::read(image_dir().join("oci-layout")).unwrap();
     let index = std::fs::read(image_dir().join("index.json")).unwrap();
     // Serve tampered bytes for every blob: the manifest no longer matches.
-    let err = ingest_image(&store, &layout, &index, |_digest| {
-        Some(b"tampered blob content".to_vec())
-    })
+    let err = ingest_image(
+        &store,
+        &layout,
+        &index,
+        holospaces::Arch::Riscv64,
+        |_digest| Some(b"tampered blob content".to_vec()),
+    )
     .expect_err("a forged image must be refused");
     assert!(
         matches!(err, OciError::DigestMismatch(_)),

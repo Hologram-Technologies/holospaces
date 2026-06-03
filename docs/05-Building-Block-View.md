@@ -131,7 +131,19 @@ replaces per-byte loops, and redundant interrupt-latch writes are elided
 the `qemu-system-riscv64` oracle (`CC-9`/`CC-14`). It is itself a
 κ-addressed code module satisfying the Execution Surface — imported and
 verified trustlessly (`get_with_fetch`). It computes an arbitrary OS
-image; holospaces starts with Linux.
+image; holospaces starts with Linux. It is not bound to one ISA:
+alongside RV64GC it has a second target, a real *AArch64 (ARMv8-A)*
+machine (the A64 instruction set + the EL0/EL1 exception model,
+VMSAv8-64 paging, and the ARM `virt` platform — a *GICv2* interrupt
+controller, the generic timer, *PSCI* over SMC, and a *PL011* console),
+reusing the *same* substrate-backed `virtio` device bus unchanged (one
+κ-disk/9p/NAT servicing, two thin MMIO transports — Law L4). A real,
+unmodified `arm64` Linux boots to userspace on it and an `arm64`
+devcontainer runs the ecosystem's stock `linux-arm64` binaries, verified
+against `qemu-system-aarch64 -M virt` (`CC-35`/`CC-36`/`CC-37`,
+ADR-021). The guest architecture is the operator's selection at
+provisioning and is part of the holospace's content-addressed identity,
+so it is fixed for the holospace's lifetime (Law L1).
 
 **Identity** — a *Key store* (the self-sovereign sign-in key) and a
 *Sync binding* (scopes which content an operator’s instances announce

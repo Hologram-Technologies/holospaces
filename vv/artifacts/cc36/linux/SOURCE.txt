@@ -1,0 +1,31 @@
+CC-36 — a real arm64 Linux kernel boots to userspace on the AArch64 emulator.
+
+The external authority is the Linux kernel itself (a real, unmodified arm64 OS —
+the most stringent A64 + privileged-architecture correctness test) over the ARM
+`virt` platform, with qemu-system-aarch64 -M virt as the differential oracle. The
+emulator must add the EL0/EL1 exception model, VMSAv8-64 paging, and the `virt`
+platform devices (GIC, the CNTV generic timer, a PSCI SMC interface) and boot the
+*same* kernel image qemu boots, reaching userspace byte-identically.
+
+Pins
+  Source   : torvalds/linux, tag v6.6
+  Commit   : ffc253263a1375a65fa6c9f62a893e9767fbebfa
+  Config   : `make ARCH=arm64 defconfig` + the initramfs splice and the
+             virtio/9p/ext4/IP-autoconf options (see build.sh); committed as
+             kernel.config. defconfig is the arm64 default that boots `virt`.
+  Toolchain: aarch64-linux-gnu-gcc (Ubuntu 13.3.0), GNU binutils 2.42.
+  PID 1    : init.c — a freestanding static arm64 ELF (raw svc syscalls, no libc)
+             that prints HOLOSPACES-LINUX-USERSPACE-OK + the real /proc/version,
+             then reboots (-> PSCI SYSTEM_OFF over SMC -> the emulator halts).
+
+Artifacts
+  Image.gz       — the gzip-compressed arm64 kernel Image (flat, with the arm64
+                   boot header); loaded at the emulator's text_offset.
+  init.c         — the PID-1 source (above).
+  initramfs.list — the gen_init_cpio manifest embedding /init.
+  kernel.config  — the exact config the committed Image was built from.
+  linux.sha256   — checksums of the committed artifacts.
+
+Reproduce: ./build.sh  (clones v6.6, builds Image.gz reproducibly — fixed
+KBUILD_BUILD_TIMESTAMP/USER/HOST). The qemu-system-aarch64 differential is
+captured/checked by vv/suites/cc36-aarch64-linux.sh whenever qemu is present.

@@ -26,6 +26,7 @@ use crate::assembly::{
     assemble_ext4, assemble_ext4_with_files, find_devcontainer_json, read_archive_file, Layer,
 };
 use crate::boot::devcontainer::{self, ImageSource};
+use crate::emulator::Arch;
 use crate::oci::{ingest_image, IngestedImage, OciError};
 use crate::{compose, dockerfile};
 use alloc::collections::BTreeMap;
@@ -75,9 +76,6 @@ impl From<OciError> for ImportError {
         ImportError::Oci(e)
     }
 }
-
-/// The emulator's guest architecture — the rootfs binaries must match it.
-const TARGET_ARCH: &str = "riscv64";
 
 // ── HTTP(S) transport ──────────────────────────────────────────────────────
 
@@ -260,8 +258,13 @@ const ACCEPT_MANIFESTS: &str = "application/vnd.oci.image.index.v1+json, \
 /// Pull an OCI image from its registry and ingest it into `store`, verifying
 /// every blob by re-derivation against its digest (`CC-10`, Law L5). Handles
 /// the registry's bearer-token auth challenge and multi-architecture image
-/// indexes (selecting the emulator's `riscv64` manifest).
-pub fn pull_image(store: &dyn KappaStore, image: &ImageRef) -> Result<IngestedImage, ImportError> {
+/// indexes (selecting the holospace's `arch` manifest — `linux/riscv64` or
+/// `linux/arm64`, ADR-021).
+pub fn pull_image(
+    store: &dyn KappaStore,
+    image: &ImageRef,
+    arch: Arch,
+) -> Result<IngestedImage, ImportError> {
     let base = image.base();
     let token = obtain_token(image)?;
     let bearer = token.as_deref();
@@ -276,9 +279,9 @@ pub fn pull_image(store: &dyn KappaStore, image: &ImageRef) -> Result<IngestedIm
         });
     }
 
-    // 2) If it is a multi-arch index, select the riscv64 manifest and fetch it.
+    // 2) If it is a multi-arch index, select the `arch` manifest and fetch it.
     let (manifest_bytes, manifest_digest) = if is_index(&top.content_type, &top.body) {
-        let digest = select_platform_manifest(&top.body)?;
+        let digest = select_platform_manifest(&top.body, arch)?;
         let url = format!("{base}/manifests/{digest}");
         let m = http_get_ok(&url, Some(ACCEPT_MANIFESTS), bearer)?;
         (m, digest)
@@ -299,7 +302,7 @@ pub fn pull_image(store: &dyn KappaStore, image: &ImageRef) -> Result<IngestedIm
         let url = format!("{base}/blobs/{digest}");
         http_get_ok(&url, None, bearer).ok()
     };
-    ingest_image(store, &layout, &index, provider).map_err(ImportError::Oci)
+    ingest_image(store, &layout, &index, arch, provider).map_err(ImportError::Oci)
 }
 
 /// Acquire a registry bearer token if the registry challenges for one (the
@@ -342,28 +345,29 @@ fn is_index(content_type: &str, body: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
-/// Choose the manifest for the emulator's architecture from an image index.
-fn select_platform_manifest(index_bytes: &[u8]) -> Result<String, ImportError> {
+/// Choose the manifest for the holospace's architecture from an image index.
+fn select_platform_manifest(index_bytes: &[u8], arch: Arch) -> Result<String, ImportError> {
     let v: serde_json::Value =
         serde_json::from_slice(index_bytes).map_err(|e| ImportError::BadContent(e.to_string()))?;
     let manifests = v
         .get("manifests")
         .and_then(|m| m.as_array())
         .ok_or_else(|| ImportError::BadContent("index has no manifests".into()))?;
+    let want = arch.oci_arch();
     for m in manifests {
         let plat = m.get("platform");
-        let arch = plat
+        let m_arch = plat
             .and_then(|p| p.get("architecture"))
             .and_then(|a| a.as_str());
         let os = plat.and_then(|p| p.get("os")).and_then(|o| o.as_str());
-        if arch == Some(TARGET_ARCH) && os == Some("linux") {
+        if m_arch == Some(want) && os == Some("linux") {
             if let Some(d) = m.get("digest").and_then(|d| d.as_str()) {
                 return Ok(d.to_string());
             }
         }
     }
     Err(ImportError::NoPlatform(format!(
-        "index has no {TARGET_ARCH}/linux manifest"
+        "index has no {want}/linux manifest"
     )))
 }
 
@@ -432,10 +436,12 @@ pub fn import_devcontainer(
     store: &dyn KappaStore,
     repo_url: &str,
     reference: &str,
+    arch: Arch,
 ) -> Result<ImportedDevcontainer, ImportError> {
     let archive = fetch_repo_archive(repo_url, reference)?;
-    let pull_default =
-        |store: &dyn KappaStore| pull_image(store, &parse_image_ref(DEFAULT_DEVCONTAINER_IMAGE)?);
+    let pull_default = |store: &dyn KappaStore| {
+        pull_image(store, &parse_image_ref(DEFAULT_DEVCONTAINER_IMAGE)?, arch)
+    };
 
     let (config, used_default, image, build) = match repo_devcontainer_config(&archive)? {
         Some(cfg) => {
@@ -448,7 +454,7 @@ pub fn import_devcontainer(
                 blob: &archive,
             };
             let (image, build) = match &dc.image_source {
-                ImageSource::Image(r) => (pull_image(store, &parse_image_ref(r)?)?, None),
+                ImageSource::Image(r) => (pull_image(store, &parse_image_ref(r)?, arch)?, None),
                 ImageSource::Build(bc) => {
                     let (img, plan) = resolve_build(
                         store,
@@ -456,6 +462,7 @@ pub fn import_devcontainer(
                         &bc.context,
                         &bc.dockerfile,
                         &bc.args,
+                        arch,
                     )?;
                     (img, Some(plan))
                 }
@@ -475,15 +482,21 @@ pub fn import_devcontainer(
                         .map_err(|e| ImportError::BadContent(format!("compose: {e}")))?
                     {
                         compose::ServiceSource::Image(r) => {
-                            (pull_image(store, &parse_image_ref(&r)?)?, None)
+                            (pull_image(store, &parse_image_ref(&r)?, arch)?, None)
                         }
                         compose::ServiceSource::Build {
                             context,
                             dockerfile,
                             args,
                         } => {
-                            let (img, plan) =
-                                resolve_build(store, &archive_layer, &context, &dockerfile, &args)?;
+                            let (img, plan) = resolve_build(
+                                store,
+                                &archive_layer,
+                                &context,
+                                &dockerfile,
+                                &args,
+                                arch,
+                            )?;
                             (img, Some(plan))
                         }
                     }
@@ -544,6 +557,7 @@ fn resolve_build(
     context: &str,
     dockerfile: &str,
     args: &BTreeMap<String, String>,
+    arch: Arch,
 ) -> Result<(IngestedImage, BuildPlan), ImportError> {
     let df_bytes = read_build_file(archive, context, dockerfile)?.ok_or_else(|| {
         ImportError::BadContent(format!(
@@ -552,7 +566,7 @@ fn resolve_build(
     })?;
     let df = dockerfile::parse(&df_bytes, args)
         .map_err(|e| ImportError::BadContent(format!("Dockerfile: {e}")))?;
-    let image = pull_image(store, &parse_image_ref(&df.from)?)?;
+    let image = pull_image(store, &parse_image_ref(&df.from)?, arch)?;
     let mut copy_files = Vec::new();
     for (src, dst) in df.copies() {
         let bytes = read_build_file(archive, context, src)?.ok_or_else(|| {
@@ -579,8 +593,9 @@ pub fn import_and_assemble(
     store: &dyn KappaStore,
     repo_url: &str,
     reference: &str,
+    arch: Arch,
 ) -> Result<(ImportedDevcontainer, Vec<u8>), ImportError> {
-    let imported = import_devcontainer(store, repo_url, reference)?;
+    let imported = import_devcontainer(store, repo_url, reference, arch)?;
     // Resolve the verified layer blobs from the store and assemble them.
     let mut blobs: Vec<(String, Vec<u8>)> = Vec::new();
     for (k, mt) in imported

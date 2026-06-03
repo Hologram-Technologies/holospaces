@@ -26,6 +26,7 @@ use serde_json::Value;
 
 use hologram_substrate_core::{verify_kappa_axis, KappaStore, StoreError};
 
+use crate::emulator::Arch;
 use crate::realizations::{address, Kappa};
 
 /// OCI media types holospaces recognises at the ingestion boundary
@@ -109,6 +110,8 @@ impl IngestedImage {
 /// bytes; `blob` resolves a descriptor digest (`"sha256:…"`) to its content
 /// (the boundary read — once; everything after is κ-addressed). The graph walked
 /// is index → manifest → config + layers, per the OCI image specification.
+/// `arch` selects the manifest for the holospace's ISA from a multi-platform
+/// index (`linux/riscv64` or `linux/arm64`; ADR-021).
 ///
 /// # Errors
 ///
@@ -119,6 +122,7 @@ pub fn ingest_image<F>(
     store: &dyn KappaStore,
     oci_layout: &[u8],
     index_json: &[u8],
+    arch: Arch,
     mut blob: F,
 ) -> Result<IngestedImage, OciError>
 where
@@ -141,7 +145,7 @@ where
         .get("manifests")
         .and_then(Value::as_array)
         .ok_or(OciError::NoManifest)?;
-    let manifest_desc = select_manifest(manifests)?;
+    let manifest_desc = select_manifest(manifests, arch)?;
     let manifest_digest = descriptor_digest(manifest_desc)?;
     expect_media(manifest_desc, media::MANIFEST)?;
 
@@ -209,19 +213,21 @@ where
     Ok((bytes, k))
 }
 
-/// The platform the system emulator (`CC-9`) runs: a 64-bit RISC-V Linux guest.
-/// An OCI image *index* (multi-platform) must carry a manifest for it — selecting
-/// the wrong architecture would assemble an unrunnable rootfs, so a mismatch is an
-/// explicit error, never a silent first-match default.
+/// The OS the system emulator runs: a Linux guest (both ISA targets). The
+/// architecture is the holospace's selected [`Arch`] (ADR-021) — `linux/riscv64`
+/// (`CC-9`) or `linux/arm64` (`CC-36`/`CC-37`). An OCI image *index*
+/// (multi-platform) must carry a manifest for the selected architecture —
+/// selecting the wrong one would assemble an unrunnable rootfs, so a mismatch is
+/// an explicit error, never a silent first-match default.
 const TARGET_OS: &str = "linux";
-const TARGET_ARCH: &str = "riscv64";
 
-/// Select the image manifest from an index's `manifests` descriptors. A single
-/// image manifest is unambiguous (the registry served one image); among several
-/// (a multi-platform index) the one matching the emulator's `linux/riscv64` is
-/// chosen, and a missing match is an explicit [`OciError::NoMatchingPlatform`]
-/// listing what was available — never a silently wrong architecture.
-fn select_manifest(manifests: &[Value]) -> Result<&Value, OciError> {
+/// Select the image manifest from an index's `manifests` descriptors for the
+/// holospace's architecture `arch`. A single image manifest is unambiguous (the
+/// registry served one image); among several (a multi-platform index) the one
+/// matching `linux/<arch.oci_arch()>` is chosen, and a missing match is an
+/// explicit [`OciError::NoMatchingPlatform`] listing what was available — never a
+/// silently wrong architecture.
+fn select_manifest(manifests: &[Value], arch: Arch) -> Result<&Value, OciError> {
     // Image manifests only — an index may also carry attestation descriptors.
     let images: Vec<&Value> = manifests
         .iter()
@@ -233,21 +239,21 @@ fn select_manifest(manifests: &[Value]) -> Result<&Value, OciError> {
         many => many
             .iter()
             .copied()
-            .find(|d| platform_matches(d))
+            .find(|d| platform_matches(d, arch))
             .ok_or_else(|| OciError::NoMatchingPlatform {
-                want: format!("{TARGET_OS}/{TARGET_ARCH}"),
+                want: format!("{TARGET_OS}/{}", arch.oci_arch()),
                 have: many.iter().map(|d| platform_label(d)).collect(),
             }),
     }
 }
 
-/// True if a manifest descriptor's `platform` is the emulator's `linux/riscv64`.
-fn platform_matches(desc: &Value) -> bool {
+/// True if a manifest descriptor's `platform` is `linux/<arch>`.
+fn platform_matches(desc: &Value, arch: Arch) -> bool {
     let Some(p) = desc.get("platform") else {
         return false;
     };
     p.get("os").and_then(Value::as_str) == Some(TARGET_OS)
-        && p.get("architecture").and_then(Value::as_str) == Some(TARGET_ARCH)
+        && p.get("architecture").and_then(Value::as_str) == Some(arch.oci_arch())
 }
 
 /// A descriptor's platform as `os/arch` (for a diagnostic listing of an index).
@@ -429,14 +435,20 @@ mod tests {
     fn ingests_and_verifies_every_blob_by_re_derivation() {
         let (layout, index, blobs) = build_layout();
         let store = MemKappaStore::new();
-        let img = ingest_image(&store, &layout, &index, |d| blobs.get(d).cloned()).unwrap();
+        let img = ingest_image(&store, &layout, &index, Arch::Riscv64, |d| {
+            blobs.get(d).cloned()
+        })
+        .unwrap();
         assert_eq!(img.layers().len(), 1);
         assert!(store.contains(img.manifest()));
         assert!(store.contains(img.config()));
         assert!(store.contains(&img.layers()[0]));
         // Reproducible identity (Law L1).
         let store2 = MemKappaStore::new();
-        let img2 = ingest_image(&store2, &layout, &index, |d| blobs.get(d).cloned()).unwrap();
+        let img2 = ingest_image(&store2, &layout, &index, Arch::Riscv64, |d| {
+            blobs.get(d).cloned()
+        })
+        .unwrap();
         assert_eq!(img.identity(), img2.identity());
         assert_eq!(img.digest(), img2.digest());
     }
@@ -448,7 +460,10 @@ mod tests {
         let some_digest = blobs.keys().next().unwrap().clone();
         blobs.insert(some_digest.clone(), b"tampered content".to_vec());
         let store = MemKappaStore::new();
-        let err = ingest_image(&store, &layout, &index, |d| blobs.get(d).cloned()).unwrap_err();
+        let err = ingest_image(&store, &layout, &index, Arch::Riscv64, |d| {
+            blobs.get(d).cloned()
+        })
+        .unwrap_err();
         assert!(
             matches!(err, OciError::DigestMismatch(_)),
             "a blob that does not re-derive to its OCI digest is refused (L5), got {err:?}"
@@ -459,7 +474,7 @@ mod tests {
     fn a_missing_blob_is_refused() {
         let (layout, index, _blobs) = build_layout();
         let store = MemKappaStore::new();
-        let err = ingest_image(&store, &layout, &index, |_| None).unwrap_err();
+        let err = ingest_image(&store, &layout, &index, Arch::Riscv64, |_| None).unwrap_err();
         assert!(matches!(err, OciError::MissingBlob(_)));
     }
 
@@ -475,17 +490,24 @@ mod tests {
     }
 
     #[test]
-    fn a_multi_platform_index_selects_the_emulators_architecture() {
-        // A real multi-arch index: pick linux/riscv64, not the first (amd64).
+    fn a_multi_platform_index_selects_the_holospaces_architecture() {
+        // A real multi-arch index: pick the selected ISA's manifest, not the
+        // first (amd64). RISC-V picks riscv64; AArch64 picks arm64 — never a
+        // silently wrong architecture (ADR-021).
         let manifests = vec![
             manifest_desc(Some("amd64")),
             manifest_desc(Some("riscv64")),
             manifest_desc(Some("arm64")),
         ];
-        let sel = select_manifest(&manifests).unwrap();
+        let sel = select_manifest(&manifests, Arch::Riscv64).unwrap();
         assert_eq!(
             sel.get("platform").unwrap().get("architecture").unwrap(),
             "riscv64"
+        );
+        let sel = select_manifest(&manifests, Arch::Aarch64).unwrap();
+        assert_eq!(
+            sel.get("platform").unwrap().get("architecture").unwrap(),
+            "arm64"
         );
     }
 
@@ -493,17 +515,18 @@ mod tests {
     fn a_single_manifest_index_is_unambiguous() {
         // One image manifest (no platform tag) — the registry served one image.
         let manifests = vec![manifest_desc(None)];
-        assert!(select_manifest(&manifests).is_ok());
+        assert!(select_manifest(&manifests, Arch::Riscv64).is_ok());
     }
 
     #[test]
-    fn an_index_without_the_emulators_platform_is_an_explicit_error() {
-        let manifests = vec![manifest_desc(Some("amd64")), manifest_desc(Some("arm64"))];
-        let err = select_manifest(&manifests).unwrap_err();
+    fn an_index_without_the_holospaces_platform_is_an_explicit_error() {
+        // An arm64 holospace against an index with no arm64 manifest.
+        let manifests = vec![manifest_desc(Some("amd64")), manifest_desc(Some("riscv64"))];
+        let err = select_manifest(&manifests, Arch::Aarch64).unwrap_err();
         match err {
             OciError::NoMatchingPlatform { want, have } => {
-                assert_eq!(want, "linux/riscv64");
-                assert_eq!(have, vec!["linux/amd64", "linux/arm64"]);
+                assert_eq!(want, "linux/arm64");
+                assert_eq!(have, vec!["linux/amd64", "linux/riscv64"]);
             }
             other => panic!("expected NoMatchingPlatform, got {other:?}"),
         }
@@ -513,7 +536,10 @@ mod tests {
     fn devcontainer_source_identity_is_reproducible_and_validates_the_config() {
         let (layout, index, blobs) = build_layout();
         let store = MemKappaStore::new();
-        let img = ingest_image(&store, &layout, &index, |d| blobs.get(d).cloned()).unwrap();
+        let img = ingest_image(&store, &layout, &index, Arch::Riscv64, |d| {
+            blobs.get(d).cloned()
+        })
+        .unwrap();
         let cfg = br#"{"name":"app","image":"debian:12"}"#;
         let a = devcontainer_source_identity(cfg, &img).unwrap();
         let b = devcontainer_source_identity(cfg, &img).unwrap();

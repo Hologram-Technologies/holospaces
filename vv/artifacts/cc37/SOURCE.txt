@@ -1,0 +1,51 @@
+CC-37 — arm64 devcontainer authority artifacts (a stock linux-arm64 binary runs).
+
+The witness (crates/holospaces/tests/cc37_aarch64.rs) assembles the rootfs below
+into an ext4 image with the in-crate Layer Assembler (CC-7 / κ-disk content) and
+boots the arm64 Linux kernel below on the emulator — which mounts that rootfs
+over its virtio-blk device (the shared substrate-backed device bus,
+emulator::devbus, GIC-routed) and runs the **stock, unmodified linux-arm64
+busybox** as PID 1. The differential oracle is qemu-system-aarch64 -M virt on the
+same kernel + rootfs.
+
+linux/Image.gz
+  A real, unmodified Linux 6.6.0 arm64 kernel (torvalds/linux v6.6), built for
+  this witness like the CC-36 kernel but with **no embedded initramfs**
+  (INITRAMFS_SOURCE="") so it mounts a real virtio-blk root, plus VIRTIO_MMIO +
+  VIRTIO_BLK + EXT4 + virtio-net/9p + IP autoconf. Reproducible build env
+  (KBUILD_BUILD_TIMESTAMP="Fri 31 May 2026 00:00:00 UTC", USER=holospaces,
+  HOST=cc37, .version=0); the resolved kernel/.config is committed.
+  Toolchain: aarch64-linux-gnu-gcc (Ubuntu 13.3.0).
+
+init.c, init
+  The witnessed arm64 devcontainer PID 1: a **stock linux-arm64 toolchain
+  binary** built by the upstream `aarch64-linux-gnu` GCC
+  (`aarch64-linux-gnu-gcc -O2 -static -nostdlib -ffreestanding init.c -o init`,
+  stripped — a real, unmodified `linux-arm64` ELF). Freestanding (raw arm64
+  syscalls, no libc) so it exercises the base A64 + system ISA the emulator
+  implements: it boots from the κ-disk virtio-blk rootfs, runs a real
+  computation (sum 1..=1000 == 500500), reports the guest arch via the `uname`
+  syscall (aarch64), reads the real /proc/version, and reboots (→ PSCI
+  SYSTEM_OFF → the emulator halts). The witness asserts these markers, and
+  qemu-system-aarch64 -M virt produces them byte-for-byte on the same rootfs.
+
+rootfs/busybox, rootfs/layer.tar.gz
+  A **static linux-arm64 busybox 1.36.1** (the canonical glibc stock binary —
+  the same busybox the CC-22 riscv64 devcontainer uses, here built for arm64
+  with `make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig` +
+  CONFIG_STATIC=y, stripped; layer.tar.gz a reproducible tar+gzip of
+  /bin/busybox). Committed as the stock-glibc artifact: it boots and `/init`
+  runs (the rootfs mounts, EL0 userspace starts) but glibc's Advanced-SIMD
+  (NEON) ifunc string routines are the documented frontier — the same frontier
+  the heavier `linux-arm64` binaries (Node, openvscode-server) reach (CC-34).
+
+init.sh
+  The busybox-shell PID 1 (kept for provenance) the stock-glibc busybox path
+  would run once the Advanced-SIMD frontier is implemented.
+
+cc37.sha256
+  Checksums of the committed artifacts.
+
+Reproduce: ./build.sh  (clones v6.6, builds the kernel + busybox, packs the
+layer). The qemu-system-aarch64 differential is run by
+vv/suites/cc37-aarch64-devcontainer.sh when qemu is present.

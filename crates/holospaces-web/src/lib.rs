@@ -316,6 +316,15 @@ impl Console {
     /// its config selects is validated against the host-ABI surface (`CC-6`) and
     /// booted through the substrate runtime over the interpreter engine — same
     /// lifecycle as a native or remote peer (Q6). Returns the suspend snapshot κ.
+    ///
+    /// `arch` is the operator's **architecture selection** (the Manager GUI's
+    /// arch picker; ADR-021) — `"riscv64"` or `"aarch64"`. It becomes part of the
+    /// holospace's content-addressed identity, so it is fixed for the holospace's
+    /// lifetime (an unknown id falls back to the default RISC-V target).
+    // A flat JS-facing signature (the repository URL, reference, config path,
+    // config + userland bytes, the architecture, and the memory budget) — the
+    // wasm-bindgen boundary takes scalars/byte-slices, not a Rust struct.
+    #[allow(clippy::too_many_arguments)]
     pub fn run_devcontainer(
         &mut self,
         repo: &str,
@@ -323,6 +332,7 @@ impl Console {
         config_path: &str,
         config_json: &[u8],
         userland_module: &[u8],
+        arch: &str,
         memory_bytes: f64,
     ) -> Result<String, JsValue> {
         devcontainer::parse(config_json).map_err(js_err)?;
@@ -343,6 +353,7 @@ impl Console {
             config_path: config_path.to_owned(),
             config,
             userland,
+            arch: holospaces::Arch::from_id(arch).unwrap_or_default(),
         };
         let holospace =
             provision(self.runtime.store(), source, capabilities(memory_bytes)).map_err(js_err)?;
@@ -488,8 +499,14 @@ fn parse_directives(json: &str) -> Result<Vec<Directive>, JsValue> {
             Directive::UnforwardPort(u16::try_from(p).map_err(|_| JsValue::from_str("bad port"))?)
         } else if let Some(n) = d.get("network") {
             Directive::SetNetwork {
-                fetch: n.get("fetch").and_then(serde_json::Value::as_bool).unwrap_or(false),
-                announce: n.get("announce").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                fetch: n
+                    .get("fetch")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                announce: n
+                    .get("announce")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
             }
         } else if let Some(q) = d.get("quota").and_then(serde_json::Value::as_u64) {
             Directive::SetStorageQuota(q)
@@ -812,7 +829,10 @@ impl Workspace {
         // Publish the canonical event as *resolvable content* on the channel — its
         // bytes are stored so the κ re-derives and resolves (Law L1/L3), not a
         // dangling label — then store the file content itself.
-        let event = self.store.put("blake3", &intent.canonicalize()).map_err(js_err)?;
+        let event = self
+            .store
+            .put("blake3", &intent.canonicalize())
+            .map_err(js_err)?;
         self.channel.push(event);
         let stored = self.store.put("blake3", content).map_err(js_err)?;
         self.files.insert(path.to_owned(), stored);
@@ -930,8 +950,9 @@ impl Workspace {
         for d in config.directives() {
             match d {
                 Directive::ForwardPort(guest) => match self.machine.forward_port(*guest) {
-                    Some(host) => forwarded
-                        .push(serde_json::json!({ "guest": guest, "host": host })),
+                    Some(host) => {
+                        forwarded.push(serde_json::json!({ "guest": guest, "host": host }))
+                    }
                     // This peer's forwarded-port transport cannot bind live (the
                     // browser uses a relay route, ADR-016) — reported, not dropped.
                     None => unsupported.push(serde_json::json!({ "forwardPort": guest })),

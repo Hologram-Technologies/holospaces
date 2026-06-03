@@ -28,6 +28,7 @@ use holospaces::import::{
     import_and_assemble, parse_image_ref, pull_image, DEFAULT_DEVCONTAINER_IMAGE,
 };
 use holospaces::machine::MachineSpec;
+use holospaces::Arch;
 
 fn cc14_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vv/artifacts/cc14")
@@ -150,7 +151,7 @@ fn a_devcontainer_provisions_from_a_repository_url() {
 
     let store = MemKappaStore::new();
     let repo_url = format!("http://127.0.0.1:{port}/repo");
-    let (imported, rootfs) = import_and_assemble(&store, &repo_url, "main")
+    let (imported, rootfs) = import_and_assemble(&store, &repo_url, "main", Arch::Riscv64)
         .expect("import the devcontainer from its URL");
     assert!(
         !imported.used_default,
@@ -204,6 +205,7 @@ fn live_pull_of_the_default_image_from_docker_hub() {
     let image = pull_image(
         &store,
         &parse_image_ref(DEFAULT_DEVCONTAINER_IMAGE).unwrap(),
+        Arch::Riscv64,
     )
     .expect("pull the default image from Docker Hub");
     assert!(!image.layers().is_empty(), "the pulled image has layers");

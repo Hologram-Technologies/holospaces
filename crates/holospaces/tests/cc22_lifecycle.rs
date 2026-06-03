@@ -82,7 +82,13 @@ fn blob_bytes(digest: &str) -> Option<Vec<u8>> {
 fn ingest(store: &MemKappaStore) -> Result<IngestedImage, OciError> {
     let layout = std::fs::read(cc22_dir().join("image/oci-layout")).unwrap();
     let index = std::fs::read(cc22_dir().join("image/index.json")).unwrap();
-    ingest_image(store, &layout, &index, blob_bytes)
+    ingest_image(
+        store,
+        &layout,
+        &index,
+        holospaces::Arch::Riscv64,
+        blob_bytes,
+    )
 }
 /// Minimal USTAR reader: return the bytes of `want` (a file path in the tar).
 fn extract_tar_file(tar: &[u8], want: &str) -> Option<Vec<u8>> {

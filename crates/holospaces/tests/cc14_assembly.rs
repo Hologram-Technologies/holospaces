@@ -37,7 +37,13 @@ fn blob_bytes(digest: &str) -> Option<Vec<u8>> {
 fn ingest(store: &MemKappaStore) -> Result<IngestedImage, OciError> {
     let layout = std::fs::read(image_dir().join("oci-layout")).expect("oci-layout");
     let index = std::fs::read(image_dir().join("index.json")).expect("index.json");
-    ingest_image(store, &layout, &index, blob_bytes)
+    ingest_image(
+        store,
+        &layout,
+        &index,
+        holospaces::Arch::Riscv64,
+        blob_bytes,
+    )
 }
 
 /// Resolve the ingested layer blobs from the store, in manifest order, paired

@@ -1,0 +1,3487 @@
+//! **AArch64 (ARMv8-A) core** — the system emulator's second ISA target
+//! (ADR-021). This module is the A64 **integer** instruction core (`CC-35`): a
+//! faithful interpreter of the A64 base instruction set over a flat
+//! little-endian RAM, with the `NZCV` condition flags driving the condition
+//! codes — the AArch64 analogue of the [RISC-V core](super)'s integer base.
+//!
+//! The external authority is the **Arm Architecture Reference Manual** (ARM DDI
+//! 0487) for the A64 base instruction set and `PSTATE.NZCV`, with
+//! `qemu-system-aarch64` as the differential oracle (`vv/suites/cc35-aarch64-core`):
+//! a hand-assembled A64 battery's final register/memory state is the
+//! Arm-ARM-defined result and matches qemu byte-for-byte, with `X0` carrying the
+//! self-check verdict. The in-crate batteries below exercise every instruction
+//! group against that same Arm-ARM-defined result.
+//!
+//! The instruction groups implemented (the `CC-35` surface): data-processing
+//! immediate (`ADD`/`SUB`/`ADDS`/`SUBS` immediate, the logical-immediate group,
+//! `MOVZ`/`MOVN`/`MOVK`, the bitfield/`EXTR` group, `ADR`/`ADRP`);
+//! data-processing register (logical and add/sub shifted/extended register,
+//! add/sub-with-carry, conditional select, conditional compare, the 1/2/3-source
+//! groups — `MADD`/`MSUB`/`MUL`, `UMULH`/`SMULH`, `UDIV`/`SDIV`, the variable
+//! shifts, `RBIT`/`REV`/`CLZ`/`CLS`); the full load/store family (`LDR`/`STR`
+//! unsigned-offset + unscaled + pre/post-index + register-offset, `LDR` literal,
+//! `LDP`/`STP`, with the sign/zero-extension variants); and control flow
+//! (`B`/`BL`/`B.cond`/`CBZ`/`CBNZ`/`TBZ`/`TBNZ`/`RET`/`BR`/`BLR`). A flat program
+//! reaches the host boundary with `SVC #0` under the Linux `arm64` syscall ABI
+//! (`x8` selects `write`/`exit`) — the A64 analogue of the RISC-V `ecall` flat
+//! boundary — so a self-checking battery exits with its verdict in `X0`.
+//!
+//! `no_std` + `alloc`, like the RISC-V core, so the AArch64 target compiles into
+//! the same κ-addressed emulator codemodule (ADR-009).
+
+use alloc::collections::BTreeMap;
+#[cfg(not(feature = "std"))]
+#[allow(unused_imports)]
+use alloc::{boxed::Box, string::String, vec, vec::Vec};
+
+/// The Linux `arm64` syscall numbers the `SVC #0` host boundary recognises (the
+/// guest passes the number in `x8`, arguments in `x0`–`x5`). Identical numbers
+/// to the RISC-V core's generic Linux ABI — `write` and `exit`/`exit_group` let
+/// a real self-checking battery run unmodified.
+mod syscall {
+    pub const WRITE: u64 = 64;
+    pub const EXIT: u64 = 93;
+    pub const EXIT_GROUP: u64 = 94;
+}
+
+/// Why the AArch64 core stopped stepping — the analogue of [`super::Halt`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Halt {
+    /// The guest called `exit`/`exit_group` (`SVC #0`, `x8` = 93/94) with this
+    /// status in `x0`.
+    Exit(u64),
+    /// An instruction could not be executed (an unimplemented/illegal encoding or
+    /// a memory fault).
+    Trap(Trap),
+    /// The step budget was exhausted before the guest exited (a liveness bound,
+    /// not a guest fault).
+    OutOfBudget,
+}
+
+/// An A64 processor trap — an encoding the core cannot execute, a fault, or a
+/// debug/host event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Trap {
+    /// An A64 encoding the integer core does not implement / a reserved encoding.
+    Illegal(u32),
+    /// A load/store/fetch outside guest RAM (the flat-core analogue of an
+    /// external abort).
+    AccessFault(u64),
+    /// An `SVC #0` whose `x8` is not a recognised syscall.
+    UnknownSyscall(u64),
+    /// A `BRK #imm` software breakpoint (the `imm16` comment field).
+    Breakpoint(u16),
+    /// A `HLT #imm` — a flat battery uses it as an explicit halt.
+    Halted(u16),
+}
+
+/// `PSTATE.NZCV` — the four condition flags the A64 condition codes read.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct Nzcv {
+    n: bool,
+    z: bool,
+    c: bool,
+    v: bool,
+}
+
+impl Nzcv {
+    /// Pack into the `NZCV` field layout (`N` at bit 31 … `V` at bit 28) — the
+    /// `MRS NZCV` / `SPSR` form.
+    fn pack(self) -> u32 {
+        (u32::from(self.n) << 31)
+            | (u32::from(self.z) << 30)
+            | (u32::from(self.c) << 29)
+            | (u32::from(self.v) << 28)
+    }
+    /// Unpack a 4-bit `nzcv` immediate (`{n,z,c,v}` in bits 3..0) — the
+    /// `CCMP`/`CCMN` "condition false" result.
+    fn from_imm4(v: u32) -> Self {
+        Nzcv {
+            n: v & 0b1000 != 0,
+            z: v & 0b0100 != 0,
+            c: v & 0b0010 != 0,
+            v: v & 0b0001 != 0,
+        }
+    }
+}
+
+/// A single AArch64 PE (processing element) over a flat little-endian RAM: the
+/// 31 general registers `X0`–`X30`, the stack pointer `SP` (the architectural
+/// `XZR`/`SP` split at register slot 31 is resolved per-instruction), the program
+/// counter, and `PSTATE.NZCV`. RAM is mapped at `base`; a flat image loads there
+/// and the reset PC is `base`. Deterministic — identical image + input yield
+/// identical console output and final state (Law L1/L5), so a κ snapshot is
+/// reproducible.
+pub struct Cpu {
+    x: [u64; 31],
+    sp: u64,
+    pc: u64,
+    flags: Nzcv,
+    ram: Vec<u8>,
+    base: u64,
+    console: Vec<u8>,
+    /// The privileged-mode state (`CC-36`): the EL0/EL1 exception model,
+    /// VMSAv8-64 MMU, and the ARM `virt` platform devices. `None` is the flat
+    /// `CC-35` integer core — `SVC` is the host syscall boundary, memory is
+    /// identity-mapped RAM, and there is no privileged state — so the integer
+    /// batteries run unchanged. [`Cpu::boot_linux`] installs `Some` to boot a real
+    /// `arm64` kernel.
+    sys: Option<Box<Sys>>,
+    /// The local exclusive monitor address set by `LDXR`/`LDAXR`; a `STXR`/`STLXR`
+    /// succeeds only while it is set (cleared on exception entry, so a `LDXR`/`STXR`
+    /// loop retries when interrupted — the kernel's lock semantics on a single PE).
+    excl: Option<u64>,
+    /// The SIMD&FP register file `V0`–`V31` (128-bit). The integer core never
+    /// computes with them; they exist so the kernel's FP/SIMD context
+    /// save/restore (`LDP`/`STP`/`LDR`/`STR` of the `Q`/`D`/`S` registers, e.g.
+    /// `fpsimd_load_state`) moves a task's FP state through memory on the way to
+    /// userspace (`CC-36`).
+    v: [u128; 32],
+}
+
+/// The kind of guest memory access (selects the page-table permission bit and the
+/// fault syndrome).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Access {
+    Fetch,
+    Load,
+    Store,
+}
+
+impl Cpu {
+    /// A new machine with `ram_bytes` of zeroed RAM mapped at `base`; the reset PC
+    /// is `base` and `SP` is the top of RAM (a flat battery resets it as needed).
+    #[must_use]
+    pub fn new(base: u64, ram_bytes: usize) -> Self {
+        Cpu {
+            x: [0; 31],
+            sp: base.wrapping_add(ram_bytes as u64),
+            pc: base,
+            flags: Nzcv::default(),
+            ram: vec![0; ram_bytes],
+            base,
+            console: Vec::new(),
+            sys: None,
+            excl: None,
+            v: [0; 32],
+        }
+    }
+
+    /// Load a flat A64 image at `base` and reset the PC to it.
+    pub fn load_image(&mut self, image: &[u8]) {
+        let n = image.len().min(self.ram.len());
+        self.ram[..n].copy_from_slice(&image[..n]);
+        self.pc = self.base;
+    }
+
+    /// The bytes the guest has written to the host console (`SVC #0`, `write` to
+    /// fd 1/2).
+    #[must_use]
+    pub fn console(&self) -> &[u8] {
+        &self.console
+    }
+
+    /// The current value of `X0`–`X30` (`i` in `0..=30`); `X31` reads as the zero
+    /// register. The verdict register a `CC-35` battery leaves its self-check in.
+    #[must_use]
+    pub fn xreg(&self, i: usize) -> u64 {
+        if i >= 31 {
+            0
+        } else {
+            self.x[i]
+        }
+    }
+
+    /// The current `SP`.
+    #[must_use]
+    pub fn sp(&self) -> u64 {
+        self.sp
+    }
+
+    /// The current PC.
+    #[must_use]
+    pub fn pc(&self) -> u64 {
+        self.pc
+    }
+
+    /// Run up to `max_steps` instructions, stopping at the first `Halt` (an
+    /// `exit`, a trap, or the budget). The liveness bound mirrors the RISC-V
+    /// core's [`run`](super::Emulator::run).
+    pub fn run(&mut self, max_steps: u64) -> Halt {
+        for _ in 0..max_steps {
+            if let Err(h) = self.step() {
+                return h;
+            }
+        }
+        Halt::OutOfBudget
+    }
+
+    // ── register file (the XZR/SP slot-31 split) ────────────────────────────
+
+    /// Read register `i` with slot 31 = `XZR` (the common data-processing case).
+    #[inline]
+    fn rx(&self, i: u32) -> u64 {
+        if i == 31 {
+            0
+        } else {
+            self.x[i as usize]
+        }
+    }
+
+    /// Read register `i` with slot 31 = `SP` (base registers and `SP`-forms).
+    #[inline]
+    fn rx_sp(&self, i: u32) -> u64 {
+        if i == 31 {
+            self.sp
+        } else {
+            self.x[i as usize]
+        }
+    }
+
+    /// Write register `i` with slot 31 = `XZR` (discard).
+    #[inline]
+    fn wx(&mut self, i: u32, v: u64) {
+        if i != 31 {
+            self.x[i as usize] = v;
+        }
+    }
+
+    /// Write register `i` with slot 31 = `SP`.
+    #[inline]
+    fn wx_sp(&mut self, i: u32, v: u64) {
+        if i == 31 {
+            self.sp = v;
+        } else {
+            self.x[i as usize] = v;
+        }
+    }
+
+    /// A 32-bit register write zero-extends into the 64-bit slot (the A64 rule for
+    /// every `W`-register result).
+    #[inline]
+    fn wx_sz(&mut self, i: u32, v: u64, sf: bool) {
+        self.wx(i, if sf { v } else { v & 0xffff_ffff });
+    }
+
+    /// Read register `i` as an operand of size `sf` (64-bit) / `!sf` (32-bit,
+    /// masked to the low word), slot 31 = `XZR`.
+    #[inline]
+    fn op(&self, i: u32, sf: bool) -> u64 {
+        let v = self.rx(i);
+        if sf {
+            v
+        } else {
+            v & 0xffff_ffff
+        }
+    }
+
+    // ── flat memory bus ─────────────────────────────────────────────────────
+
+    #[inline]
+    fn offset(&self, addr: u64, width: usize) -> Result<usize, Trap> {
+        let off = addr.wrapping_sub(self.base);
+        let end = off.checked_add(width as u64);
+        match end {
+            Some(e) if e <= self.ram.len() as u64 => Ok(off as usize),
+            _ => Err(Trap::AccessFault(addr)),
+        }
+    }
+
+    fn read(&mut self, addr: u64, width: usize, acc: Access) -> Result<u64, Trap> {
+        if self.sys.is_some() {
+            let pa = self.translate(addr, acc)?;
+            return Ok(self.phys_read(pa, width));
+        }
+        let o = self.offset(addr, width)?;
+        let mut v = 0u64;
+        for i in 0..width {
+            v |= u64::from(self.ram[o + i]) << (8 * i);
+        }
+        Ok(v)
+    }
+
+    fn write(&mut self, addr: u64, width: usize, value: u64) -> Result<(), Trap> {
+        if self.sys.is_some() {
+            let pa = self.translate(addr, Access::Store)?;
+            self.phys_write(pa, width, value);
+            return Ok(());
+        }
+        let o = self.offset(addr, width)?;
+        for i in 0..width {
+            self.ram[o + i] = (value >> (8 * i)) as u8;
+        }
+        Ok(())
+    }
+
+    // ── the step loop ───────────────────────────────────────────────────────
+
+    /// Fetch, decode, and execute one A64 instruction (a fixed 32-bit word). In
+    /// system mode (`CC-36`) a pending interrupt is delivered first, and a fetch /
+    /// data abort or an undefined instruction raises the corresponding EL1
+    /// exception (rather than halting the flat core).
+    fn step(&mut self) -> Result<(), Halt> {
+        if self.sys.is_some() {
+            if self.sys().halted {
+                return Err(Halt::Exit(self.sys().halt_status));
+            }
+            self.sys_tick();
+            if self.take_pending_interrupt() {
+                return Ok(());
+            }
+        }
+        let pc = self.pc;
+        let inst = match self.read(pc, 4, Access::Fetch) {
+            Ok(v) => v as u32,
+            Err(t) => {
+                if self.sys.is_some() {
+                    self.take_mem_abort(pc, pc, true, false);
+                    return Ok(());
+                }
+                return Err(Halt::Trap(t));
+            }
+        };
+        match self.exec(inst, pc) {
+            Err(Halt::Trap(t)) if self.sys.is_some() => {
+                self.take_exec_trap(pc, inst, t);
+                Ok(())
+            }
+            other => other,
+        }
+    }
+
+    /// Decode + execute one instruction. The PC is advanced to `pc + 4` unless a
+    /// branch sets it. `Err(Halt)` stops the machine — an `exit` (`Halt::Exit`),
+    /// or a `Halt::Trap` for an illegal encoding or a fault (a flat core has no
+    /// vectors; the privileged exception model is `CC-36`).
+    fn exec(&mut self, inst: u32, pc: u64) -> Result<(), Halt> {
+        // A64 top-level decode (Arm-ARM C4.1): op0 = bits[28:25].
+        let next = pc.wrapping_add(4);
+        // Data Processing -- Immediate (op0 = 100x).
+        if inst & 0x1c00_0000 == 0x1000_0000 {
+            self.dp_immediate(inst, pc, next).map_err(Halt::Trap)
+        } else if inst & 0x1c00_0000 == 0x1400_0000 {
+            // Branches, Exception generating, and System (op0 = 101x) — carries the
+            // `SVC` host boundary, so it produces `Halt::Exit` directly.
+            self.branch_system(inst, pc, next)
+        } else if inst & 0x0a00_0000 == 0x0800_0000 {
+            // Loads and Stores (op0 = x1x0).
+            self.loads_stores(inst, next).map_err(Halt::Trap)
+        } else if inst & 0x0e00_0000 == 0x0a00_0000 {
+            // Data Processing -- Register (op0 = x101).
+            self.dp_register(inst, next).map_err(Halt::Trap)
+        } else {
+            // Scalar FP / Advanced SIMD (op0 = x111) and anything unallocated are
+            // outside the CC-35 integer core.
+            Err(Halt::Trap(Trap::Illegal(inst)))
+        }
+    }
+
+    // ── Data Processing -- Immediate ────────────────────────────────────────
+
+    fn dp_immediate(&mut self, inst: u32, pc: u64, next: u64) -> Result<(), Trap> {
+        let rd = inst & 0x1f;
+        let rn = (inst >> 5) & 0x1f;
+        let sf = inst & 0x8000_0000 != 0;
+        if inst & 0x1f00_0000 == 0x1000_0000 {
+            // PC-relative addressing: ADR / ADRP.
+            let immlo = (inst >> 29) & 0x3;
+            let immhi = (inst >> 5) & 0x7_ffff;
+            let imm = ((immhi << 2) | immlo) as u64;
+            if inst & 0x8000_0000 == 0 {
+                // ADR: signed 21-bit byte offset from the instruction's PC.
+                let off = sign_extend(imm, 21);
+                self.wx(rd, pc.wrapping_add(off));
+            } else {
+                // ADRP: signed 21-bit offset of 4 KiB pages from the page of PC.
+                let off = sign_extend(imm << 12, 33);
+                self.wx(rd, (pc & !0xfff).wrapping_add(off));
+            }
+            self.pc = next;
+            return Ok(());
+        }
+        match (inst >> 23) & 0x7 {
+            0b010 => {
+                // Add/subtract (immediate).
+                let sh = (inst >> 22) & 1;
+                let mut imm12 = ((inst >> 10) & 0xfff) as u64;
+                if sh == 1 {
+                    imm12 <<= 12;
+                }
+                let op = inst & 0x4000_0000 != 0; // 0=ADD, 1=SUB
+                let setflags = inst & 0x2000_0000 != 0;
+                let a = self.rx_sp(rn);
+                let (res, f) = add_with_carry(a, if op { !imm12 } else { imm12 }, op, sf);
+                if setflags {
+                    self.flags = f;
+                    self.wx_sz(rd, res, sf);
+                } else {
+                    self.wx_sp(rd, if sf { res } else { res & 0xffff_ffff });
+                }
+            }
+            0b100 => {
+                // Logical (immediate).
+                let n = (inst >> 22) & 1;
+                let immr = (inst >> 16) & 0x3f;
+                let imms = (inst >> 10) & 0x3f;
+                let opc = (inst >> 29) & 0x3;
+                let datasize = if sf { 64 } else { 32 };
+                let Some((imm, _)) = decode_bit_masks(n, imms, immr, datasize, true) else {
+                    return Err(Trap::Illegal(inst));
+                };
+                let a = self.op(rn, sf);
+                let res = match opc {
+                    0b00 => a & imm, // AND
+                    0b01 => a | imm, // ORR
+                    0b10 => a ^ imm, // EOR
+                    0b11 => a & imm, // ANDS
+                    _ => unreachable!(),
+                };
+                let res = if sf { res } else { res & 0xffff_ffff };
+                if opc == 0b11 {
+                    self.flags = logical_flags(res, sf);
+                    self.wx_sz(rd, res, sf);
+                } else {
+                    // ANDS targets XZR-slot; AND/ORR/EOR target SP-slot.
+                    self.wx_sp(rd, res);
+                }
+            }
+            0b101 => {
+                // Move wide (immediate): MOVN / MOVZ / MOVK.
+                let opc = (inst >> 29) & 0x3;
+                let hw = (inst >> 21) & 0x3;
+                let imm16 = ((inst >> 5) & 0xffff) as u64;
+                if !sf && hw > 1 {
+                    return Err(Trap::Illegal(inst)); // 32-bit: only hw 0/1 valid
+                }
+                let shift = hw * 16;
+                let shifted = imm16 << shift;
+                let res = match opc {
+                    0b00 => !shifted,                                        // MOVN
+                    0b10 => shifted,                                         // MOVZ
+                    0b11 => (self.rx(rd) & !(0xffffu64 << shift)) | shifted, // MOVK
+                    _ => return Err(Trap::Illegal(inst)),
+                };
+                self.wx_sz(rd, res, sf);
+            }
+            0b110 => {
+                // Bitfield: SBFM / BFM / UBFM.
+                let n = (inst >> 22) & 1;
+                let immr = (inst >> 16) & 0x3f;
+                let imms = (inst >> 10) & 0x3f;
+                let opc = (inst >> 29) & 0x3;
+                let datasize = if sf { 64 } else { 32 };
+                // 32-bit requires N==0 and immr/imms<6:5>==0.
+                if (sf && n == 0) || (!sf && n == 1) {
+                    return Err(Trap::Illegal(inst));
+                }
+                let Some((wmask, tmask)) = decode_bit_masks(n, imms, immr, datasize, false) else {
+                    return Err(Trap::Illegal(inst));
+                };
+                let (inzero, extend) = match opc {
+                    0b00 => (true, true),   // SBFM
+                    0b01 => (false, false), // BFM
+                    0b10 => (true, false),  // UBFM
+                    _ => return Err(Trap::Illegal(inst)),
+                };
+                let src = self.op(rn, sf);
+                let dst = if inzero { 0 } else { self.op(rd, sf) };
+                let bot = (dst & !wmask) | (ror(src, immr, datasize) & wmask);
+                let sign_bit = (src >> imms) & 1;
+                let top = if extend && sign_bit == 1 {
+                    mask(datasize)
+                } else if extend {
+                    0
+                } else {
+                    dst
+                };
+                let res = (top & !tmask) | (bot & tmask);
+                self.wx_sz(rd, res, sf);
+            }
+            0b111 => {
+                // Extract: EXTR (and its ROR alias when Rn==Rm).
+                let n = (inst >> 22) & 1;
+                let imms = (inst >> 10) & 0x3f;
+                let rm = (inst >> 16) & 0x1f;
+                if (sf && n == 0) || (!sf && (n == 1 || imms & 0x20 != 0)) {
+                    return Err(Trap::Illegal(inst));
+                }
+                let datasize = if sf { 64 } else { 32 };
+                let hi = self.op(rn, sf);
+                let lo = self.op(rm, sf);
+                let res = if imms == 0 {
+                    lo
+                } else if datasize == 64 {
+                    (lo >> imms) | (hi << (64 - imms))
+                } else {
+                    let concat = ((hi & 0xffff_ffff) << 32) | (lo & 0xffff_ffff);
+                    (concat >> imms) & 0xffff_ffff
+                };
+                self.wx_sz(rd, res, sf);
+            }
+            _ => return Err(Trap::Illegal(inst)),
+        }
+        self.pc = next;
+        Ok(())
+    }
+
+    // ── Branches, Exception generating, and System ──────────────────────────
+
+    fn branch_system(&mut self, inst: u32, pc: u64, next: u64) -> Result<(), Halt> {
+        if inst & 0x7c00_0000 == 0x1400_0000 {
+            // Unconditional branch (immediate): B / BL.
+            let imm = sign_extend((inst & 0x03ff_ffff) as u64, 26) << 2;
+            if inst & 0x8000_0000 != 0 {
+                self.x[30] = next; // BL sets the link register
+            }
+            self.pc = pc.wrapping_add(imm);
+            return Ok(());
+        }
+        if inst & 0x7e00_0000 == 0x3400_0000 {
+            // Compare and branch (immediate): CBZ / CBNZ.
+            let sf = inst & 0x8000_0000 != 0;
+            let rt = inst & 0x1f;
+            let imm = sign_extend(((inst >> 5) & 0x7_ffff) as u64, 19) << 2;
+            let v = self.op(rt, sf);
+            let take = if inst & 0x0100_0000 != 0 {
+                v != 0
+            } else {
+                v == 0
+            };
+            self.pc = if take { pc.wrapping_add(imm) } else { next };
+            return Ok(());
+        }
+        if inst & 0x7e00_0000 == 0x3600_0000 {
+            // Test and branch (immediate): TBZ / TBNZ.
+            let rt = inst & 0x1f;
+            let bit = ((inst >> 31) << 5) | ((inst >> 19) & 0x1f);
+            let imm = sign_extend(((inst >> 5) & 0x3fff) as u64, 14) << 2;
+            let set = (self.rx(rt) >> bit) & 1 == 1;
+            let take = if inst & 0x0100_0000 != 0 { set } else { !set };
+            self.pc = if take { pc.wrapping_add(imm) } else { next };
+            return Ok(());
+        }
+        if inst & 0xfe00_0000 == 0x5400_0000 && inst & 0x10 == 0 {
+            // Conditional branch (immediate): B.cond.
+            let cond = inst & 0xf;
+            let imm = sign_extend(((inst >> 5) & 0x7_ffff) as u64, 19) << 2;
+            self.pc = if self.cond_holds(cond) {
+                pc.wrapping_add(imm)
+            } else {
+                next
+            };
+            return Ok(());
+        }
+        if inst & 0xff00_0000 == 0xd400_0000 {
+            // Exception generation: SVC / HVC / SMC / BRK / HLT.
+            let imm16 = ((inst >> 5) & 0xffff) as u16;
+            return match inst & 0x00e0_001f {
+                0x0000_0001 => self.svc(next), // SVC #imm
+                0x0000_0002 | 0x0000_0003 if self.sys.is_some() => {
+                    // HVC / SMC — the PSCI firmware conduit (handled in-machine).
+                    self.psci(next);
+                    Ok(())
+                }
+                0x0020_0000 => Err(Halt::Trap(Trap::Breakpoint(imm16))), // BRK #imm
+                0x0040_0000 => Err(Halt::Trap(Trap::Halted(imm16))),     // HLT #imm
+                _ => Err(Halt::Trap(Trap::Illegal(inst))),
+            };
+        }
+        if inst & 0xffc0_0000 == 0xd500_0000 {
+            // System: hints (`CRn==2`), barriers (`CRn==3` — DSB/DMB/ISB/CLREX),
+            // the `MSR`(immediate) PSTATE writes, the `SYS`/`TLBI`/`AT` ops, and the
+            // `MRS`/`MSR` system-register moves. In the flat integer core only the
+            // side-effect-free hints/barriers are valid; the privileged ones need
+            // the `CC-36` EL model.
+            if self.sys.is_some() {
+                return self.system_instr(inst, next);
+            }
+            let crn = (inst >> 12) & 0xf;
+            if crn == 0x2 || crn == 0x3 {
+                self.pc = next;
+                return Ok(());
+            }
+            return Err(Halt::Trap(Trap::Illegal(inst)));
+        }
+        if inst & 0xfe00_0000 == 0xd600_0000 {
+            // Unconditional branch (register): RET / BR / BLR / ERET.
+            let rn = (inst >> 5) & 0x1f;
+            let opc = (inst >> 21) & 0xf;
+            let target = self.rx(rn);
+            match opc {
+                0b0000 => self.pc = target, // BR
+                0b0001 => {
+                    self.x[30] = next; // BLR
+                    self.pc = target;
+                }
+                0b0010 => self.pc = target,                  // RET
+                0b0100 if self.sys.is_some() => self.eret(), // ERET
+                _ => return Err(Halt::Trap(Trap::Illegal(inst))),
+            }
+            return Ok(());
+        }
+        Err(Halt::Trap(Trap::Illegal(inst)))
+    }
+
+    /// `SVC #0` host boundary (the flat-core Linux `arm64` ABI): `x8` selects the
+    /// syscall, `x0`–`x5` are the arguments. `write(fd, buf, len)` appends to the
+    /// console; `exit`/`exit_group` stop the machine with the status in `x0`.
+    fn svc(&mut self, next: u64) -> Result<(), Halt> {
+        // System mode (`CC-36`): `SVC` is a synchronous exception to EL1 (the
+        // kernel's syscall entry), not the flat host boundary.
+        if self.sys.is_some() {
+            // The syscall number is in x8 (the Linux ABI); the ISS is 0.
+            self.take_to_el1(Some(ExcKind::Svc), 0, next, 0x00);
+            return Ok(());
+        }
+        match self.x[8] {
+            syscall::EXIT | syscall::EXIT_GROUP => Err(Halt::Exit(self.x[0])),
+            syscall::WRITE => {
+                let (_fd, buf, len) = (self.x[0], self.x[1], self.x[2]);
+                for i in 0..len {
+                    let byte = self
+                        .read(buf.wrapping_add(i), 1, Access::Load)
+                        .map_err(Halt::Trap)? as u8;
+                    self.console.push(byte);
+                }
+                self.x[0] = len; // bytes written
+                self.pc = next;
+                Ok(())
+            }
+            other => Err(Halt::Trap(Trap::UnknownSyscall(other))),
+        }
+    }
+
+    // ── Data Processing -- Register ─────────────────────────────────────────
+
+    fn dp_register(&mut self, inst: u32, next: u64) -> Result<(), Trap> {
+        let rd = inst & 0x1f;
+        let rn = (inst >> 5) & 0x1f;
+        let rm = (inst >> 16) & 0x1f;
+        let sf = inst & 0x8000_0000 != 0;
+        let datasize = if sf { 64 } else { 32 };
+
+        if inst & 0x1f00_0000 == 0x0a00_0000 {
+            // Logical (shifted register).
+            let shift_type = (inst >> 22) & 0x3;
+            let n = (inst >> 21) & 1;
+            let amount = (inst >> 10) & 0x3f;
+            if !sf && amount & 0x20 != 0 {
+                return Err(Trap::Illegal(inst));
+            }
+            let opc = (inst >> 29) & 0x3;
+            let a = self.op(rn, sf);
+            let mut b = shift_reg(self.op(rm, sf), shift_type, amount, datasize);
+            if n == 1 {
+                b = !b & mask(datasize);
+            }
+            let res = match opc {
+                0b00 | 0b11 => a & b, // AND / ANDS
+                0b01 => a | b,        // ORR / ORN
+                0b10 => a ^ b,        // EOR / EON
+                _ => unreachable!(),
+            } & mask(datasize);
+            if opc == 0b11 {
+                self.flags = logical_flags(res, sf);
+            }
+            self.wx_sz(rd, res, sf);
+            self.pc = next;
+            return Ok(());
+        }
+        if inst & 0x1f20_0000 == 0x0b00_0000 {
+            // Add/subtract (shifted register).
+            let shift_type = (inst >> 22) & 0x3;
+            let amount = (inst >> 10) & 0x3f;
+            if shift_type == 0b11 || (!sf && amount & 0x20 != 0) {
+                return Err(Trap::Illegal(inst));
+            }
+            let op = inst & 0x4000_0000 != 0;
+            let setflags = inst & 0x2000_0000 != 0;
+            let a = self.op(rn, sf);
+            let b = shift_reg(self.op(rm, sf), shift_type, amount, datasize);
+            let (res, f) = add_with_carry(a, if op { !b } else { b }, op, sf);
+            if setflags {
+                self.flags = f;
+            }
+            self.wx_sz(rd, res, sf);
+            self.pc = next;
+            return Ok(());
+        }
+        if inst & 0x1f20_0000 == 0x0b20_0000 {
+            // Add/subtract (extended register).
+            let option = (inst >> 13) & 0x7;
+            let imm3 = (inst >> 10) & 0x7;
+            if imm3 > 4 {
+                return Err(Trap::Illegal(inst));
+            }
+            let op = inst & 0x4000_0000 != 0;
+            let setflags = inst & 0x2000_0000 != 0;
+            let a = self.rx_sp(rn);
+            let b = extend_reg(self.rx(rm), option, imm3, sf);
+            let (res, f) = add_with_carry(a, if op { !b } else { b }, op, sf);
+            if setflags {
+                self.flags = f;
+                self.wx_sz(rd, res, sf);
+            } else {
+                self.wx_sp(rd, if sf { res } else { res & 0xffff_ffff });
+            }
+            self.pc = next;
+            return Ok(());
+        }
+        if inst & 0x1fe0_0000 == 0x1a00_0000 {
+            // Add/subtract (with carry): ADC (op=0) / SBC (op=1).
+            let op = inst & 0x4000_0000 != 0;
+            let setflags = inst & 0x2000_0000 != 0;
+            let a = self.op(rn, sf);
+            let b = self.op(rm, sf);
+            // ADC: a + b + C; SBC: a + NOT(b) + C.
+            let (res, f) = add_with_carry(a, if op { !b } else { b }, self.flags.c, sf);
+            if setflags {
+                self.flags = f;
+            }
+            self.wx_sz(rd, res, sf);
+            self.pc = next;
+            return Ok(());
+        }
+        if inst & 0x1fe0_0000 == 0x1a40_0000 {
+            // Conditional compare (register and immediate): CCMP / CCMN.
+            let cond = (inst >> 12) & 0xf;
+            let nzcv = inst & 0xf;
+            let op = inst & 0x4000_0000 != 0; // 0=CCMN, 1=CCMP
+            let imm_form = inst & 0x0000_0800 != 0;
+            let a = self.op(rn, sf);
+            let b = if imm_form {
+                ((inst >> 16) & 0x1f) as u64
+            } else {
+                self.op(rm, sf)
+            };
+            if self.cond_holds(cond) {
+                let (_, f) = add_with_carry(a, if op { !b } else { b }, op, sf);
+                self.flags = f;
+            } else {
+                self.flags = Nzcv::from_imm4(nzcv);
+            }
+            self.pc = next;
+            return Ok(());
+        }
+        if inst & 0x1fe0_0000 == 0x1a80_0000 {
+            // Conditional select: CSEL / CSINC / CSINV / CSNEG.
+            let cond = (inst >> 12) & 0xf;
+            let op = inst & 0x4000_0000 != 0;
+            let o2 = inst & 0x0000_0400 != 0;
+            let a = self.op(rn, sf);
+            let b = self.op(rm, sf);
+            let res = if self.cond_holds(cond) {
+                a
+            } else {
+                match (op, o2) {
+                    (false, false) => b,                  // CSEL
+                    (false, true) => b.wrapping_add(1),   // CSINC
+                    (true, false) => !b,                  // CSINV
+                    (true, true) => (!b).wrapping_add(1), // CSNEG
+                }
+            };
+            self.wx_sz(rd, res, sf);
+            self.pc = next;
+            return Ok(());
+        }
+        if inst & 0x1f00_0000 == 0x1b00_0000 {
+            // Data-processing (3 source).
+            let ra = (inst >> 10) & 0x1f;
+            let op31 = (inst >> 21) & 0x7;
+            let o0 = inst & 0x0000_8000 != 0;
+            let res = match (op31, o0) {
+                (0b000, false) => self
+                    .op(ra, sf)
+                    .wrapping_add(self.op(rn, sf).wrapping_mul(self.op(rm, sf))), // MADD
+                (0b000, true) => self
+                    .op(ra, sf)
+                    .wrapping_sub(self.op(rn, sf).wrapping_mul(self.op(rm, sf))), // MSUB
+                (0b001, false) => self.rx(ra).wrapping_add(smull(self.rx(rn), self.rx(rm))), // SMADDL
+                (0b001, true) => self.rx(ra).wrapping_sub(smull(self.rx(rn), self.rx(rm))), // SMSUBL
+                (0b010, false) => smulh(self.rx(rn), self.rx(rm)),                          // SMULH
+                (0b101, false) => self.rx(ra).wrapping_add(umull(self.rx(rn), self.rx(rm))), // UMADDL
+                (0b101, true) => self.rx(ra).wrapping_sub(umull(self.rx(rn), self.rx(rm))), // UMSUBL
+                (0b110, false) => umulh(self.rx(rn), self.rx(rm)),                          // UMULH
+                _ => return Err(Trap::Illegal(inst)),
+            };
+            // The long-multiply forms (SMADDL…UMULH) are 64-bit results.
+            let res = if op31 == 0b000 && !sf {
+                res & 0xffff_ffff
+            } else {
+                res
+            };
+            self.wx(rd, res);
+            self.pc = next;
+            return Ok(());
+        }
+        if inst & 0x5fe0_0000 == 0x1ac0_0000 {
+            // Data-processing (2 source, bit30==0): the variable shifts and divides.
+            let opcode = (inst >> 10) & 0x3f;
+            let a = self.op(rn, sf);
+            let b = self.op(rm, sf);
+            let res = match opcode {
+                0b000010 => udiv(a, b, sf),                                      // UDIV
+                0b000011 => sdiv(a, b, sf),                                      // SDIV
+                0b001000 => shift_reg(a, 0b00, (b as u32) % datasize, datasize), // LSLV
+                0b001001 => shift_reg(a, 0b01, (b as u32) % datasize, datasize), // LSRV
+                0b001010 => shift_reg(a, 0b10, (b as u32) % datasize, datasize), // ASRV
+                0b001011 => shift_reg(a, 0b11, (b as u32) % datasize, datasize), // RORV
+                _ => return Err(Trap::Illegal(inst)),
+            };
+            self.wx_sz(rd, res, sf);
+            self.pc = next;
+            return Ok(());
+        }
+        if inst & 0x5fe0_0000 == 0x5ac0_0000 {
+            // Data-processing (1 source): RBIT / REV16 / REV32 / REV / CLZ / CLS.
+            let opcode = (inst >> 10) & 0x3f;
+            let opcode2 = (inst >> 16) & 0x1f;
+            if opcode2 != 0 {
+                return Err(Trap::Illegal(inst));
+            }
+            let a = self.op(rn, sf);
+            let res = match opcode {
+                0b000000 => rbit(a, datasize),  // RBIT
+                0b000001 => rev16(a, datasize), // REV16
+                0b000010 => {
+                    if sf {
+                        rev32(a)
+                    } else {
+                        rev_bytes(a, 4)
+                    }
+                } // REV32 (64-bit) / REV (32-bit)
+                0b000011 if sf => rev_bytes(a, 8), // REV (64-bit)
+                0b000100 => u64::from(clz(a, datasize)), // CLZ
+                0b000101 => u64::from(cls(a, datasize)), // CLS
+                _ => return Err(Trap::Illegal(inst)),
+            };
+            self.wx_sz(rd, res, sf);
+            self.pc = next;
+            return Ok(());
+        }
+        Err(Trap::Illegal(inst))
+    }
+
+    // ── Loads and Stores ────────────────────────────────────────────────────
+
+    fn loads_stores(&mut self, inst: u32, next: u64) -> Result<(), Trap> {
+        // Load/store exclusive + load-acquire/store-release (the kernel's locks
+        // and atomics: LDXR/STXR/LDAXR/STLXR/LDAR/STLR/LDXP/STXP). Without the LSE
+        // atomics (ID_AA64ISAR0.Atomic = 0) the kernel uses these LL/SC forms.
+        if inst & 0x3f00_0000 == 0x0800_0000 {
+            return self.ldst_exclusive(inst, next);
+        }
+        // Load register (literal) — integer (V=0) and SIMD&FP (V=1).
+        if inst & 0x3b00_0000 == 0x1800_0000 {
+            let opc = (inst >> 30) & 0x3;
+            let rt = inst & 0x1f;
+            let imm = sign_extend(((inst >> 5) & 0x7_ffff) as u64, 19) << 2;
+            let addr = self.pc.wrapping_add(imm);
+            if inst & 0x0400_0000 != 0 {
+                // LDR (literal, SIMD&FP): opc 00→S, 01→D, 10→Q.
+                let width = 4usize << opc;
+                let val = self.read_simd(addr, width)?;
+                self.v[rt as usize] = val;
+                self.pc = next;
+                return Ok(());
+            }
+            let (val, sf) = match opc {
+                0b00 => (self.read(addr, 4, Access::Load)?, false), // LDR Wt
+                0b01 => (self.read(addr, 8, Access::Load)?, true),  // LDR Xt
+                0b10 => (sign_extend(self.read(addr, 4, Access::Load)?, 32), true), // LDRSW
+                _ => return Err(Trap::Illegal(inst)),
+            };
+            self.wx_sz(rt, val, sf);
+            self.pc = next;
+            return Ok(());
+        }
+        // Load/store pair (integer and SIMD&FP).
+        if inst & 0x3a00_0000 == 0x2800_0000 {
+            if inst & 0x0400_0000 != 0 {
+                return self.ldst_pair_simd(inst, next);
+            }
+            return self.ldst_pair(inst, next);
+        }
+        // Load/store register (the size-111-V-0 group). V=1 is SIMD&FP.
+        if inst & 0x3b00_0000 == 0x3900_0000 {
+            // Unsigned immediate offset.
+            return self.ldst_reg(inst, LdStMode::UnsignedOffset, next);
+        }
+        if inst & 0x3b00_0000 == 0x3800_0000 {
+            if inst & 0x0020_0000 != 0 && inst & 0x0000_0c00 == 0x0000_0800 {
+                // Register offset.
+                return self.ldst_reg(inst, LdStMode::RegisterOffset, next);
+            }
+            // Unscaled / immediate pre/post-index / unprivileged.
+            let mode = match (inst >> 10) & 0x3 {
+                0b00 => LdStMode::Unscaled,
+                0b01 => LdStMode::PostIndex,
+                0b11 => LdStMode::PreIndex,
+                0b10 => LdStMode::Unscaled, // LDTR/STTR (unprivileged) — flat-core equivalent
+                _ => unreachable!(),
+            };
+            return self.ldst_reg(inst, mode, next);
+        }
+        Err(Trap::Illegal(inst))
+    }
+
+    /// Compute the effective address (and any base writeback) of a load/store
+    /// register instruction, for the given addressing `mode` and `scale` (the
+    /// log2 access size — the integer `size` or the SIMD element size).
+    fn ldst_addr(&self, inst: u32, mode: LdStMode, scale: u32) -> (u64, Option<u64>) {
+        let rn = (inst >> 5) & 0x1f;
+        let base = self.rx_sp(rn);
+        match mode {
+            LdStMode::UnsignedOffset => {
+                let imm = ((inst >> 10) & 0xfff) as u64;
+                (base.wrapping_add(imm << scale), None)
+            }
+            LdStMode::Unscaled => {
+                let imm = sign_extend(((inst >> 12) & 0x1ff) as u64, 9);
+                (base.wrapping_add(imm), None)
+            }
+            LdStMode::PostIndex => {
+                let imm = sign_extend(((inst >> 12) & 0x1ff) as u64, 9);
+                (base, Some(base.wrapping_add(imm)))
+            }
+            LdStMode::PreIndex => {
+                let imm = sign_extend(((inst >> 12) & 0x1ff) as u64, 9);
+                let a = base.wrapping_add(imm);
+                (a, Some(a))
+            }
+            LdStMode::RegisterOffset => {
+                let rm = (inst >> 16) & 0x1f;
+                let option = (inst >> 13) & 0x7;
+                let s = (inst >> 12) & 1;
+                let shift = if s == 1 { scale } else { 0 };
+                let off = extend_reg_for_addr(self.rx(rm), option, shift);
+                (base.wrapping_add(off), None)
+            }
+        }
+    }
+
+    fn ldst_reg(&mut self, inst: u32, mode: LdStMode, next: u64) -> Result<(), Trap> {
+        let size = (inst >> 30) & 0x3;
+        let opc = (inst >> 22) & 0x3;
+        let rt = inst & 0x1f;
+        let rn = (inst >> 5) & 0x1f;
+        if inst & 0x0400_0000 != 0 {
+            return self.ldst_reg_simd(inst, mode, next); // V==1 → SIMD&FP
+        }
+        let width = 1usize << size;
+        // opc decodes load/store + sign/zero extension (the integer table).
+        let (is_load, signed, dst64) = match (size, opc) {
+            (_, 0b00) => (false, false, size == 0b11), // STR
+            (_, 0b01) => (true, false, size == 0b11),  // LDR (zero-extend)
+            (0b11, 0b10) => {
+                // PRFM (prefetch) — architecturally a hint; consume and continue.
+                self.pc = next;
+                return Ok(());
+            }
+            (_, 0b10) => (true, true, true), // LDRS* to 64-bit
+            (0b10, 0b11) => return Err(Trap::Illegal(inst)), // reserved
+            (_, 0b11) => (true, true, false), // LDRS* to 32-bit
+            _ => return Err(Trap::Illegal(inst)),
+        };
+
+        let (addr, writeback) = self.ldst_addr(inst, mode, size);
+
+        if is_load {
+            let raw = self.read(addr, width, Access::Load)?;
+            let val = if signed {
+                let v = sign_extend(raw, (width * 8) as u32);
+                if dst64 {
+                    v
+                } else {
+                    v & 0xffff_ffff
+                }
+            } else {
+                raw
+            };
+            self.wx_sz(rt, val, dst64);
+        } else {
+            self.write(addr, width, self.rx(rt))?;
+        }
+        if let Some(wb) = writeback {
+            self.wx_sp(rn, wb);
+        }
+        self.pc = next;
+        Ok(())
+    }
+
+    /// Read a `width`-byte (1/2/4/8/16) value from memory into a 128-bit lane,
+    /// zero-extended — the SIMD&FP load primitive.
+    fn read_simd(&mut self, addr: u64, width: usize) -> Result<u128, Trap> {
+        Ok(if width == 16 {
+            let lo = self.read(addr, 8, Access::Load)? as u128;
+            let hi = self.read(addr.wrapping_add(8), 8, Access::Load)? as u128;
+            lo | (hi << 64)
+        } else {
+            self.read(addr, width, Access::Load)? as u128
+        })
+    }
+
+    /// Write the low `width` bytes of a 128-bit lane to memory — the SIMD&FP store
+    /// primitive.
+    fn write_simd(&mut self, addr: u64, width: usize, val: u128) -> Result<(), Trap> {
+        if width == 16 {
+            self.write(addr, 8, val as u64)?;
+            self.write(addr.wrapping_add(8), 8, (val >> 64) as u64)?;
+        } else {
+            self.write(addr, width, val as u64)?;
+        }
+        Ok(())
+    }
+
+    /// Load/store a single SIMD&FP register (`B`/`H`/`S`/`D`/`Q`) — `LDR`/`STR`
+    /// (vector). Pure data movement (no FP arithmetic): the kernel uses these to
+    /// move a task's FP context, and the integer userspace never computes with it.
+    fn ldst_reg_simd(&mut self, inst: u32, mode: LdStMode, next: u64) -> Result<(), Trap> {
+        let size = (inst >> 30) & 0x3;
+        let opc = (inst >> 22) & 0x3;
+        let rt = inst & 0x1f;
+        let rn = (inst >> 5) & 0x1f;
+        // The SIMD access size: opc<1> is the high bit of the log2 size (Q = 0b100).
+        let scale = ((opc & 2) << 1) | size;
+        if scale > 4 {
+            return Err(Trap::Illegal(inst));
+        }
+        let width = 1usize << scale;
+        let is_load = opc & 1 != 0;
+        let (addr, writeback) = self.ldst_addr(inst, mode, scale);
+        if is_load {
+            let val = self.read_simd(addr, width)?;
+            self.v[rt as usize] = val;
+        } else {
+            self.write_simd(addr, width, self.v[rt as usize])?;
+        }
+        if let Some(wb) = writeback {
+            self.wx_sp(rn, wb);
+        }
+        self.pc = next;
+        Ok(())
+    }
+
+    /// Load/store a pair of SIMD&FP registers (`S`/`D`/`Q`) — `LDP`/`STP` (vector),
+    /// the form the kernel's `fpsimd_save_state`/`fpsimd_load_state` use.
+    fn ldst_pair_simd(&mut self, inst: u32, next: u64) -> Result<(), Trap> {
+        let opc = (inst >> 30) & 0x3;
+        let l = inst & 0x0040_0000 != 0;
+        let rt = inst & 0x1f;
+        let rt2 = (inst >> 10) & 0x1f;
+        let rn = (inst >> 5) & 0x1f;
+        let scale = 2 + opc; // 00→S(4), 01→D(8), 10→Q(16)
+        if scale > 4 {
+            return Err(Trap::Illegal(inst));
+        }
+        let width = 1usize << scale;
+        let imm = sign_extend(((inst >> 15) & 0x7f) as u64, 7) << scale;
+        let base = self.rx_sp(rn);
+        let (addr, writeback) = match (inst >> 23) & 0x3 {
+            0b01 => (base, Some(base.wrapping_add(imm))), // post-index
+            0b11 => (base.wrapping_add(imm), Some(base.wrapping_add(imm))), // pre-index
+            _ => (base.wrapping_add(imm), None),          // signed offset / no-alloc
+        };
+        if l {
+            let v1 = self.read_simd(addr, width)?;
+            let v2 = self.read_simd(addr.wrapping_add(width as u64), width)?;
+            self.v[rt as usize] = v1;
+            self.v[rt2 as usize] = v2;
+        } else {
+            self.write_simd(addr, width, self.v[rt as usize])?;
+            self.write_simd(addr.wrapping_add(width as u64), width, self.v[rt2 as usize])?;
+        }
+        if let Some(wb) = writeback {
+            self.wx_sp(rn, wb);
+        }
+        self.pc = next;
+        Ok(())
+    }
+
+    fn ldst_pair(&mut self, inst: u32, next: u64) -> Result<(), Trap> {
+        if inst & 0x0400_0000 != 0 {
+            return Err(Trap::Illegal(inst)); // V==1 → SIMD/FP
+        }
+        let opc = (inst >> 30) & 0x3;
+        let l = inst & 0x0040_0000 != 0;
+        let rt = inst & 0x1f;
+        let rt2 = (inst >> 10) & 0x1f;
+        let rn = (inst >> 5) & 0x1f;
+        let (scale, signed): (u32, bool) = match opc {
+            0b00 => (2, false), // 32-bit
+            0b01 => (2, true),  // LDPSW (signed-word → 64-bit)
+            0b10 => (3, false), // 64-bit
+            _ => return Err(Trap::Illegal(inst)),
+        };
+        let width = 1usize << scale;
+        let dst64 = scale == 3 || signed;
+        let imm = sign_extend(((inst >> 15) & 0x7f) as u64, 7) << scale;
+        let base = self.rx_sp(rn);
+        // bits[24:23] select the index variant.
+        let (addr, writeback) = match (inst >> 23) & 0x3 {
+            0b01 => (base, Some(base.wrapping_add(imm))), // post-index
+            0b11 => (base.wrapping_add(imm), Some(base.wrapping_add(imm))), // pre-index
+            _ => (base.wrapping_add(imm), None),          // signed offset / no-alloc
+        };
+        if l {
+            let v1 = self.read(addr, width, Access::Load)?;
+            let v2 = self.read(addr.wrapping_add(width as u64), width, Access::Load)?;
+            let (v1, v2) = if signed {
+                (sign_extend(v1, 32), sign_extend(v2, 32))
+            } else {
+                (v1, v2)
+            };
+            self.wx_sz(rt, v1, dst64);
+            self.wx_sz(rt2, v2, dst64);
+        } else {
+            self.write(addr, width, self.rx(rt))?;
+            self.write(addr.wrapping_add(width as u64), width, self.rx(rt2))?;
+        }
+        if let Some(wb) = writeback {
+            self.wx_sp(rn, wb);
+        }
+        self.pc = next;
+        Ok(())
+    }
+
+    /// Load/store exclusive + ordered (Arm-ARM C3.2.6): `LDXR`/`STXR`,
+    /// `LDAXR`/`STLXR`, the pair forms `LDXP`/`STXP`, and the non-exclusive
+    /// `LDAR`/`STLR`. On a single PE the monitor is a one-address reservation;
+    /// the acquire/release ordering is a no-op on a sequential interpreter.
+    fn ldst_exclusive(&mut self, inst: u32, next: u64) -> Result<(), Trap> {
+        let size = (inst >> 30) & 0x3;
+        let o2 = (inst >> 23) & 1; // 0 = exclusive, 1 = ordered (LDAR/STLR)
+        let l = (inst >> 22) & 1; // 0 = store, 1 = load
+        let o1 = (inst >> 21) & 1; // 1 = pair
+        let rs = (inst >> 16) & 0x1f; // status result (stores)
+        let rt2 = (inst >> 10) & 0x1f;
+        let rn = (inst >> 5) & 0x1f;
+        let rt = inst & 0x1f;
+        let width = 1usize << size;
+        let addr = self.rx_sp(rn);
+        let dst64 = size == 3;
+
+        if o2 == 1 {
+            // Load-acquire / store-release (non-exclusive): LDAR / STLR.
+            if l == 1 {
+                let v = self.read(addr, width, Access::Load)?;
+                self.wx_sz(rt, v, dst64);
+            } else {
+                self.write(addr, width, self.rx(rt))?;
+            }
+            self.pc = next;
+            return Ok(());
+        }
+
+        // Exclusive forms.
+        if l == 1 {
+            // LDXR / LDAXR / LDXP / LDAXP — load and set the monitor.
+            if o1 == 1 {
+                let v1 = self.read(addr, width, Access::Load)?;
+                let v2 = self.read(addr.wrapping_add(width as u64), width, Access::Load)?;
+                self.wx_sz(rt, v1, dst64);
+                self.wx_sz(rt2, v2, dst64);
+            } else {
+                let v = self.read(addr, width, Access::Load)?;
+                self.wx_sz(rt, v, dst64);
+            }
+            self.excl = Some(addr);
+        } else {
+            // STXR / STLXR / STXP / STLXP — store iff the monitor is set, and
+            // report success (0) / failure (1) in Ws.
+            if self.excl == Some(addr) {
+                if o1 == 1 {
+                    self.write(addr, width, self.rx(rt))?;
+                    self.write(addr.wrapping_add(width as u64), width, self.rx(rt2))?;
+                } else {
+                    self.write(addr, width, self.rx(rt))?;
+                }
+                self.excl = None;
+                self.wx(rs, 0);
+            } else {
+                self.wx(rs, 1);
+            }
+        }
+        self.pc = next;
+        Ok(())
+    }
+
+    /// Evaluate an A64 condition code against `PSTATE.NZCV` (Arm-ARM `ConditionHolds`).
+    fn cond_holds(&self, cond: u32) -> bool {
+        let f = self.flags;
+        let base = match cond >> 1 {
+            0b000 => f.z,                  // EQ
+            0b001 => f.c,                  // CS/HS
+            0b010 => f.n,                  // MI
+            0b011 => f.v,                  // VS
+            0b100 => f.c && !f.z,          // HI
+            0b101 => f.n == f.v,           // GE
+            0b110 => (f.n == f.v) && !f.z, // GT
+            _ => true,                     // AL
+        };
+        if cond & 1 == 1 && cond != 0b1111 {
+            !base
+        } else {
+            base
+        }
+    }
+}
+
+/// The addressing mode of a load/store register instruction.
+#[derive(Clone, Copy)]
+enum LdStMode {
+    UnsignedOffset,
+    Unscaled,
+    PostIndex,
+    PreIndex,
+    RegisterOffset,
+}
+
+// ── pure A64 helpers (the Arm-ARM primitives) ───────────────────────────────
+
+/// `mask(width)` — the low `width` bits set (`width` in 1..=64).
+#[inline]
+fn mask(width: u32) -> u64 {
+    if width >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << width) - 1
+    }
+}
+
+/// Sign-extend the low `bits` of `v` to 64 bits (Arm-ARM `SignExtend`).
+#[inline]
+fn sign_extend(v: u64, bits: u32) -> u64 {
+    if bits >= 64 {
+        return v;
+    }
+    let shift = 64 - bits;
+    (((v << shift) as i64) >> shift) as u64
+}
+
+/// Rotate the low `width` bits of `x` right by `shift` (Arm-ARM `ROR`).
+#[inline]
+fn ror(x: u64, shift: u32, width: u32) -> u64 {
+    let x = x & mask(width);
+    let s = shift % width;
+    if s == 0 {
+        x
+    } else {
+        ((x >> s) | (x << (width - s))) & mask(width)
+    }
+}
+
+/// Apply a register shift (`LSL`/`LSR`/`ASR`/`ROR`) of `amount` to the low
+/// `width` bits of `v` (Arm-ARM `ShiftReg`).
+fn shift_reg(v: u64, shift_type: u32, amount: u32, width: u32) -> u64 {
+    let v = v & mask(width);
+    let amount = amount % 64;
+    match shift_type {
+        0b00 => (v << amount) & mask(width), // LSL
+        0b01 => v >> amount,                 // LSR
+        0b10 => {
+            // ASR within `width`.
+            let s = sign_extend(v, width);
+            ((s as i64) >> amount) as u64 & mask(width)
+        }
+        _ => ror(v, amount, width), // ROR
+    }
+}
+
+/// `AddWithCarry` (Arm-ARM): the `width`-bit sum of `x`, `y`, and `carry_in`,
+/// with the `NZCV` flags it produces. Subtraction is `add_with_carry(x, !y, 1)`.
+fn add_with_carry(x: u64, y: u64, carry_in: bool, sf: bool) -> (u64, Nzcv) {
+    let width = if sf { 64 } else { 32 };
+    let (x, y) = (x & mask(width), y & mask(width));
+    let cin = u128::from(carry_in);
+    let usum = u128::from(x) + u128::from(y) + cin;
+    let result = (usum as u64) & mask(width);
+    let sx = i128::from(sign_extend(x, width) as i64);
+    let sy = i128::from(sign_extend(y, width) as i64);
+    let ssum = sx + sy + cin as i128;
+    let n = (result >> (width - 1)) & 1 == 1;
+    let z = result == 0;
+    let c = (usum >> width) & 1 == 1;
+    let v = i128::from(sign_extend(result, width) as i64) != ssum;
+    (result, Nzcv { n, z, c, v })
+}
+
+/// The `NZCV` a logical operation (`ANDS`/`BICS`/`TST`) sets: `N`/`Z` from the
+/// result, `C` and `V` cleared.
+fn logical_flags(result: u64, sf: bool) -> Nzcv {
+    let width = if sf { 64 } else { 32 };
+    Nzcv {
+        n: (result >> (width - 1)) & 1 == 1,
+        z: result & mask(width) == 0,
+        c: false,
+        v: false,
+    }
+}
+
+/// Extend register `v` per an add/sub extended-register `option` then `LSL` by
+/// `shift` (Arm-ARM `ExtendReg`). The destination size is `sf`.
+fn extend_reg(v: u64, option: u32, shift: u32, sf: bool) -> u64 {
+    let (bits, signed) = match option {
+        0b000 => (8, false),  // UXTB
+        0b001 => (16, false), // UXTH
+        0b010 => (32, false), // UXTW
+        0b011 => (64, false), // UXTX
+        0b100 => (8, true),   // SXTB
+        0b101 => (16, true),  // SXTH
+        0b110 => (32, true),  // SXTW
+        _ => (64, true),      // SXTX
+    };
+    let extracted = v & mask(bits);
+    let ext = if signed {
+        sign_extend(extracted, bits)
+    } else {
+        extracted
+    };
+    let out = ext << shift;
+    if sf {
+        out
+    } else {
+        out & 0xffff_ffff
+    }
+}
+
+/// The address-form extend (the register-offset load/store): a 64-bit address
+/// offset, with `UXTX`/`SXTX`/`LSL` and the `UXTW`/`SXTW` word forms.
+fn extend_reg_for_addr(v: u64, option: u32, shift: u32) -> u64 {
+    let (bits, signed) = match option {
+        0b010 => (32, false), // UXTW
+        0b011 => (64, false), // LSL/UXTX
+        0b110 => (32, true),  // SXTW
+        0b111 => (64, true),  // SXTX
+        _ => (64, false),     // (reserved address extends behave as UXTX)
+    };
+    let ext = if signed {
+        sign_extend(v & mask(bits), bits)
+    } else {
+        v & mask(bits)
+    };
+    ext << shift
+}
+
+/// `DecodeBitMasks` (Arm-ARM): decode an `(N, imms, immr)` bitmask immediate into
+/// the work mask and the (bitfield) tail mask, replicated across 64 bits.
+/// `immediate` rejects the reserved logical-immediate `imms == levels` form.
+fn decode_bit_masks(
+    immn: u32,
+    imms: u32,
+    immr: u32,
+    m: u32,
+    immediate: bool,
+) -> Option<(u64, u64)> {
+    let combined = ((immn & 1) << 6) | ((!imms) & 0x3f);
+    if combined == 0 {
+        return None;
+    }
+    let len = 31 - combined.leading_zeros(); // HighestSetBit
+    if len < 1 || (1u32 << len) > m {
+        return None;
+    }
+    let levels = (1u32 << len) - 1;
+    if immediate && (imms & levels) == levels {
+        return None;
+    }
+    let s = imms & levels;
+    let r = immr & levels;
+    let diff = s.wrapping_sub(r) & levels;
+    let esize = 1u32 << len;
+    let welem = ones(s + 1);
+    let telem = ones(diff + 1);
+    let wmask = replicate(ror(welem, r, esize), esize);
+    let tmask = replicate(telem, esize);
+    Some((wmask, tmask))
+}
+
+/// `n` low bits set (`n` in 0..=64).
+#[inline]
+fn ones(n: u32) -> u64 {
+    if n >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << n) - 1
+    }
+}
+
+/// Replicate the low `esize` bits of `pattern` across the full 64-bit width.
+fn replicate(pattern: u64, esize: u32) -> u64 {
+    let pat = pattern & mask(esize);
+    let mut out = 0u64;
+    let mut i = 0;
+    while i < 64 {
+        out |= pat << i;
+        i += esize;
+    }
+    out
+}
+
+/// Signed `width`-bit divide with the A64 result for divide-by-zero (0) and the
+/// `INT_MIN / -1` overflow (`INT_MIN`).
+fn sdiv(a: u64, b: u64, sf: bool) -> u64 {
+    let width = if sf { 64 } else { 32 };
+    let (a, b) = (sign_extend(a, width) as i64, sign_extend(b, width) as i64);
+    if b == 0 {
+        0
+    } else {
+        (a.wrapping_div(b)) as u64 & mask(width)
+    }
+}
+
+/// Unsigned `width`-bit divide; divide-by-zero yields 0 (the A64 result).
+fn udiv(a: u64, b: u64, sf: bool) -> u64 {
+    let width = if sf { 64 } else { 32 };
+    let (a, b) = (a & mask(width), b & mask(width));
+    // Divide-by-zero yields 0 (the A64 result), never a host panic.
+    a.checked_div(b).unwrap_or(0)
+}
+
+/// Signed 32×32 → 64 (the `SMADDL`/`SMSUBL` product).
+fn smull(a: u64, b: u64) -> u64 {
+    ((a as i32 as i64) * (b as i32 as i64)) as u64
+}
+
+/// Unsigned 32×32 → 64 (the `UMADDL`/`UMSUBL` product).
+fn umull(a: u64, b: u64) -> u64 {
+    (a as u32 as u64) * (b as u32 as u64)
+}
+
+/// The high 64 bits of a signed 64×64 product (`SMULH`).
+fn smulh(a: u64, b: u64) -> u64 {
+    (((a as i64 as i128) * (b as i64 as i128)) >> 64) as u64
+}
+
+/// The high 64 bits of an unsigned 64×64 product (`UMULH`).
+fn umulh(a: u64, b: u64) -> u64 {
+    (((a as u128) * (b as u128)) >> 64) as u64
+}
+
+/// Reverse the low `width` bits of `v` (`RBIT`).
+fn rbit(v: u64, width: u32) -> u64 {
+    let v = v & mask(width);
+    v.reverse_bits() >> (64 - width)
+}
+
+/// Reverse the byte order of each `group`-byte unit of `v` (the `REV*` family).
+fn rev_bytes(v: u64, group: u32) -> u64 {
+    let mut out = 0u64;
+    let bytes = group;
+    for i in 0..bytes {
+        let b = (v >> (8 * i)) & 0xff;
+        out |= b << (8 * (bytes - 1 - i));
+    }
+    out
+}
+
+/// `REV16` — reverse bytes within each 16-bit halfword of the low `width` bits.
+fn rev16(v: u64, width: u32) -> u64 {
+    let mut out = 0u64;
+    let mut i = 0;
+    while i < width {
+        let h = (v >> i) & 0xffff;
+        let r = ((h & 0xff) << 8) | (h >> 8);
+        out |= r << i;
+        i += 16;
+    }
+    out & mask(width)
+}
+
+/// `REV32` (64-bit) — reverse bytes within each 32-bit word.
+fn rev32(v: u64) -> u64 {
+    let lo = rev_bytes(v & 0xffff_ffff, 4);
+    let hi = rev_bytes(v >> 32, 4);
+    (hi << 32) | lo
+}
+
+/// Count leading zeros within `width` bits (`CLZ`).
+fn clz(v: u64, width: u32) -> u32 {
+    let v = v & mask(width);
+    if v == 0 {
+        width
+    } else {
+        v.leading_zeros() - (64 - width)
+    }
+}
+
+/// Count leading sign bits within `width` bits (`CLS`) — leading bits equal to
+/// the sign bit, minus one.
+fn cls(v: u64, width: u32) -> u32 {
+    let v = v & mask(width);
+    let sign = (v >> (width - 1)) & 1;
+    let mut count = 0;
+    let mut i = width - 1;
+    loop {
+        if i == 0 {
+            break;
+        }
+        i -= 1;
+        if (v >> i) & 1 == sign {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    count
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  CC-36 — the privileged AArch64 system: EL0/EL1 exception model, VMSAv8-64
+//  paging, and the ARM `virt` platform (GICv2, the generic timer, a PL011
+//  console, PSCI over SMC). With this installed (`Cpu::sys = Some`), the integer
+//  core boots a real, unmodified `arm64` Linux to userspace — byte-identical to
+//  `qemu-system-aarch64 -M virt` on the same image. The flat `CC-35` core
+//  (`Cpu::sys = None`) is untouched.
+// ════════════════════════════════════════════════════════════════════════════
+
+// The ARM `virt` memory map (matching `qemu-system-aarch64 -M virt`, so the
+// emulator and the qemu oracle line up). holospaces generates the devicetree
+// describing it, so the same kernel boots on both.
+const GICD_BASE: u64 = 0x0800_0000;
+const GICD_END: u64 = 0x0801_0000;
+const GICC_BASE: u64 = 0x0801_0000;
+const GICC_END: u64 = 0x0802_0000;
+const UART_BASE: u64 = 0x0900_0000;
+const UART_END: u64 = 0x0900_1000;
+const RAM_BASE: u64 = 0x4000_0000;
+/// The kernel Image loads `text_offset` (0x80000) above the base of RAM, with the
+/// devicetree placed safely above it (the kernel maps it by the physical address
+/// in `x0`).
+const KERNEL_OFFSET: u64 = 0x0008_0000;
+const DTB_OFFSET: u64 = 0x0400_0000;
+
+// The `virtio-mmio` transport slots (matching `qemu-system-aarch64 -M virt`:
+// 0x0a00_0000, stride 0x200, SPI 16+). holospaces attaches the same κ-disk /
+// 9p / network devices the RISC-V machine does (the shared [`devbus`]), here
+// raising the GIC instead of the PLIC.
+const VIRTIO_BLK_BASE: u64 = 0x0a00_0000;
+const VIRTIO_BLK_END: u64 = 0x0a00_0200;
+
+// GIC interrupt IDs. PPIs are 16..32 (the generic-timer lines); SPIs are 32+.
+const INTID_CNTP: u32 = 30; // the EL1 physical timer (PPI 14)
+const INTID_CNTV: u32 = 27; // the virtual timer (PPI 11)
+                            // SPIs start at INTID 32; the devicetree `GIC_SPI n` maps to INTID 32 + n.
+const SPI_BASE_INTID: u32 = 32;
+// The `virtio-blk` SPI (devicetree `interrupts = <GIC_SPI 16 …>` → INTID 48).
+const INTID_VIRTIO_BLK: u32 = 48;
+
+/// The packed identifier of an AArch64 system register `(op0,op1,CRn,CRm,op2)` —
+/// the `MRS`/`MSR` operand. A `u32` key for the dispatch table.
+const fn sr(op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> u32 {
+    (op0 << 16) | (op1 << 13) | (crn << 9) | (crm << 5) | op2
+}
+
+// The boot-critical system registers (Arm-ARM D17).
+const SR_MIDR: u32 = sr(3, 0, 0, 0, 0);
+const SR_MPIDR: u32 = sr(3, 0, 0, 0, 5);
+const SR_ID_AA64PFR0: u32 = sr(3, 0, 0, 4, 0);
+const SR_ID_AA64DFR0: u32 = sr(3, 0, 0, 5, 0);
+const SR_ID_AA64ISAR0: u32 = sr(3, 0, 0, 6, 0);
+const SR_ID_AA64MMFR0: u32 = sr(3, 0, 0, 7, 0);
+const SR_CTR: u32 = sr(3, 3, 0, 0, 1);
+const SR_DCZID: u32 = sr(3, 3, 0, 0, 7);
+const SR_SCTLR: u32 = sr(3, 0, 1, 0, 0);
+const SR_TTBR0: u32 = sr(3, 0, 2, 0, 0);
+const SR_TTBR1: u32 = sr(3, 0, 2, 0, 1);
+const SR_TCR: u32 = sr(3, 0, 2, 0, 2);
+const SR_VBAR: u32 = sr(3, 0, 12, 0, 0);
+const SR_ESR: u32 = sr(3, 0, 5, 2, 0);
+const SR_FAR: u32 = sr(3, 0, 6, 0, 0);
+const SR_ELR: u32 = sr(3, 0, 4, 0, 1);
+const SR_SPSR: u32 = sr(3, 0, 4, 0, 0);
+const SR_SP_EL0: u32 = sr(3, 0, 4, 1, 0);
+const SR_SP_EL1: u32 = sr(3, 4, 4, 1, 0);
+const SR_CURRENTEL: u32 = sr(3, 0, 4, 2, 2);
+const SR_DAIF: u32 = sr(3, 3, 4, 2, 1);
+const SR_NZCV: u32 = sr(3, 3, 4, 2, 0);
+const SR_SPSEL: u32 = sr(3, 0, 4, 2, 0);
+const SR_CNTFRQ: u32 = sr(3, 3, 14, 0, 0);
+const SR_CNTPCT: u32 = sr(3, 3, 14, 0, 1);
+const SR_CNTVCT: u32 = sr(3, 3, 14, 0, 2);
+const SR_CNTP_TVAL: u32 = sr(3, 3, 14, 2, 0);
+const SR_CNTP_CTL: u32 = sr(3, 3, 14, 2, 1);
+const SR_CNTP_CVAL: u32 = sr(3, 3, 14, 2, 2);
+const SR_CNTV_TVAL: u32 = sr(3, 3, 14, 3, 0);
+const SR_CNTV_CTL: u32 = sr(3, 3, 14, 3, 1);
+const SR_CNTV_CVAL: u32 = sr(3, 3, 14, 3, 2);
+const SR_PAR: u32 = sr(3, 0, 7, 4, 0);
+
+/// The exception class an EL1 entry was taken for (selects the `ESR_EL1.EC` and
+/// the vector offset).
+#[derive(Clone, Copy)]
+enum ExcKind {
+    /// `SVC` from AArch64 (a syscall) — `EC` 0x15.
+    Svc,
+}
+
+/// A simple direct-mapped software TLB over [`Cpu::translate`] — a cache of
+/// virtual-page → physical-frame translations so a hot loop does not re-walk the
+/// page table every access. Flushed (by bumping `gen`) on `TLBI`, a `TTBR`/`TCR`/
+/// `SCTLR` write, and every exception/`ERET` (a context change).
+#[derive(Clone, Copy)]
+struct TlbEntry {
+    tag: u64,
+    frame: u64,
+    gen: u64,
+}
+
+const TLB_SETS: usize = 1024;
+
+/// The GICv2 distributor + CPU interface state (Arm GICv2 spec). Only the parts a
+/// booting kernel drives are modelled: per-INTID enable/pending/active, the
+/// distributor/CPU enables, and the priority mask — enough to deliver the timer
+/// tick and the `virtio` SPIs.
+struct Gic {
+    dist_enable: bool,
+    cpu_enable: bool,
+    pmr: u32,
+    enabled: [u64; 16],
+    pending: [u64; 16],
+    active: [u64; 16],
+    cfg: [u32; 32],
+}
+
+impl Gic {
+    fn new() -> Self {
+        Gic {
+            dist_enable: false,
+            cpu_enable: false,
+            pmr: 0,
+            enabled: [0; 16],
+            pending: [0; 16],
+            active: [0; 16],
+            cfg: [0; 32],
+        }
+    }
+    fn set_bit(set: &mut [u64; 16], id: u32, on: bool) {
+        let (w, b) = ((id / 64) as usize, id % 64);
+        if w < 16 {
+            if on {
+                set[w] |= 1 << b;
+            } else {
+                set[w] &= !(1 << b);
+            }
+        }
+    }
+    fn get_bit(set: &[u64; 16], id: u32) -> bool {
+        let (w, b) = ((id / 64) as usize, id % 64);
+        w < 16 && set[w] & (1 << b) != 0
+    }
+    /// Raise an edge-triggered source (a `virtio` SPI): latch it pending.
+    fn raise(&mut self, id: u32) {
+        Self::set_bit(&mut self.pending, id, true);
+    }
+    /// Drive a level-triggered source (the generic timer) to `on`.
+    fn set_level(&mut self, id: u32, on: bool) {
+        Self::set_bit(&mut self.pending, id, on);
+    }
+    /// The highest-priority pending+enabled+inactive INTID, or `None`.
+    fn best(&self) -> Option<u32> {
+        (0..1020u32).find(|&id| {
+            Self::get_bit(&self.pending, id)
+                && Self::get_bit(&self.enabled, id)
+                && !Self::get_bit(&self.active, id)
+        })
+    }
+    /// Whether the CPU IRQ line is asserted.
+    fn irq_pending(&self) -> bool {
+        self.dist_enable && self.cpu_enable && self.pmr > 0 && self.best().is_some()
+    }
+}
+
+/// The PL011 UART (the console). Only the data + flag registers and the AMBA
+/// PrimeCell identification registers matter — the latter so the kernel's `amba`
+/// bus binds the full `ttyAMA0` driver (not just earlycon), giving `/dev/console`
+/// for PID 1's stdout.
+struct Pl011 {
+    /// Pending input bytes (the terminal channel), and the next unread index.
+    input: Vec<u8>,
+    in_cursor: usize,
+}
+
+/// The privileged-mode state (`CC-36`): EL/PSTATE, the EL1 system registers, the
+/// VMSAv8-64 translation context + TLB, and the `virt` platform devices.
+struct Sys {
+    el: u8,
+    spsel: bool,
+    /// `PSTATE.DAIF` held in bits [9:6] (`D,A,I,F`).
+    daif: u64,
+    sp_el0: u64,
+    sp_el1: u64,
+    elr_el1: u64,
+    spsr_el1: u64,
+    esr_el1: u64,
+    far_el1: u64,
+    vbar_el1: u64,
+    sctlr_el1: u64,
+    ttbr0_el1: u64,
+    ttbr1_el1: u64,
+    tcr_el1: u64,
+    par_el1: u64,
+    /// The long tail of EL1 control registers the kernel writes then reads
+    /// (`MAIR`, `TPIDR*`, `CNTKCTL`, the performance-monitor controls, …), keyed
+    /// by the packed system-register id.
+    regs: BTreeMap<u32, u64>,
+    /// A translation faulted: `(faulting VA, is-write)` — consumed by the abort.
+    fault: Option<(u64, bool)>,
+    cntfrq: u64,
+    counter: u64,
+    cntp_ctl: u64,
+    cntp_cval: u64,
+    cntv_ctl: u64,
+    cntv_cval: u64,
+    cntvoff: u64,
+    gic: Gic,
+    uart: Pl011,
+    /// The `virtio-blk` device — the κ-disk rootfs (`CC-7`), when a disk is
+    /// attached (`CC-37`); shared with the RISC-V machine via the shared device bus (`devbus`).
+    virtio: Option<super::VirtioBlk>,
+    tlb: Vec<TlbEntry>,
+    tlb_gen: u64,
+    halted: bool,
+    halt_status: u64,
+}
+
+impl Sys {
+    fn new() -> Self {
+        Sys {
+            el: 1,
+            spsel: true,    // EL1h
+            daif: 0xf << 6, // start with interrupts masked, as on reset
+            sp_el0: 0,
+            sp_el1: 0,
+            elr_el1: 0,
+            spsr_el1: 0,
+            esr_el1: 0,
+            far_el1: 0,
+            vbar_el1: 0,
+            sctlr_el1: 0,
+            ttbr0_el1: 0,
+            ttbr1_el1: 0,
+            tcr_el1: 0,
+            par_el1: 0,
+            regs: BTreeMap::new(),
+            fault: None,
+            cntfrq: 62_500_000,
+            counter: 0,
+            cntp_ctl: 0,
+            cntp_cval: 0,
+            cntv_ctl: 0,
+            cntv_cval: 0,
+            cntvoff: 0,
+            gic: Gic::new(),
+            virtio: None,
+            uart: Pl011 {
+                input: Vec::new(),
+                in_cursor: 0,
+            },
+            tlb: vec![
+                TlbEntry {
+                    tag: 0,
+                    frame: 0,
+                    gen: 0
+                };
+                TLB_SETS
+            ],
+            tlb_gen: 1,
+            halted: false,
+            halt_status: 0,
+        }
+    }
+}
+
+impl Cpu {
+    /// Boot a real, unmodified `arm64` Linux kernel `Image` to userspace on the
+    /// ARM `virt` platform (`CC-36`). `bootargs` is the kernel command line. The
+    /// emulator generates the devicetree from its own memory map (one source of
+    /// truth), loads the kernel at `RAM_BASE + 0x80000` with `x0` = the DTB
+    /// physical address, and enters at EL1 with the MMU off — the arm64 boot
+    /// protocol (Documentation/arm64/booting.rst). Drive it with
+    /// [`Cpu::run`] (a `PSCI SYSTEM_OFF` returns [`Halt::Exit`]).
+    #[must_use]
+    pub fn boot_linux(ram_bytes: usize, kernel: &[u8], bootargs: &str) -> Self {
+        Self::boot_linux_inner(ram_bytes, kernel, bootargs, None)
+    }
+
+    /// Boot like [`Cpu::boot_linux`], additionally attaching a **`virtio-blk`
+    /// root filesystem** (`CC-37`): `rootfs` is the assembled `ext4` image, taken
+    /// as κ-addressed content into the κ-disk (`CC-7`), and
+    /// the guest mounts it over `/dev/vda`. The shared the shared device bus (`devbus`) services
+    /// the device — the same κ-disk the RISC-V machine boots, with no per-ISA
+    /// re-implementation. Use a `bootargs` with `root=/dev/vda`.
+    #[must_use]
+    pub fn boot_linux_disk(
+        ram_bytes: usize,
+        kernel: &[u8],
+        rootfs: Vec<u8>,
+        bootargs: &str,
+    ) -> Self {
+        Self::boot_linux_inner(ram_bytes, kernel, bootargs, Some(rootfs))
+    }
+
+    fn boot_linux_inner(
+        ram_bytes: usize,
+        kernel: &[u8],
+        bootargs: &str,
+        rootfs: Option<Vec<u8>>,
+    ) -> Self {
+        let mut cpu = Cpu::new(RAM_BASE, ram_bytes);
+        // Load the kernel image at text_offset above the base of RAM.
+        let load = KERNEL_OFFSET as usize;
+        let n = kernel.len().min(cpu.ram.len() - load);
+        cpu.ram[load..load + n].copy_from_slice(&kernel[..n]);
+        // Place the devicetree above the kernel and hand its address in x0. The
+        // `virtio-blk` node is advertised only when a disk is attached (an
+        // unattached `virtio-mmio` slot makes the kernel read magic 0 and stall).
+        let has_blk = rootfs.is_some();
+        let dtb = arm64_virt_dtb(RAM_BASE, ram_bytes as u64, bootargs, has_blk);
+        let dtb_off = DTB_OFFSET as usize;
+        let dn = dtb.len().min(cpu.ram.len() - dtb_off);
+        cpu.ram[dtb_off..dtb_off + dn].copy_from_slice(&dtb[..dn]);
+        cpu.x[0] = RAM_BASE + DTB_OFFSET;
+        cpu.pc = RAM_BASE + KERNEL_OFFSET;
+        cpu.sp = RAM_BASE + KERNEL_OFFSET;
+        let mut sys = Sys::new();
+        if let Some(image) = rootfs {
+            sys.virtio = Some(super::VirtioBlk::new(image));
+        }
+        cpu.sys = Some(Box::new(sys));
+        cpu
+    }
+
+    /// The current contents of the `virtio-blk` κ-disk as a flat image (the guest
+    /// writes are reflected — observing the devcontainer's filesystem state).
+    #[must_use]
+    pub fn disk_image(&self) -> Option<Vec<u8>> {
+        self.sys
+            .as_ref()
+            .and_then(|s| s.virtio.as_ref())
+            .map(|d| d.disk.to_image())
+    }
+
+    /// Feed terminal input to the booted guest's console (the `CC-11` input
+    /// channel, the AArch64 analogue): the bytes become readable at the PL011.
+    pub fn feed_console(&mut self, bytes: &[u8]) {
+        if let Some(sys) = self.sys.as_mut() {
+            sys.uart.input.extend_from_slice(bytes);
+        }
+    }
+
+    #[inline]
+    fn sys(&self) -> &Sys {
+        self.sys.as_ref().expect("system mode")
+    }
+    #[inline]
+    fn sys_mut(&mut self) -> &mut Sys {
+        self.sys.as_mut().expect("system mode")
+    }
+
+    // ── physical memory + device MMIO ───────────────────────────────────────
+
+    fn in_ram(&self, pa: u64, width: usize) -> bool {
+        pa >= self.base && pa.wrapping_add(width as u64) <= self.base + self.ram.len() as u64
+    }
+
+    fn phys_read(&mut self, pa: u64, width: usize) -> u64 {
+        if self.in_ram(pa, width) {
+            let o = (pa - self.base) as usize;
+            let mut v = 0u64;
+            for i in 0..width {
+                v |= u64::from(self.ram[o + i]) << (8 * i);
+            }
+            return v;
+        }
+        if (UART_BASE..UART_END).contains(&pa) {
+            return self.uart_read(pa - UART_BASE);
+        }
+        if (GICD_BASE..GICD_END).contains(&pa) {
+            return self.gicd_read(pa - GICD_BASE);
+        }
+        if (GICC_BASE..GICC_END).contains(&pa) {
+            return self.gicc_read(pa - GICC_BASE);
+        }
+        if (VIRTIO_BLK_BASE..VIRTIO_BLK_END).contains(&pa) {
+            return super::devbus::blk_mmio_read(self.sys().virtio.as_ref(), pa - VIRTIO_BLK_BASE);
+        }
+        0
+    }
+
+    fn phys_write(&mut self, pa: u64, width: usize, value: u64) {
+        if self.in_ram(pa, width) {
+            let o = (pa - self.base) as usize;
+            for i in 0..width {
+                self.ram[o + i] = (value >> (8 * i)) as u8;
+            }
+            return;
+        }
+        if (UART_BASE..UART_END).contains(&pa) {
+            self.uart_write(pa - UART_BASE, value);
+        } else if (GICD_BASE..GICD_END).contains(&pa) {
+            self.gicd_write(pa - GICD_BASE, value as u32);
+        } else if (GICC_BASE..GICC_END).contains(&pa) {
+            self.gicc_write(pa - GICC_BASE, value as u32);
+        } else if (VIRTIO_BLK_BASE..VIRTIO_BLK_END).contains(&pa) {
+            self.virtio_blk_write(pa - VIRTIO_BLK_BASE, value as u32);
+        }
+    }
+
+    /// A `virtio-blk` MMIO register write; a `QueueNotify` services the queue
+    /// against the κ-disk (the shared the shared device bus (`devbus`)) and latches the GIC SPI.
+    fn virtio_blk_write(&mut self, off: u64, value: u32) {
+        let Some(mut dev) = self.sys_mut().virtio.take() else {
+            return;
+        };
+        let notify = super::devbus::blk_mmio_write(&mut dev, off, value);
+        let mut raise = false;
+        if notify {
+            let mut mem = super::devbus::GuestRam {
+                ram: &mut self.ram,
+                base: self.base,
+            };
+            raise = super::devbus::blk_service_queue(&mut mem, &mut dev);
+        }
+        self.sys_mut().virtio = Some(dev);
+        if raise {
+            self.sys_mut().gic.raise(INTID_VIRTIO_BLK);
+        }
+    }
+
+    /// Read a 64-bit little-endian word from physical RAM (the page-table walker).
+    fn phys_read64(&self, pa: u64) -> u64 {
+        if pa >= self.base && pa + 8 <= self.base + self.ram.len() as u64 {
+            let o = (pa - self.base) as usize;
+            u64::from_le_bytes(self.ram[o..o + 8].try_into().unwrap())
+        } else {
+            0
+        }
+    }
+
+    // ── PL011 UART ──────────────────────────────────────────────────────────
+
+    fn uart_read(&mut self, off: u64) -> u64 {
+        match off {
+            0x00 => {
+                // DR — the next input byte (0 if none).
+                let sys = self.sys_mut();
+                if sys.uart.in_cursor < sys.uart.input.len() {
+                    let b = sys.uart.input[sys.uart.in_cursor];
+                    sys.uart.in_cursor += 1;
+                    u64::from(b)
+                } else {
+                    0
+                }
+            }
+            0x18 => {
+                // FR — flags: RXFE (bit4) set when no input; TX always ready.
+                let sys = self.sys();
+                let rxfe = if sys.uart.in_cursor < sys.uart.input.len() {
+                    0
+                } else {
+                    1 << 4
+                };
+                (1 << 7) | rxfe // TXFE | maybe RXFE
+            }
+            // AMBA PrimeCell ID — so the kernel's `amba` bus binds `ttyAMA0`.
+            0xfe0 => 0x11,
+            0xfe4 => 0x10,
+            0xfe8 => 0x14,
+            0xfec => 0x00,
+            0xff0 => 0x0d,
+            0xff4 => 0xf0,
+            0xff8 => 0x05,
+            0xffc => 0xb1,
+            _ => 0,
+        }
+    }
+
+    fn uart_write(&mut self, off: u64, value: u64) {
+        if off == 0x00 {
+            // DR — emit the byte to the console.
+            self.console.push(value as u8);
+        }
+        // The control/baud/interrupt registers are accepted and ignored — the
+        // model is a polled console (no UART interrupt needed to boot).
+    }
+
+    // ── GICv2 ───────────────────────────────────────────────────────────────
+
+    fn gicd_read(&mut self, off: u64) -> u64 {
+        let g = &self.sys().gic;
+        match off {
+            0x000 => u64::from(g.dist_enable), // GICD_CTLR
+            0x004 => 0x0000_0001,              // GICD_TYPER: ITLinesNumber=1 → 64 INTIDs
+            0x008 => 0x0200_043b,              // GICD_IIDR (an ARM GICv2)
+            0x100..=0x17c => {
+                // GICD_ISENABLER<n>
+                let n = (off - 0x100) / 4;
+                self.gic_bits(&self.sys().gic.enabled, n)
+            }
+            0x180..=0x1fc => {
+                let n = (off - 0x180) / 4;
+                self.gic_bits(&self.sys().gic.enabled, n)
+            }
+            0xc00..=0xc7c => {
+                let i = ((off - 0xc00) / 4) as usize;
+                u64::from(self.sys().gic.cfg.get(i).copied().unwrap_or(0))
+            }
+            _ => 0,
+        }
+    }
+
+    fn gic_bits(&self, set: &[u64; 16], n: u64) -> u64 {
+        let base = (n * 32) as u32;
+        let mut v = 0u64;
+        for i in 0..32 {
+            if Gic::get_bit(set, base + i) {
+                v |= 1 << i;
+            }
+        }
+        v
+    }
+
+    fn gicd_write(&mut self, off: u64, value: u32) {
+        match off {
+            0x000 => self.sys_mut().gic.dist_enable = value & 1 != 0,
+            0x100..=0x17c => {
+                let base = (((off - 0x100) / 4) * 32) as u32;
+                for i in 0..32 {
+                    if value & (1 << i) != 0 {
+                        Gic::set_bit(&mut self.sys_mut().gic.enabled, base + i, true);
+                    }
+                }
+            }
+            0x180..=0x1fc => {
+                let base = (((off - 0x180) / 4) * 32) as u32;
+                for i in 0..32 {
+                    if value & (1 << i) != 0 {
+                        Gic::set_bit(&mut self.sys_mut().gic.enabled, base + i, false);
+                    }
+                }
+            }
+            0x200..=0x27c => {
+                let base = (((off - 0x200) / 4) * 32) as u32;
+                for i in 0..32 {
+                    if value & (1 << i) != 0 {
+                        Gic::set_bit(&mut self.sys_mut().gic.pending, base + i, true);
+                    }
+                }
+            }
+            0x280..=0x2fc => {
+                let base = (((off - 0x280) / 4) * 32) as u32;
+                for i in 0..32 {
+                    if value & (1 << i) != 0 {
+                        Gic::set_bit(&mut self.sys_mut().gic.pending, base + i, false);
+                    }
+                }
+            }
+            0xc00..=0xc7c => {
+                let i = ((off - 0xc00) / 4) as usize;
+                if i < 32 {
+                    self.sys_mut().gic.cfg[i] = value;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn gicc_read(&mut self, off: u64) -> u64 {
+        match off {
+            0x00 => u64::from(self.sys().gic.cpu_enable), // GICC_CTLR
+            0x04 => u64::from(self.sys().gic.pmr),        // GICC_PMR
+            0x0c => {
+                // GICC_IAR — acknowledge the highest pending interrupt.
+                match self.sys().gic.best() {
+                    Some(id) => {
+                        Gic::set_bit(&mut self.sys_mut().gic.active, id, true);
+                        // Edge sources clear on acknowledge; level sources are
+                        // re-evaluated by `sys_tick`.
+                        Gic::set_bit(&mut self.sys_mut().gic.pending, id, false);
+                        u64::from(id)
+                    }
+                    None => 1023, // spurious
+                }
+            }
+            0xfc => 0x0000_043b, // GICC_IIDR
+            _ => 0,
+        }
+    }
+
+    fn gicc_write(&mut self, off: u64, value: u32) {
+        match off {
+            0x00 => self.sys_mut().gic.cpu_enable = value & 1 != 0,
+            0x04 => self.sys_mut().gic.pmr = value,
+            0x10 => {
+                // GICC_EOIR — end of interrupt: clear the active bit.
+                let id = value & 0x3ff;
+                Gic::set_bit(&mut self.sys_mut().gic.active, id, false);
+            }
+            _ => {}
+        }
+    }
+
+    // ── the generic timer + interrupt delivery ──────────────────────────────
+
+    /// Advance the architected counter and re-evaluate the timer interrupt lines
+    /// (level-triggered through the GIC). Called once per instruction step.
+    fn sys_tick(&mut self) {
+        let sys = self.sys_mut();
+        sys.counter = sys.counter.wrapping_add(1);
+        let counter = sys.counter;
+        // EL1 physical timer (CNTP) → PPI INTID 30.
+        let p_fire = sys.cntp_ctl & 1 != 0 && sys.cntp_ctl & 2 == 0 && counter >= sys.cntp_cval;
+        if p_fire {
+            sys.cntp_ctl |= 4;
+        } else {
+            sys.cntp_ctl &= !4;
+        }
+        // Virtual timer (CNTV) → PPI INTID 27.
+        let vcount = counter.wrapping_sub(sys.cntvoff);
+        let v_fire = sys.cntv_ctl & 1 != 0 && sys.cntv_ctl & 2 == 0 && vcount >= sys.cntv_cval;
+        if v_fire {
+            sys.cntv_ctl |= 4;
+        } else {
+            sys.cntv_ctl &= !4;
+        }
+        sys.gic.set_level(INTID_CNTP, p_fire);
+        sys.gic.set_level(INTID_CNTV, v_fire);
+    }
+
+    /// Deliver a pending IRQ if the line is asserted and `PSTATE.I` is clear.
+    /// Returns `true` when an exception was taken (the caller re-fetches from the
+    /// vector).
+    fn take_pending_interrupt(&mut self) -> bool {
+        if self.sys().halted {
+            return false;
+        }
+        let i_masked = self.sys().daif & (1 << 7) != 0;
+        if i_masked || !self.sys().gic.irq_pending() {
+            return false;
+        }
+        let ret = self.pc;
+        self.take_to_el1(None, 0, ret, 0x80); // IRQ vector offset
+        true
+    }
+
+    // ── the EL1 exception model ─────────────────────────────────────────────
+
+    /// `PSTATE` packed into the `SPSR_EL1` layout (`NZCV` + `DAIF` + the mode
+    /// field `M[3:0]`).
+    fn pack_pstate(&self) -> u64 {
+        let f = self.flags;
+        let nzcv = (u64::from(f.n) << 31)
+            | (u64::from(f.z) << 30)
+            | (u64::from(f.c) << 29)
+            | (u64::from(f.v) << 28);
+        let el = self.sys().el as u64;
+        let m = (el << 2) | u64::from(el == 1 && self.sys().spsel);
+        nzcv | self.sys().daif | m
+    }
+
+    /// Switch the current (EL, SPSel) context, banking `SP` (`SP_EL0`/`SP_EL1`).
+    fn set_context(&mut self, new_el: u8, new_spsel: bool) {
+        let cur_uses_el0 = self.sys().el == 0 || !self.sys().spsel;
+        if cur_uses_el0 {
+            self.sys_mut().sp_el0 = self.sp;
+        } else {
+            self.sys_mut().sp_el1 = self.sp;
+        }
+        self.sys_mut().el = new_el;
+        self.sys_mut().spsel = new_spsel;
+        let new_uses_el0 = new_el == 0 || !new_spsel;
+        self.sp = if new_uses_el0 {
+            self.sys().sp_el0
+        } else {
+            self.sys().sp_el1
+        };
+    }
+
+    /// Take an exception to EL1: bank PSTATE into `SPSR_EL1`/`ELR_EL1`, set
+    /// `ESR_EL1` (for a synchronous entry), switch to EL1h with interrupts masked,
+    /// and branch to the right `VBAR_EL1` vector. `class_off` selects sync (0x00)
+    /// vs IRQ (0x80) within the source-EL group.
+    fn take_to_el1(&mut self, kind: Option<ExcKind>, iss: u32, ret: u64, class_off: u64) {
+        let from_el0 = self.sys().el == 0;
+        let spsr = self.pack_pstate();
+        let group = if from_el0 {
+            0x400
+        } else if self.sys().spsel {
+            0x200
+        } else {
+            0x000
+        };
+        let target = self.sys().vbar_el1.wrapping_add(group + class_off);
+        self.sys_mut().elr_el1 = ret;
+        self.sys_mut().spsr_el1 = spsr;
+        if let Some(k) = kind {
+            let ec = match k {
+                ExcKind::Svc => 0x15u64,
+            };
+            self.sys_mut().esr_el1 = (ec << 26) | (1 << 25) | (u64::from(iss) & 0x1ff_ffff);
+        }
+        self.excl = None;
+        self.set_context(1, true);
+        self.sys_mut().daif = 0xf << 6; // mask D,A,I,F on entry
+        self.bump_tlb();
+        self.pc = target;
+    }
+
+    /// Take a memory abort (instruction or data) to EL1, building `ESR_EL1`/`FAR_EL1`.
+    fn take_mem_abort(&mut self, ret: u64, far: u64, is_fetch: bool, is_write: bool) {
+        let from_el0 = self.sys().el == 0;
+        let spsr = self.pack_pstate();
+        let group = if from_el0 {
+            0x400
+        } else if self.sys().spsel {
+            0x200
+        } else {
+            0x000
+        };
+        let target = self.sys().vbar_el1.wrapping_add(group);
+        // EC: instruction abort 0x20/0x21, data abort 0x24/0x25 (lower/same EL).
+        let ec: u64 = match (is_fetch, from_el0) {
+            (true, true) => 0x20,
+            (true, false) => 0x21,
+            (false, true) => 0x24,
+            (false, false) => 0x25,
+        };
+        // ISS: a translation fault, with the write bit for data aborts.
+        let dfsc = 0b000101u64; // translation fault, level 1
+        let iss = dfsc | (if !is_fetch && is_write { 1 << 6 } else { 0 });
+        self.sys_mut().elr_el1 = ret;
+        self.sys_mut().spsr_el1 = spsr;
+        self.sys_mut().esr_el1 = (ec << 26) | (1 << 25) | iss;
+        self.sys_mut().far_el1 = far;
+        self.sys_mut().fault = None;
+        self.excl = None;
+        self.set_context(1, true);
+        self.sys_mut().daif = 0xf << 6;
+        self.bump_tlb();
+        self.pc = target;
+    }
+
+    /// Take an "unknown instruction" exception (`EC` 0x00) to EL1.
+    fn take_undef(&mut self, ret: u64, _inst: u32) {
+        let from_el0 = self.sys().el == 0;
+        let spsr = self.pack_pstate();
+        let group = if from_el0 {
+            0x400
+        } else if self.sys().spsel {
+            0x200
+        } else {
+            0x000
+        };
+        let target = self.sys().vbar_el1.wrapping_add(group);
+        self.sys_mut().elr_el1 = ret;
+        self.sys_mut().spsr_el1 = spsr;
+        self.sys_mut().esr_el1 = 1 << 25; // EC=0 (unknown), IL=1
+        self.excl = None;
+        self.set_context(1, true);
+        self.sys_mut().daif = 0xf << 6;
+        self.bump_tlb();
+        self.pc = target;
+    }
+
+    /// Route an `exec` trap in system mode to the right exception: a translation
+    /// fault recorded by the MMU becomes a data abort; anything else is undefined.
+    fn take_exec_trap(&mut self, pc: u64, inst: u32, _t: Trap) {
+        if let Some((far, is_write)) = self.sys().fault {
+            self.take_mem_abort(pc, far, false, is_write);
+        } else {
+            self.take_undef(pc, inst);
+        }
+    }
+
+    /// `ERET` — return from EL1 to the EL/PSTATE saved in `SPSR_EL1`, at `ELR_EL1`.
+    fn eret(&mut self) {
+        let spsr = self.sys().spsr_el1;
+        let m = spsr & 0x1f;
+        let new_el = ((m >> 2) & 0x3) as u8;
+        let new_spsel = m & 1 == 1;
+        self.flags = Nzcv {
+            n: spsr & (1 << 31) != 0,
+            z: spsr & (1 << 30) != 0,
+            c: spsr & (1 << 29) != 0,
+            v: spsr & (1 << 28) != 0,
+        };
+        self.sys_mut().daif = spsr & (0xf << 6);
+        self.excl = None;
+        self.set_context(new_el, new_spsel);
+        self.bump_tlb();
+        self.pc = self.sys().elr_el1;
+    }
+
+    // ── the VMSAv8-64 MMU ───────────────────────────────────────────────────
+
+    fn bump_tlb(&mut self) {
+        self.sys_mut().tlb_gen = self.sys_mut().tlb_gen.wrapping_add(1);
+    }
+
+    /// Translate a virtual address to a physical address (Arm-ARM VMSAv8-64, 4 KiB
+    /// granule). With the MMU off (`SCTLR_EL1.M == 0`) translation is the identity
+    /// — the boot protocol's initial state. Permission/attribute checks are not
+    /// enforced (the kernel's own mappings are correct, and the boot path reaches
+    /// userspace without relying on them) — only translation faults are raised, so
+    /// the kernel's demand-paging handler runs.
+    fn translate(&mut self, va: u64, acc: Access) -> Result<u64, Trap> {
+        if self.sys().sctlr_el1 & 1 == 0 {
+            return Ok(va); // MMU off → identity
+        }
+        let page = va & !0xfff;
+        let set = (page >> 12) as usize & (TLB_SETS - 1);
+        let gen = self.sys().tlb_gen;
+        let e = self.sys().tlb[set];
+        if e.gen == gen && e.tag == page {
+            return Ok(e.frame | (va & 0xfff));
+        }
+        match self.walk(va) {
+            Some(pa) => {
+                self.sys_mut().tlb[set] = TlbEntry {
+                    tag: page,
+                    frame: pa & !0xfff,
+                    gen,
+                };
+                Ok(pa)
+            }
+            None => {
+                let is_write = acc == Access::Store;
+                self.sys_mut().fault = Some((va, is_write));
+                Err(Trap::AccessFault(va))
+            }
+        }
+    }
+
+    /// Walk the page tables (4 KiB granule). Returns the physical address, or
+    /// `None` on a translation fault.
+    fn walk(&self, va: u64) -> Option<u64> {
+        let tcr = self.sys().tcr_el1;
+        let t0sz = (tcr & 0x3f) as u32;
+        let t1sz = ((tcr >> 16) & 0x3f) as u32;
+        // Select TTBR by the top bits: all-zero → TTBR0, all-one → TTBR1.
+        let (ttbr, tnsz) = if va >> 63 == 0 {
+            (self.sys().ttbr0_el1, t0sz)
+        } else {
+            (self.sys().ttbr1_el1, t1sz)
+        };
+        let va_bits = 64 - tnsz;
+        // The initial lookup level (4 KiB granule): resolve 9 bits per level.
+        let n_levels = (va_bits - 12).div_ceil(9);
+        let start = 4u32.saturating_sub(n_levels);
+        let mut table = ttbr & 0x0000_ffff_ffff_f000;
+        let mut level = start;
+        loop {
+            let shift = 12 + 9 * (3 - level);
+            let idx = (va >> shift) & 0x1ff;
+            let desc = self.phys_read64(table + idx * 8);
+            if desc & 1 == 0 {
+                return None; // invalid descriptor → translation fault
+            }
+            let is_block = desc & 2 == 0; // bits[1:0]==01 block, ==11 table/page
+            if level == 3 {
+                // Level 3: a page descriptor (bits[1:0] must be 11).
+                if desc & 2 == 0 {
+                    return None;
+                }
+                let out = desc & 0x0000_ffff_ffff_f000;
+                return Some(out | (va & 0xfff));
+            }
+            if is_block {
+                let blk_mask = (1u64 << shift) - 1;
+                let out = desc & !blk_mask & 0x0000_ffff_ffff_ffff;
+                return Some(out | (va & blk_mask));
+            }
+            table = desc & 0x0000_ffff_ffff_f000;
+            level += 1;
+        }
+    }
+
+    // ── the System instruction class (MRS/MSR/SYS/hints/barriers) ───────────
+
+    fn system_instr(&mut self, inst: u32, next: u64) -> Result<(), Halt> {
+        let l = (inst >> 21) & 1;
+        let op0 = (inst >> 19) & 0x3;
+        let op1 = (inst >> 16) & 0x7;
+        let crn = (inst >> 12) & 0xf;
+        let crm = (inst >> 8) & 0xf;
+        let op2 = (inst >> 5) & 0x7;
+        let rt = inst & 0x1f;
+
+        if op0 == 0 && l == 0 {
+            // MSR (immediate), hints, and barriers.
+            match crn {
+                0x2 => {
+                    // HINT space: WFI/WFE/YIELD/NOP/…
+                    if crm == 0 && op2 == 3 {
+                        self.wfi();
+                    }
+                    self.pc = next;
+                    return Ok(());
+                }
+                0x3 => {
+                    // Barriers (DSB/DMB/ISB/CLREX/SB): ordering no-ops; CLREX
+                    // clears the monitor.
+                    if op2 == 2 {
+                        self.excl = None;
+                    }
+                    self.pc = next;
+                    return Ok(());
+                }
+                0x4 => {
+                    // MSR (immediate) to a PSTATE field.
+                    if op1 == 0 && op2 == 5 {
+                        // SPSel
+                        self.set_spsel(crm & 1 == 1);
+                    } else if op1 == 3 && op2 == 6 {
+                        // DAIFSet — set the masked bits.
+                        let mut bits = 0u64;
+                        for i in 0..4 {
+                            if crm & (1 << i) != 0 {
+                                bits |= 1 << (6 + i);
+                            }
+                        }
+                        self.sys_mut().daif |= bits;
+                    } else if op1 == 3 && op2 == 7 {
+                        // DAIFClr
+                        let mut bits = 0u64;
+                        for i in 0..4 {
+                            if crm & (1 << i) != 0 {
+                                bits |= 1 << (6 + i);
+                            }
+                        }
+                        self.sys_mut().daif &= !bits;
+                    }
+                    self.pc = next;
+                    return Ok(());
+                }
+                _ => {
+                    self.pc = next;
+                    return Ok(());
+                }
+            }
+        }
+
+        if op0 == 1 {
+            // SYS/SYSL: TLBI / IC / DC / AT.
+            if crn == 0x8 {
+                // TLBI — invalidate the TLB.
+                self.bump_tlb();
+            } else if crn == 0x7 && (crm == 0x8 || crm == 0x9) {
+                // AT (address translate) — record the result in PAR_EL1.
+                let va = self.rx(rt);
+                match self.walk(va) {
+                    Some(pa) => self.sys_mut().par_el1 = pa & 0x0000_ffff_ffff_f000,
+                    None => self.sys_mut().par_el1 = 1, // F bit: translation aborted
+                }
+            }
+            // IC/DC cache ops are no-ops on a coherent interpreter.
+            self.pc = next;
+            return Ok(());
+        }
+
+        // MRS / MSR (register).
+        let id = sr(op0, op1, crn, crm, op2);
+        if l == 1 {
+            let v = self.sysreg_read(id);
+            self.wx(rt, v);
+        } else {
+            let v = self.rx(rt);
+            self.sysreg_write(id, v);
+        }
+        self.pc = next;
+        Ok(())
+    }
+
+    fn set_spsel(&mut self, s: bool) {
+        if self.sys().spsel != s {
+            let el = self.sys().el;
+            self.set_context(el, s);
+        }
+    }
+
+    /// `WFI` — wait for interrupt. If none is pending, fast-forward the architected
+    /// counter to the next enabled timer deadline so the tick fires on the next
+    /// step (rather than spinning the idle loop against the step budget).
+    fn wfi(&mut self) {
+        if self.sys().gic.irq_pending() {
+            return;
+        }
+        let sys = self.sys_mut();
+        let mut deadline = u64::MAX;
+        if sys.cntp_ctl & 1 != 0 && sys.cntp_ctl & 2 == 0 {
+            deadline = deadline.min(sys.cntp_cval);
+        }
+        if sys.cntv_ctl & 1 != 0 && sys.cntv_ctl & 2 == 0 {
+            deadline = deadline.min(sys.cntv_cval.wrapping_add(sys.cntvoff));
+        }
+        if deadline != u64::MAX && deadline > sys.counter {
+            sys.counter = deadline - 1; // the next sys_tick increments past it
+        }
+    }
+
+    fn sysreg_read(&mut self, id: u32) -> u64 {
+        match id {
+            SR_MIDR => 0x411f_d070,         // Cortex-A57 r1p0
+            SR_MPIDR => 0x8000_0000,        // affinity 0, RES1 bit31
+            SR_ID_AA64PFR0 => 0x0000_0011,  // EL0/EL1 AArch64; FP+SIMD present
+            SR_ID_AA64DFR0 => 0x0000_0006,  // ARMv8 debug architecture
+            SR_ID_AA64ISAR0 => 0,           // no LSE atomics → LL/SC locks
+            SR_ID_AA64MMFR0 => 0x0000_1122, // 40-bit PA, 16-bit ASID, 4 KiB granule
+            SR_CTR => 0x8444_8004,          // cache type (Cortex-A57)
+            SR_DCZID => 0x10,               // DC ZVA prohibited (DZP=1)
+            SR_SCTLR => self.sys().sctlr_el1,
+            SR_TTBR0 => self.sys().ttbr0_el1,
+            SR_TTBR1 => self.sys().ttbr1_el1,
+            SR_TCR => self.sys().tcr_el1,
+            SR_VBAR => self.sys().vbar_el1,
+            SR_ESR => self.sys().esr_el1,
+            SR_FAR => self.sys().far_el1,
+            SR_ELR => self.sys().elr_el1,
+            SR_SPSR => self.sys().spsr_el1,
+            SR_PAR => self.sys().par_el1,
+            SR_SP_EL0 => {
+                if self.sys().el == 1 && self.sys().spsel {
+                    self.sys().sp_el0
+                } else {
+                    self.sp
+                }
+            }
+            SR_SP_EL1 => {
+                if self.sys().spsel {
+                    self.sp
+                } else {
+                    self.sys().sp_el1
+                }
+            }
+            SR_CURRENTEL => u64::from(self.sys().el) << 2,
+            SR_DAIF => self.sys().daif,
+            SR_NZCV => u64::from(self.flags.pack()),
+            SR_SPSEL => u64::from(self.sys().spsel),
+            SR_CNTFRQ => self.sys().cntfrq,
+            SR_CNTPCT => self.sys().counter,
+            SR_CNTVCT => self.sys().counter.wrapping_sub(self.sys().cntvoff),
+            SR_CNTP_CTL => self.sys().cntp_ctl,
+            SR_CNTP_CVAL => self.sys().cntp_cval,
+            SR_CNTP_TVAL => {
+                (self.sys().cntp_cval.wrapping_sub(self.sys().counter) as i32 as i64) as u64
+            }
+            SR_CNTV_CTL => self.sys().cntv_ctl,
+            SR_CNTV_CVAL => self.sys().cntv_cval,
+            SR_CNTV_TVAL => {
+                let vc = self.sys().counter.wrapping_sub(self.sys().cntvoff);
+                (self.sys().cntv_cval.wrapping_sub(vc) as i32 as i64) as u64
+            }
+            _ => self.sys().regs.get(&id).copied().unwrap_or(0),
+        }
+    }
+
+    fn sysreg_write(&mut self, id: u32, v: u64) {
+        match id {
+            SR_SCTLR => {
+                let was = self.sys().sctlr_el1;
+                self.sys_mut().sctlr_el1 = v;
+                if (was ^ v) & 1 != 0 {
+                    self.bump_tlb(); // MMU enable/disable changes translation
+                }
+            }
+            SR_TTBR0 => {
+                self.sys_mut().ttbr0_el1 = v;
+                self.bump_tlb();
+            }
+            SR_TTBR1 => {
+                self.sys_mut().ttbr1_el1 = v;
+                self.bump_tlb();
+            }
+            SR_TCR => {
+                self.sys_mut().tcr_el1 = v;
+                self.bump_tlb();
+            }
+            SR_VBAR => self.sys_mut().vbar_el1 = v,
+            SR_ESR => self.sys_mut().esr_el1 = v,
+            SR_FAR => self.sys_mut().far_el1 = v,
+            SR_ELR => self.sys_mut().elr_el1 = v,
+            SR_SPSR => self.sys_mut().spsr_el1 = v,
+            SR_PAR => self.sys_mut().par_el1 = v,
+            SR_SP_EL0 => {
+                if self.sys().el == 1 && self.sys().spsel {
+                    self.sys_mut().sp_el0 = v;
+                } else {
+                    self.sp = v;
+                }
+            }
+            SR_SP_EL1 => {
+                if self.sys().spsel {
+                    self.sp = v;
+                } else {
+                    self.sys_mut().sp_el1 = v;
+                }
+            }
+            SR_DAIF => self.sys_mut().daif = v & (0xf << 6),
+            SR_NZCV => {
+                self.flags = Nzcv {
+                    n: v & (1 << 31) != 0,
+                    z: v & (1 << 30) != 0,
+                    c: v & (1 << 29) != 0,
+                    v: v & (1 << 28) != 0,
+                }
+            }
+            SR_SPSEL => self.set_spsel(v & 1 == 1),
+            SR_CNTFRQ => self.sys_mut().cntfrq = v,
+            SR_CNTP_CTL => self.sys_mut().cntp_ctl = v & 0x7,
+            SR_CNTP_CVAL => self.sys_mut().cntp_cval = v,
+            SR_CNTP_TVAL => {
+                let c = self.sys().counter;
+                self.sys_mut().cntp_cval = c.wrapping_add((v as i32 as i64) as u64);
+            }
+            SR_CNTV_CTL => self.sys_mut().cntv_ctl = v & 0x7,
+            SR_CNTV_CVAL => self.sys_mut().cntv_cval = v,
+            SR_CNTV_TVAL => {
+                let vc = self.sys().counter.wrapping_sub(self.sys().cntvoff);
+                self.sys_mut().cntv_cval = vc.wrapping_add((v as i32 as i64) as u64);
+            }
+            _ => {
+                self.sys_mut().regs.insert(id, v);
+            }
+        }
+    }
+
+    /// `SMC`/`HVC` — the PSCI firmware interface (the emulator is the monitor; with
+    /// no EL2/EL3 the conduit is handled here, as `qemu`'s in-machine PSCI does).
+    /// `x0` is the PSCI function id; the result returns in `x0`.
+    fn psci(&mut self, next: u64) {
+        let func = self.x[0] as u32;
+        const PSCI_VERSION: u32 = 0x8400_0000;
+        const CPU_OFF: u32 = 0x8400_0002;
+        const CPU_ON64: u32 = 0xc400_0003;
+        const SYSTEM_OFF: u32 = 0x8400_0008;
+        const SYSTEM_RESET: u32 = 0x8400_0009;
+        const PSCI_FEATURES: u32 = 0x8400_000a;
+        const MIGRATE_INFO_TYPE: u32 = 0x8400_0006;
+        match func {
+            PSCI_VERSION => self.x[0] = 0x0001_0000, // PSCI 1.0
+            PSCI_FEATURES => self.x[0] = 0u64.wrapping_sub(1), // NOT_SUPPORTED for queried fn
+            MIGRATE_INFO_TYPE => self.x[0] = 2,      // migration not required
+            CPU_ON64 => self.x[0] = 0u64.wrapping_sub(2), // INVALID_PARAMETERS (single PE)
+            CPU_OFF => self.x[0] = 0,
+            SYSTEM_OFF | SYSTEM_RESET => {
+                self.sys_mut().halted = true;
+                self.sys_mut().halt_status = 0;
+            }
+            _ => self.x[0] = 0u64.wrapping_sub(1), // NOT_SUPPORTED
+        }
+        self.pc = next;
+    }
+}
+
+// ── the ARM `virt` devicetree (a minimal FDT the kernel parses) ─────────────
+
+/// Generate the flattened devicetree (DTB) for the holospaces ARM `virt` machine
+/// — the blob the guest kernel parses to find its memory, CPU, GIC, generic
+/// timer, PSCI, and PL011 console. Emitted from the same memory-map constants the
+/// emulator decodes (one source of truth, Law L4).
+fn arm64_virt_dtb(ram_base: u64, ram_size: u64, bootargs: &str, has_blk: bool) -> Vec<u8> {
+    const PH_GIC: u32 = 1;
+    const PH_CLK: u32 = 2;
+    let mut f = Fdt::new();
+    f.begin_node("");
+    f.prop_u32("#address-cells", 2);
+    f.prop_u32("#size-cells", 2);
+    f.prop_str("compatible", "linux,dummy-virt");
+    f.prop_str("model", "holospaces ARM virt (AArch64)");
+    f.prop_u32("interrupt-parent", PH_GIC);
+
+    f.begin_node("chosen");
+    f.prop_str("bootargs", bootargs);
+    f.prop_str("stdout-path", "/pl011@9000000");
+    f.end_node();
+
+    f.begin_node("psci");
+    f.prop_str_list("compatible", &["arm,psci-1.0", "arm,psci-0.2", "arm,psci"]);
+    f.prop_str("method", "smc");
+    f.end_node();
+
+    f.begin_node("cpus");
+    f.prop_u32("#address-cells", 1);
+    f.prop_u32("#size-cells", 0);
+    f.begin_node("cpu@0");
+    f.prop_str("device_type", "cpu");
+    f.prop_str("compatible", "arm,cortex-a57");
+    f.prop_u32("reg", 0);
+    f.prop_str("enable-method", "psci");
+    f.end_node();
+    f.end_node();
+
+    f.begin_node("timer");
+    f.prop_str("compatible", "arm,armv8-timer");
+    // <PPI 13 LEVEL_HIGH(0x104)> sec-phys, <14> phys, <11> virt, <10> hyp.
+    f.prop_cells(
+        "interrupts",
+        &[1, 13, 0x104, 1, 14, 0x104, 1, 11, 0x104, 1, 10, 0x104],
+    );
+    f.prop_empty("always-on");
+    f.end_node();
+
+    f.begin_node(&alloc::format!("memory@{ram_base:x}"));
+    f.prop_str("device_type", "memory");
+    f.prop_reg(ram_base, ram_size);
+    f.end_node();
+
+    // The GICv2: distributor + CPU interface.
+    f.begin_node(&alloc::format!("intc@{GICD_BASE:x}"));
+    f.prop_str("compatible", "arm,cortex-a15-gic");
+    f.prop_u32("#interrupt-cells", 3);
+    f.prop_empty("interrupt-controller");
+    f.prop_u32("#address-cells", 0);
+    f.prop_cells(
+        "reg",
+        &[
+            0,
+            GICD_BASE as u32,
+            0,
+            (GICD_END - GICD_BASE) as u32,
+            0,
+            GICC_BASE as u32,
+            0,
+            (GICC_END - GICC_BASE) as u32,
+        ],
+    );
+    f.prop_u32("phandle", PH_GIC);
+    f.end_node();
+
+    // A fixed clock for the PL011 (the amba bus needs `apb_pclk`).
+    f.begin_node("apb-pclk");
+    f.prop_str("compatible", "fixed-clock");
+    f.prop_u32("#clock-cells", 0);
+    f.prop_u32("clock-frequency", 24_000_000);
+    f.prop_str("clock-output-names", "clk24mhz");
+    f.prop_u32("phandle", PH_CLK);
+    f.end_node();
+
+    f.begin_node(&alloc::format!("pl011@{UART_BASE:x}"));
+    f.prop_str_list("compatible", &["arm,pl011", "arm,primecell"]);
+    f.prop_reg(UART_BASE, UART_END - UART_BASE);
+    // <SPI 1 LEVEL_HIGH> (the UART interrupt; the console is polled, but the
+    // node is complete).
+    f.prop_cells("interrupts", &[0, 1, 4]);
+    f.prop_cells("clocks", &[PH_CLK, PH_CLK]);
+    f.prop_str_list("clock-names", &["uartclk", "apb_pclk"]);
+    f.end_node();
+
+    // The `virtio-mmio` block device (the κ-disk rootfs, `CC-37`) — declared only
+    // when a disk is attached. `interrupts = <GIC_SPI 16 LEVEL_HIGH>` → INTID 48.
+    if has_blk {
+        f.begin_node(&alloc::format!("virtio_mmio@{VIRTIO_BLK_BASE:x}"));
+        f.prop_str("compatible", "virtio,mmio");
+        f.prop_reg(VIRTIO_BLK_BASE, VIRTIO_BLK_END - VIRTIO_BLK_BASE);
+        f.prop_cells("interrupts", &[0, INTID_VIRTIO_BLK - SPI_BASE_INTID, 4]);
+        f.end_node();
+    }
+
+    f.end_node(); // root
+    f.finish()
+}
+
+// ── a minimal flattened-device-tree (DTB) writer (the DTB spec) ─────────────
+
+const FDT_MAGIC: u32 = 0xd00d_feed;
+const FDT_BEGIN_NODE: u32 = 1;
+const FDT_END_NODE: u32 = 2;
+const FDT_PROP: u32 = 3;
+const FDT_END: u32 = 9;
+const FDT_VERSION: u32 = 17;
+const FDT_LAST_COMP_VERSION: u32 = 16;
+
+struct Fdt {
+    structure: Vec<u8>,
+    strings: Vec<u8>,
+}
+
+impl Fdt {
+    fn new() -> Self {
+        Fdt {
+            structure: Vec::new(),
+            strings: Vec::new(),
+        }
+    }
+    fn token(&mut self, t: u32) {
+        self.structure.extend_from_slice(&t.to_be_bytes());
+    }
+    fn pad(&mut self) {
+        while !self.structure.len().is_multiple_of(4) {
+            self.structure.push(0);
+        }
+    }
+    fn begin_node(&mut self, name: &str) {
+        self.token(FDT_BEGIN_NODE);
+        self.structure.extend_from_slice(name.as_bytes());
+        self.structure.push(0);
+        self.pad();
+    }
+    fn end_node(&mut self) {
+        self.token(FDT_END_NODE);
+    }
+    fn name_off(&mut self, name: &str) -> u32 {
+        let needle = name.as_bytes();
+        let mut i = 0;
+        while i < self.strings.len() {
+            let end = self.strings[i..]
+                .iter()
+                .position(|&b| b == 0)
+                .map(|p| i + p)
+                .unwrap_or(self.strings.len());
+            if &self.strings[i..end] == needle {
+                return i as u32;
+            }
+            i = end + 1;
+        }
+        let off = self.strings.len() as u32;
+        self.strings.extend_from_slice(needle);
+        self.strings.push(0);
+        off
+    }
+    fn prop(&mut self, name: &str, value: &[u8]) {
+        let nameoff = self.name_off(name);
+        self.token(FDT_PROP);
+        self.structure
+            .extend_from_slice(&(value.len() as u32).to_be_bytes());
+        self.structure.extend_from_slice(&nameoff.to_be_bytes());
+        self.structure.extend_from_slice(value);
+        self.pad();
+    }
+    fn prop_empty(&mut self, name: &str) {
+        self.prop(name, &[]);
+    }
+    fn prop_u32(&mut self, name: &str, v: u32) {
+        self.prop(name, &v.to_be_bytes());
+    }
+    fn prop_str(&mut self, name: &str, s: &str) {
+        let mut v = Vec::with_capacity(s.len() + 1);
+        v.extend_from_slice(s.as_bytes());
+        v.push(0);
+        self.prop(name, &v);
+    }
+    fn prop_str_list(&mut self, name: &str, items: &[&str]) {
+        let mut v = Vec::new();
+        for s in items {
+            v.extend_from_slice(s.as_bytes());
+            v.push(0);
+        }
+        self.prop(name, &v);
+    }
+    fn prop_cells(&mut self, name: &str, cells: &[u32]) {
+        let mut v = Vec::with_capacity(cells.len() * 4);
+        for c in cells {
+            v.extend_from_slice(&c.to_be_bytes());
+        }
+        self.prop(name, &v);
+    }
+    fn prop_reg(&mut self, addr: u64, size: u64) {
+        self.prop_cells(
+            "reg",
+            &[
+                (addr >> 32) as u32,
+                addr as u32,
+                (size >> 32) as u32,
+                size as u32,
+            ],
+        );
+    }
+    fn finish(mut self) -> Vec<u8> {
+        self.token(FDT_END);
+        let header_len = 40u32;
+        let memrsv_len = 16u32;
+        let off_struct = header_len + memrsv_len;
+        let off_strings = off_struct + self.structure.len() as u32;
+        let total = off_strings + self.strings.len() as u32;
+        let mut out = Vec::with_capacity(total as usize);
+        out.extend_from_slice(&FDT_MAGIC.to_be_bytes());
+        out.extend_from_slice(&total.to_be_bytes());
+        out.extend_from_slice(&off_struct.to_be_bytes());
+        out.extend_from_slice(&off_strings.to_be_bytes());
+        out.extend_from_slice(&header_len.to_be_bytes());
+        out.extend_from_slice(&FDT_VERSION.to_be_bytes());
+        out.extend_from_slice(&FDT_LAST_COMP_VERSION.to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&(self.strings.len() as u32).to_be_bytes());
+        out.extend_from_slice(&(self.structure.len() as u32).to_be_bytes());
+        out.extend_from_slice(&0u64.to_be_bytes());
+        out.extend_from_slice(&0u64.to_be_bytes());
+        out.extend_from_slice(&self.structure);
+        out.extend_from_slice(&self.strings);
+        out
+    }
+}
+
+#[cfg(test)]
+// The encoders below mirror the A64 fixed-field instruction layouts: a `0 << n`
+// marker shows a zero field at its bit position (`clippy::identity_op`), and the
+// register-class encoders take one argument per ISA operand field
+// (`clippy::too_many_arguments`). Both are intentional — they keep the encoders
+// legible against the Arm-ARM encoding tables.
+#[allow(clippy::identity_op, clippy::too_many_arguments)]
+mod tests {
+    use super::*;
+
+    // ── A64 instruction encoders (the Arm-ARM fixed-field layouts) ──────────
+    // Hand-encoding lets a battery assert against the Arm-ARM-defined final
+    // state with no external assembler — the same approach the RISC-V core's
+    // tests use for hand-assembled programs.
+
+    fn movz(sf: u32, rd: u32, imm: u32, hw: u32) -> u32 {
+        (sf << 31) | (0b10 << 29) | (0b100101 << 23) | (hw << 21) | ((imm & 0xffff) << 5) | rd
+    }
+    fn movn(sf: u32, rd: u32, imm: u32, hw: u32) -> u32 {
+        (sf << 31) | (0b00 << 29) | (0b100101 << 23) | (hw << 21) | ((imm & 0xffff) << 5) | rd
+    }
+    fn movk(sf: u32, rd: u32, imm: u32, hw: u32) -> u32 {
+        (sf << 31) | (0b11 << 29) | (0b100101 << 23) | (hw << 21) | ((imm & 0xffff) << 5) | rd
+    }
+    fn addsub_imm(sf: u32, op: u32, s: u32, rd: u32, rn: u32, imm12: u32, sh: u32) -> u32 {
+        (sf << 31)
+            | (op << 30)
+            | (s << 29)
+            | (0b100010 << 23)
+            | (sh << 22)
+            | ((imm12 & 0xfff) << 10)
+            | (rn << 5)
+            | rd
+    }
+    fn logical_imm(sf: u32, opc: u32, rd: u32, rn: u32, n: u32, immr: u32, imms: u32) -> u32 {
+        (sf << 31)
+            | (opc << 29)
+            | (0b100100 << 23)
+            | (n << 22)
+            | (immr << 16)
+            | (imms << 10)
+            | (rn << 5)
+            | rd
+    }
+    fn addsub_reg(
+        sf: u32,
+        op: u32,
+        s: u32,
+        rd: u32,
+        rn: u32,
+        rm: u32,
+        shift: u32,
+        amt: u32,
+    ) -> u32 {
+        (sf << 31)
+            | (op << 30)
+            | (s << 29)
+            | (0b01011 << 24)
+            | (shift << 22)
+            | (rm << 16)
+            | (amt << 10)
+            | (rn << 5)
+            | rd
+    }
+    fn addsub_ext(
+        sf: u32,
+        op: u32,
+        s: u32,
+        rd: u32,
+        rn: u32,
+        rm: u32,
+        option: u32,
+        imm3: u32,
+    ) -> u32 {
+        (sf << 31)
+            | (op << 30)
+            | (s << 29)
+            | (0b01011 << 24)
+            | (1 << 21)
+            | (rm << 16)
+            | (option << 13)
+            | (imm3 << 10)
+            | (rn << 5)
+            | rd
+    }
+    fn logical_reg(
+        sf: u32,
+        opc: u32,
+        n: u32,
+        rd: u32,
+        rn: u32,
+        rm: u32,
+        shift: u32,
+        amt: u32,
+    ) -> u32 {
+        (sf << 31)
+            | (opc << 29)
+            | (0b01010 << 24)
+            | (shift << 22)
+            | (n << 21)
+            | (rm << 16)
+            | (amt << 10)
+            | (rn << 5)
+            | rd
+    }
+    fn adc_sbc(sf: u32, op: u32, s: u32, rd: u32, rn: u32, rm: u32) -> u32 {
+        (sf << 31) | (op << 30) | (s << 29) | (0b11010000 << 21) | (rm << 16) | (rn << 5) | rd
+    }
+    fn three_src(sf: u32, op31: u32, o0: u32, rd: u32, rn: u32, rm: u32, ra: u32) -> u32 {
+        (sf << 31)
+            | (0b11011 << 24)
+            | (op31 << 21)
+            | (rm << 16)
+            | (o0 << 15)
+            | (ra << 10)
+            | (rn << 5)
+            | rd
+    }
+    fn two_src(sf: u32, opcode: u32, rd: u32, rn: u32, rm: u32) -> u32 {
+        (sf << 31) | (0b11010110 << 21) | (rm << 16) | (opcode << 10) | (rn << 5) | rd
+    }
+    fn one_src(sf: u32, opcode: u32, rd: u32, rn: u32) -> u32 {
+        (sf << 31) | (1 << 30) | (0b11010110 << 21) | (opcode << 10) | (rn << 5) | rd
+    }
+    fn csel(sf: u32, op: u32, o2: u32, rd: u32, rn: u32, rm: u32, cond: u32) -> u32 {
+        (sf << 31)
+            | (op << 30)
+            | (0b11010100 << 21)
+            | (rm << 16)
+            | (cond << 12)
+            | (o2 << 10)
+            | (rn << 5)
+            | rd
+    }
+    fn ccmp_reg(sf: u32, op: u32, rn: u32, rm: u32, cond: u32, nzcv: u32) -> u32 {
+        (sf << 31)
+            | (op << 30)
+            | (1 << 29)
+            | (0b11010010 << 21)
+            | (rm << 16)
+            | (cond << 12)
+            | (rn << 5)
+            | nzcv
+    }
+    fn bitfield(sf: u32, opc: u32, rd: u32, rn: u32, n: u32, immr: u32, imms: u32) -> u32 {
+        (sf << 31)
+            | (opc << 29)
+            | (0b100110 << 23)
+            | (n << 22)
+            | (immr << 16)
+            | (imms << 10)
+            | (rn << 5)
+            | rd
+    }
+    fn extr(sf: u32, rd: u32, rn: u32, rm: u32, n: u32, imms: u32) -> u32 {
+        (sf << 31) | (0b100111 << 23) | (n << 22) | (rm << 16) | (imms << 10) | (rn << 5) | rd
+    }
+    fn b(off_words: i32) -> u32 {
+        0x1400_0000 | ((off_words as u32) & 0x03ff_ffff)
+    }
+    fn bcond(cond: u32, off_words: i32) -> u32 {
+        0x5400_0000 | (((off_words as u32) & 0x7_ffff) << 5) | cond
+    }
+    fn cbnz(sf: u32, rt: u32, off_words: i32) -> u32 {
+        (sf << 31) | 0x3500_0000 | (((off_words as u32) & 0x7_ffff) << 5) | rt
+    }
+    fn ldst_uimm(size: u32, opc: u32, rt: u32, rn: u32, imm12: u32) -> u32 {
+        (size << 30) | 0x3900_0000 | (opc << 22) | ((imm12 & 0xfff) << 10) | (rn << 5) | rt
+    }
+    fn ldp_stp(opc: u32, l: u32, rt: u32, rt2: u32, rn: u32, imm7: i32) -> u32 {
+        (opc << 30)
+            | 0x2900_0000
+            | (l << 22)
+            | (((imm7 as u32) & 0x7f) << 15)
+            | (rt2 << 10)
+            | (rn << 5)
+            | rt
+    }
+    fn ret(rn: u32) -> u32 {
+        0xd65f_0000 | (rn << 5)
+    }
+    fn bl(off_words: i32) -> u32 {
+        0x9400_0000 | ((off_words as u32) & 0x03ff_ffff)
+    }
+    fn svc0() -> u32 {
+        0xd400_0001
+    }
+
+    const BASE: u64 = 0x4000_0000;
+
+    /// Assemble, load at `BASE`, run to exit, and return the `exit` status — the
+    /// value the battery left in `x0`. Panics if the program faults or runs away.
+    fn exit_code(prog: &[u32]) -> u64 {
+        let mut cpu = Cpu::new(BASE, 0x1_0000);
+        let mut img = Vec::new();
+        for w in prog {
+            img.extend_from_slice(&w.to_le_bytes());
+        }
+        cpu.load_image(&img);
+        match cpu.run(1_000_000) {
+            Halt::Exit(code) => code,
+            other => panic!("battery did not exit cleanly: {other:?}"),
+        }
+    }
+
+    /// The two-instruction epilogue: `MOV w8, #93 ; SVC #0` — exit with the
+    /// verdict already in `x0`.
+    fn exit_seq() -> [u32; 2] {
+        [movz(0, 8, 93, 0), svc0()]
+    }
+
+    fn prog(mut body: Vec<u32>) -> Vec<u32> {
+        body.extend_from_slice(&exit_seq());
+        body
+    }
+
+    #[test]
+    fn movz_movk_movn_compose_a_64bit_constant() {
+        // x0 = 0x1122_3344_5566_7788 via MOVZ + three MOVK.
+        let code = exit_code(&prog(vec![
+            movz(1, 0, 0x7788, 0),
+            movk(1, 0, 0x5566, 1),
+            movk(1, 0, 0x3344, 2),
+            movk(1, 0, 0x1122, 3),
+        ]));
+        assert_eq!(code, 0x1122_3344_5566_7788);
+        // MOVN w0, #0 -> 0xffff_ffff (32-bit, zero-extended).
+        assert_eq!(exit_code(&prog(vec![movn(0, 0, 0, 0)])), 0xffff_ffff);
+    }
+
+    #[test]
+    fn add_sub_immediate_and_flags() {
+        // 100 + 23 = 123.
+        assert_eq!(
+            exit_code(&prog(vec![
+                movz(1, 0, 100, 0),
+                addsub_imm(1, 0, 0, 0, 0, 23, 0)
+            ])),
+            123
+        );
+        // SUBS computing 5 - 5 sets Z; CSET via CSINC of XZR reads it back.
+        // x0 = (5-5==0) ? 1 : 0  → use SUBS then CSINC x0, xzr, xzr, NE (cond inverted).
+        let code = exit_code(&prog(vec![
+            movz(1, 1, 5, 0),
+            addsub_imm(1, 1, 1, 31, 1, 5, 0), // SUBS xzr, x1, #5  (CMP x1,#5)
+            csel(1, 0, 1, 0, 31, 31, 0b0001), // CSINC x0, xzr, xzr, NE → x0 = NE? 0 : 1 = Z
+        ]));
+        assert_eq!(code, 1, "Z flag set after 5-5");
+        // ADD with LSL #12 shift of the immediate (Rn=x1=0, since Rn=31 would be SP).
+        assert_eq!(
+            exit_code(&prog(vec![
+                movz(1, 1, 0, 0),
+                addsub_imm(1, 0, 0, 0, 1, 1, 1)
+            ])),
+            0x1000
+        );
+    }
+
+    #[test]
+    fn add_sub_shifted_and_extended_register() {
+        // x0 = (3 << 4) + 5 via ADD shifted register (LSL 4).
+        let code = exit_code(&prog(vec![
+            movz(1, 1, 3, 0),
+            movz(1, 2, 5, 0),
+            addsub_reg(1, 0, 0, 0, 2, 1, 0b00, 4),
+        ]));
+        assert_eq!(code, (3 << 4) + 5);
+        // Extended register: ADD x0, x1, w2, SXTB — sign-extend a byte then add.
+        let code = exit_code(&prog(vec![
+            movz(1, 1, 100, 0),
+            movn(0, 2, 0, 0), // w2 = 0xffff_ffff (byte 0xff = -1)
+            addsub_ext(1, 0, 0, 0, 1, 2, 0b100, 0), // SXTB → -1
+        ]));
+        assert_eq!(code, 99);
+    }
+
+    #[test]
+    fn logical_register_and_immediate() {
+        // ORR/AND/EOR shifted register.
+        let code = exit_code(&prog(vec![
+            movz(1, 1, 0xff00, 0),
+            movz(1, 2, 0x00ff, 0),
+            logical_reg(1, 0b01, 0, 0, 1, 2, 0, 0), // ORR
+        ]));
+        assert_eq!(code, 0xffff);
+        // BIC: x0 = 0xff & ~0x0f = 0xf0 (logical_reg with N=1).
+        let code = exit_code(&prog(vec![
+            movz(1, 1, 0xff, 0),
+            movz(1, 2, 0x0f, 0),
+            logical_reg(1, 0b00, 1, 0, 1, 2, 0, 0),
+        ]));
+        assert_eq!(code, 0xf0);
+        // AND immediate: x0 = 0x1234 & 0xff = 0x34. Encoding N=1,immr=0,imms=7 = 0xff.
+        let code = exit_code(&prog(vec![
+            movz(1, 1, 0x1234, 0),
+            logical_imm(1, 0b00, 0, 1, 1, 0, 7),
+        ]));
+        assert_eq!(code, 0x34);
+    }
+
+    #[test]
+    fn multiply_divide_and_high_products() {
+        // MUL (MADD with Ra=XZR): 7 * 6 = 42.
+        let code = exit_code(&prog(vec![
+            movz(1, 1, 7, 0),
+            movz(1, 2, 6, 0),
+            three_src(1, 0b000, 0, 0, 1, 2, 31),
+        ]));
+        assert_eq!(code, 42);
+        // MADD: 7*6 + 8 = 50.
+        let code = exit_code(&prog(vec![
+            movz(1, 1, 7, 0),
+            movz(1, 2, 6, 0),
+            movz(1, 3, 8, 0),
+            three_src(1, 0b000, 0, 0, 1, 2, 3),
+        ]));
+        assert_eq!(code, 50);
+        // UMULH of (1<<63)*2 = 1.
+        let code = exit_code(&prog(vec![
+            movz(1, 1, 0x8000, 3), // x1 = 1<<63
+            movz(1, 2, 2, 0),
+            three_src(1, 0b110, 0, 0, 1, 2, 31),
+        ]));
+        assert_eq!(code, 1);
+        // SDIV: -20 / 3 = -6 (truncated toward zero).
+        let code = exit_code(&prog(vec![
+            movn(1, 1, 19, 0), // x1 = ~19 = -20
+            movz(1, 2, 3, 0),
+            two_src(1, 0b000011, 0, 1, 2),
+        ]));
+        assert_eq!(code as i64, -6);
+        // UDIV by zero = 0 (the A64 result).
+        let code = exit_code(&prog(vec![
+            movz(1, 1, 5, 0),
+            two_src(1, 0b000010, 0, 1, 31),
+        ]));
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn variable_shifts_bitfield_and_extract() {
+        // LSLV: 1 << 40.
+        let code = exit_code(&prog(vec![
+            movz(1, 1, 1, 0),
+            movz(1, 2, 40, 0),
+            two_src(1, 0b001000, 0, 1, 2),
+        ]));
+        assert_eq!(code, 1u64 << 40);
+        // UBFX x0, x1, #8, #8  (UBFM immr=8, imms=15) extracts byte 1 of 0xAB_CD_EF.
+        let code = exit_code(&prog(vec![
+            movz(1, 1, 0xcdef, 0),
+            movk(1, 1, 0x00ab, 1),
+            bitfield(1, 0b10, 0, 1, 1, 8, 15),
+        ]));
+        assert_eq!(code, 0xcd);
+        // ASR via SBFM: -256 >> 4 = -16.
+        let code = exit_code(&prog(vec![
+            movn(1, 1, 0xff, 0),               // x1 = ~0xff = -256
+            bitfield(1, 0b00, 0, 1, 1, 4, 63), // SBFM immr=4, imms=63 → ASR #4
+        ]));
+        assert_eq!(code as i64, -16);
+        // EXTR x0, x1, x2, #16 — bottom 16 of x1 become top, top 48 of x2 the rest.
+        let code = exit_code(&prog(vec![
+            movz(1, 1, 0xaaaa, 0),
+            movz(1, 2, 0xbbbb, 0),
+            extr(1, 0, 1, 2, 1, 16),
+        ]));
+        assert_eq!(code, (0xaaaau64 << 48) | (0xbbbbu64 >> 16));
+    }
+
+    #[test]
+    fn one_source_bit_ops() {
+        // CLZ of (1<<60) = 3.
+        let code = exit_code(&prog(vec![
+            movz(1, 1, 0x1000, 3), // 1<<60
+            one_src(1, 0b000100, 0, 1),
+        ]));
+        assert_eq!(code, 3);
+        // RBIT of 1 = 1<<63.
+        let code = exit_code(&prog(vec![movz(1, 1, 1, 0), one_src(1, 0b000000, 0, 1)]));
+        assert_eq!(code, 1u64 << 63);
+        // REV (64-bit) of 0x1122_3344_5566_7788.
+        let code = exit_code(&prog(vec![
+            movz(1, 1, 0x7788, 0),
+            movk(1, 1, 0x5566, 1),
+            movk(1, 1, 0x3344, 2),
+            movk(1, 1, 0x1122, 3),
+            one_src(1, 0b000011, 0, 1),
+        ]));
+        assert_eq!(code, 0x8877_6655_4433_2211);
+    }
+
+    #[test]
+    fn add_with_carry_chains_128bit() {
+        // (0xffff_ffff_ffff_ffff + 1) as a 128-bit add: low = 0, high carries to 1.
+        // x1:x0 = -1 ; add 1 to low (ADDS sets C), ADC high (0)+0+C → 1.
+        let code = exit_code(&prog(vec![
+            movn(1, 0, 0, 0),                        // x0 = 0xffff...ffff
+            movz(1, 1, 0, 0),                        // x1 = 0 (high)
+            addsub_imm(1, 0, 1, 0, 0, 1, 0),         // ADDS x0, x0, #1 → x0=0, C=1
+            adc_sbc(1, 0, 0, 2, 1, 31),              // ADC x2, x1, xzr → x2 = 0+0+C = 1
+            logical_reg(1, 0b01, 0, 0, 2, 31, 0, 0), // ORR x0, x2, xzr (MOV x0,x2)
+        ]));
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn conditional_compare_select() {
+        // CMP x1,#10 ; CCMP x1,#20,#0,EQ — EQ false so flags = #0 (no flags). Then
+        // verify GT path via CSEL.  Simpler: x0 = (5 > 3) ? 111 : 222.
+        let code = exit_code(&prog(vec![
+            movz(1, 1, 5, 0),
+            movz(1, 2, 3, 0),
+            addsub_reg(1, 1, 1, 31, 1, 2, 0, 0), // SUBS xzr, x1, x2  (CMP)
+            movz(1, 3, 111, 0),
+            movz(1, 4, 222, 0),
+            csel(1, 0, 0, 0, 3, 4, 0b1100), // CSEL x0, x3, x4, GT
+        ]));
+        assert_eq!(code, 111);
+        // CCMP register: CMP x1,#1 (NE for !=) then CCMP feeding a fixed nzcv when
+        // the first condition is false.
+        let code = exit_code(&prog(vec![
+            movz(1, 1, 2, 0),
+            addsub_imm(1, 1, 1, 31, 1, 2, 0), // CMP x1,#2 → Z=1 (EQ)
+            ccmp_reg(1, 1, 1, 1, 0b0000, 0b0010), // CCMP x1,x1,#2,EQ → cond true → flags of x1-x1: Z=1,C=1
+            csel(1, 0, 1, 0, 31, 31, 0b0001),     // CSINC x0,xzr,xzr,NE → Z? 1:0
+        ]));
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn loads_stores_round_trip() {
+        // Store 0xdeadbeef to [sp,#-16]! style via a scratch area in RAM, reload.
+        // Use x1 as a base pointer into RAM (BASE + 0x800), store a dword, load it.
+        let code = exit_code(&prog(vec![
+            movz(1, 1, 0x0800, 0),
+            movk(1, 1, 0x4000, 1), // x1 = BASE + 0x800
+            movz(1, 2, 0xbeef, 0),
+            movk(1, 2, 0xdead, 1),    // x2 = 0xdead_beef
+            ldst_uimm(3, 0, 2, 1, 0), // STR x2, [x1]
+            ldst_uimm(3, 1, 0, 1, 0), // LDR x0, [x1]
+        ]));
+        assert_eq!(code, 0xdead_beef);
+        // STRB then LDRSB sign-extends 0xff to -1.
+        let code = exit_code(&prog(vec![
+            movz(1, 1, 0x0820, 0),
+            movk(1, 1, 0x4000, 1),
+            movn(1, 2, 0, 0),         // x2 = 0xffff...
+            ldst_uimm(0, 0, 2, 1, 0), // STRB w2, [x1]
+            ldst_uimm(0, 2, 0, 1, 0), // LDRSB x0, [x1]
+        ]));
+        assert_eq!(code as i64, -1);
+        // STP/LDP pair round trip.
+        let code = exit_code(&prog(vec![
+            movz(1, 1, 0x0840, 0),
+            movk(1, 1, 0x4000, 1),
+            movz(1, 2, 0x1111, 0),
+            movz(1, 3, 0x2222, 0),
+            ldp_stp(0b10, 0, 2, 3, 1, 0),        // STP x2, x3, [x1]
+            ldp_stp(0b10, 1, 4, 5, 1, 0),        // LDP x4, x5, [x1]
+            three_src(1, 0b000, 0, 0, 4, 31, 5), // x0 = x4*0 + x5? no: use ADD
+        ]));
+        // x4=0x1111, x5=0x2222; the MADD above gives x4*xzr + x5 = 0x2222.
+        assert_eq!(code, 0x2222);
+    }
+
+    #[test]
+    fn control_flow_loop_and_call() {
+        // Sum 1..=10 = 55 via a CBNZ countdown loop.
+        let code = exit_code(&prog(vec![
+            movz(1, 0, 0, 0),                   // 0: acc = 0
+            movz(1, 1, 10, 0),                  // 1: i = 10
+            addsub_reg(1, 0, 0, 0, 0, 1, 0, 0), // 2: acc += i   (loop top)
+            addsub_imm(1, 1, 0, 1, 1, 1, 0),    // 3: i -= 1
+            cbnz(1, 1, -2),                     // 4: if i != 0 → back to index 2
+        ]));
+        assert_eq!(code, 55);
+        // BL/RET: a subroutine that adds 1.
+        let code = exit_code(&prog(vec![
+            movz(1, 0, 41, 0),               // 0
+            bl(3),                           // 1: call index 4
+            movz(1, 8, 93, 0),               // 2: epilogue (exit)
+            svc0(),                          // 3
+            addsub_imm(1, 0, 0, 0, 0, 1, 0), // 4: x0 += 1
+            ret(30),                         // 5
+        ]));
+        assert_eq!(code, 42);
+    }
+
+    #[test]
+    fn unconditional_and_conditional_immediate_branches() {
+        // B skips a poison MOV.
+        let code = exit_code(&prog(vec![
+            movz(1, 0, 7, 0),   // 0
+            b(2),               // 1: → index 3 (the exit epilogue)
+            movz(1, 0, 999, 0), // 2: skipped
+        ]));
+        assert_eq!(code, 7);
+        // CMP then B.GT over a poison MOV.
+        let code = exit_code(&prog(vec![
+            movz(1, 1, 5, 0),
+            movz(1, 2, 3, 0),
+            addsub_reg(1, 1, 1, 31, 1, 2, 0, 0), // CMP x1, x2 → GT
+            bcond(0b1100, 2),                    // B.GT → index 5
+            movz(1, 0, 999, 0),                  // 4: skipped
+            movz(1, 0, 42, 0),                   // 5
+        ]));
+        assert_eq!(code, 42);
+    }
+
+    #[test]
+    fn tbz_tbnz_branches() {
+        // TBNZ on bit 3 of 0b1000 should branch (skip a SUB that would corrupt x0).
+        // Encode TBNZ x1, #3, +2 ; (skipped) MOVZ x0,#999 ; MOVZ x0,#7
+        let tbnz = (0u32 << 31) | 0x3700_0000 | (3 << 19) | (((2i32 as u32) & 0x3fff) << 5) | 1;
+        let code = exit_code(&prog(vec![
+            movz(1, 1, 0b1000, 0),
+            tbnz,
+            movz(1, 0, 999, 0),
+            movz(1, 0, 7, 0),
+        ]));
+        assert_eq!(code, 7);
+    }
+
+    #[test]
+    fn console_write_syscall() {
+        // write(1, msg, 2) where msg points at a 2-byte literal in RAM we store.
+        let mut cpu = Cpu::new(BASE, 0x1_0000);
+        let prog = prog(vec![
+            // store "OK" at BASE+0x900
+            movz(1, 1, 0x0900, 0),
+            movk(1, 1, 0x4000, 1),
+            movz(1, 2, 0x4b4f, 0),    // 'O'=0x4f,'K'=0x4b little-endian
+            ldst_uimm(1, 0, 2, 1, 0), // STRH w2,[x1]
+            movz(1, 0, 1, 0),         // fd = 1
+            logical_reg(1, 0b01, 0, 1, 1, 31, 0, 0), // x1 = buf (already), MOV via ORR
+            movz(1, 2, 2, 0),         // len = 2
+            movz(1, 8, 64, 0),        // write
+            svc0(),
+        ]);
+        let mut img = Vec::new();
+        for w in &prog {
+            img.extend_from_slice(&w.to_le_bytes());
+        }
+        cpu.load_image(&img);
+        assert_eq!(cpu.run(10_000), Halt::Exit(2));
+        assert_eq!(cpu.console(), b"OK");
+    }
+
+    #[test]
+    fn adr_yields_its_own_pc() {
+        // ADR x0, . → x0 = BASE (the instruction's address).
+        let adr = (0u32 << 31) | (0 << 29) | (0b10000 << 24) | (0 << 5);
+        assert_eq!(exit_code(&prog(vec![adr])), BASE);
+    }
+
+    #[test]
+    fn decode_bit_masks_matches_known_immediates() {
+        // 0xff: N=1, immr=0, imms=7.
+        assert_eq!(decode_bit_masks(1, 7, 0, 64, true).unwrap().0, 0xff);
+        // 0x5555_5555_5555_5555: N=0, imms=0x3c, immr=0 → esize-2 pattern `01` repeated.
+        assert_eq!(
+            decode_bit_masks(0, 0x3c, 0, 64, true).unwrap().0,
+            0x5555_5555_5555_5555
+        );
+        // N=0, imms=0, immr=0 → esize-32 pattern with a single low bit set.
+        assert_eq!(
+            decode_bit_masks(0, 0, 0, 64, true).unwrap().0,
+            0x0000_0001_0000_0001
+        );
+        // The all-ones reserved logical immediate is rejected.
+        assert!(decode_bit_masks(1, 63, 0, 64, true).is_none());
+    }
+}
