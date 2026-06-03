@@ -32,9 +32,19 @@ const BOOTSTRAP_PIN = "@vscode/test-web@0.0.80";
 // so the web-capable ones install from Open VSX on launch; a non-web extension is
 // the workbench's own "unsupported" badge (the remote-model path, ADR-015) — never
 // a silent drop. `extensionIds` may also arrive per-launch via `?ext=a.b,c.d`.
-function runtimeConfig(extensionIds) {
+//
+// The launched holospace's IDENTITY (its κ) arrives per-launch via `?id=<κ>` (the
+// Platform Manager opens `workbench.html?id=<κ>&name=…`). That κ is carried into
+// the workspace folder URI's *authority* — `holospace://<κ>/workspace` — so the
+// workbench is the workspace OF THAT holospace, not a where-addressed "/workspace"
+// shared by every tab. The holospace-fs extension reads the κ from the folder and
+// keys all per-instance durable state (the OPFS resume snapshot, CC-31) by it, so
+// distinct holospaces never bleed into one another (identity is what-not-where,
+// Law L1; ADR-019). No `?id` (the single-holospace demo) → authority "" → the one
+// default slot.
+export function runtimeConfig(extensionIds) {
   const ids = JSON.stringify(extensionIds || []);
-  return `<script>(function(){var loc=window.location;var dir=loc.pathname.replace(/\\/[^/]*$/,"");var declared=${ids};var q=new URLSearchParams(loc.search).get("ext");if(q){declared=declared.concat(q.split(",").filter(Boolean));}var gallery=declared.map(function(id){return {id:id};});var cfg={folderUri:{"$mid":1,scheme:"holospace",authority:"",path:"/workspace"},additionalBuiltinExtensions:[{scheme:loc.protocol.replace(":",""),authority:loc.host,path:dir+"/ext/holospace-fs"}].concat(gallery),productConfiguration:{nameShort:"holospaces VS Code",nameLong:"holospaces VS Code",applicationName:"code-web",version:"1.91.1",extensionsGallery:{serviceUrl:"https://open-vsx.org/vscode/gallery",itemUrl:"https://open-vsx.org/vscode/item",resourceUrlTemplate:"https://open-vsx.org/vscode/unpkg/{publisher}/{name}/{version}/{path}"}}};document.getElementById("vscode-workbench-web-configuration").setAttribute("data-settings",JSON.stringify(cfg));})();</script>`;
+  return `<script>(function(){var loc=window.location;var dir=loc.pathname.replace(/\\/[^/]*$/,"");var declared=${ids};var sp=new URLSearchParams(loc.search);var q=sp.get("ext");if(q){declared=declared.concat(q.split(",").filter(Boolean));}var id=sp.get("id")||"";var gallery=declared.map(function(id){return {id:id};});var cfg={folderUri:{"$mid":1,scheme:"holospace",authority:id,path:"/workspace"},additionalBuiltinExtensions:[{scheme:loc.protocol.replace(":",""),authority:loc.host,path:dir+"/ext/holospace-fs"}].concat(gallery),productConfiguration:{nameShort:"holospaces VS Code",nameLong:"holospaces VS Code",applicationName:"code-web",version:"1.91.1",extensionsGallery:{serviceUrl:"https://open-vsx.org/vscode/gallery",itemUrl:"https://open-vsx.org/vscode/item",resourceUrlTemplate:"https://open-vsx.org/vscode/unpkg/{publisher}/{name}/{version}/{path}"}}};document.getElementById("vscode-workbench-web-configuration").setAttribute("data-settings",JSON.stringify(cfg));})();</script>`;
 }
 
 /**

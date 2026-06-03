@@ -28,3 +28,10 @@ cargo test --manifest-path "$ROOT/Cargo.toml" -p holospaces \
 cargo test --release --manifest-path "$ROOT/Cargo.toml" -p holospaces \
     --test cc30_resume a_suspended_real_linux_machine_resumes_to_the_identical_boot \
     -- --ignored --nocapture || exit 1
+# CC-31 resume terminal: the deployed devcontainer, suspended at its *idle shell*
+# (the steady state the periodic snapshot actually captures — not mid-boot),
+# resumes to a LIVE machine, and the machine snapshot is κ-pure (the console
+# scrollback is a terminal concern, not machine state). Release; boots the
+# devcontainer to userspace.
+cargo test --release --manifest-path "$ROOT/Cargo.toml" -p holospaces \
+    --test cc31_resume_terminal -- --ignored --nocapture || exit 1

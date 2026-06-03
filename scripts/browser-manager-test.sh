@@ -68,6 +68,9 @@ node devcontainer-test.mjs
 echo "==> running the devcontainer resume test in Chromium (CC-30/CC-31: suspend → κ snapshot → gzip → OPFS → reload → verify(L5) → resume, workspace intact)"
 node resume-test.mjs
 
+echo "==> running the multi-holospace snapshot-keying test (CC-31: each holospace's resume state is keyed by its identity κ — distinct holospaces never share an OPFS slot/bleed)"
+node snapshot-keying-test.mjs
+
 echo "==> running the raw terminal test in Chromium (CC-11: raw keystrokes echoed/edited by the guest tty, Ctrl-C interrupts, delta streaming)"
 node terminal-test.mjs
 
