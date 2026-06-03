@@ -2,7 +2,9 @@ build/
 src/arc42/images/
 tools/structurizr.war
 tools/pandoc.deb
+tools/pandoc-*.deb
 tools/pandoc-prefix/
+tools/playwright-browsers/
 tools/bin/
 tools/cmark-gfm-src/
 tools/cmark-prefix/

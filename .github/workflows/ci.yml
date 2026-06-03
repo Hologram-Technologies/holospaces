@@ -1,8 +1,9 @@
 name: ci
 
 # The repository upholds the documented quality commitments (arc42 ch.10) from
-# the beginning: every change runs the V&V (CS spec conformance + CC component
-# conformance) alongside the Rust quality gates and the test tiers.
+# the beginning: every change runs the V&V conformance gates (CS spec
+# conformance + CC component conformance) alongside the Rust quality gates and
+# the test tiers. Release publishes also run the performance/throughput gate.
 #
 # holospaces consumes the private hologram substrate as a pinned git dependency
 # (ADR-006). Each job configures git with the org-level secret `HOLOGRAM` (a
@@ -15,6 +16,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  release:
+    types: [published]
 
 jobs:
   vv:
@@ -67,7 +70,13 @@ jobs:
           key: doc-tools-${{ hashFiles('docs/tools/checksums.txt', 'docs/scripts/install-tools.sh') }}
       - name: Provision the pinned doc toolchain
         run: docs/scripts/install-tools.sh
-      - name: V&V (CS-1..CS-6 + CC-1..CC-5)
+      - name: V&V (CS + CC, without release performance gate)
+        if: github.event_name != 'release'
+        env:
+          HOLOSPACES_SKIP_PERF: '1'
+        run: vv/run.sh
+      - name: V&V (CS + CC + release performance gate)
+        if: github.event_name == 'release'
         run: vv/run.sh
 
   rust:

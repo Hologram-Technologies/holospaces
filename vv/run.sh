@@ -35,6 +35,10 @@ for suite in "$ROOT"/vv/suites/*.sh; do
     [ -e "$suite" ] || continue
     name="$(basename "$suite" .sh)"
     echo "  • $name"
+    if [ "${HOLOSPACES_SKIP_PERF:-0}" = "1" ] && [[ "$name" == perf-* ]]; then
+        echo "    SKIP ($name — performance gate runs on release CI)"
+        continue
+    fi
     "$suite"
     rc=$?
     if [ "$rc" -eq 0 ]; then
