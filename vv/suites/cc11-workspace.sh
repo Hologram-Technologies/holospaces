@@ -32,6 +32,13 @@ cargo test --release --manifest-path "$ROOT/Cargo.toml" -p holospaces \
     --test cc11_workspace the_workspace_drives_a_running_linux_terminal \
     -- --ignored --nocapture || exit 1
 
+# The *raw interactive terminal* on the deployed devcontainer: raw keystrokes are
+# echoed + line-edited by the guest tty, and Ctrl-C raises SIGINT in the
+# foreground process (the controlling-terminal / signal contract a real terminal
+# has). Boots the CC-22 BusyBox devcontainer (~release).
+cargo test --release --manifest-path "$ROOT/Cargo.toml" -p holospaces \
+    --test cc11_raw_terminal -- --ignored --nocapture || exit 1
+
 # The differential oracle, when the reference is available: the same interactive
 # Image, fed input.txt after boot, must produce expected-session.txt on
 # qemu-system-riscv64 (echo disabled so the session is deterministic). Re-derives

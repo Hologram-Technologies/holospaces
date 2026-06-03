@@ -522,6 +522,10 @@ pub struct Workspace {
     channel: Vec<Kappa>,
     files: std::collections::BTreeMap<String, Kappa>,
     halted: bool,
+    /// The next unread byte of the console buffer — the cursor [`Workspace::terminal_delta`]
+    /// advances, so the integrated terminal streams only newly-produced output
+    /// instead of re-reading the whole console each tick.
+    console_cursor: usize,
 }
 
 #[wasm_bindgen]
@@ -547,6 +551,7 @@ impl Workspace {
             channel: Vec::new(),
             files: std::collections::BTreeMap::new(),
             halted: false,
+            console_cursor: 0,
         })
     }
 
@@ -570,6 +575,7 @@ impl Workspace {
             channel: Vec::new(),
             files: std::collections::BTreeMap::new(),
             halted: false,
+            console_cursor: 0,
         })
     }
 
@@ -596,6 +602,7 @@ impl Workspace {
             channel: Vec::new(),
             files: std::collections::BTreeMap::new(),
             halted: false,
+            console_cursor: 0,
         })
     }
 
@@ -624,6 +631,7 @@ impl Workspace {
             channel: Vec::new(),
             files: std::collections::BTreeMap::new(),
             halted: false,
+            console_cursor: 0,
         })
     }
 
@@ -678,6 +686,33 @@ impl Workspace {
             self.halted = true;
         }
         event.as_str().to_owned()
+    }
+
+    /// Feed **raw terminal input** to the running holospace — the bytes an
+    /// interactive terminal delivers for each keystroke, *unbuffered*: ordinary
+    /// characters, control bytes (Ctrl-C = `0x03`, Ctrl-D = `0x04`), and escape
+    /// sequences (arrows, Home/End). Unlike [`Workspace::type_line`] this does not
+    /// line-buffer or block: the bytes go to the guest console and the caller's
+    /// render loop ([`Workspace::run`] + [`Workspace::terminal_delta`]) advances
+    /// the machine, so the guest's own tty echoes and edits the line and Ctrl-C
+    /// raises SIGINT — a real terminal, not a line submitter. The input is part of
+    /// the machine's canonical state (it is captured in the κ snapshot), so the
+    /// session stays reproducible (Law L1).
+    pub fn feed_input(&mut self, bytes: &[u8]) {
+        self.machine.feed_console(bytes);
+    }
+
+    /// The console bytes produced **since the last call** (an internal cursor),
+    /// for the integrated terminal's render loop. Returning only the delta avoids
+    /// re-reading and re-encoding the whole console each tick — output stays O(new
+    /// bytes), not O(total) per frame. Returns raw bytes (the terminal decodes
+    /// them); [`Workspace::terminal`] still returns the full buffer for tests.
+    pub fn terminal_delta(&mut self) -> Vec<u8> {
+        let console = self.machine.console();
+        let from = self.console_cursor.min(console.len());
+        let delta = console[from..].to_vec();
+        self.console_cursor = console.len();
+        delta
     }
 
     /// The running holospace's κ snapshot — its canonical state (Law L1/L3/L5).

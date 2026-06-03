@@ -61,6 +61,9 @@ node devcontainer-test.mjs
 echo "==> running the devcontainer resume test in Chromium (CC-30/CC-31: suspend → κ snapshot → gzip → OPFS → reload → verify(L5) → resume, workspace intact)"
 node resume-test.mjs
 
+echo "==> running the raw terminal test in Chromium (CC-11: raw keystrokes echoed/edited by the guest tty, Ctrl-C interrupts, delta streaming)"
+node terminal-test.mjs
+
 echo "==> running the devcontainer network test in Chromium (CC-16: virtio-net + userspace NAT, egress tunnelled over a WebSocket relay)"
 node devcontainer-net-test.mjs
 
