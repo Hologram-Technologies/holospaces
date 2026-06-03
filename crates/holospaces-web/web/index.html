@@ -151,7 +151,8 @@
           // Launch the Workspace Projection in a new tab — the REAL VS Code web
           // workbench over the running holospace (CC-17; ADR-012 supersedes the
           // CC-13 Monaco fallback at workspace.html).
-          window.open(`workbench.html?id=${encodeURIComponent(k)}&name=${encodeURIComponent(m.name)}`, "_blank");
+          const ext = m.extensions && m.extensions.length ? "&ext=" + encodeURIComponent(m.extensions.join(",")) : "";
+          window.open(`workbench.html?id=${encodeURIComponent(k)}&name=${encodeURIComponent(m.name)}${ext}`, "_blank");
           toast("entering " + m.name + " — the VS Code workbench opens in a new tab");
         } else if (act === "suspend") {
           // Real: publish a lifecycle configuration the instance applies (no stub).
@@ -185,10 +186,16 @@
 
       $("create").onclick = () => {
         const name = $("hname").value.trim() || "devcontainer";
-        const json = new TextEncoder().encode($("dcjson").value);
+        const text = $("dcjson").value;
+        const json = new TextEncoder().encode(text);
         try {
           const k = console0.provision_devcontainer(json, 128 * 1024 * 1024);
-          meta.set(k, { name, source: "devcontainer", status: "stopped" });
+          // The devcontainer's declared VS Code extensions
+          // (customizations.vscode.extensions, CC-4): carried to the workbench on
+          // launch, which installs the web-capable ones from the open gallery.
+          let extensions = [];
+          try { extensions = JSON.parse(text)?.customizations?.vscode?.extensions || []; } catch {}
+          meta.set(k, { name, source: "devcontainer", status: "stopped", extensions });
           render();
           toast("provisioned " + name + " → " + k.slice(0, 28) + "…");
         } catch (e) {
