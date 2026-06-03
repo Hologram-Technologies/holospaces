@@ -50,6 +50,7 @@ if command -v qemu-system-aarch64 >/dev/null 2>&1; then
             echo "cc37-aarch64-devcontainer: qemu-system-aarch64 differential PASS (stock arm64 binary ran)"
         else
             echo "cc37-aarch64-devcontainer: qemu-system-aarch64 differential FAILED" >&2
+            echo "── qemu console (tail) ──" >&2; tail -40 "$tmp/qemu.log" >&2
             rm -rf "$tmp"; exit 1
         fi
     else
