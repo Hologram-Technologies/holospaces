@@ -47,12 +47,20 @@ if command -v qemu-system-aarch64 >/dev/null 2>&1; then
     timeout 90 qemu-system-aarch64 -M virt -cpu cortex-a57 -m 512M -nographic \
         -kernel "$tmp/Image" -append "console=ttyAMA0" 2>&1 \
         | tr -d '\r' > "$tmp/qemu.log"
-    if grep -aq 'HOLOSPACES-LINUX-USERSPACE-OK' "$tmp/qemu.log" \
-       && diff <(grep -aA1 'HOLOSPACES-LINUX-USERSPACE-OK' "$tmp/qemu.log" | head -2) \
-               "$LINUX/expected-userspace.txt" >/dev/null; then
+    # Each expected userspace line (the marker + the real /proc/version) must
+    # appear in qemu's console — checked independently rather than by adjacency,
+    # since the kernel's own console messages can interleave between PID 1's
+    # writes (a timing-dependent ordering that is not part of the oracle).
+    ok=1
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        grep -aqF "$line" "$tmp/qemu.log" || ok=0
+    done < "$LINUX/expected-userspace.txt"
+    if [ "$ok" = 1 ]; then
         echo "cc36-aarch64-linux: qemu-system-aarch64 differential PASS (oracle current)"
     else
         echo "cc36-aarch64-linux: qemu-system-aarch64 differential FAILED — oracle drift" >&2
+        echo "── qemu console (tail) ──" >&2; tail -40 "$tmp/qemu.log" >&2
         rm -rf "$tmp"; exit 1
     fi
     rm -rf "$tmp"

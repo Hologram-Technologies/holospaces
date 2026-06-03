@@ -70,18 +70,21 @@ jobs:
           key: doc-tools-${{ hashFiles('docs/tools/checksums.txt', 'docs/scripts/install-tools.sh') }}
       - name: Provision the pinned doc toolchain
         run: docs/scripts/install-tools.sh
-      - name: Provision the differential oracles (QEMU) + cross assemblers
+      - name: Provision the differential oracles (QEMU) + the AArch64 cross toolchain
         # The CC component suites validate the holospaces emulator against QEMU as
-        # the differential oracle — qemu-system-riscv64 (CC-9/14/15/16/…) and
-        # qemu-system-aarch64 + qemu-aarch64 (CC-35/36/37) — and assemble the
-        # CC-35 A64 batteries with LLVM's cross assembler. Installing them here
-        # makes the differentials run for real (strict V&V) rather than fall back
-        # to the committed pins; each suite is SKIP-aware if an oracle is absent.
+        # the differential oracle — qemu-system-riscv64 (CC-9/14/15/16/…),
+        # qemu-system-aarch64 + qemu-aarch64 (CC-35/36/37) — and build the CC-35
+        # A64 batteries as static `_start` ELFs with the aarch64 cross GCC
+        # (`gcc-aarch64-linux-gnu`, which also provides the `as`/`ld`/`objcopy`
+        # binutils). Installed WITH recommends (matching a stock workstation: the
+        # QEMU firmware/machine data the `virt` boards expect), so every
+        # differential runs for real (strict V&V) instead of falling back to the
+        # committed pins. Each suite is still SKIP-aware if an oracle is absent.
         run: |
           sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             qemu-system-arm qemu-system-misc qemu-user \
-            binutils-aarch64-linux-gnu binutils-riscv64-linux-gnu llvm
+            gcc-aarch64-linux-gnu
       - name: V&V (CS + CC, without release performance gate)
         if: github.event_name != 'release'
         env:
