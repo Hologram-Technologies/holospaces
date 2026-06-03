@@ -24,15 +24,25 @@ const BOOTSTRAP_PIN = "@vscode/test-web@0.0.80";
 // from `window.location`, so the same HTML works at any origin/path (a user site
 // at the root, or a project site under `/<repo>/`). It opens the holospace
 // workspace folder, registers `holospace-fs` as a builtin (located beside this
-// page), and wires the OPEN gallery (Open VSX) — arbitrary extensions, no lock-in.
-const RUNTIME_CONFIG = `<script>(function(){var loc=window.location;var dir=loc.pathname.replace(/\\/[^/]*$/,"");var cfg={folderUri:{"$mid":1,scheme:"holospace",authority:"",path:"/workspace"},additionalBuiltinExtensions:[{scheme:loc.protocol.replace(":",""),authority:loc.host,path:dir+"/ext/holospace-fs"}],productConfiguration:{nameShort:"holospaces VS Code",nameLong:"holospaces VS Code",applicationName:"code-web",version:"1.91.1",extensionsGallery:{serviceUrl:"https://open-vsx.org/vscode/gallery",itemUrl:"https://open-vsx.org/vscode/item",resourceUrlTemplate:"https://open-vsx.org/vscode/unpkg/{publisher}/{name}/{version}/{path}"}}};document.getElementById("vscode-workbench-web-configuration").setAttribute("data-settings",JSON.stringify(cfg));})();</script>`;
+// page), wires the OPEN gallery (Open VSX) — arbitrary extensions, no lock-in —
+// and **auto-installs the devcontainer's declared web extensions** by listing them
+// in `additionalBuiltinExtensions` as gallery ids (the same mechanism vscode.dev /
+// Codespaces use to pre-install a workspace's extensions). A devcontainer.json's
+// `customizations.vscode.extensions` (parsed by `CC-4`) flows here as `extensionIds`,
+// so the web-capable ones install from Open VSX on launch; a non-web extension is
+// the workbench's own "unsupported" badge (the remote-model path, ADR-015) — never
+// a silent drop. `extensionIds` may also arrive per-launch via `?ext=a.b,c.d`.
+function runtimeConfig(extensionIds) {
+  const ids = JSON.stringify(extensionIds || []);
+  return `<script>(function(){var loc=window.location;var dir=loc.pathname.replace(/\\/[^/]*$/,"");var declared=${ids};var q=new URLSearchParams(loc.search).get("ext");if(q){declared=declared.concat(q.split(",").filter(Boolean));}var gallery=declared.map(function(id){return {id:id};});var cfg={folderUri:{"$mid":1,scheme:"holospace",authority:"",path:"/workspace"},additionalBuiltinExtensions:[{scheme:loc.protocol.replace(":",""),authority:loc.host,path:dir+"/ext/holospace-fs"}].concat(gallery),productConfiguration:{nameShort:"holospaces VS Code",nameLong:"holospaces VS Code",applicationName:"code-web",version:"1.91.1",extensionsGallery:{serviceUrl:"https://open-vsx.org/vscode/gallery",itemUrl:"https://open-vsx.org/vscode/item",resourceUrlTemplate:"https://open-vsx.org/vscode/unpkg/{publisher}/{name}/{version}/{path}"}}};document.getElementById("vscode-workbench-web-configuration").setAttribute("data-settings",JSON.stringify(cfg));})();</script>`;
+}
 
 /**
  * Compose the workbench HTML. `baseUrl` is where the vscode-web dist is served
  * relative to the page (`.` when the dist is at the page's directory, `./workbench`
  * when it is in a `workbench/` subdirectory).
  */
-export async function composeWorkbenchHtml({ distDir, twDir, baseUrl }) {
+export async function composeWorkbenchHtml({ distDir, twDir, baseUrl, extensions = [] }) {
   const tpl = await readFile(path.join(distDir, "out/vs/code/browser/workbench/workbench.html"), "utf8");
   // The supported web-embedding bootstrap — it reads the web-configuration meta
   // and calls the workbench's `create()` (the dist's stock `workbench.js` is the
@@ -64,7 +74,7 @@ export async function composeWorkbenchHtml({ distDir, twDir, baseUrl }) {
   // Fill the config at runtime (after the meta, before the bootstrap).
   html = html.replace(
     '<meta id="vscode-workbench-web-configuration" data-settings="{}">',
-    '<meta id="vscode-workbench-web-configuration" data-settings="{}">\n' + RUNTIME_CONFIG,
+    '<meta id="vscode-workbench-web-configuration" data-settings="{}">\n' + runtimeConfig(extensions),
   );
   // Swap the dist's server bootstrap for the supported web `create()` bootstrap.
   html = html.replace(/<script src="[^"]*workbench\/workbench\.js"><\/script>/, `<script>${twMain}</script>`);

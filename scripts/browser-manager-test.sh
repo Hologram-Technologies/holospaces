@@ -75,3 +75,17 @@ node vscode-workbench-fs-test.mjs
 
 echo "==> running the VS Code extension test in Chromium (CC-19 foundation: a real extension activates in the real workbench)"
 node vscode-extension-test.mjs
+
+echo "==> running the extensions marketplace test in Chromium (CC-19: the gallery displays + lists real extensions from Open VSX)"
+# Compose the deployed workbench (workbench.html + dist + holospace-fs) and stage
+# the peer assets so the real config is exercised, then drive the marketplace.
+HS_SITE="$(mktemp -d)"
+node build-workbench.mjs "$HS_SITE"
+cp -r pkg "$HS_SITE/pkg"
+cp index.html "$HS_SITE/" 2>/dev/null || true
+cp devcontainer-kernel.gz devcontainer-layer.tar.gz "$HS_SITE/" 2>/dev/null || true
+node marketplace-test.mjs "$HS_SITE"
+rm -rf "$HS_SITE"
+
+echo "==> running the devcontainer-extensions test in Chromium (CC-19: a devcontainer's declared web extensions auto-install from Open VSX)"
+node extensions-test.mjs
