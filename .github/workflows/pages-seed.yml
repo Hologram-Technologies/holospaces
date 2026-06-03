@@ -1,0 +1,55 @@
+name: pages-seed
+
+# One-shot helper to (re)seed the `gh-pages` branch **root** with the production
+# Platform Manager built from a chosen ref (default `main`). Run this once when
+# adopting the gh-pages-branch Pages model — BEFORE switching Settings → Pages →
+# Source to "Deploy from a branch → gh-pages /(root)" — so production is served
+# from a complete, pristine build with no gap, and per-PR previews
+# (`pr-preview/**`) are preserved. Manual (workflow_dispatch) only.
+#
+# The build LOGIC (the `build-site` composite) is taken from the ref this
+# workflow runs on; the site CONTENT is built from `inputs.ref` (checked out at
+# the workspace root, where the composite's commands run).
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: The git ref to build the production site from.
+        required: false
+        default: main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pages-production
+  cancel-in-progress: false
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the content to build (at the workspace root)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Check out the build logic (this workflow's ref)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          path: _build-logic
+      - name: Build the production site from the requested ref
+        uses: ./_build-logic/.github/actions/build-site
+        with:
+          hologram-token: ${{ secrets.HOLOGRAM }}
+          out-dir: ${{ github.workspace }}/_site
+      - name: Deploy to the gh-pages root (seed production)
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          folder: _site
+          branch: gh-pages
+          clean: true
+          clean-exclude: |
+            pr-preview/**
+          commit-message: "seed: gh-pages root from ${{ inputs.ref }}"
