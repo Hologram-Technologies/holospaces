@@ -36,6 +36,8 @@ use alloc::collections::BTreeMap;
 #[cfg(not(feature = "std"))]
 #[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
+use hologram_store_mem::MemKappaStore;
+use hologram_substrate_core::{KappaLabel71, KappaStore};
 
 pub mod net;
 
@@ -516,6 +518,121 @@ impl Plic {
     }
 }
 
+/// The byte size of a disk sector (`virtio-blk` LBA unit).
+const DISK_SECTOR: usize = 512;
+
+/// The system emulator's block-device backing — the **κ-disk** (`CC-7`): every
+/// 512-byte sector is *content-addressed in an owned [`KappaStore`]*, not held as
+/// an in-RAM image. The KappaStore IS the memory (Law L3): identical sectors dedup
+/// to one κ, an all-zero sector is sparse (stored as `None`, never put), and every
+/// read/write goes through the store — the substrate, not a second medium (Law
+/// L4). This is the same κ-addressed block device as [`crate::disk`], owned and
+/// sync for the emulator's hot path. The disk snapshot is the reconstructed image
+/// (content captured), so resume is faithful.
+struct KappaBacking {
+    /// The owned in-memory canonical store backing the sectors (the substrate).
+    store: MemKappaStore,
+    /// One entry per sector: the sector's content κ, or `None` for a sparse
+    /// (never-written, all-zero) sector.
+    index: Vec<Option<KappaLabel71>>,
+}
+
+impl KappaBacking {
+    /// Load a disk image into the κ-disk: each 512-byte sector is content-addressed
+    /// in the store (all-zero sectors stay sparse). The image is padded to a sector
+    /// boundary.
+    fn from_image(image: &[u8]) -> Self {
+        let sector_count = image.len().div_ceil(DISK_SECTOR);
+        let store = MemKappaStore::new();
+        let mut index = Vec::with_capacity(sector_count);
+        let mut sector = [0u8; DISK_SECTOR];
+        for i in 0..sector_count {
+            let start = i * DISK_SECTOR;
+            let end = (start + DISK_SECTOR).min(image.len());
+            sector.fill(0);
+            sector[..end - start].copy_from_slice(&image[start..end]);
+            index.push(Self::store_sector(&store, &sector));
+        }
+        KappaBacking { store, index }
+    }
+
+    /// Content-address a sector through the store (sparse all-zero → `None`).
+    fn store_sector(store: &MemKappaStore, sector: &[u8; DISK_SECTOR]) -> Option<KappaLabel71> {
+        if sector.iter().all(|&b| b == 0) {
+            None
+        } else {
+            Some(store.put("blake3", sector).expect("κ-disk: put sector"))
+        }
+    }
+
+    /// The disk capacity in bytes.
+    fn len(&self) -> usize {
+        self.index.len() * DISK_SECTOR
+    }
+
+    /// Read sector `i` (sparse → zeros) as a 512-byte block.
+    fn read_sector(&self, i: usize) -> [u8; DISK_SECTOR] {
+        let mut out = [0u8; DISK_SECTOR];
+        if let Some(k) = &self.index[i] {
+            let bytes = self
+                .store
+                .get(k)
+                .ok()
+                .flatten()
+                .expect("κ-disk: a sector's content resolves for its κ");
+            out.copy_from_slice(bytes.as_ref());
+        }
+        out
+    }
+
+    /// Read `buf.len()` bytes from byte offset `off` (spanning sectors).
+    fn read_into(&self, off: usize, buf: &mut [u8]) {
+        let mut done = 0;
+        while done < buf.len() {
+            let pos = off + done;
+            let sector = self.read_sector(pos / DISK_SECTOR);
+            let so = pos % DISK_SECTOR;
+            let n = (DISK_SECTOR - so).min(buf.len() - done);
+            buf[done..done + n].copy_from_slice(&sector[so..so + n]);
+            done += n;
+        }
+    }
+
+    /// Write `data` at byte offset `off` (read-modify-write per affected sector,
+    /// re-content-addressing each touched sector through the store).
+    fn write_from(&mut self, off: usize, data: &[u8]) {
+        let mut done = 0;
+        while done < data.len() {
+            let pos = off + done;
+            let si = pos / DISK_SECTOR;
+            let mut sector = self.read_sector(si);
+            let so = pos % DISK_SECTOR;
+            let n = (DISK_SECTOR - so).min(data.len() - done);
+            sector[so..so + n].copy_from_slice(&data[done..done + n]);
+            self.index[si] = Self::store_sector(&self.store, &sector);
+            done += n;
+        }
+    }
+
+    /// Reconstruct the full disk image — the self-contained snapshot of the disk
+    /// content (the live store dedups; the snapshot captures the bytes).
+    fn to_image(&self) -> Vec<u8> {
+        let mut image = vec![0u8; self.len()];
+        for (i, slot) in self.index.iter().enumerate() {
+            if let Some(k) = slot {
+                let bytes = self
+                    .store
+                    .get(k)
+                    .ok()
+                    .flatten()
+                    .expect("κ-disk: a sector's content resolves for its κ");
+                image[i * DISK_SECTOR..(i + 1) * DISK_SECTOR].copy_from_slice(bytes.as_ref());
+            }
+        }
+        image
+    }
+}
+
 /// The VirtIO **block device** over the **virtio-mmio** transport (modern /
 /// version 2, OASIS VirtIO v1.2). Its backing store is the root filesystem
 /// image (the κ-disk's content, `CC-7`); a guest kernel mounts it over
@@ -524,9 +641,9 @@ impl Plic {
 /// data → status), serve it against the disk, write the used ring, and raise
 /// the PLIC interrupt (`CC-14`).
 struct VirtioBlk {
-    /// The backing disk image — the assembled rootfs (`CC-7` content). Reads and
-    /// writes hit this directly; it is part of the machine's reproducible state.
-    disk: Vec<u8>,
+    /// The backing disk — the assembled rootfs as κ-addressed content (`CC-7`):
+    /// every sector lives in the store, not an in-RAM image (Law L3/L4).
+    disk: KappaBacking,
     /// Device status (the guest's driver progresses ACKNOWLEDGE→DRIVER→…→OK).
     status: u32,
     /// `DeviceFeaturesSel` / `DriverFeaturesSel` (which 32-bit feature word).
@@ -554,7 +671,15 @@ struct VirtioBlk {
 }
 
 impl VirtioBlk {
-    fn new(disk: Vec<u8>) -> Self {
+    /// Construct from a disk *image*, content-addressing it into the κ-disk.
+    fn new(image: Vec<u8>) -> Self {
+        Self::with_backing(KappaBacking::from_image(&image))
+    }
+
+    /// Construct around an existing κ-disk backing (queue state freshly reset) —
+    /// used on a device reset, which keeps the disk content and clears only the
+    /// negotiated queue registers.
+    fn with_backing(disk: KappaBacking) -> Self {
         VirtioBlk {
             disk,
             status: 0,
@@ -2144,8 +2269,11 @@ impl Emulator {
                 out.extend_from_slice(&dev.last_avail.to_le_bytes());
                 out.extend_from_slice(&dev.interrupt_status.to_le_bytes());
                 out.push(u8::from(dev.irq_pending));
-                out.extend_from_slice(&(dev.disk.len() as u64).to_le_bytes());
-                out.extend_from_slice(&dev.disk);
+                // The disk content (reconstructed from the κ-disk) — a self-
+                // contained snapshot so resume is faithful on any peer.
+                let image = dev.disk.to_image();
+                out.extend_from_slice(&(image.len() as u64).to_le_bytes());
+                out.extend_from_slice(&image);
             }
         }
         // The VirtIO 9P device: its transport state, the fid table, the mount
@@ -2251,7 +2379,9 @@ impl Emulator {
                 let interrupt_status = r.u32()?;
                 let irq_pending = r.u8()? != 0;
                 let disk_len = r.u64()? as usize;
-                let disk = r.bytes(disk_len)?.to_vec();
+                // Rebuild the κ-disk by content-addressing the snapshot image back
+                // into a fresh store (the substrate; Law L3).
+                let disk = KappaBacking::from_image(r.bytes(disk_len)?);
                 Some(VirtioBlk {
                     disk,
                     status,
@@ -2560,8 +2690,10 @@ impl Emulator {
                 0x070 => {
                     dev.status = value;
                     if value == 0 {
-                        // Reset: clear the negotiated queue state.
-                        *dev = VirtioBlk::new(core::mem::take(&mut dev.disk));
+                        // Reset: clear the negotiated queue state, *keeping* the
+                        // κ-disk content (move the backing out, re-wrap it fresh).
+                        let disk = core::mem::replace(&mut dev.disk, KappaBacking::from_image(&[]));
+                        *dev = VirtioBlk::with_backing(disk);
                     }
                 }
                 0x080 => dev.desc_addr = (dev.desc_addr & !0xffff_ffff) | u64::from(value),
@@ -2668,7 +2800,11 @@ impl Emulator {
                         status = VIRTIO_BLK_S_IOERR;
                         break;
                     }
-                    self.write_phys_bytes(*addr, &dev.disk[disk_off..disk_off + n]);
+                    // Read the sectors out of the κ-disk (the substrate) into a
+                    // buffer, then scatter to guest memory.
+                    let mut buf = vec![0u8; n];
+                    dev.disk.read_into(disk_off, &mut buf);
+                    self.write_phys_bytes(*addr, &buf);
                     disk_off += n;
                     written += *len;
                 }
@@ -2680,7 +2816,11 @@ impl Emulator {
                         status = VIRTIO_BLK_S_IOERR;
                         break;
                     }
-                    self.read_phys_bytes(*addr, &mut dev.disk[disk_off..disk_off + n]);
+                    // Gather from guest memory, then content-address the sectors
+                    // into the κ-disk (write-through to the store).
+                    let mut buf = vec![0u8; n];
+                    self.read_phys_bytes(*addr, &mut buf);
+                    dev.disk.write_from(disk_off, &buf);
                     disk_off += n;
                 }
             }
@@ -5132,6 +5272,53 @@ fn j_imm(inst: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The κ-disk backing (`CC-7` over the substrate store) round-trips byte
+    /// ranges faithfully, keeps all-zero sectors sparse, and dedups identical
+    /// sectors to one κ — every read/write goes through the owned `KappaStore`.
+    #[test]
+    fn the_kappa_disk_backing_round_trips_through_the_store() {
+        // An image with a non-zero sector 0, a sparse (all-zero) sector 1, and a
+        // sector 2 identical to sector 0 (dedup).
+        let mut image = vec![0u8; 3 * DISK_SECTOR];
+        for (i, b) in image[0..DISK_SECTOR].iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let sector0 = image[0..DISK_SECTOR].to_vec();
+        image[2 * DISK_SECTOR..3 * DISK_SECTOR].copy_from_slice(&sector0);
+        let mut disk = KappaBacking::from_image(&image);
+
+        // Reconstruction is byte-identical, and the disk is content-addressed.
+        assert_eq!(disk.to_image(), image, "the κ-disk reconstructs its image");
+        assert_eq!(disk.len(), 3 * DISK_SECTOR);
+        assert!(
+            disk.index[1].is_none(),
+            "the all-zero sector is sparse (unstored)"
+        );
+        assert_eq!(
+            disk.index[0], disk.index[2],
+            "identical sectors dedup to one κ (Law L1/L2)"
+        );
+
+        // A partial-sector write (read-modify-write spanning the sector-1 boundary)
+        // is read back faithfully.
+        let patch = b"HOLOSPACES-KAPPA-DISK";
+        let off = DISK_SECTOR - 4; // straddles sectors 0 and 1
+        disk.write_from(off, patch);
+        let mut got = vec![0u8; patch.len()];
+        disk.read_into(off, &mut got);
+        assert_eq!(&got, patch, "a straddling partial-sector write round-trips");
+        // Sector 1 is no longer fully zero (it received the tail of the patch).
+        assert!(
+            disk.index[1].is_some(),
+            "the written sector is now content-addressed"
+        );
+        // Sector 2 (untouched) still shares sector 0's original κ.
+        assert_eq!(
+            disk.to_image()[2 * DISK_SECTOR..3 * DISK_SECTOR],
+            image[0..DISK_SECTOR]
+        );
+    }
 
     fn run_to_exit(image: &[u8]) -> u64 {
         let mut emu = Emulator::new(0, 64 * 1024);

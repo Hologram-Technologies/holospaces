@@ -382,6 +382,7 @@ dependencies = [
  "hologram-bare-hal",
  "hologram-exec",
  "hologram-realizations",
+ "hologram-store-mem",
  "hologram-substrate-core",
  "libm",
  "miniz_oxide",
