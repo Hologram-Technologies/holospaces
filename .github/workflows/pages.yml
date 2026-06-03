@@ -5,9 +5,16 @@ name: pages
 # (arc42 ch.3 / ch.5 / ch.6: "served from GitHub Pages", an untrusted gateway;
 # every byte is verified by re-derivation on load, Law L5).
 #
-# Requires the same hologram access secret as ci.yml (the org-level `HOLOGRAM`
-# token) to build the wasm bundle, plus Pages enabled for the repository
-# (Settings → Pages → Source: GitHub Actions).
+# Production is served from the `gh-pages` branch **root** (Settings → Pages →
+# Source: Deploy from a branch → gh-pages /(root)). Per-PR previews live in
+# isolated `pr-preview/pr-<N>/` subfolders on the same branch (pages-preview.yml),
+# so a PR is never deployed to the production site — `clean-exclude: pr-preview`
+# below keeps the previews intact across production deploys. The build itself is
+# shared with the preview via the `build-site` composite action, so both build
+# byte-identically.
+#
+# Requires the org-level `HOLOGRAM` token (Contents:read on
+# Hologram-Technologies/hologram) to build the wasm bundle.
 
 on:
   push:
@@ -18,105 +25,35 @@ on:
       - 'vv/artifacts/cc9/linux/**'
       - 'vv/artifacts/cc13/**'
       - '.github/workflows/pages.yml'
+      - '.github/actions/build-site/**'
   workflow_dispatch:
 
 permissions:
-  contents: read
-  pages: write
-  id-token: write
+  contents: write
 
 concurrency:
-  group: pages
+  group: pages-production
   cancel-in-progress: true
 
 jobs:
   deploy:
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      url: https://hologram-technologies.github.io/holospaces/
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Configure git for the hologram substrate dependency
-        env:
-          HOLOGRAM_TOKEN: ${{ secrets.HOLOGRAM }}
-        run: git config --global url."https://x-access-token:${HOLOGRAM_TOKEN}@github.com/Hologram-Technologies/".insteadOf "https://github.com/Hologram-Technologies/"
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the Platform Manager site
+        uses: ./.github/actions/build-site
         with:
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+          hologram-token: ${{ secrets.HOLOGRAM }}
+      - name: Deploy to the gh-pages root (production)
+        uses: JamesIves/github-pages-deploy-action@v4
         with:
-          workspaces: crates/holospaces-web
-      - uses: jetli/wasm-pack-action@v0.4.0
-      - name: Generate the in-browser fixtures (.holo + recompiled userland)
-        run: cargo run -q -p holospaces --example holo_fixture -- crates/holospaces-web/web
-      - name: Build the Platform Manager (wasm32)
-        run: wasm-pack build crates/holospaces-web --release --target web --out-dir web/pkg
-      - name: Assemble the site
-        run: |
-          mkdir -p _site
-          cp crates/holospaces-web/web/index.html _site/        # the management console
-          cp crates/holospaces-web/web/workspace.html _site/    # the VS Code workspace IDE
-          cp crates/holospaces-web/web/fixture.holo _site/
-          cp crates/holospaces-web/web/fixture-userland.wasm _site/
-          cp -r crates/holospaces-web/web/pkg _site/pkg
-          # Trim wasm-pack's dev-only emissions from the production artifact: the
-          # browser loads only holospaces_web.js + holospaces_web_bg.wasm (see
-          # index.html / the holospace-fs extension). The TypeScript declarations,
-          # the package.json, and the .gitignore are build/tooling files with no
-          # runtime role — they have no place in the deployed site.
-          rm -f _site/pkg/*.d.ts _site/pkg/package.json _site/pkg/.gitignore
-          # The workspace devcontainer OS: a real RISC-V Linux kernel + device tree
-          # (the pinned CC-11 image; provenance in vv/artifacts/cc11). Booted on the
-          # system emulator — CC-9 / CC-11.
-          cp vv/artifacts/cc11/Image.gz _site/workspace-kernel.gz
-          cp vv/artifacts/cc9/linux/holospaces.dtb _site/workspace.dtb
-          # The real VS Code components (Monaco + xterm.js; pinned CC-13 vendor set).
-          # The workspace imports them by κ and verifies by re-derivation (CC-13).
-          cp -r vv/artifacts/cc13/vendor _site/vendor
-          # The devcontainer (CC-14 / CC-20): the virtio-mmio kernel + the OCI
-          # image's layer. The browser peer assembles the rootfs (the in-crate
-          # Layer Assembler, wasm) and boots it over virtio-blk — the devcontainer
-          # flow, in the browser.
-          # The deployed devcontainer boots the CC-22 BusyBox base (a static
-          # /bin/busybox), so the injected persistent /init can exec an interactive
-          # shell — a running dev environment, not the boot-and-halt CC-14 test init.
-          # CC-22 reuses the CC-14 kernel.
-          cp vv/artifacts/cc14/kernel/Image.gz _site/devcontainer-kernel.gz
-          mfdig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['manifests'][0]['digest'].split(':')[1])" vv/artifacts/cc22/image/index.json)
-          ldig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['layers'][0]['digest'].split(':')[1])" "vv/artifacts/cc22/image/blobs/sha256/$mfdig")
-          cp "vv/artifacts/cc22/image/blobs/sha256/$ldig" _site/devcontainer-layer.tar.gz
-          # The networked devcontainer (CC-16): the net-enabled kernel + init layer,
-          # so the browser peer boots virtio-net + the userspace NAT and tunnels TCP
-          # out over a WebSocket to the egress relay (ADR-014).
-          cp vv/artifacts/cc16/kernel/Image.gz _site/devcontainer-net-kernel.gz
-          nmfdig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['manifests'][0]['digest'].split(':')[1])" vv/artifacts/cc16/image/index.json)
-          nldig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['layers'][0]['digest'].split(':')[1])" "vv/artifacts/cc16/image/blobs/sha256/$nmfdig")
-          cp "vv/artifacts/cc16/image/blobs/sha256/$nldig" _site/devcontainer-net-layer.tar.gz
-          # The deployed devcontainer (CC-18 over ADR-020): the CC-18 base image
-          # layer (BusyBox + the lsp-demo language server) booted on the CC-16 net
-          # kernel with the in-process loopback bridge. The workbench reaches the
-          # in-OS language server over the bridge (CC-33) for real language
-          # intelligence with no Node.
-          lmfdig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['manifests'][0]['digest'].split(':')[1])" vv/artifacts/cc18/image/index.json)
-          lldig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['layers'][0]['digest'].split(':')[1])" "vv/artifacts/cc18/image/blobs/sha256/$lmfdig")
-          cp "vv/artifacts/cc18/image/blobs/sha256/$lldig" _site/devcontainer-lsp-layer.tar.gz
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-      # The REAL VS Code web workbench (CC-17 Phase 3, ADR-012): holospaces serves
-      # Microsoft's κ-verified executable core BYTE-IDENTICAL (Law L5) and composes
-      # it with the supported web `create()` bootstrap + the `holospace-fs` builtin
-      # extension that boots the holospace in the extension-host worker and binds
-      # the workbench to its virtio-9p workspace (CC-15) + console (CC-11), wired to
-      # the open gallery (Open VSX — CC-19). Writes _site/workbench.html +
-      # _site/workbench/ (the dist) + _site/ext/holospace-fs/. The Manager enters
-      # this; workspace.html (Monaco, CC-13) remains the documented fallback.
-      - name: Compose the real VS Code workbench (CC-17 Phase 3)
-        run: node crates/holospaces-web/web/build-workbench.mjs _site
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: _site
-      - id: deployment
-        uses: actions/deploy-pages@v4
+          folder: _site
+          branch: gh-pages
+          clean: true
+          # Never wipe the per-PR preview deployments living alongside production.
+          clean-exclude: |
+            pr-preview/**
+          commit-message: "deploy: Platform Manager → gh-pages root (${{ github.sha }})"
