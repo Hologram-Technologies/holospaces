@@ -71,7 +71,7 @@ echo
 
 # CC rows defined in the catalog (arc42 ch.10); those without a green suite
 # above are not-yet-witnessed.
-all_cc="CC-1 CC-2 CC-3 CC-4 CC-5 CC-6 CC-7 CC-8 CC-9 CC-10 CC-11 CC-12 CC-13 CC-14 CC-15 CC-16 CC-17 CC-18 CC-19 CC-20 CC-21 CC-22 CC-23 CC-24 CC-25 CC-26 CC-27 CC-28 CC-29 CC-30 CC-31 CC-32 CC-33 CC-34"
+all_cc="CC-1 CC-2 CC-3 CC-4 CC-5 CC-6 CC-7 CC-8 CC-9 CC-10 CC-11 CC-12 CC-13 CC-14 CC-15 CC-16 CC-17 CC-18 CC-19 CC-20 CC-21 CC-22 CC-23 CC-24 CC-25 CC-26 CC-27 CC-28 CC-29 CC-30 CC-31 CC-32 CC-33 CC-34 CC-35 CC-36 CC-37"
 pending=""
 for cc in $all_cc; do
     cc_key="${cc//-/}"        # CC-1 -> CC1
