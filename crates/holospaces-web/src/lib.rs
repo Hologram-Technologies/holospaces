@@ -700,16 +700,28 @@ impl Workspace {
     /// machine, and run until the response settles. The holospace's κ snapshot
     /// advances. Returns the event's κ.
     pub fn type_line(&mut self, line: &str) -> String {
-        let event = {
+        // Feed the keystrokes + advance the machine (the projection runs the same
+        // intent on the live OS).
+        {
             let mut projection = Projection::attach(&mut self.machine);
-            projection.type_line(line, 400_000_000)
-        };
+            projection.type_line(line, 400_000_000);
+        }
+        // Publish the event as *resolvable content* on the channel: the canonical
+        // event bytes are stored, so its κ re-derives and resolves (the KappaStore
+        // IS the memory, Law L3) — not a dangling label. `put` content-addresses,
+        // so the stored κ equals the event's identity (Law L1/L2).
+        let canonical = Intent::Type(line.to_owned()).canonicalize();
+        let event = self
+            .store
+            .put("blake3", &canonical)
+            .unwrap_or_else(|_| address(&canonical));
+        let event_str = event.as_str().to_owned();
         self.channel.push(event);
         // The `exit` line powers the machine off; reflect that in the workspace.
         if self.shows("WORKSPACE-DONE") {
             self.halted = true;
         }
-        event.as_str().to_owned()
+        event_str
     }
 
     /// Feed **raw terminal input** to the running holospace — the bytes an
@@ -797,7 +809,11 @@ impl Workspace {
             path: path.to_owned(),
             content: content.to_vec(),
         };
-        self.channel.push(intent.kappa());
+        // Publish the canonical event as *resolvable content* on the channel — its
+        // bytes are stored so the κ re-derives and resolves (Law L1/L3), not a
+        // dangling label — then store the file content itself.
+        let event = self.store.put("blake3", &intent.canonicalize()).map_err(js_err)?;
+        self.channel.push(event);
         let stored = self.store.put("blake3", content).map_err(js_err)?;
         self.files.insert(path.to_owned(), stored);
         Ok(stored.as_str().to_owned())
