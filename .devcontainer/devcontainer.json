@@ -14,8 +14,8 @@
     },
   },
   "features": {
-    // Substrate / peers toolchain (Rust + Lean + wasm)
-    "ghcr.io/devcontainers/features/rust:1": {},
+    // Substrate / peers toolchain (Lean + wasm; Rust is installed in the
+    // Dockerfile, see the note there about the Rust feature + CodeLLDB).
     "ghcr.io/guiyomh/features/just:0": {},
     "ghcr.io/lumenpink/devcontainer-features/wasm-pack:0": {},
     // Documentation pipeline runtimes
@@ -70,7 +70,7 @@
     "source=${localEnv:HOME}/.claude,target=/home/vscode/.claude,type=bind,consistency=cached",
   ],
   "remoteEnv": {
-    "PATH": "/home/vscode/.elan/bin:/home/vscode/.cargo/bin:${containerEnv:PATH}",
+    "PATH": "/home/vscode/.elan/bin:/usr/local/cargo/bin:${containerEnv:PATH}",
     "ANTHROPIC_API_KEY": "${localEnv:ANTHROPIC_API_KEY}",
     "OPENAI_API_KEY": "${localEnv:OPENAI_API_KEY}",
     "HOLOSPACES_GIT_USER_NAME": "${localEnv:HOLOSPACES_GIT_USER_NAME}",
