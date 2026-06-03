@@ -85,8 +85,12 @@ impl Intent {
 /// A workspace projection over a running holospace (the booted [`Emulator`]).
 ///
 /// The projection borrows the running machine; it owns only the **channel** —
-/// the κ of each operator event it has published (Law L3: no other state, the
-/// canonical state lives in the holospace's κ snapshot and the substrate).
+/// the κ *identity* of each operator event (Law L1). It is intentionally
+/// store-less (Law L3: no duplicated state — the canonical state lives in the
+/// holospace's κ snapshot and the substrate); the operator's *store-backed* peer
+/// (the browser `Workspace`) persists each event's canonical bytes into its
+/// `KappaStore`, so the channel's κ re-derive and **resolve** there. The bare
+/// projection records identities; the substrate-backed peer makes them content.
 pub struct Workspace<'m> {
     machine: &'m mut Emulator,
     channel: Vec<Kappa>,
