@@ -617,7 +617,7 @@ impl Workspace {
     /// with [`run`](Workspace::run), pumping the NAT so the bridge's bytes flow.
     pub fn boot_devcontainer_bridged(kernel: &[u8], rootfs: &[u8]) -> Result<Workspace, JsValue> {
         let mut machine = MachineSpec::devcontainer_net()
-            .boot_net(kernel, rootfs.to_vec(), Box::new(net::NoEgress))
+            .boot_workspace_net(kernel, rootfs.to_vec(), &[], Box::new(net::NoEgress))
             .map_err(js_err)?;
         machine.enable_loopback();
         Ok(Workspace {

@@ -93,6 +93,14 @@ jobs:
           nmfdig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['manifests'][0]['digest'].split(':')[1])" vv/artifacts/cc16/image/index.json)
           nldig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['layers'][0]['digest'].split(':')[1])" "vv/artifacts/cc16/image/blobs/sha256/$nmfdig")
           cp "vv/artifacts/cc16/image/blobs/sha256/$nldig" _site/devcontainer-net-layer.tar.gz
+          # The deployed devcontainer (CC-18 over ADR-020): the CC-18 base image
+          # layer (BusyBox + the lsp-demo language server) booted on the CC-16 net
+          # kernel with the in-process loopback bridge. The workbench reaches the
+          # in-OS language server over the bridge (CC-33) for real language
+          # intelligence with no Node.
+          lmfdig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['manifests'][0]['digest'].split(':')[1])" vv/artifacts/cc18/image/index.json)
+          lldig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['layers'][0]['digest'].split(':')[1])" "vv/artifacts/cc18/image/blobs/sha256/$lmfdig")
+          cp "vv/artifacts/cc18/image/blobs/sha256/$lldig" _site/devcontainer-lsp-layer.tar.gz
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
