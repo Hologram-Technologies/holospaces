@@ -47,6 +47,13 @@ async function ociLayerDigest(imageDir) {
   return manifest.layers[0].digest.split(":")[1];
 }
 const cc14Layer = await ociLayerDigest(path.join(cc14, "image"));
+// The *deployed* devcontainer is bridged (ADR-020): the CC-16 net kernel + the
+// CC-18 layer (BusyBox + lsp-demo), booted with the in-process loopback bridge so
+// the workbench gets language intelligence from a server in the OS. The extension
+// fetches these, so the witness serves them — it tests the real deployed config.
+const cc16 = path.join(ROOT, "vv/artifacts/cc16");
+const cc18 = path.join(ROOT, "vv/artifacts/cc18");
+const cc18Layer = await ociLayerDigest(path.join(cc18, "image"));
 
 let failed = false;
 const check = (c, m) => (c ? console.log("  ✓", m) : ((failed = true), console.error("HOLOSPACE-WORKBENCH: FAIL —", m)));
@@ -89,6 +96,8 @@ const server = http.createServer(async (req, res) => {
     if (rel.startsWith("/pkg/")) return send(await readFile(path.join(DIR, rel)), TYPES[path.extname(rel)]);
     if (rel === "/devcontainer-kernel.gz") return send(await readFile(path.join(cc14, "kernel/Image.gz")), "application/gzip");
     if (rel === "/devcontainer-layer.tar.gz") return send(await readFile(path.join(cc14, "image/blobs/sha256", cc14Layer)), "application/gzip");
+    if (rel === "/devcontainer-net-kernel.gz") return send(await readFile(path.join(cc16, "kernel/Image.gz")), "application/gzip");
+    if (rel === "/devcontainer-lsp-layer.tar.gz") return send(await readFile(path.join(cc18, "image/blobs/sha256", cc18Layer)), "application/gzip");
     return send(await readFile(path.join(distDir, rel)), TYPES[path.extname(rel)]);
   } catch { res.writeHead(404).end("null"); }
 });
