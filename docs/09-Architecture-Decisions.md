@@ -614,7 +614,13 @@ worker boots the holospace and binds the workbench to the `virtio-9p`
 workspace + console, served statically. The **remote model** on a
 server-capable peer is the staged extension of the same seam — the
 conformance catalog (Chapter 10) marks each row `live` or staged, and
-V&V/CI and git reflect the status.)
+V&V/CI and git reflect the status.) **This per-peer capability fork is
+superseded in part by ADR-020: because the browser peer’s workbench
+worker and the system emulator are one process, an in-process substrate
+bridge gives the browser peer the **remote** model too — so the choice
+of model becomes a performance difference (the interpreter’s cost of
+running the OS-side server), not a capability difference, and no peer is
+confined to the web model.**
 
 ## ADR-016: the workspace targets full Codespaces/Gitpod capability parity, mapped to substrate primitives
 
@@ -930,3 +936,198 @@ pins both behaviours — and a slightly larger one-time wasm download from
 the speed-first `wasm-opt` level (immaterial next to the kernel and
 workbench assets, and dwarfed by the interpreter-throughput win it
 buys).
+
+## ADR-020: the remote extension host reaches the devcontainer over an in-process substrate bridge to a guest listener — the same κ on any peer
+
+**Status:** accepted
+
+**Context:** ADR-015 settled that extensions belong in a **remote
+extension host inside the devcontainer OS**, the workbench driving it
+over VS Code’s remote protocol "carried on a substrate channel."
+ADR-015’s feasibility refinement then routed the **browser** peer to the
+**web** model — not because the remote model is wrong there, but because
+it lacked two things: a **transport** from the in-tab workbench to a
+server inside the emulated OS, and a server provisioned in that OS. The
+first is the gating primitive: without a way for the browser to speak a
+byte-stream protocol to a process **inside** the guest, non-web
+extensions (rust-analyzer, the GitHub provider, any language server’s
+client) cannot run, and the workbench shows VS Code’s own "not available
+… for the Web." The substrate already has the pieces — they have not
+been composed into that transport.
+
+- The enabling observation: in the browser peer the workbench’s
+  extension host and the **system emulator are the same process** — the
+  `Workspace` wasm peer runs in the extension-host worker (ADR-015’s
+  web-model refinement). So reaching a server **inside** the guest is
+  not a network round trip at all; it is an **in-process bridge** into
+  the emulator’s own TCP stack. The emulator already terminates guest
+  TCP in a full userspace NAT and exposes the **ingress** dual — an
+  inbound connection bridged to a guest listener (`CC-16`/`CC-21`). The
+  bridge is a host-driven ingress connection: open to a guest port,
+  write the client’s bytes into the guest socket, read the guest’s bytes
+  back, close — pumping the emulator between turns, exactly as the
+  egress relay (ADR-014) drives outbound TCP, only inward and
+  **in-process** (no relay, no socket, no server — Law L4/ADR-001
+  preserved: the backend is content and a process on the substrate, not
+  an endpoint).
+
+- This is the faithful VS Code **remote** transport, not a substitute:
+  the server in the OS speaks the standard remote-server protocol on a
+  guest port; the workbench’s remote-authority resolver returns this
+  bridge as its connection. The web model’s
+  `FileSystemProvider`-over-`virtio-9p` becomes unnecessary for the
+  remote case — the remote host serves the OS’s **own** files, terminal,
+  and network directly, as in a Codespace — while the κ-import/verify
+  discipline (Law L5; ADR-012) still gates the workbench and every
+  extension.
+
+- The connection holospaces serves it over is the bridge — **holospaces
+  is the remote**, in the tab, not a server anywhere else. holospaces
+  deploys to GitHub Pages and nowhere else (ADR-005); there is no
+  server-backed deployment. The same in-process bridge is also what the
+  host V&V witnesses drive natively (the `StdEgress`/host-socket path
+  that backs `CC-16` in CI), so the behaviour is proven where it is free
+  — but that is the **test harness**, not a deployment target. The
+  substrate’s peer-agnosticism (Q6, ADR-009 — the same κ is content that
+  could run on any peer) is a property of the κ, not a place holospaces
+  is hosted: the deployed peer is the tab, and holospaces serves the
+  remote model **from the tab, on the substrate**.
+
+**Decision:** **holospaces is the VS Code remote server** the workbench
+talks to — in the tab, on the substrate, never a server elsewhere — and
+the **in-process substrate bridge to a guest listener** is the
+connection. The emulator exposes a host-driven ingress connection to a
+guest port (`dial`/`send`/`recv`/`close`), surfaced on the `Workspace`
+peer; the workbench’s remote-protocol connection is this bridge, not a
+socket or a control-plane channel. Over it holospaces serves the
+remote’s backends from the holospace’s own primitives — its filesystem
+(`CC-15`), terminal/process surface (`CC-11`), and the **server-backed
+editor capabilities** (a real server **inside the booted devcontainer**
+— language intelligence `CC-18`, debugging — **no Node, nothing outside
+the holospace**). This supersedes ADR-015’s claim that the **browser**
+peer is confined to the web model: holospaces hosts the **remote** model
+from the tab. Witnessed against external authorities: (`CC-33`) a guest
+listener is byte-faithfully reachable over the bridge (TCP + the guest’s
+own socket, the `CC-16`/`CC-21` NAT/ingress, live); (`CC-18`/`CC-34`)
+holospaces serves a real LSP server’s session to the workbench over the
+bridge, spec-valid through `lsp-types` (live, host + browser). The
+remaining row — the **extension host** that activates **arbitrary**
+marketplace extensions — is holospaces' own on the substrate (it
+replaces the legacy Node `vscode-server`, as the substrate replaces the
+cloud VM); a κ-addressed runtime hosting it is the open frontier, never
+a server stood up elsewhere.
+
+**Consequences:** holospaces is the workbench’s remote server, in the
+tab, on the substrate — and the catalog states which parts of the remote
+model are `live` rather than feigning parity. (1) The **server-backed
+editor capabilities** — what a **language server** or **debug adapter**
+gives the editor — run **now** in the deployed browser tab over the
+bridge, no Node: a real server runs **inside the booted devcontainer**
+and holospaces serves its session to the workbench (`CC-18` is the
+witnessed exemplar — real hovers/completion/diagnostics from an in-OS
+LSP server, host **and** browser). (2) The **extension host** that
+activates **arbitrary** marketplace extensions and removes the "not
+available for the Web" notice is **holospaces' own, on the hologram
+substrate** — holospaces is the remote server (in the tab), and its ext
+host replaces the legacy Node `vscode-server` exactly as the substrate
+replaces the cloud VM (ADR-008/009, Law L4: the substrate is used
+**instead of** the legacy machinery, never a server beside it). That ext
+host’s VS Code + Node API surface is backed by the holospace’s **own**
+primitives — its filesystem (`CC-15`), terminal/process surface
+(`CC-11`), and network (`CC-16`); the open frontier is the
+substrate-native runtime that hosts it (a κ-addressed engine on the
+substrate), not "stand up a server," of which there is none and no other
+deployment. This is the architecture’s own answer — the server-backed
+capabilities a Codespace’s remote provides (language intelligence,
+debugging) are delivered to the tab **now** over the bridge; the
+arbitrary-extension host is the substrate-native frontier — not a
+limitation papered over with an external server. The bridge adds no new
+trust surface — it carries the workbench’s own remote protocol to the
+workbench’s own holospace, both κ-verified on import (Law L5).
+
+## ADR-021: the system emulator gains a first-class AArch64 target, so the mainstream ecosystem runs in the guest without per-ISA workarounds
+
+**Status:** accepted
+
+**Context:** The substrate-native extension host (ADR-020) — and, more
+broadly, "run **arbitrary** developer tools in the devcontainer"
+(ADR-016 parity) — kept hitting one wall: the tools the ecosystem ships
+do not exist for `riscv64`. `openvscode-server` publishes `linux-x64`
+and `linux-arm64` and **no** `riscv64`; countless prebuilt binaries
+(Node native addons, language servers, debuggers, vendored CLIs) are the
+same. The honest options were (a) port/rebuild each tool for `riscv64`
+(an unbounded per-tool tax, and impossible for closed binaries), or (b)
+emulate a foreign architecture in user space inside the guest
+(`qemu-user`-style — doubly interpreted, slow). Both are **workarounds
+for the ISA**, not the architecture’s answer.
+
+- The clean answer is to **speak the architecture the ecosystem already
+  ships**. ARM’s **AArch64** (ARMv8-A, the A64 instruction set) is a
+  first-class Linux target with `linux-arm64` builds for essentially
+  everything a devcontainer needs — Node, `openvscode-server`,
+  rust-analyzer, clangd, debuggers, the Debian/Ubuntu `arm64` archive.
+  If holospaces' system emulator runs AArch64, those binaries boot and
+  run **directly** in the guest (one layer of emulation, exactly as
+  `riscv64` does today), with **no per-tool porting and no second
+  emulation layer**.
+
+- holospaces is unchanged in every other respect: it still deploys
+  **only** to GitHub Pages, it is still the substrate (the emulator is a
+  κ-addressed system codemodule, ADR-009), it is still the VS Code
+  remote server in the tab (ADR-020). AArch64 is a **second ISA target
+  for the same emulator role** — the devices (`virtio-mmio`
+  block/9p/net + the userspace NAT), the κ-disk, the workbench, the
+  bridge, and the whole CC-15…CC-34 surface are reused unchanged; only
+  the CPU core, the privileged/exception model, the MMU, and the
+  platform (the ARM **virt** machine — `GIC` interrupt controller, the
+  ARM generic timer, `PSCI` for boot/reset — in place of RISC-V’s
+  `PLIC`/`CLINT`/`SBI`) are new. Law L4 holds: the substrate is still
+  the only execution medium; it now decodes a second ISA.
+
+- The same V&V rigor that validates the RISC-V core applies, against
+  AArch64’s own authorities: the **Arm Architecture Reference Manual**
+  (ARM DDI 0487) for the A64 ISA, the exception model, and the VMSAv8-64
+  translation system; the **ARM `virt` platform** conventions
+  (GIC/timer/PSCI/devicetree); and **`qemu-system-aarch64`** as the
+  differential oracle, with **a real, unmodified `arm64` Linux kernel
+  booting to userspace** as the strongest witness — the AArch64 analogue
+  of `CC-9.c`. The same κ snapshot/reproducibility laws (L1/L5) and the
+  same `riscv-tests`-style instruction batteries (here, hand-assembled
+  A64 + the qemu differential) gate it.
+
+**Decision:** holospaces' system emulator becomes **multi-ISA**:
+alongside RV64GC it gains a first-class **AArch64 (ARMv8-A)** target — a
+real A64 core, the EL0–EL1 exception model, VMSAv8-64 paging, and the
+ARM **virt** platform (GIC + generic timer + PSCI) — reusing the
+existing `virtio-mmio` devices, κ-disk, NAT, workbench, and bridge. An
+arm64 holospace boots an `arm64` Linux + rootfs (ADR-009’s κ-addressed
+system emulator, now AArch64) and runs the ecosystem’s `linux-arm64`
+binaries directly, so the substrate-native extension host (ADR-020) and
+arbitrary devcontainer tooling work **without per-ISA workarounds**. The
+RISC-V target remains; the ISA is a property of the booted holospace’s
+image, selected at boot, validated independently. Witnessed in phases
+(Chapter 10): `CC-35` the A64 integer core against hand-assembled
+batteries + the qemu differential; `CC-36` the privileged model +
+VMSAv8-64 + the **virt** platform booting a real `arm64` Linux to
+userspace (qemu-system-aarch64 oracle); `CC-37` the arm64 devcontainer
+over the reused `virtio` devices, running an `arm64` toolchain (and the
+Node ext host, closing ADR-020’s frontier).
+
+**Consequences:** The ecosystem "just runs" because holospaces speaks
+its architecture — the per-`riscv64`-tool tax disappears, closed
+binaries work, and ADR-020’s open frontier (the arbitrary-extension
+host) is reached by running the **real** `linux-arm64`
+`openvscode-server` in the guest, on the substrate, in the tab — no
+server, no other deployment, no porting. The cost is real and bounded: a
+second CPU core + privileged model + MMU + platform (~the size of the
+RISC-V core), each validated against the Arm ARM and the qemu
+differential before it is `live` — staged as `CC-35…CC-37`, the matrix
+saying so until each lands. Because everything **above** the CPU is
+shared (devices, κ-disk, workbench, bridge, the CC-15…CC-34 surface),
+the marginal surface is the ISA itself, not the platform; and because
+the emulator is a κ-addressed codemodule (ADR-009), the AArch64 core is
+**content** that runs on the same wasm engine (wasmi in the tab,
+Wasmtime natively in CI), so Q6 (same κ, any peer) and the Pages-only
+deployment are unchanged. The substrate, not a workaround, is the
+answer: a foreign ISA is just a second decoder over the one execution
+medium (Law L4).
