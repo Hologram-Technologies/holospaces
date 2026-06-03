@@ -17,6 +17,7 @@ RUN apt-get update \
         graphviz \
         just \
         less \
+        lldb \
         openjdk-21-jdk \
         pkg-config \
         qemu-system-misc \
@@ -26,7 +27,12 @@ RUN apt-get update \
         vim \
         wget \
         zsh \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    # Ubuntu's lldb package ships the debug adapter as the versioned
+    # /usr/bin/lldb-dap-18 with no unversioned symlink. The lldb-dap VS Code
+    # extension (and devcontainer.json's lldb-dap.executable-path) expects
+    # /usr/bin/lldb-dap, so provide it.
+    && ln -sf lldb-dap-18 /usr/bin/lldb-dap
 
 RUN if [ ! -d "/home/${USERNAME}/.oh-my-zsh" ]; then \
         git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git "/home/${USERNAME}/.oh-my-zsh"; \

@@ -2,7 +2,7 @@
   "name": "holospaces",
   "build": {
     "dockerfile": "Dockerfile",
-    "context": "."
+    "context": ".",
   },
   "forwardPorts": [8000],
   "portsAttributes": {
@@ -10,8 +10,8 @@
       "label": "holospaces site",
       "onAutoForward": "openBrowser",
       "protocol": "http",
-      "visibility": "public"
-    }
+      "visibility": "public",
+    },
   },
   "features": {
     // Substrate / peers toolchain (Rust + Lean + wasm)
@@ -20,23 +20,23 @@
     "ghcr.io/lumenpink/devcontainer-features/wasm-pack:0": {},
     // Documentation pipeline runtimes
     "ghcr.io/devcontainers/features/ruby:1": {
-      "version": "3.3"
+      "version": "3.3",
     },
     "ghcr.io/devcontainers/features/node:1": {
-      "version": "lts"
+      "version": "lts",
     },
     "ghcr.io/devcontainers/features/docker-in-docker:2": {},
     "ghcr.io/dirien/devcontainer-feature-codex/codex:0": {},
-    "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {}
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {},
   },
   "customizations": {
     "vscode": {
       "extensions": [
         "rust-lang.rust-analyzer",
-        "vadimcn.vscode-lldb",
+        "llvm-vs-code-extensions.lldb-dap",
         "anthropic.claude-code",
         "leanprover.lean4",
-        "asciidoctor.asciidoctor-vscode"
+        "asciidoctor.asciidoctor-vscode",
       ],
       "settings": {
         "editor.formatOnSave": true,
@@ -46,11 +46,14 @@
         "rust-analyzer.check.command": "clippy",
         "rust-analyzer.procMacro.enable": true,
         "rust-analyzer.cargo.allFeatures": true,
+
+        "lldb-dap.executable-path": "/usr/bin/lldb-dap",
+
         "terminal.integrated.defaultProfile.linux": "zsh",
         "terminal.integrated.profiles.linux": {
           "zsh": {
-            "path": "/usr/bin/zsh"
-          }
+            "path": "/usr/bin/zsh",
+          },
         },
         "search.exclude": {
           "**/target": true,
