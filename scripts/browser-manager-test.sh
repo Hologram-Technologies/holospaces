@@ -35,6 +35,13 @@ cp "$ROOT/vv/artifacts/cc14/kernel/Image.gz" "$CRATE/web/devcontainer-kernel.gz"
 mfdig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['manifests'][0]['digest'].split(':')[1])" "$ROOT/vv/artifacts/cc14/image/index.json")
 ldig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['layers'][0]['digest'].split(':')[1])" "$ROOT/vv/artifacts/cc14/image/blobs/sha256/$mfdig")
 cp "$ROOT/vv/artifacts/cc14/image/blobs/sha256/$ldig" "$CRATE/web/devcontainer-layer.tar.gz"
+# The *deployed* devcontainer base (CC-22): the BusyBox layer the Pages deploy
+# assembles into the persistent interactive shell (DEVCONTAINER_INIT needs its
+# busybox + setsid/stty applets). The raw-terminal test boots this, as the deploy
+# does — distinct from the init-only CC-14 layer the boot/resume tests use.
+bmfdig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['manifests'][0]['digest'].split(':')[1])" "$ROOT/vv/artifacts/cc22/image/index.json")
+bldig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['layers'][0]['digest'].split(':')[1])" "$ROOT/vv/artifacts/cc22/image/blobs/sha256/$bmfdig")
+cp "$ROOT/vv/artifacts/cc22/image/blobs/sha256/$bldig" "$CRATE/web/devcontainer-busybox-layer.tar.gz"
 # The networked devcontainer (CC-16): the net-enabled kernel + the init layer, so
 # the browser peer boots virtio-net + the userspace NAT and tunnels TCP out.
 cp "$ROOT/vv/artifacts/cc16/kernel/Image.gz" "$CRATE/web/devcontainer-net-kernel.gz"
