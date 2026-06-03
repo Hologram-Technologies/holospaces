@@ -376,7 +376,12 @@ fn synth_index(manifest_digest: &str, manifest_size: usize) -> Vec<u8> {
     .into_bytes()
 }
 
-/// `sha256:<hex>` over `bytes` — the registry's content address.
+/// Form an **OCI distribution-spec digest** (`sha256:<lowercase-hex>`) — the
+/// *registry's* content-address format used to name a blob in a pull request. This
+/// is the OCI spec's wire format, not a holospace κ; the *trust boundary* (Law L5)
+/// re-derives every fetched blob through the substrate's `verify_kappa_axis`
+/// ("sha256") in [`crate::oci`], so this is a URL-forming helper, not a parallel
+/// content-addressing path.
 fn sha256_digest(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();

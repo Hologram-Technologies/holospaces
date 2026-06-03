@@ -27,6 +27,7 @@ std = [
     "hologram-realizations/std",
     "hologram-exec/std",
     "hologram-backend/std",
+    "hologram-store-mem/std",
 ]
 # `net` (off by default) enables the internet *import boundary* (ADR-013): the
 # Repository Fetcher + OCI registry Image Fetcher (`CC-20`), an HTTP(S) client
@@ -45,6 +46,11 @@ hologram-realizations = { workspace = true }
 # KappaStore — a real filesystem image as κ-addressed content. no_std + alloc,
 # so it is part of the portable peer core (the execution surface on every peer).
 hologram-bare-hal = { workspace = true }
+# The substrate's in-memory KappaStore — backs the system emulator's virtio-blk
+# disk: every devcontainer's sectors are content-addressed in the store (the
+# κ-disk, CC-7), not an in-RAM image (Law L3: the KappaStore IS the memory).
+# no_std + alloc (default-features off; the `std` feature re-enables).
+hologram-store-mem = { workspace = true, default-features = false }
 async-trait = { workspace = true }
 spin = { workspace = true }
 # The emulator's F/D floating-point extension (CC-9) on hologram's no_std float
@@ -83,7 +89,6 @@ hologram-substrate-core = { workspace = true, features = ["std"] }
 hologram-realizations = { workspace = true, features = ["std"] }
 # CC-3 — the substrate conformance battery + the stores holospaces resolves through.
 hologram-substrate-tck = { workspace = true }
-hologram-store-mem = { workspace = true }
 hologram-store-native = { workspace = true }
 # Real container runtime — the e2e tier boots a real hologram.* Wasm container
 # through hologram's runtime (no mocks).
