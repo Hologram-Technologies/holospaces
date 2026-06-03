@@ -162,6 +162,10 @@
         } else if (act === "terminate") {
           const cfg = configure(k, [{ lifecycle: "terminate" }]);
           m.status = "stopped"; render();
+          // Terminate destroys the running state: drop this holospace's persisted
+          // resume snapshot so a later Enter cold-boots a clean instance (a Suspend
+          // keeps it — that is the point of suspend/resume).
+          forgetSnapshot(k);
           toast(m.name + " — published terminate config " + cfg.slice(0, 22) + "…");
         } else if (act === "forward") {
           const port = parseInt(prompt("Forward which guest port? (the app-preview port the instance runs a server on)", "8080"), 10);
@@ -169,6 +173,7 @@
           const cfg = configure(k, [{ forwardPort: port }]);
           toast(m.name + " — published forwardPort " + port + " config " + cfg.slice(0, 18) + "… (the running instance begins forwarding it)");
         } else if (act === "remove") {
+          forgetSnapshot(k);
           meta.delete(k); remove(k); render();
         }
       }
@@ -176,6 +181,27 @@
       // operator's set (a presentation action — the content stays addressable).
       const removed = new Set();
       function remove(k) { removed.add(k); }
+
+      // Drop a holospace's persisted resume state from OPFS. The snapshot is keyed
+      // by the holospace identity (κ) — the SAME sanitization the workbench
+      // extension uses (holospace-fs `deriveHoloKey`) — so removing/terminating a
+      // holospace here actually clears its slot, instead of leaving remnants that
+      // bleed into the next launch. OPFS is per-origin, shared with the tabs.
+      function holoKeyOf(k) {
+        return String(k).replace(/[^A-Za-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "default";
+      }
+      async function forgetSnapshot(k) {
+        if (!navigator.storage || !navigator.storage.getDirectory) return;
+        try {
+          const root = await navigator.storage.getDirectory();
+          const key = holoKeyOf(k);
+          for (const name of [`holospace.${key}.snapshot.gz`, `holospace.${key}.snapshot.kappa`, `holospace.${key}.scrollback.gz`]) {
+            await root.removeEntry(name).catch(() => {});
+          }
+        } catch {
+          /* OPFS unavailable — nothing persisted to forget */
+        }
+      }
 
       $("signin").onclick = () => {
         console0.sign_in(new TextEncoder().encode("operator-self-sovereign-key"));
