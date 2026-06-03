@@ -15,6 +15,7 @@
 /crates/holospaces-web/web/vendor
 /crates/holospaces-web/web/devcontainer-kernel.gz
 /crates/holospaces-web/web/devcontainer-layer.tar.gz
+/crates/holospaces-web/web/devcontainer-busybox-layer.tar.gz
 /crates/holospaces-web/web/devcontainer-net-kernel.gz
 /crates/holospaces-web/web/devcontainer-net-layer.tar.gz
 
