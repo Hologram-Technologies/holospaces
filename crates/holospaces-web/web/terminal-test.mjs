@@ -44,7 +44,10 @@ try {
     const enc = new TextEncoder();
     const dec = new TextDecoder();
 
-    const layer = await bytes("./devcontainer-layer.tar.gz");
+    // The deployed devcontainer base: the CC-22 BusyBox layer (its busybox +
+    // setsid/stty applets back the persistent interactive shell), not the
+    // init-only CC-14 layer.
+    const layer = await bytes("./devcontainer-busybox-layer.tar.gz");
     const kernel = await gunzip(await bytes("./devcontainer-kernel.gz"));
     const img = new hs.DevcontainerImage();
     img.add_layer("application/vnd.oci.image.layer.v1.tar+gzip", layer);
