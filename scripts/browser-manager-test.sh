@@ -42,6 +42,13 @@ cp "$ROOT/vv/artifacts/cc14/image/blobs/sha256/$ldig" "$CRATE/web/devcontainer-l
 bmfdig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['manifests'][0]['digest'].split(':')[1])" "$ROOT/vv/artifacts/cc22/image/index.json")
 bldig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['layers'][0]['digest'].split(':')[1])" "$ROOT/vv/artifacts/cc22/image/blobs/sha256/$bmfdig")
 cp "$ROOT/vv/artifacts/cc22/image/blobs/sha256/$bldig" "$CRATE/web/devcontainer-busybox-layer.tar.gz"
+# The deployed devcontainer layer (CC-18 over ADR-020): BusyBox + the lsp-demo
+# language server. The deploy boots this on the CC-16 net kernel with the
+# loopback bridge, so the workbench gets language intelligence from the in-OS
+# server over the bridge (CC-33). The LSP browser test boots this layer.
+lmfdig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['manifests'][0]['digest'].split(':')[1])" "$ROOT/vv/artifacts/cc18/image/index.json")
+lldig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['layers'][0]['digest'].split(':')[1])" "$ROOT/vv/artifacts/cc18/image/blobs/sha256/$lmfdig")
+cp "$ROOT/vv/artifacts/cc18/image/blobs/sha256/$lldig" "$CRATE/web/devcontainer-lsp-layer.tar.gz"
 # The networked devcontainer (CC-16): the net-enabled kernel + the init layer, so
 # the browser peer boots virtio-net + the userspace NAT and tunnels TCP out.
 cp "$ROOT/vv/artifacts/cc16/kernel/Image.gz" "$CRATE/web/devcontainer-net-kernel.gz"
@@ -73,6 +80,9 @@ node snapshot-keying-test.mjs
 
 echo "==> running the raw terminal test in Chromium (CC-11: raw keystrokes echoed/edited by the guest tty, Ctrl-C interrupts, delta streaming)"
 node terminal-test.mjs
+
+echo "==> running the LSP-over-bridge test in Chromium (CC-18 deployed / ADR-020: real language intelligence from a server in the devcontainer OS, over the in-process substrate bridge — no Node)"
+node lsp-test.mjs
 
 echo "==> running the devcontainer network test in Chromium (CC-16: virtio-net + userspace NAT, egress tunnelled over a WebSocket relay)"
 node devcontainer-net-test.mjs

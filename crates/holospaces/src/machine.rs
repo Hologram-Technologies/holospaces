@@ -43,6 +43,12 @@ const DTB_OFFSET: u64 = 0x0700_0000;
 /// terminal. (`exec setsid` is safe from PID 1 here: PID 1 is not a process-group
 /// leader, so BusyBox `setsid` does not fork — it cannot orphan init.)
 ///
+/// If the image ships a language server at `/usr/bin/lsp-demo` (the `CC-18`
+/// base), it is started as a background TCP service (`--listen 7000`) before the
+/// shell, so the workbench's LSP client reaches it over the in-process substrate
+/// bridge (ADR-020, `CC-33`) — language intelligence with no Node. The guard
+/// (`[ -x … ]`) makes it a no-op for an image without it.
+///
 /// The base image must provide a static `/bin/busybox` with the `setsid`/`stty`
 /// applets (the `CC-22` BusyBox base).
 pub const DEVCONTAINER_INIT: &[u8] = b"#!/bin/busybox sh\n\
@@ -55,6 +61,7 @@ pub const DEVCONTAINER_INIT: &[u8] = b"#!/bin/busybox sh\n\
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin HOME=/root PS1='holospace:$PWD\\$ '\n\
 /bin/busybox stty rows 24 cols 80 2>/dev/null\n\
 cd /workspace\n\
+[ -x /usr/bin/lsp-demo ] && /usr/bin/lsp-demo --listen 7000 &\n\
 /bin/busybox echo 'holospace devcontainer ready \xe2\x80\x94 /workspace is your shared workspace'\n\
 exec /bin/busybox setsid -c /bin/busybox sh\n";
 
@@ -283,6 +290,30 @@ impl MachineSpec {
         emu.attach_disk(rootfs);
         emu.attach_net_forward(egress, ingress);
         let dtb = self.device_tree_for(false, true);
+        emu.boot_kernel(kernel, &dtb, self.base + DTB_OFFSET)?;
+        Ok(emu)
+    }
+
+    /// Boot with **both** the shared `virtio-9p` workspace (`CC-15`) **and** the
+    /// network (`CC-16`): the editor and the OS share `/workspace` (so the
+    /// `FileSystemProvider` works) *and* the guest has a TCP stack — the
+    /// combination the deployed devcontainer needs to run a language server / a
+    /// remote extension host reachable over the in-process bridge (ADR-020). Use
+    /// with [`Self::devcontainer_net`] (the guest's interface comes up with DHCP).
+    /// The caller attaches the loopback ingress with [`Emulator::enable_loopback`].
+    pub fn boot_workspace_net(
+        &self,
+        kernel: &[u8],
+        rootfs: Vec<u8>,
+        seed: &[(&str, &[u8])],
+        egress: alloc::boxed::Box<dyn net::Egress>,
+    ) -> Result<Emulator, crate::emulator::Trap> {
+        let mut emu = Emulator::new(self.base, self.ram_bytes as usize);
+        emu.enable_sbi();
+        emu.attach_disk(rootfs);
+        emu.attach_workspace(seed);
+        emu.attach_net(egress);
+        let dtb = self.device_tree_for(true, true);
         emu.boot_kernel(kernel, &dtb, self.base + DTB_OFFSET)?;
         Ok(emu)
     }

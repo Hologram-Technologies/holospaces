@@ -183,6 +183,14 @@ async function saveSnapshot() {
 }
 
 // Boot the holospace in the extension host (the web model's backend).
+// Whether this launch booted the bridged (networked) devcontainer, which runs a
+// language server reachable over the in-process substrate bridge (ADR-020). A
+// networked machine's snapshot does not yet carry the virtio-net device + live
+// connection state, so the bridged devcontainer *cold-boots* each session rather
+// than resuming (a documented frontier); the resume path (CC-30/31) stays for the
+// non-networked machine and is exercised by its witnesses.
+let bridged = false;
+
 async function bootHolospace() {
   wasm = await import(`${base}/pkg/holospaces_web.js`);
   await wasm.default(`${base}/pkg/holospaces_web_bg.wasm`);
@@ -190,7 +198,8 @@ async function bootHolospace() {
   // Resume path (CC-30): if a verified κ snapshot is persisted from a previous
   // session, restore the whole machine from it — the running OS, its disk, and
   // the workspace files come back exactly. This skips the kernel fetch, the
-  // rootfs assembly, and the cold boot entirely.
+  // rootfs assembly, and the cold boot entirely. (Skipped for the bridged
+  // devcontainer — see `bridged`.)
   const persisted = await loadSnapshot();
   if (persisted) {
     ws = wasm.Workspace.resume_devcontainer(persisted);
@@ -199,13 +208,19 @@ async function bootHolospace() {
     return;
   }
 
-  const kernel = await gunzip(await fetchBytes(`${base}/devcontainer-kernel.gz`));
-  const layer = await fetchBytes(`${base}/devcontainer-layer.tar.gz`);
+  // The bridged devcontainer: the *networked* kernel (virtio-net) + a base image
+  // that ships a language server, so the workbench gets real language intelligence
+  // from a server in the OS over the in-process bridge (ADR-020/CC-33) — no Node.
+  // The init starts the server (`/usr/bin/lsp-demo --listen 7000`) when present.
+  bridged = true;
+  const kernel = await gunzip(await fetchBytes(`${base}/devcontainer-net-kernel.gz`));
+  const layer = await fetchBytes(`${base}/devcontainer-lsp-layer.tar.gz`);
   const image = new wasm.DevcontainerImage();
   image.add_layer("application/vnd.oci.image.layer.v1.tar+gzip", layer);
   // Assemble a *bootable* rootfs — the persistent devcontainer init is injected,
   // so the OS comes up as a running dev environment (mounts /workspace, execs a
-  // shell) instead of powering off right after boot — on a disk with room to work.
+  // shell, starts the language server) instead of powering off right after boot —
+  // on a disk with room to work.
   //
   // The devcontainer's disk size. A real dev environment needs space (BusyBox
   // installs its applets, /tmp, the files you create), so this is sized rather
@@ -214,15 +229,21 @@ async function bootHolospace() {
   // the browser peer (the image lives in wasm memory beside the guest's RAM).
   const DISK_BYTES = 128 * 1024 * 1024;
   const rootfs = image.assemble_bootable(DISK_BYTES); // gunzip + untar + overlay + ext4 + /init, in wasm
-  ws = wasm.Workspace.boot_devcontainer(kernel, rootfs);
+  ws = wasm.Workspace.boot_devcontainer_bridged(kernel, rootfs);
   // Seed a welcome note into the shared workspace so the editor and the OS both
   // see it (the editor writes by κ; the OS reads it over 9p).
   ws.ws_write(
     "WELCOME.md",
     new TextEncoder().encode(
       "# holospace\n\nThe real VS Code workbench, over the running devcontainer.\n" +
-        "This file lives on the virtio-9p workspace (CC-15) — the terminal sees it too.\n",
+        "This file lives on the virtio-9p workspace (CC-15) — the terminal sees it too.\n" +
+        "Open `main.rs` — language intelligence comes from a server in the OS over the substrate bridge (CC-18/CC-33).\n",
     ),
+  );
+  // Seed a source file the language server can analyze (the editor + OS share it).
+  ws.ws_write(
+    "main.rs",
+    new TextEncoder().encode("fn greet(name) {\n  // TODO: greet\n  return greet(name)\n}\n"),
   );
 }
 
@@ -352,6 +373,179 @@ function makeTerminal() {
   return vscode.window.createTerminal({ name: "holospace", pty });
 }
 
+// ── Language intelligence over the in-process bridge (CC-18 deployed; ADR-020) ──
+// The devcontainer OS runs a language server (`/usr/bin/lsp-demo --listen 7000`);
+// this connects an LSP client to it over the in-process substrate bridge
+// (`Workspace.dial_guest` → `guest_send`/`guest_recv`, CC-33) and wires its
+// hovers + diagnostics into the editor through the published `vscode.languages`
+// API. The editor's language intelligence comes from a server *in the OS* — the
+// VS Code remote model (ADR-015), in the browser tab, with no Node extension host.
+function findBytes(buf, needle) {
+  outer: for (let i = 0; i + needle.length <= buf.length; i++) {
+    for (let j = 0; j < needle.length; j++) if (buf[i + j] !== needle[j]) continue outer;
+    return i;
+  }
+  return -1;
+}
+const HDR_SEP = new TextEncoder().encode("\r\n\r\n");
+
+function startLanguageClient(context, out) {
+  const PORT = 7000;
+  const diagnostics = vscode.languages.createDiagnosticCollection("holospace");
+  context.subscriptions.push(diagnostics);
+  const lspUri = (uri) => uri.toString();
+  let connId = null;
+  let nextId = 1;
+  let initialized = false;
+  let inbuf = new Uint8Array(0);
+  const pending = new Map();
+
+  const send = (msg) => {
+    if (connId == null) return;
+    const body = encoder.encode(JSON.stringify(msg));
+    const header = encoder.encode(`Content-Length: ${body.length}\r\n\r\n`);
+    const frame = new Uint8Array(header.length + body.length);
+    frame.set(header, 0);
+    frame.set(body, header.length);
+    ws.guest_send(connId, frame);
+  };
+  const request = (method, params) =>
+    new Promise((resolve) => {
+      const id = nextId++;
+      pending.set(id, resolve);
+      send({ jsonrpc: "2.0", id, method, params });
+    });
+  const notify = (method, params) => send({ jsonrpc: "2.0", method, params });
+
+  const dispatch = (msg) => {
+    if (msg.id != null && pending.has(msg.id)) {
+      pending.get(msg.id)(msg.result);
+      pending.delete(msg.id);
+    } else if (msg.method === "textDocument/publishDiagnostics" && msg.params) {
+      const p = msg.params;
+      const list = (p.diagnostics || []).map((d) => {
+        const r = new vscode.Range(
+          d.range.start.line,
+          d.range.start.character,
+          d.range.end.line,
+          d.range.end.character,
+        );
+        const sev = d.severity === 1 ? vscode.DiagnosticSeverity.Error : vscode.DiagnosticSeverity.Warning;
+        return new vscode.Diagnostic(r, d.message, sev);
+      });
+      try {
+        diagnostics.set(vscode.Uri.parse(p.uri), list);
+      } catch {
+        /* a uri the editor cannot parse — skip */
+      }
+    }
+  };
+
+  // Drain the server's reply bytes and parse complete `Content-Length` frames.
+  const drain = () => {
+    if (connId == null) return;
+    const bytes = ws.guest_recv(connId);
+    if (!bytes.length) return;
+    const merged = new Uint8Array(inbuf.length + bytes.length);
+    merged.set(inbuf, 0);
+    merged.set(bytes, inbuf.length);
+    inbuf = merged;
+    for (;;) {
+      const hdrEnd = findBytes(inbuf, HDR_SEP);
+      if (hdrEnd < 0) break;
+      const header = decoder.decode(inbuf.subarray(0, hdrEnd));
+      const m = /Content-Length:\s*(\d+)/i.exec(header);
+      if (!m) break;
+      const len = parseInt(m[1], 10);
+      const start = hdrEnd + HDR_SEP.length;
+      if (inbuf.length < start + len) break; // body not fully arrived
+      const body = decoder.decode(inbuf.subarray(start, start + len));
+      inbuf = inbuf.slice(start + len);
+      try {
+        dispatch(JSON.parse(body));
+      } catch {
+        /* malformed frame — skip */
+      }
+    }
+  };
+
+  // A machine pump independent of the terminal, so the OS (and its server) runs
+  // even before a terminal is focused, and the bridge is drained continuously.
+  let pumping = true;
+  const pump = () => {
+    if (!ws || !pumping) return;
+    if (!ws.halted) ws.run(6_000_000);
+    drain();
+    setTimeout(pump, 25);
+  };
+
+  (async () => {
+    // Wait until the in-OS server is listening, then dial it over the bridge.
+    for (let i = 0; i < 600 && !(ws.shows && ws.shows("LSP-LISTENING")); i++) {
+      if (!ws.halted) ws.run(6_000_000);
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    connId = ws.dial_guest(PORT);
+    if (connId == null) {
+      out.appendLine("holospace: LSP bridge unavailable (no networked devcontainer)");
+      return;
+    }
+    pump();
+    await request("initialize", { processId: null, rootUri: "file:///workspace", capabilities: {} });
+    notify("initialized", {});
+    initialized = true;
+    out.appendLine("holospace: language server connected over the substrate bridge (CC-18/CC-33)");
+    // A visible signal the language server is live over the bridge (also the
+    // deterministic witness for the browser conformance test).
+    const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+    status.text = "$(symbol-method) HOLOSPACE-LSP-LIVE";
+    status.tooltip = "Language intelligence from a server in the devcontainer OS, over the substrate bridge (CC-18/CC-33)";
+    status.show();
+    context.subscriptions.push(status);
+
+    const openDoc = (doc) => {
+      if (doc.uri.scheme !== "holospace") return;
+      notify("textDocument/didOpen", {
+        textDocument: { uri: lspUri(doc.uri), languageId: doc.languageId || "plaintext", version: 1, text: doc.getText() },
+      });
+    };
+    vscode.workspace.textDocuments.forEach(openDoc);
+    context.subscriptions.push(vscode.workspace.onDidOpenTextDocument(openDoc));
+    context.subscriptions.push(
+      vscode.workspace.onDidChangeTextDocument((e) => {
+        if (e.document.uri.scheme !== "holospace") return;
+        notify("textDocument/didChange", {
+          textDocument: { uri: lspUri(e.document.uri), version: e.document.version },
+          contentChanges: [{ text: e.document.getText() }],
+        });
+      }),
+    );
+    context.subscriptions.push(
+      vscode.languages.registerHoverProvider(
+        { scheme: "holospace" },
+        {
+          async provideHover(doc, position) {
+            if (!initialized) return null;
+            const r = await request("textDocument/hover", {
+              textDocument: { uri: lspUri(doc.uri) },
+              position: { line: position.line, character: position.character },
+            });
+            const val = r && r.contents && (r.contents.value || (typeof r.contents === "string" ? r.contents : ""));
+            return val ? new vscode.Hover(new vscode.MarkdownString(val)) : null;
+          },
+        },
+      ),
+    );
+  })().catch((e) => out.appendLine("holospace: language client error — " + e));
+
+  context.subscriptions.push(
+    new vscode.Disposable(() => {
+      pumping = false;
+      if (connId != null) ws.guest_close(connId);
+    }),
+  );
+}
+
 function activate(context) {
   base = deriveBase(context.extensionUri);
   // This launch's holospace identity (its κ), carried in the workspace folder
@@ -384,12 +578,25 @@ function activate(context) {
       );
       makeTerminal().show();
       listenForControl(out);
+      // Real language intelligence: connect an LSP client to the language server
+      // running in the devcontainer OS over the in-process substrate bridge
+      // (ADR-020/CC-33). The editor's hovers + diagnostics come from a server in
+      // the OS — the VS Code remote model, in the browser tab, no Node.
+      if (bridged) {
+        startLanguageClient(context, out);
+      }
       // Persist the running machine to OPFS periodically (CC-30/CC-31), so the
       // next launch resumes from it instead of cold-booting. The extension host
       // is a worker (no `document` visibility events), so a timer is the portable
       // suspend trigger; `saveSnapshot` no-ops while a previous save is in flight.
-      const timer = setInterval(saveSnapshot, 120000);
-      context.subscriptions.push(new vscode.Disposable(() => clearInterval(timer)));
+      // Skipped for the bridged (networked) devcontainer: its snapshot does not
+      // yet carry the virtio-net device + live connection state, so it cold-boots
+      // each session (a documented frontier; the non-networked resume — CC-30/31 —
+      // stays witnessed).
+      if (!bridged) {
+        const timer = setInterval(saveSnapshot, 120000);
+        context.subscriptions.push(new vscode.Disposable(() => clearInterval(timer)));
+      }
     })
     .catch((e) => {
       bootError = String(e && e.stack ? e.stack : e);

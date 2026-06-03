@@ -18,6 +18,7 @@
 /crates/holospaces-web/web/devcontainer-busybox-layer.tar.gz
 /crates/holospaces-web/web/devcontainer-net-kernel.gz
 /crates/holospaces-web/web/devcontainer-net-layer.tar.gz
+/crates/holospaces-web/web/devcontainer-lsp-layer.tar.gz
 
 # Excluded wasm codemodule crate build output (artifact is staged under vv/)
 crates/holospaces-emulator/target/
