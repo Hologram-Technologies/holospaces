@@ -68,6 +68,14 @@ fn template_configs() -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
+fn repo_config() -> Vec<u8> {
+    std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.devcontainer/devcontainer.json"),
+    )
+    .expect("read repo devcontainer.json")
+}
+
 /// (1) Every real authoritative template config validates against the
 /// authoritative Dev Container schema and is accepted by holospaces' ingestor.
 #[test]
@@ -81,6 +89,41 @@ fn real_configs_conform_to_the_dev_container_schema() {
             "{name} does not validate against the Dev Container schema"
         );
         devcontainer::parse(&raw).unwrap_or_else(|e| panic!("{name}: ingestor rejected: {e}"));
+    }
+}
+
+/// This repository's own `.devcontainer/devcontainer.json` is accepted by the
+/// ingestor and its declared image source is preserved. If the repo config ever
+/// returns to a features-only shape, the ingestor will surface the documented
+/// default-image source instead (the Codespaces behavior).
+#[test]
+fn repo_config_ingests_with_its_declared_image_source() {
+    let raw = repo_config();
+    let dc = devcontainer::parse(&raw).expect("ingestor accepts the repo config");
+    let json = to_canonical_json(&raw).expect("repo config JSONC canonicalizes");
+    let value: Value = serde_json::from_slice(&json).expect("repo config is JSON");
+    if let Some(image) = value.get("image").and_then(Value::as_str) {
+        assert_eq!(
+            dc.image_source,
+            devcontainer::ImageSource::Image(image.to_owned())
+        );
+    } else if let Some(build) = value.get("build") {
+        let expected = devcontainer::BuildConfig {
+            dockerfile: build
+                .get("dockerfile")
+                .and_then(Value::as_str)
+                .unwrap_or("Dockerfile")
+                .to_owned(),
+            context: build
+                .get("context")
+                .and_then(Value::as_str)
+                .unwrap_or(".")
+                .to_owned(),
+            args: Default::default(),
+        };
+        assert_eq!(dc.image_source, devcontainer::ImageSource::Build(expected));
+    } else {
+        assert_eq!(dc.image_source, devcontainer::ImageSource::Default);
     }
 }
 

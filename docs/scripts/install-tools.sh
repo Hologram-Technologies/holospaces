@@ -24,12 +24,10 @@ readonly JDK_MAJOR="21"
 readonly RUBY_MAJOR="3"
 readonly DOCKER_MAJOR_MIN="20"
 
-# Playwright headless Chromium (used by structurizr.war's SVG exporter)
-# needs ~30 system libraries that aren't in minimal Ubuntu installs. The
-# canonical list shifts with Chromium versions, so we delegate to
-# Playwright's own install-deps installer rather than hand-maintaining
-# apt package names. Requires npx (node is in the codespace base image).
-readonly PLAYWRIGHT_NPM="playwright@latest"
+# Structurizr 2026.04.19 bundles Playwright Java 1.58.0. Use the matching
+# Node package for browser/dependency provisioning so the cached Chromium
+# revision is the one the Java exporter asks for.
+readonly PLAYWRIGHT_NPM="playwright@1.58.0"
 
 readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly TOOLS_DIR="$REPO_ROOT/tools"
@@ -37,8 +35,13 @@ readonly VERSIONS_FILE="$TOOLS_DIR/versions.txt"
 readonly CHECKSUMS_FILE="$TOOLS_DIR/checksums.txt"
 readonly STRUCTURIZR_WAR="$TOOLS_DIR/structurizr.war"
 readonly STRUCTURIZR_URL="https://download.structurizr.com/structurizr-${STRUCTURIZR_VERSION}-playwright.war"
-readonly PANDOC_DEB="$TOOLS_DIR/pandoc.deb"
-readonly PANDOC_URL="https://github.com/jgm/pandoc/releases/download/${PANDOC_VERSION}/pandoc-${PANDOC_VERSION}-1-amd64.deb"
+case "$(dpkg --print-architecture)" in
+    amd64) readonly PANDOC_ARCH="amd64" ;;
+    arm64) readonly PANDOC_ARCH="arm64" ;;
+    *) printf 'install-tools: ERROR: unsupported Pandoc package architecture: %s\n' "$(dpkg --print-architecture)" >&2; exit 1 ;;
+esac
+readonly PANDOC_DEB="$TOOLS_DIR/pandoc-${PANDOC_ARCH}.deb"
+readonly PANDOC_URL="https://github.com/jgm/pandoc/releases/download/${PANDOC_VERSION}/pandoc-${PANDOC_VERSION}-1-${PANDOC_ARCH}.deb"
 readonly PANDOC_PREFIX="$TOOLS_DIR/pandoc-prefix"
 readonly CMARK_SRC_DIR="$TOOLS_DIR/cmark-gfm-src"
 readonly CMARK_PREFIX="$TOOLS_DIR/cmark-prefix"
@@ -46,6 +49,7 @@ readonly TOOL_BIN_DIR="$TOOLS_DIR/bin"
 readonly CMARK_BIN_DIR="$TOOL_BIN_DIR"
 readonly CMARK_BIN="$CMARK_BIN_DIR/cmark-gfm"
 readonly PANDOC_BIN="$TOOL_BIN_DIR/pandoc"
+readonly PLAYWRIGHT_BROWSERS_DIR="$TOOLS_DIR/playwright-browsers"
 
 err()  { printf 'install-tools: ERROR: %s\n' "$*" >&2; }
 info() { printf 'install-tools: %s\n' "$*"; }
@@ -213,6 +217,9 @@ CMARK_REPORTED=$( "$CMARK_BIN" --version 2>&1 | head -1 )
 
 # ---- 5. Verify submodules -----------------------------------------------
 
+info "ensuring arc42-generator submodule is initialized"
+( cd "$REPO_ROOT" && git submodule update --init --recursive vendor/arc42-generator )
+
 [ -d "$REPO_ROOT/vendor/arc42-generator/.git" ] \
     || [ -f "$REPO_ROOT/vendor/arc42-generator/.git" ] \
     || { err "vendor/arc42-generator submodule not initialized; run: git submodule update --init --recursive"; exit 1; }
@@ -239,14 +246,21 @@ fi
     || { err "$ARC42_TEMPLATE_DIR/EN/adoc/ layout not found at pinned SHA — pin may be too old"; exit 1; }
 
 # ---- 6. Install Playwright system libraries ----------------------------
-# structurizr.war's SVG exporter launches headless Chromium via Playwright
-# the first time `export -format svg` runs against a workspace that has
-# views. Delegate the dep selection to Playwright's own installer.
+# structurizr.war's SVG exporter launches Playwright the first time
+# `export -format svg` runs against a workspace that has views. The Java
+# Playwright bundle validates more than the Chromium-only dependency set on
+# Ubuntu arm64, so delegate the full dep selection to Playwright's installer.
 # Idempotent: re-runs are no-ops once packages are present.
 
-info "ensuring Playwright system libraries are installed (sudo npx ${PLAYWRIGHT_NPM} install-deps chromium)"
-sudo npx -y "$PLAYWRIGHT_NPM" install-deps chromium >/dev/null 2>&1 \
-    || { err "playwright install-deps chromium failed"; exit 1; }
+info "ensuring Playwright system libraries are installed (sudo env PATH=... npx ${PLAYWRIGHT_NPM} install-deps)"
+sudo env "PATH=$PATH" npx -y "$PLAYWRIGHT_NPM" install-deps >/dev/null 2>&1 \
+    || { err "playwright install-deps failed"; exit 1; }
+
+info "ensuring Playwright browsers are installed in tools/playwright-browsers"
+mkdir -p "$PLAYWRIGHT_BROWSERS_DIR"
+PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_DIR" \
+    npx -y "$PLAYWRIGHT_NPM" install >/dev/null 2>&1 \
+    || { err "playwright install failed"; exit 1; }
 
 # ---- 6b. Install Graphviz for tools/opl-to-svg.rb ------------------------
 # Graphviz's `dot` is the renderer behind tools/opl-to-svg.rb, the

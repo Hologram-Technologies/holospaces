@@ -13,6 +13,14 @@ vv:
 docs:
     docs/scripts/build.sh
 
+# Build the GitHub Pages site locally into _site/.
+site:
+    scripts/build-site.sh
+
+# Build, serve, and live-rebuild the GitHub Pages site locally.
+site-dev port="8000":
+    scripts/dev-site.py {{port}}
+
 # Run the documentation validators only (V1–V8; no render / idempotence).
 validate:
     docs/scripts/validate.sh

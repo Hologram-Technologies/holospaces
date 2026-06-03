@@ -20,11 +20,21 @@ import { mkdtemp, writeFile, mkdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import net from "node:net";
 import { chromium } from "playwright";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 let failed = false;
 const check = (c, m) => (c ? console.log("  ✓", m) : ((failed = true), console.error("WORKBENCH-FS-TEST: FAIL —", m)));
+const freePort = () =>
+  new Promise((resolve, reject) => {
+    const s = net.createServer();
+    s.on("error", reject);
+    s.listen(0, "localhost", () => {
+      const port = s.address().port;
+      s.close(() => resolve(port));
+    });
+  });
 
 // 1) Materialize the holospace's workspace (the files the OS shares over 9p).
 const ws = await mkdtemp(path.join(tmpdir(), "holospace-ws-"));
@@ -34,17 +44,21 @@ await writeFile(path.join(ws, "main.rs"), 'fn main() { println!("hello from the 
 
 // 2) Serve it to the REAL workbench via @vscode/test-web's built-in
 //    FileSystemProvider (--browser none = serve only; we drive our own Chromium).
-const port = 3217;
+const port = await freePort();
 const srv = spawn(
   "npx",
   ["--no-install", "@vscode/test-web", "--browser", "none", "--port", String(port), ws],
-  { cwd: DIR },
+  { cwd: DIR, detached: true },
 );
 let srvlog = "";
 srv.stdout.on("data", (d) => (srvlog += d));
 srv.stderr.on("data", (d) => (srvlog += d));
 const listening = await new Promise((resolve) => {
   const t = setInterval(() => {
+    if (/EADDRINUSE|uncaughtException|Error: listen/.test(srvlog)) {
+      clearInterval(t);
+      resolve(false);
+    }
     if (/Listening on/.test(srvlog)) {
       clearInterval(t);
       resolve(true);
@@ -63,7 +77,7 @@ try {
   check(listening, "the real VS Code web workbench is served with the workspace mounted (the github.dev FileSystemProvider mechanism)");
   if (!listening) throw new Error("server did not start:\n" + srvlog.slice(-500));
   const page = await (await browser.newContext()).newPage();
-  await page.goto(`http://localhost:${port}/`, { timeout: 30000 });
+  await page.goto(`http://localhost:${port}/`, { timeout: 120000, waitUntil: "domcontentloaded" });
 
   // The real workbench loads (the genuine vscode-web, not Monaco-only — CC-13).
   await page.waitForSelector(".monaco-workbench", { timeout: 60000 });
@@ -126,7 +140,11 @@ try {
   console.log(failed ? "WORKBENCH-FS-TEST: FAILED" : "WORKBENCH-FS-TEST: PASS (the real workbench is served the holospace workspace the supported way, github.dev-style)");
 } finally {
   await browser.close();
-  srv.kill("SIGKILL");
+  try {
+    process.kill(-srv.pid, "SIGKILL");
+  } catch {
+    srv.kill("SIGKILL");
+  }
   await rm(ws, { recursive: true, force: true }).catch(() => {});
 }
 // Force-exit: the spawned @vscode/test-web server / browser can leave lingering

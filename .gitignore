@@ -1,4 +1,6 @@
 /target
+/_site
+__pycache__/
 **/*.rs.bk
 # Browser peer (holospaces-web): generated wasm bindings, its build dir, and
 # the Playwright install. Built on demand by scripts/browser-manager-test.sh.

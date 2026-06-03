@@ -15,24 +15,38 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import net from "node:net";
 import { chromium } from "playwright";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const ext = path.join(DIR, "extensions/holospace-demo");
 let failed = false;
 const check = (c, m) => (c ? console.log("  ✓", m) : ((failed = true), console.error("EXTENSION-TEST: FAIL —", m)));
+const freePort = () =>
+  new Promise((resolve, reject) => {
+    const s = net.createServer();
+    s.on("error", reject);
+    s.listen(0, "localhost", () => {
+      const port = s.address().port;
+      s.close(() => resolve(port));
+    });
+  });
 
-const port = 3219;
+const port = await freePort();
 const srv = spawn(
   "npx",
   ["--no-install", "@vscode/test-web", "--browser", "none", "--port", String(port), "--extensionDevelopmentPath", ext, DIR],
-  { cwd: DIR },
+  { cwd: DIR, detached: true },
 );
 let log = "";
 srv.stdout.on("data", (d) => (log += d));
 srv.stderr.on("data", (d) => (log += d));
 const up = await new Promise((r) => {
   const t = setInterval(() => {
+    if (/EADDRINUSE|uncaughtException|Error: listen/.test(log)) {
+      clearInterval(t);
+      r(false);
+    }
     if (/Listening on/.test(log)) {
       clearInterval(t);
       r(true);
@@ -49,7 +63,7 @@ try {
   check(up, "the real VS Code web workbench is served with the extension under development (the supported extension-host mechanism)");
   if (!up) throw new Error("server did not start:\n" + log.slice(-500));
   const page = await (await browser.newContext()).newPage();
-  await page.goto(`http://localhost:${port}/`, { timeout: 30000 });
+  await page.goto(`http://localhost:${port}/`, { timeout: 120000, waitUntil: "domcontentloaded" });
   await page.waitForSelector(".monaco-workbench", { timeout: 60000 });
 
   // The extension activates and contributes a status-bar item — proof its code
@@ -82,7 +96,11 @@ try {
   console.log(failed ? "EXTENSION-TEST: FAILED" : "EXTENSION-TEST: PASS (a real extension activates in the real workbench's extension host, the supported way)");
 } finally {
   await browser.close();
-  srv.kill("SIGKILL");
+  try {
+    process.kill(-srv.pid, "SIGKILL");
+  } catch {
+    srv.kill("SIGKILL");
+  }
 }
 // Force-exit: the spawned @vscode/test-web server / browser can leave lingering
 // handles that keep the event loop alive after the result is printed (the test

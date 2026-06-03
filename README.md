@@ -10,7 +10,7 @@ A UOR-native **boot layer** over the [hologram](https://github.com/Hologram-Tech
 
 ## Build & validate
 
-The devcontainer provides the toolchain (Rust, Lean, wasm-pack; and for the docs: JDK 21, Ruby, Node, Docker, cmake, graphviz). First run provisions the pinned doc toolchain:
+The devcontainer provides the toolchain (Rust, Lean, wasm-pack; and for the docs: JDK 21, Ruby, Node, Docker, cmake, graphviz, QEMU). Its post-create hook provisions the pinned docs toolchain; rerun this manually after docs toolchain changes:
 
     docs/scripts/install-tools.sh   # or: just install-tools
 

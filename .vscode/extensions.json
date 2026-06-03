@@ -1,5 +1,7 @@
 {
     "recommendations": [
-        "openai.chatgpt"
+        "openai.chatgpt",
+        "nefrob.vscode-just-syntax",
+        "skellock.just"
     ]
 }

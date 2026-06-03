@@ -50,10 +50,58 @@ assert_match() {
     }
 }
 
-assert_match "java"           "$(java --version 2>&1 | head -1)"
-assert_match "ruby"           "$(ruby --version 2>&1)"
-assert_match "bundler"        "$(bundle --version 2>&1)"
-assert_match "docker"         "$(docker --version 2>&1)"
+version_field() {
+    printf '%s' "$1" | grep -oE '[0-9]+([.][0-9]+)+' | head -1
+}
+
+major_version() {
+    printf '%s' "$1" | cut -d. -f1
+}
+
+assert_same_major() {
+    local key="$1" actual_line="$2"
+    local pinned="${PINNED[$key]:-}"
+    [ -n "$pinned" ] || { err "no pin recorded for $key in versions.txt"; exit 1; }
+    local pinned_major actual_major
+    pinned_major="$(major_version "$(version_field "$pinned")")"
+    actual_major="$(major_version "$(version_field "$actual_line")")"
+    [ -n "$actual_major" ] && [ "$actual_major" = "$pinned_major" ] || {
+        err "$key major version drift: pinned='$pinned' actual='$actual_line'"
+        exit 1
+    }
+}
+
+assert_min_major() {
+    local key="$1" actual_line="$2"
+    local pinned="${PINNED[$key]:-}"
+    [ -n "$pinned" ] || { err "no pin recorded for $key in versions.txt"; exit 1; }
+    local pinned_major actual_major
+    pinned_major="$(major_version "$(version_field "$pinned")")"
+    actual_major="$(major_version "$(version_field "$actual_line")")"
+    [ -n "$actual_major" ] && [ "$actual_major" -ge "$pinned_major" ] || {
+        err "$key major version too old: pinned='$pinned' actual='$actual_line'"
+        exit 1
+    }
+}
+
+assert_cmd() {
+    command -v "$1" >/dev/null 2>&1 || {
+        err "required command not found: $1 — run scripts/install-tools.sh"
+        exit 1
+    }
+}
+
+assert_cmd java
+assert_cmd ruby
+assert_cmd bundle
+assert_cmd docker
+assert_cmd git
+
+assert_same_major "java"   "$(java --version 2>&1 | head -1)"
+assert_same_major "ruby"   "$(ruby --version 2>&1)"
+assert_same_major "bundler" "$(bundle --version 2>&1)"
+assert_min_major  "docker" "$(docker --version 2>&1)"
+docker compose version >/dev/null 2>&1 || { err "docker compose v2 not available"; exit 1; }
 assert_match "docker-compose" "$(docker compose version --short 2>&1)"
 assert_match "structurizr-reported" "$(java -jar tools/structurizr.war version 2>&1 \
     | grep -oE 'structurizr: [^[:space:]]+' | head -1 \

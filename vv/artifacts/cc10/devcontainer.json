@@ -3,13 +3,21 @@
 {
 	"name": "Ubuntu",
 	// Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
-	"image": "mcr.microsoft.com/devcontainers/base:${templateOption:imageVariant}"
+	"image": "mcr.microsoft.com/devcontainers/base:${templateOption:imageVariant}",
 
 	// Features to add to the dev container. More info: https://containers.dev/features.
 	// "features": {},
 
 	// Use 'forwardPorts' to make a list of ports inside the container available locally.
-	// "forwardPorts": [],
+	"forwardPorts": [8000],
+	"portsAttributes": {
+		"8000": {
+			"label": "holospaces site",
+			"onAutoForward": "openBrowser",
+			"protocol": "http",
+			"visibility": "public"
+		}
+	},
 
 	// Use 'postCreateCommand' to run commands after the container is created.
 	// "postCreateCommand": "uname -a",

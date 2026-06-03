@@ -15,6 +15,7 @@ readonly WAR="$REPO_ROOT/tools/structurizr.war"
 readonly WORKSPACE="$REPO_ROOT/src/c4/workspace.dsl"
 readonly IMAGES_DIR="$REPO_ROOT/src/arc42/images"
 readonly ADOC_DIR="$REPO_ROOT/src/arc42/adoc"
+readonly PLAYWRIGHT_BROWSERS="$REPO_ROOT/tools/playwright-browsers"
 
 err()  { printf 'V3: ERROR: %s\n' "$*" >&2; }
 info() { printf 'V3: %s\n' "$*"; }
@@ -54,6 +55,8 @@ find "$IMAGES_DIR" -maxdepth 1 -name '*.svg' -delete
 # AND lacks a `key` property inside view blocks.
 if grep -E -q '^\s*(systemContext|container|component|dynamic|deployment|filtered|image)\s+[A-Za-z_]' "$WORKSPACE"; then
     info "exporting views to $IMAGES_DIR"
+    mkdir -p "$PLAYWRIGHT_BROWSERS"
+    PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS" \
     java -jar "$WAR" export \
          -workspace "$WORKSPACE" \
          -format svg \

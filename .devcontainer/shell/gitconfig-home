@@ -1,0 +1,8 @@
+[user]
+	name = Ari
+
+# `post-create.sh` overrides this with the host's local environment when
+# HOLOSPACES_GIT_USER_NAME / HOLOSPACES_GIT_USER_EMAIL, GIT_AUTHOR_*, or
+# GIT_COMMITTER_* are provided.
+[include]
+	path = ~/.config/git/holospaces.gitconfig
