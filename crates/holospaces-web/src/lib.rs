@@ -37,7 +37,7 @@ use hologram_substrate_core::{Capabilities, KappaStore, Realization};
 use holospaces::assembly::{assemble_ext4, assemble_ext4_bootable, Layer};
 use holospaces::boot::{devcontainer, provision, LifecycleError, ReadVerify, Resolver, Session};
 use holospaces::config::{Configuration, Directive, LifecycleAction};
-use holospaces::emulator::{Emulator, Halt};
+use holospaces::emulator::{net, Emulator, Halt};
 use holospaces::identity::{Operator, Roster};
 use holospaces::machine::MachineSpec;
 use holospaces::projection::{Intent, Workspace as Projection};
@@ -606,6 +606,30 @@ impl Workspace {
         })
     }
 
+    /// Boot a devcontainer with the **in-process loopback bridge** enabled
+    /// (ADR-020, `CC-33`): the guest's interface comes up with DHCP (so it has a
+    /// real TCP stack), but instead of a WebSocket egress to the internet it gets
+    /// a no-op egress and the *loopback ingress* — so the workbench, in this same
+    /// process, can [`dial_guest`](Workspace::dial_guest) a server *inside* the
+    /// devcontainer (a language server, a remote extension host) and exchange a
+    /// byte stream with it, with no relay or socket. This is the transport the VS
+    /// Code remote model runs over in the browser peer (ADR-015/ADR-020). Drive it
+    /// with [`run`](Workspace::run), pumping the NAT so the bridge's bytes flow.
+    pub fn boot_devcontainer_bridged(kernel: &[u8], rootfs: &[u8]) -> Result<Workspace, JsValue> {
+        let mut machine = MachineSpec::devcontainer_net()
+            .boot_net(kernel, rootfs.to_vec(), Box::new(net::NoEgress))
+            .map_err(js_err)?;
+        machine.enable_loopback();
+        Ok(Workspace {
+            machine,
+            store: MemKappaStore::new(),
+            channel: Vec::new(),
+            files: std::collections::BTreeMap::new(),
+            halted: false,
+            console_cursor: 0,
+        })
+    }
+
     /// Suspend the running machine to a κ snapshot — the canonical,
     /// content-addressed bytes of the whole machine: CPU, RAM, the rootfs disk,
     /// and the *workspace files* (virtio-9p). The browser persists these (gzipped)
@@ -713,6 +737,40 @@ impl Workspace {
         let delta = console[from..].to_vec();
         self.console_cursor = console.len();
         delta
+    }
+
+    /// Dial an in-process connection to a server *inside* the devcontainer,
+    /// listening on `guest_port`, over the loopback substrate bridge (ADR-020,
+    /// `CC-33`). Returns the connection id, or `None` if the machine was not booted
+    /// with the bridge ([`boot_devcontainer_bridged`](Workspace::boot_devcontainer_bridged)).
+    /// The workbench uses this to reach a language server / the remote extension
+    /// host (ADR-015) without a relay or socket. Pump with [`run`](Workspace::run)
+    /// so the NAT opens the connection and the byte stream flows.
+    pub fn dial_guest(&mut self, guest_port: u16) -> Option<u32> {
+        self.machine.dial_guest(guest_port)
+    }
+
+    /// Write bytes toward the guest server on a loopback connection (`CC-33`).
+    pub fn guest_send(&mut self, id: u32, data: &[u8]) {
+        self.machine.guest_send(id, data);
+    }
+
+    /// Drain the guest server's reply bytes on a loopback connection (empty until
+    /// the machine is pumped enough for the stream to advance; `CC-33`).
+    pub fn guest_recv(&mut self, id: u32) -> Vec<u8> {
+        self.machine.guest_recv(id)
+    }
+
+    /// Close the host side of a loopback connection (`CC-33`).
+    pub fn guest_close(&mut self, id: u32) {
+        self.machine.guest_close(id);
+    }
+
+    /// Whether a loopback connection is still usable — the guest has not closed it,
+    /// or has but unread bytes remain (`CC-33`).
+    #[must_use]
+    pub fn guest_is_open(&self, id: u32) -> bool {
+        self.machine.guest_is_open(id)
     }
 
     /// The running holospace's κ snapshot — its canonical state (Law L1/L3/L5).
