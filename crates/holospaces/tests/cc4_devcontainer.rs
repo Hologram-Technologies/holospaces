@@ -68,14 +68,6 @@ fn template_configs() -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-fn repo_config() -> Vec<u8> {
-    std::fs::read(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.devcontainer/devcontainer.json"),
-    )
-    .expect("read repo devcontainer.json")
-}
-
 /// (1) Every real authoritative template config validates against the
 /// authoritative Dev Container schema and is accepted by holospaces' ingestor.
 #[test]
@@ -92,14 +84,24 @@ fn real_configs_conform_to_the_dev_container_schema() {
     }
 }
 
-/// This repository's own `.devcontainer/devcontainer.json` is a *features-only*
-/// configuration: it declares no image source and relies on the implementor's
-/// default base image (the Codespaces behavior). The Dev Container *base*
-/// schema requires an explicit image source, so it does not model this case;
-/// holospaces' ingestor accepts it as the documented default-image superset.
+/// A *features-only* configuration declares no image source and relies on the
+/// implementor's default base image (the Codespaces behavior). The Dev Container
+/// *base* schema requires an explicit image source, so it does not model this
+/// case; holospaces' ingestor accepts it as the documented default-image superset.
+///
+/// This asserts the property against a *fixed* features-only config, not the
+/// repo's own `.devcontainer/devcontainer.json`: a CI runner or Codespaces
+/// prebuild resolves the platform's default base image *into* the live repo file
+/// (e.g. `mcr.microsoft.com/devcontainers/base:ubuntu-24.04`), which is exactly
+/// the resolution this test must not depend on.
 #[test]
-fn repo_features_only_config_ingests_as_default_image() {
-    let dc = devcontainer::parse(&repo_config()).expect("ingestor accepts the repo config");
+fn a_features_only_config_ingests_as_default_image() {
+    let cfg = br#"{
+        "name": "features-only",
+        "features": { "ghcr.io/devcontainers/features/rust:1": {} },
+        "customizations": { "vscode": { "extensions": ["rust-lang.rust-analyzer"] } }
+    }"#;
+    let dc = devcontainer::parse(cfg).expect("ingestor accepts a features-only config");
     assert_eq!(dc.image_source, devcontainer::ImageSource::Default);
 }
 
