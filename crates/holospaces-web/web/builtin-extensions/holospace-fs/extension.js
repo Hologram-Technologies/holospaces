@@ -229,7 +229,18 @@ async function bootHolospace() {
   // the browser peer (the image lives in wasm memory beside the guest's RAM).
   const DISK_BYTES = 128 * 1024 * 1024;
   const rootfs = image.assemble_bootable(DISK_BYTES); // gunzip + untar + overlay + ext4 + /init, in wasm
-  ws = wasm.Workspace.boot_devcontainer_bridged(kernel, rootfs);
+  // The per-guest egress node (CC-39), carried on the folder URI query by the
+  // Manager (the drawer's Network → Egress node setting). A tab has no NIC, so
+  // when an egress node is configured the guest's TCP tunnels to it over the
+  // WsEgress WebSocket (CC-16); otherwise the in-process bridge (no live egress,
+  // language-server only) — the default, unchanged.
+  const folder = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0];
+  const egress = folder && folder.uri && folder.uri.query
+    ? new URLSearchParams(folder.uri.query).get("egress")
+    : null;
+  ws = egress
+    ? wasm.Workspace.boot_devcontainer_net(kernel, rootfs, egress)
+    : wasm.Workspace.boot_devcontainer_bridged(kernel, rootfs);
   // Seed a welcome note into the shared workspace so the editor and the OS both
   // see it (the editor writes by κ; the OS reads it over 9p).
   ws.ws_write(
