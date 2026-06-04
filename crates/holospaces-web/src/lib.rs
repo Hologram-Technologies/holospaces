@@ -265,15 +265,33 @@ impl Console {
     pub fn provision_devcontainer(
         &mut self,
         config_json: &[u8],
+        arch: &str,
         memory_bytes: f64,
     ) -> Result<String, JsValue> {
         devcontainer::parse(config_json).map_err(js_err)?;
-        let artifact = self
+        let config = self
             .runtime
             .store()
             .put("blake3", config_json)
             .map_err(js_err)?;
-        self.provision_source(Source::HoloFile { artifact }, memory_bytes)
+        // The operator's **architecture** selection (`riscv64`/`aarch64`, the
+        // Manager's arch picker — ADR-021) is part of the source, hence part of
+        // the holospace's content-addressed identity (Law L1): it is fixed for
+        // the guest's life, and the same devcontainer config under two ISAs is
+        // two distinct holospaces. (Other guest settings —
+        // lifecycle/network/storage/account — are mutable `CC-28` directives via
+        // [`Console::configure`].) The locally-supplied config doubles as the
+        // userland reference; the arch-specific emulator surface is resolved at
+        // boot (`CC-9`).
+        let source = Source::Devcontainer {
+            repo: String::new(),
+            reference: String::new(),
+            config_path: "devcontainer.json".to_owned(),
+            config,
+            userland: config,
+            arch: holospaces::Arch::from_id(arch).unwrap_or_default(),
+        };
+        self.provision_source(source, memory_bytes)
     }
 
     /// Provision a holospace from a *Wasm-recompiled userland* (the execution
