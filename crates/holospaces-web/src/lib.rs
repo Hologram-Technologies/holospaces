@@ -490,6 +490,37 @@ impl Console {
             .map_err(js_err)
     }
 
+    /// Receive content the operator's page fetched from a substrate **HTTP-CAS
+    /// gateway** (`GET /cas/{κ}`, `hologram-net-http`) and admit it into this
+    /// peer's store — the *receive* side of [`get_with_fetch`], realized for the
+    /// browser where the async `fetch` is the page's and the verification is the
+    /// peer's. The bytes are **verified by re-derivation against the requested
+    /// κ** before they are admitted (Law L5): a gateway is untrusted, so content
+    /// that does not re-derive to the κ the page asked for is **refused**, never
+    /// stored. On success the content is cached locally (so a subsequent
+    /// [`resolve`](Self::resolve) is a trusted read) and the κ is returned.
+    ///
+    /// This is what lets the browser peer boot a devcontainer it did **not**
+    /// assemble locally: the page fetches the rootfs + kernel by κ from any
+    /// hologram gateway, hands each blob here for verify-and-cache, and the
+    /// content is then trustworthy substrate content — no bespoke server, no
+    /// trust in the gateway (`CC-20`).
+    ///
+    /// [`get_with_fetch`]: hologram_substrate_core::get_with_fetch
+    pub fn receive(&mut self, bytes: &[u8], kappa: &str) -> Result<String, JsValue> {
+        let expected = parse_kappa(kappa)?;
+        if !verify(bytes, &expected).map_err(js_err)? {
+            return Err(JsValue::from_str(
+                "content from the gateway does not re-derive to the requested κ — refused (Law L5)",
+            ));
+        }
+        let axis = expected
+            .sigma_axis()
+            .ok_or_else(|| JsValue::from_str("unknown σ-axis"))?;
+        let stored = self.runtime.store().put(axis, bytes).map_err(js_err)?;
+        Ok(stored.as_str().to_owned())
+    }
+
     /// The operator's roster κ — the content address that links their instances
     /// (R5). Its bytes are in the store, so another instance can resolve it.
     pub fn roster_kappa(&self) -> Option<String> {
