@@ -67,14 +67,33 @@ scrutinise:
   port and hands the guest's egress frames to the extension, exactly as it would
   a node's WebSocket.
 
-## Install (developer / unpacked)
+## Build the upload package
 
-1. `chrome://extensions` → enable Developer mode → **Load unpacked** → this
-   folder.
-2. Copy the extension id into the holospaces page (or set
-   `HOLOSPACES_EGRESS_EXTENSION_ID` in `connector.js` before publishing).
-3. The guest's network then exits through the extension's sockets — local,
-   no node.
+```sh
+scripts/build-extension.sh
+# → crates/holospaces-web/extension/dist/holospaces-egress-extension-v<ver>.zip
+```
+
+The zip contains **only** the files Chrome loads — `manifest.json`,
+`background.js`, and the icons — so it is exactly what the store expects (the
+build refuses to ship if a dev/test/page file leaks in, or if the manifest is not
+MV3 + minimal-permission). The Pages deploy also builds it and offers it at
+`/extension/` for download.
+
+## Publish / install
+
+- **Chrome Developer Console:** upload the `.zip` above.
+- **Load unpacked (dev):** `chrome://extensions` → Developer mode → **Load
+  unpacked** → this folder.
+
+Then copy the extension id into the holospaces page (or set
+`HOLOSPACES_EGRESS_EXTENSION_ID` in `connector.js` before publishing). The
+guest's network then exits through the extension's sockets — local, no node.
+
+## Icons
+
+`icons/{16,48,128}.png` are committed source assets, regenerated deterministically
+by `icons/gen-icons.py` (a dependency-free raw-PNG generator).
 
 ## Verification (CC-41)
 
