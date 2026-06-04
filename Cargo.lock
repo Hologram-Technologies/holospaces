@@ -1061,7 +1061,12 @@ dependencies = [
 name = "holospaces-node"
 version = "0.0.0"
 dependencies = [
+ "hologram-net-http",
+ "hologram-store-mem",
+ "hologram-store-native",
+ "hologram-substrate-core",
  "tungstenite",
+ "ureq",
 ]
 
 [[package]]

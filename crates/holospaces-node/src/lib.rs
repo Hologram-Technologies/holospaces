@@ -11,13 +11,14 @@
 //!   TCP to the real internet (`apt`/`pip`/`npm`, a `git` clone, an outbound
 //!   socket), speaking the same egress framing the browser's `WsEgress` already
 //!   uses (`CC-16`). A device you own is the tab's route to the internet.
-//! - **storage-sync** (roadmap) — a persistent, file-backed `KappaStore`
-//!   (`hologram-store-native`) the operator's content syncs to, so a holospace
-//!   survives across browser reloads and devices (the substrate's content network,
-//!   `CC-38`).
-//! - **OTA from GitHub Pages** (roadmap) — the node fetches its own updates from
+//! - [`storage`] — **storage-sync**: a persistent, file-backed `KappaStore`
+//!   (`hologram-store-native`) served over the substrate's HTTP-CAS protocol
+//!   (`GET /cas/{κ}`), so the operator's content survives across browser reloads
+//!   and devices, fetched trustlessly (verify-on-receipt, `CC-20`/`CC-38`).
+//! - [`ota`] — **OTA from GitHub Pages**: the node fetches its own updates from
 //!   the holospaces Pages site, κ-addressed and verified by re-derivation (Law L5;
-//!   the cold-start gateway as the update source), and installs them as available.
+//!   the cold-start gateway as the update source — a forged update is refused),
+//!   and stages them for the next restart.
 //!
 //! The node is plain `std` so it cross-compiles to small Linux SBCs; the
 //! `no_std` content-network core it shares with the browser
@@ -25,6 +26,8 @@
 //! variants participate too.
 
 pub mod egress;
+pub mod ota;
+pub mod storage;
 
 pub use egress::EgressServer;
 
