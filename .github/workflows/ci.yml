@@ -19,6 +19,12 @@ on:
   release:
     types: [published]
 
+# One in-flight run per ref: a new push cancels the previous run rather than
+# letting V&V jobs pile up (each is long — full doc toolchain + conformance).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   vv:
     name: V&V (CS spec conformance V1–V8 + CC component conformance)
@@ -81,8 +87,8 @@ jobs:
         # differential runs for real (strict V&V) instead of falling back to the
         # committed pins. Each suite is still SKIP-aware if an oracle is absent.
         run: |
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          sudo apt-get -o DPkg::Lock::Timeout=300 update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y \
             qemu-system-arm qemu-system-misc qemu-user \
             gcc-aarch64-linux-gnu
       - name: V&V (CS + CC, without release performance gate)
