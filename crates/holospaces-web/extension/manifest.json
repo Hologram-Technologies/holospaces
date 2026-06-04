@@ -2,20 +2,16 @@
   "manifest_version": 3,
   "name": "holospaces egress",
   "version": "0.0.1",
-  "description": "Local egress for holospaces guests. A browser tab has no raw sockets; this extension opens them for a holospace's network via the Direct Sockets API, so a Chromebook's devcontainer reaches the internet with no node, no relay, and no proxy. It speaks the same egress protocol (CC-16) the browser already uses for a holospaces-node (CC-39) — a local egress node in the browser.",
+  "description": "Local egress for holospaces guests: opens raw TCP for your own holospace's network via the Direct Sockets API, so a Chromebook's devcontainer reaches the internet with no node and no proxy.",
 
   "background": { "service_worker": "background.js" },
 
-  "_comment_permissions": "Direct Sockets (TCPSocket/UDPSocket) is a powerful, gated capability — it lets the service worker open raw sockets to arbitrary hosts. Chrome exposes it to extensions that declare it; depending on the channel it may require an enterprise policy or chrome://flags (Direct Sockets). host_permissions additionally grants CORS-free fetch() for the content path (pulling CORS-blocked registries/CDNs as κ-content).",
-  "permissions": ["sockets"],
-  "host_permissions": ["<all_urls>"],
+  "_comment_minimal": "Requested permissions are kept to the MINIMUM for a fast Chrome Web Store review. The egress role connects to an IP:port the guest's NAT already chose and forwards opaque bytes — it never calls fetch(), reads a tab, injects a content script, or stores data. So this extension requests NO host_permissions, NO tabs, NO storage, NO scripting, NO webRequest. Its only capability is raw sockets (Direct Sockets), and its only inbound surface is a message port from the operator's own holospaces origin.",
 
-  "_comment_connect": "Only the operator's own holospaces origins may talk to this extension — the egress is the operator's, self-sovereign, not open to any page.",
+  "_comment_direct_sockets": "Direct Sockets (TCPSocket/UDPSocket) is a powerful, gated capability. It is enabled OUT OF BAND — for an enterprise/managed device via the DirectSocketsAllowedForUrls policy, or for development via chrome://flags — NOT via a broad store permission, which keeps the store-facing permission surface minimal. Confirm the exact gating for your Chrome version/channel.",
+
+  "_comment_connect": "Only the operator's own holospaces origin may message this extension — the egress is the operator's, self-sovereign, not open to any page. Trim/extend `matches` to exactly your deployment's origin(s); narrower is faster to review.",
   "externally_connectable": {
-    "matches": [
-      "https://hologram-technologies.github.io/*",
-      "http://localhost/*",
-      "http://127.0.0.1/*"
-    ]
+    "matches": ["https://hologram-technologies.github.io/*"]
   }
 }
