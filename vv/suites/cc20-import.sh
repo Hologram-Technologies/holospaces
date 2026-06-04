@@ -33,3 +33,12 @@ cargo test --manifest-path "$ROOT/Cargo.toml" -p holospaces --features net \
 cargo test --manifest-path "$ROOT/Cargo.toml" -p holospaces --features net --release \
     --test cc20_import -- --ignored --nocapture \
     a_devcontainer_provisions_from_a_repository_url || exit 1
+
+# The substrate content path: an importer peer serves its store as an untrusted
+# HTTP-CAS gateway; a second peer with NO local content fetches the rootfs +
+# kernel by κ (get_with_fetch, verify-on-receipt, Law L5) and boots a real Linux
+# — the exact path the browser peer takes to boot a devcontainer it did not
+# assemble locally (its fetch() is the same /cas client). Release, ~18s.
+cargo test --manifest-path "$ROOT/Cargo.toml" -p holospaces --features net --release \
+    --test cc20_import -- --ignored --nocapture \
+    a_devcontainer_boots_on_a_peer_that_fetched_it_from_a_substrate_cas_gateway || exit 1

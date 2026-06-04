@@ -177,6 +177,84 @@ fn a_devcontainer_provisions_from_a_repository_url() {
     );
 }
 
+/// A real-OS devcontainer's bootable content travels the **substrate's
+/// content-addressed transport**: an importer peer assembles the rootfs and
+/// serves its store as an *untrusted* HTTP-CAS gateway (`hologram-net-http`,
+/// the substrate's `/cas/{κ}` protocol); a second peer holding **no local
+/// content** fetches the kernel + rootfs by κ through `get_with_fetch`, which
+/// **verifies each on receipt** (Law L5 — a tampered byte is refused), caches
+/// them, and boots a real Linux on the fetched rootfs.
+///
+/// This is the exact path the **browser peer** takes to boot a devcontainer the
+/// page did not assemble locally: its `fetch()` is the same `/cas/{κ}` client
+/// and the verify-on-receipt happens in wasm (`verify_kappa`), so the boot
+/// content is delivered trustlessly from a generic hologram gateway — no
+/// bespoke server, no trust in the gateway. Witnessed hermetically here (a real
+/// import + a real boot; `#[ignore]`, ~17 s).
+#[test]
+#[ignore]
+fn a_devcontainer_boots_on_a_peer_that_fetched_it_from_a_substrate_cas_gateway() {
+    use hologram_net_http::live::{serve_addr, HttpKappaSync};
+    use hologram_substrate_core::get_with_fetch;
+    use std::sync::Arc;
+
+    // Importer peer: import + assemble a devcontainer from a localhost repo +
+    // registry, then publish the bootable artifacts (rootfs + kernel) as κ
+    // content in its store.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let config = format!(r#"{{"image":"127.0.0.1:{port}/img:latest"}}"#);
+    let archive = make_repo_archive(
+        "repo-main/.devcontainer/devcontainer.json",
+        config.as_bytes(),
+    );
+    spawn_server(listener, archive);
+
+    let gateway: Arc<dyn KappaStore> = Arc::new(MemKappaStore::new());
+    let repo_url = format!("http://127.0.0.1:{port}/repo");
+    let (_imported, rootfs) =
+        import_and_assemble(gateway.as_ref(), &repo_url, "main", Arch::Riscv64)
+            .expect("import the devcontainer from its URL");
+    let kernel = gunzip(&cc14_dir().join("kernel/Image.gz"));
+    let rootfs_k = gateway.put("blake3", &rootfs).unwrap();
+    let kernel_k = gateway.put("blake3", &kernel).unwrap();
+
+    // Serve the importer's store as an UNTRUSTED content-addressed gateway.
+    let server = serve_addr(gateway.clone(), "127.0.0.1:0", false).expect("serve HTTP-CAS");
+
+    // Second peer: an empty store + a sync client pointed at the gateway. It
+    // fetches the bootable artifacts by κ — verifying each on receipt.
+    let local = MemKappaStore::new();
+    let sync = HttpKappaSync::new(vec![server.addr().to_string()]);
+    let (got_rootfs, got_kernel) = pollster::block_on(async {
+        let r = get_with_fetch(&local, &sync, &rootfs_k)
+            .await
+            .expect("fetch rootfs from the gateway")
+            .expect("the gateway holds the rootfs");
+        let k = get_with_fetch(&local, &sync, &kernel_k)
+            .await
+            .expect("fetch kernel from the gateway")
+            .expect("the gateway holds the kernel");
+        (r, k)
+    });
+    assert!(
+        local.contains(&rootfs_k) && local.contains(&kernel_k),
+        "the fetched content verified on receipt and is cached locally (Law L5)"
+    );
+
+    // Boot a real Linux on the gateway-fetched rootfs — no local import.
+    let mut emu = MachineSpec::devcontainer()
+        .boot(&got_kernel, got_rootfs.to_vec())
+        .expect("boot");
+    emu.run(600_000_000);
+    let console = String::from_utf8_lossy(emu.console()).into_owned();
+    let marker = std::fs::read_to_string(cc14_dir().join("expected.txt")).unwrap();
+    assert!(
+        console.contains("Mounted root (ext4 filesystem)") && console.contains(marker.trim()),
+        "the devcontainer boots from gateway-fetched content; console:\n{console}"
+    );
+}
+
 /// A repository with no devcontainer.json falls back to the default image — the
 /// hermetic check of the fallback (pulling the default is the live test's job).
 #[test]
