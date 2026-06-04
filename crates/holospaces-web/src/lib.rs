@@ -30,6 +30,8 @@
 
 mod wsnet;
 
+use std::sync::Arc;
+
 use hologram_runtime::Runtime;
 use hologram_runtime_bare::BareMetalEngine;
 use hologram_store_mem::MemKappaStore;
@@ -519,6 +521,47 @@ impl Console {
             .ok_or_else(|| JsValue::from_str("unknown σ-axis"))?;
         let stored = self.runtime.store().put(axis, bytes).map_err(js_err)?;
         Ok(stored.as_str().to_owned())
+    }
+
+    /// Witness the **uor-native content network in the browser** — the "browser
+    /// as a router" model (ADR-006; the substrate is the network). Two in-process
+    /// peers are linked by a [`PacketLink`](netbare::PacketLink) pair (an
+    /// in-process stand-in for a WebRTC data channel) and each wrapped in
+    /// hologram's [`BareNetSync`] — the substrate's own `KappaSync` over the
+    /// `NetworkInterface` HAL. Peer B fetches content it does **not** hold from
+    /// peer A over the substrate frame protocol (`fetch`/`announce`/`discover`),
+    /// and the bytes are **verified by re-derivation on receipt** (SPINE-4)
+    /// before they are accepted — exactly as a bare-metal or std peer does it, no
+    /// central operator. Returns a JSON summary (the fetched content matched, an
+    /// unheld κ resolves to nothing — no forging). This exercises the real wasm
+    /// peer's content-network path; the only browser-specific part still to bind
+    /// is the WebRTC transport *pump* that carries a link's frames between tabs.
+    pub fn content_network_selftest(&self) -> Result<String, JsValue> {
+        use holospaces::content_net::{drive_fetch, peer, PacketLink};
+
+        // Peer A holds content; peer B is empty. (Distinct stores — two peers.)
+        let store_a: Arc<dyn KappaStore> = Arc::new(MemKappaStore::new());
+        let content: &[u8] = b"uor-native content, delivered peer-to-peer with no central operator";
+        let kappa = store_a.put("blake3", content).map_err(js_err)?;
+        let store_b: Arc<dyn KappaStore> = Arc::new(MemKappaStore::new());
+
+        // An in-process peer link (stands in for a WebRTC data channel between
+        // tabs). The SAME `content_net::peer`/`PacketLink` a bare-metal peer uses
+        // (`CC-38`) — so this witnesses the wasm peer on the shared protocol.
+        let (link_a, link_b) = PacketLink::loopback_pair(256 * 1024);
+        let peer_a = peer(link_a, store_a);
+        let peer_b = peer(link_b, store_b);
+
+        // B fetches A's content over the uor-native protocol (verify-on-receipt).
+        let fetched_ok = drive_fetch(&peer_b, &peer_a, &kappa).as_deref() == Some(content);
+        // A κ no peer holds resolves to nothing — no forging, no false content.
+        let unheld = address(b"content that no peer holds");
+        let absent_is_none = drive_fetch(&peer_b, &peer_a, &unheld).is_none();
+
+        Ok(format!(
+            r#"{{"fetched":{fetched_ok},"absent_is_none":{absent_is_none},"kappa":"{}"}}"#,
+            kappa.as_str()
+        ))
     }
 
     /// The operator's roster κ — the content address that links their instances

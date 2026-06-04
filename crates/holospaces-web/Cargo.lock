@@ -298,6 +298,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hologram-net-bare"
+version = "0.6.0"
+source = "git+https://github.com/Hologram-Technologies/hologram?rev=18f553d8578997ce32e7b653786a0bcf9b09a2c0#18f553d8578997ce32e7b653786a0bcf9b09a2c0"
+dependencies = [
+ "async-trait",
+ "hashbrown 0.15.5",
+ "hologram-bare-hal",
+ "hologram-substrate-core",
+ "spin",
+]
+
+[[package]]
 name = "hologram-ops"
 version = "0.6.0"
 source = "git+https://github.com/Hologram-Technologies/hologram?rev=18f553d8578997ce32e7b653786a0bcf9b09a2c0#18f553d8578997ce32e7b653786a0bcf9b09a2c0"
@@ -381,6 +393,7 @@ dependencies = [
  "hologram-backend",
  "hologram-bare-hal",
  "hologram-exec",
+ "hologram-net-bare",
  "hologram-realizations",
  "hologram-store-mem",
  "hologram-substrate-core",

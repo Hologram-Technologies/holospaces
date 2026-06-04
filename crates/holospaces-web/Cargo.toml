@@ -20,6 +20,10 @@ hologram-substrate-core = { git = "https://github.com/Hologram-Technologies/holo
 # wasmi interpreter runs in wasm32 where a JIT cannot.
 hologram-runtime = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-runtime" }
 hologram-runtime-bare = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-runtime-bare", features = ["std"] }
+# The uor-native content network ("browser as a router") is reached through
+# `holospaces::content_net` — the SAME `hologram-net-bare::BareNetSync` over a
+# portable `NetworkInterface` a bare-metal peer uses (`CC-38`), so no direct
+# net-bare dependency is needed here; the browser peer just drives it.
 wasm-bindgen = "0.2"
 js-sys = "0.3"
 serde_json = "1"

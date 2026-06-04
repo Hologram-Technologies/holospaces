@@ -102,6 +102,12 @@ pub mod compose;
 /// — lifecycle / storage / network / account directives published over the
 /// substrate and applied by the instance (ADR-018; `CC-28`).
 pub mod config;
+/// The uor-native content network (`CC-38`): the substrate's `BareNetSync` over a
+/// portable [`NetworkInterface`](hologram_bare_hal::NetworkInterface), so a
+/// browser peer and a bare-metal peer fetch each other's content the same
+/// content-addressed way (the "browser as a router" model). Part of the portable
+/// peer core (no_std + alloc).
+pub mod content_net;
 pub mod disk;
 /// Dockerfile parsing + substrate-native build of a `build.dockerfile` Dev
 /// Container (`CC-26`); a host-side provisioning surface, `std` only.
