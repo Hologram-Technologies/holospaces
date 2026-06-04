@@ -22,9 +22,12 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::future::Future;
+use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
 use hologram_bare_hal::{NetworkInterface, NicError};
@@ -98,6 +101,68 @@ impl PacketLink {
             peer_waker: a_waker,
         };
         (a, b)
+    }
+}
+
+/// The transport-facing end of a [`PacketLink`] — the handle a *pump* uses to
+/// move frames between the link and a real wire (a WebRTC data channel between
+/// browser tabs, a NIC on bare metal). The pump pushes inbound frames it
+/// received from the wire ([`push_inbound`](Self::push_inbound)) and drains the
+/// frames the link wants to transmit ([`pop_outbound`](Self::pop_outbound)) to
+/// the wire. It carries no JS and no transport itself — it is the `Send + Sync`
+/// substrate seam between the portable link and the surface-specific transport.
+pub struct TransportEndpoint {
+    inbox: FrameQueue,
+    outbox: FrameQueue,
+    rx_waker: WakerCell,
+}
+
+impl TransportEndpoint {
+    /// Deliver a frame received from the wire to the link, and wake any fetch
+    /// awaiting a response (the transport's RX-ready signal).
+    pub fn push_inbound(&self, frame: Vec<u8>) {
+        self.inbox.lock().push_back(frame);
+        if let Some(w) = self.rx_waker.lock().take() {
+            w.wake();
+        }
+    }
+
+    /// Take the next frame the link wants to transmit to the wire, if any.
+    #[must_use]
+    pub fn pop_outbound(&self) -> Option<Vec<u8>> {
+        self.outbox.lock().pop_front()
+    }
+}
+
+impl PacketLink {
+    /// A **transport-backed** link and its [`TransportEndpoint`]: the link's
+    /// `transmit` enqueues onto the endpoint's outbound queue (drained by the
+    /// pump to the wire), and the pump's `push_inbound` feeds the link's
+    /// `receive`. The single-peer counterpart to [`loopback_pair`] for a real
+    /// transport — the link is a portable `NetworkInterface`, the pump (WebRTC /
+    /// NIC) lives entirely outside it.
+    ///
+    /// [`loopback_pair`]: PacketLink::loopback_pair
+    #[must_use]
+    pub fn with_transport(mtu: u32) -> (PacketLink, TransportEndpoint) {
+        let inbox: FrameQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let outbox: FrameQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let rx_waker: WakerCell = Arc::new(Mutex::new(None));
+        let link = PacketLink {
+            mac: [0x02, 0, 0, 0, 0, 0x7],
+            mtu,
+            inbox: inbox.clone(),
+            outbox: outbox.clone(),
+            rx_waker: rx_waker.clone(),
+            // No in-process peer; the pump fires the wakers via the endpoint.
+            peer_waker: Arc::new(Mutex::new(None)),
+        };
+        let endpoint = TransportEndpoint {
+            inbox,
+            outbox,
+            rx_waker,
+        };
+        (link, endpoint)
     }
 }
 
@@ -181,6 +246,95 @@ pub fn drive_fetch(
         }
         // Let the responder drain the request we just sent and reply.
         let _ = responder.poll();
+    }
+    None
+}
+
+/// A content-network peer bound to a **single transport** — the browser tab's
+/// (or any surface's) seam to a live wire. It answers inbound fetches from its
+/// `store` and fetches missing content from the peer across the transport,
+/// verifying every byte on receipt (SPINE-4). The surface's *pump* (a WebRTC
+/// data channel between tabs, a NIC on bare metal) carries frames via
+/// [`inbound`](Self::inbound) / [`outbound`](Self::outbound); the peer itself is
+/// portable and transport-agnostic. This is the encapsulated handle a deployment
+/// peer holds, so it never has to touch the substrate sync type directly.
+pub struct ContentPeer {
+    sync: Arc<BareNetSync>,
+    wire: TransportEndpoint,
+}
+
+impl ContentPeer {
+    /// Bind a content peer over a fresh transport-backed link, answering fetches
+    /// from `store`.
+    #[must_use]
+    pub fn new(mtu: u32, store: Arc<dyn KappaStore>) -> Self {
+        let (link, wire) = PacketLink::with_transport(mtu);
+        Self {
+            sync: Arc::new(peer(link, store)),
+            wire,
+        }
+    }
+
+    /// Deliver a frame received from the transport and service it — answer an
+    /// inbound request from local content, or record a response for an awaiting
+    /// [`fetch`](Self::fetch) — then wake that fetch.
+    pub fn inbound(&self, frame: Vec<u8>) {
+        self.wire.push_inbound(frame);
+        let _ = self.sync.poll();
+    }
+
+    /// Drain the next frame the peer wants to send over the transport, if any.
+    #[must_use]
+    pub fn outbound(&self) -> Option<Vec<u8>> {
+        self.wire.pop_outbound()
+    }
+
+    /// A future fetching `kappa` from the peer across the transport, verified on
+    /// receipt. Poll it as the transport delivers frames (via [`inbound`]); it
+    /// resolves to the bytes, or `None` if no peer holds `kappa`. The future
+    /// owns its peer handle, so it is `'static` (the caller may store and poll it
+    /// across transport round-trips).
+    ///
+    /// [`inbound`]: Self::inbound
+    #[must_use]
+    pub fn fetch(&self, kappa: KappaLabel71) -> Pin<Box<dyn Future<Output = Option<Bytes>>>> {
+        let sync = self.sync.clone();
+        Box::pin(async move { sync.fetch(&kappa).await.ok().flatten() })
+    }
+}
+
+/// Drive a `fetcher`'s fetch of `kappa` against a `responder`, carrying frames
+/// over their [`TransportEndpoint`]s — the exact seam a live transport (a WebRTC
+/// data channel) bridges, exercised here by a synchronous in-test "wire" that
+/// shuttles each side's outbound frames to the other's inbound. This is the
+/// reference for the surface-specific pump: the protocol is identical, only the
+/// `push_inbound`/`pop_outbound` carrier differs. Returns the verified bytes, or
+/// `None` if no peer holds `kappa`.
+#[must_use]
+pub fn drive_fetch_over_transport(
+    fetcher: &BareNetSync,
+    fetcher_wire: &TransportEndpoint,
+    responder: &BareNetSync,
+    responder_wire: &TransportEndpoint,
+    kappa: &KappaLabel71,
+) -> Option<Bytes> {
+    let mut fut = fetcher.fetch(kappa);
+    let waker = Waker::noop().clone();
+    let mut cx = Context::from_waker(&waker);
+    for _ in 0..256 {
+        if let Poll::Ready(result) = fut.as_mut().poll(&mut cx) {
+            return result.ok().flatten();
+        }
+        // Carry the fetcher's outbound frames over the "wire" to the responder,
+        // let it answer, then carry its replies back — what the pump does each
+        // time the transport signals readiness.
+        while let Some(frame) = fetcher_wire.pop_outbound() {
+            responder_wire.push_inbound(frame);
+        }
+        let _ = responder.poll();
+        while let Some(frame) = responder_wire.pop_outbound() {
+            fetcher_wire.push_inbound(frame);
+        }
     }
     None
 }

@@ -30,15 +30,19 @@
 
 mod wsnet;
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 
 use hologram_runtime::Runtime;
 use hologram_runtime_bare::BareMetalEngine;
 use hologram_store_mem::MemKappaStore;
-use hologram_substrate_core::{Capabilities, KappaStore, Realization};
+use hologram_substrate_core::{Bytes, Capabilities, KappaStore, Realization};
 use holospaces::assembly::{assemble_ext4, assemble_ext4_bootable, Layer};
 use holospaces::boot::{devcontainer, provision, LifecycleError, ReadVerify, Resolver, Session};
 use holospaces::config::{Configuration, Directive, LifecycleAction};
+use holospaces::content_net::ContentPeer;
 use holospaces::emulator::{net, Emulator, Halt};
 use holospaces::identity::{Operator, Roster};
 use holospaces::machine::MachineSpec;
@@ -227,6 +231,16 @@ pub struct Console {
     /// The latest configuration published per instance — `(instance κ, config κ,
     /// next seq)` (ADR-018; the control plane's reconfiguration record).
     configs: Vec<(Kappa, Kappa, u64)>,
+    /// The content store the content network (`CC-38`) serves + caches into — the
+    /// κ-content this peer offers other peers and fetches from them.
+    content_store: Arc<MemKappaStore>,
+    /// This peer's content-network endpoint over one transport (a WebRTC data
+    /// channel to another tab, bridged by the page's pump). Drives the uor-native
+    /// `BareNetSync` without naming the substrate sync type here.
+    content: ContentPeer,
+    /// An in-flight content-network fetch future, polled as the transport
+    /// delivers frames (the browser's sync-poll discipline — no async runtime).
+    cn_pending: Option<Pin<Box<dyn Future<Output = Option<Bytes>>>>>,
 }
 
 impl Default for Console {
@@ -242,11 +256,16 @@ impl Console {
     #[wasm_bindgen(constructor)]
     #[must_use]
     pub fn new() -> Console {
+        let content_store = Arc::new(MemKappaStore::new());
+        let content = ContentPeer::new(256 * 1024, content_store.clone());
         Console {
             runtime: Runtime::new(BareMetalEngine::new(), MemKappaStore::new()),
             operator: None,
             holospaces: Vec::new(),
             configs: Vec::new(),
+            content_store,
+            content,
+            cn_pending: None,
         }
     }
 
@@ -562,6 +581,74 @@ impl Console {
             r#"{{"fetched":{fetched_ok},"absent_is_none":{absent_is_none},"kappa":"{}"}}"#,
             kappa.as_str()
         ))
+    }
+
+    // ── Content network (CC-38) — the live transport seam ────────────────────
+    // The page's transport *pump* (a WebRTC data channel to another tab, or a
+    // test bridge) carries this peer's content-network frames: it delivers
+    // inbound frames with `cn_inbound` and drains outbound frames with
+    // `cn_outbound`. A fetch is poll-driven (`cn_fetch_start` then `cn_fetch_poll`
+    // as frames flow) — the browser's sync-poll discipline, no async runtime.
+
+    /// Publish bytes into this peer's content store so it can serve them to other
+    /// peers over the content network (`CC-38`). Returns the κ that addresses
+    /// them — the handle a peer fetches by.
+    pub fn cn_put(&self, bytes: &[u8]) -> Result<String, JsValue> {
+        let kappa = self.content_store.put("blake3", bytes).map_err(js_err)?;
+        Ok(kappa.as_str().to_owned())
+    }
+
+    /// Deliver a content-network frame the transport received from the peer, and
+    /// service it (answer an inbound fetch from local content, or record a
+    /// response for an in-flight `cn_fetch`).
+    pub fn cn_inbound(&self, frame: &[u8]) {
+        self.content.inbound(frame.to_vec());
+    }
+
+    /// Drain the next content-network frame this peer wants to send over the
+    /// transport, or `undefined` if none is queued.
+    pub fn cn_outbound(&self) -> Option<Vec<u8>> {
+        self.content.outbound()
+    }
+
+    /// Begin fetching `kappa` from the peer across the transport (verify on
+    /// receipt). Drive it by pumping frames and polling [`cn_fetch_poll`]; only
+    /// one fetch is in flight at a time.
+    ///
+    /// [`cn_fetch_poll`]: Self::cn_fetch_poll
+    pub fn cn_fetch_start(&mut self, kappa: &str) -> Result<(), JsValue> {
+        let kappa = parse_kappa(kappa)?;
+        self.cn_pending = Some(self.content.fetch(kappa));
+        Ok(())
+    }
+
+    /// Poll the in-flight content-network fetch. Returns `undefined` while it is
+    /// pending (pump more frames and poll again), `null` when it completed with
+    /// the content absent (no peer holds it — no forging), or the verified bytes
+    /// when it resolved. The fetched bytes are also admitted to this peer's
+    /// content store (a subsequent fetch of the same κ is local).
+    pub fn cn_fetch_poll(&mut self) -> Result<JsValue, JsValue> {
+        let Some(fut) = self.cn_pending.as_mut() else {
+            return Ok(JsValue::UNDEFINED);
+        };
+        // A no-op waker: the page re-polls explicitly as the transport delivers
+        // frames, so readiness is observed by the next poll, not by scheduling.
+        let waker = Waker::noop().clone();
+        let mut cx = Context::from_waker(&waker);
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Pending => Ok(JsValue::UNDEFINED),
+            Poll::Ready(None) => {
+                self.cn_pending = None;
+                Ok(JsValue::NULL)
+            }
+            Poll::Ready(Some(bytes)) => {
+                self.cn_pending = None;
+                // Admit the fetched content locally (verified on receipt inside
+                // the sync), so this peer can now serve it on too.
+                let _ = self.content_store.put("blake3", &bytes);
+                Ok(js_sys::Uint8Array::from(bytes.as_ref()).into())
+            }
+        }
     }
 
     /// The operator's roster κ — the content address that links their instances

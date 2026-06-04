@@ -21,7 +21,7 @@ use std::sync::Arc;
 use hologram_store_mem::MemKappaStore;
 use hologram_substrate_core::KappaStore;
 use holospaces::address;
-use holospaces::content_net::{drive_fetch, peer, PacketLink};
+use holospaces::content_net::{drive_fetch, drive_fetch_over_transport, peer, PacketLink};
 
 /// A content store holding `content`, with the κ that addresses it.
 fn store_with(content: &[u8]) -> (Arc<dyn KappaStore>, holospaces::Kappa) {
@@ -83,4 +83,31 @@ fn the_content_network_is_bidirectional() {
         .expect("the bare-metal peer fetched the content from the browser peer");
     assert_eq!(&got[..], &content[..]);
     assert_eq!(address(&got[..]), kappa);
+}
+
+/// The transport seam: two peers carry the protocol over `TransportEndpoint`s
+/// (the handle a WebRTC data channel pump bridges between browser tabs), not a
+/// direct in-process pairing. This is the exact path the browser peer drives —
+/// the link is the same `PacketLink`, only the carrier (a real data channel vs.
+/// this in-test wire) differs — so the deployed transport rides a proven seam.
+#[test]
+fn peers_exchange_content_over_the_transport_seam() {
+    let content = b"content routed over the transport seam (a WebRTC data channel)";
+    let (a_store, kappa) = store_with(content);
+    let b_store: Arc<dyn KappaStore> = Arc::new(MemKappaStore::new());
+
+    let (a_link, a_wire) = PacketLink::with_transport(256 * 1024);
+    let (b_link, b_wire) = PacketLink::with_transport(256 * 1024);
+    let peer_a = peer(a_link, a_store);
+    let peer_b = peer(b_link, b_store);
+
+    // B fetches A's content; the pump carries frames over the endpoints.
+    let got = drive_fetch_over_transport(&peer_b, &b_wire, &peer_a, &a_wire, &kappa)
+        .expect("content fetched over the transport seam");
+    assert_eq!(&got[..], &content[..]);
+    assert_eq!(
+        address(&got[..]),
+        kappa,
+        "verified on receipt over the seam"
+    );
 }

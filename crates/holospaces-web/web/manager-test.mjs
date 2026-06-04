@@ -273,6 +273,46 @@ try {
   check(dash.hasRepoInput, "the launch form takes a git repository URL (Codespaces/Gitpod flow)");
   check(dash.defImgShown, "the launch form shows the usable default image");
 
+  // CC-38 — the content network over the LIVE transport seam. Two separate
+  // browser peers (Console A, Console B) exchange content over the frame seam a
+  // WebRTC data channel carries between tabs: A publishes content, B fetches it
+  // by κ, and a JS pump shuttles each peer's outbound frames to the other's
+  // inbound (exactly what the data channel's onmessage/send does). Verified on
+  // receipt; a κ no peer holds resolves to null. The real WebRTC pump is a
+  // drop-in for this in-test bridge.
+  const cross = await page.evaluate(() => {
+    const A = new window.hs.Console();
+    const B = new window.hs.Console();
+    // Pump one frame in each direction; returns true while any frame moved.
+    const pump = () => {
+      let moved = false, f;
+      while ((f = B.cn_outbound()) !== undefined) { A.cn_inbound(f); moved = true; }
+      while ((f = A.cn_outbound()) !== undefined) { B.cn_inbound(f); moved = true; }
+      return moved;
+    };
+    const drive = (kappa) => {
+      B.cn_fetch_start(kappa);
+      for (let i = 0; i < 200; i++) {
+        const r = B.cn_fetch_poll();   // sends the request on the first poll
+        if (r !== undefined) return r; // null (absent) or the bytes
+        pump();
+      }
+      return "timeout";
+    };
+    const expected = "a layer fetched from a peer over the content network transport";
+    const k = A.cn_put(new TextEncoder().encode(expected));
+    const got = drive(k);
+    const unheld = window.hs.kappa(new TextEncoder().encode("content no peer holds"));
+    const absent = drive(unheld);
+    return {
+      fetched: got instanceof Uint8Array ? new TextDecoder().decode(got) : String(got),
+      expected,
+      absentIsNull: absent === null,
+    };
+  });
+  check(cross.fetched === cross.expected, "two browser peers exchange content over the live transport seam a WebRTC data channel carries (CC-38)");
+  check(cross.absentIsNull, "a κ no peer holds resolves to null over the transport seam (no forging)");
+
   console.log(failed ? "MANAGER-TEST: FAILED" : "MANAGER-TEST: PASS (browser peer + Platform Manager console)");
 } finally {
   await browser.close();
