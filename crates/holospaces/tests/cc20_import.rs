@@ -24,6 +24,8 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use hologram_store_mem::MemKappaStore;
+use hologram_substrate_core::{Bytes, KappaStore};
+use holospaces::assembly::{overlay_layers, Layer, Node};
 use holospaces::import::{
     import_and_assemble, parse_image_ref, pull_image, DEFAULT_DEVCONTAINER_IMAGE,
 };
@@ -188,25 +190,87 @@ fn a_repository_without_a_devcontainer_uses_the_default_image() {
     })
     .unwrap();
     assert!(found.is_none(), "no devcontainer.json in the repository");
-    // The default image reference is a real, parseable registry reference.
+    // The default image reference is a real, parseable registry reference — the
+    // Codespaces-style *usable* default (`buildpack-deps`: curl/git/wget over a
+    // real apt userland), not a bare base.
     let r = parse_image_ref(DEFAULT_DEVCONTAINER_IMAGE).unwrap();
     assert_eq!(r.registry, "registry-1.docker.io");
-    assert!(r.repository.contains("debian"));
+    assert_eq!(r.repository, "library/buildpack-deps");
 }
 
 /// Live interop (network-gated, not in CI): pull the real default image from
 /// Docker Hub by reference and assemble it — proves the OCI distribution client
 /// (token auth, multi-arch index → riscv64, blob verification) against a real
 /// registry. Run with `--ignored` on a networked host.
+///
+/// It also witnesses that the default is a **usable** environment, not a bare
+/// base: the assembled layers carry the developer utilities an operator expects
+/// on entry (`curl`, `git`) — the Codespaces "open a repo with no config and it
+/// just works" promise. Asserted for **both** emulator architectures, since the
+/// default must boot on either (`riscv64`/`aarch64`, ADR-021).
 #[test]
 #[ignore]
 fn live_pull_of_the_default_image_from_docker_hub() {
-    let store = MemKappaStore::new();
-    let image = pull_image(
-        &store,
-        &parse_image_ref(DEFAULT_DEVCONTAINER_IMAGE).unwrap(),
-        Arch::Riscv64,
-    )
-    .expect("pull the default image from Docker Hub");
-    assert!(!image.layers().is_empty(), "the pulled image has layers");
+    for arch in [Arch::Riscv64, Arch::Aarch64] {
+        let store = MemKappaStore::new();
+        let image = pull_image(
+            &store,
+            &parse_image_ref(DEFAULT_DEVCONTAINER_IMAGE).unwrap(),
+            arch,
+        )
+        .unwrap_or_else(|e| panic!("pull the default image from Docker Hub ({arch:?}): {e:?}"));
+        assert!(!image.layers().is_empty(), "the pulled image has layers");
+
+        // The default ships basic developer tooling — witnessed in the *actual
+        // assembled filesystem* the OS boots: overlay the image's layers (lowest
+        // first, honouring OCI whiteouts — the same path `assemble_ext4` takes)
+        // and resolve the binaries through the resulting tree. Not a byte scan:
+        // this is the real `/usr/bin/curl` an operator runs on entry.
+        let media = image.layer_media_types();
+        let blobs: Vec<Bytes> = image
+            .layers()
+            .iter()
+            .map(|k| store.get(k).unwrap().expect("layer blob in store"))
+            .collect();
+        let layers: Vec<Layer> = blobs
+            .iter()
+            .zip(media)
+            .map(|(blob, mt)| Layer {
+                media_type: mt,
+                blob,
+            })
+            .collect();
+        let tree = overlay_layers(&layers).expect("overlay the default image's layers");
+
+        assert!(
+            tree_has_regular_file(&tree.root, "usr/bin/curl"),
+            "the default image provides curl ({arch:?})"
+        );
+        assert!(
+            tree_has_regular_file(&tree.root, "usr/bin/git"),
+            "the default image provides git ({arch:?})"
+        );
+    }
+}
+
+/// Whether `path` (slash-separated, relative to root) resolves to a regular file
+/// in the overlaid filesystem `root` — a true filesystem-tree walk (each
+/// non-final component must be a directory), so it witnesses a real executable,
+/// not a stray substring.
+fn tree_has_regular_file(root: &Node, path: &str) -> bool {
+    let mut node = root;
+    let mut parts = path.split('/').filter(|p| !p.is_empty()).peekable();
+    while let Some(name) = parts.next() {
+        let Node::Dir { children, .. } = node else {
+            return false;
+        };
+        let Some(child) = children.get(name) else {
+            return false;
+        };
+        if parts.peek().is_none() {
+            return matches!(child, Node::File { .. });
+        }
+        node = child;
+    }
+    false
 }
