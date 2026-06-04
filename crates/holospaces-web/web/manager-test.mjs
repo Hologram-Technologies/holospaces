@@ -194,24 +194,33 @@ try {
     const c = new window.hs.Console();
     c.sign_in(new TextEncoder().encode("operator-self-sovereign-key"));
     const cfg = new TextEncoder().encode('{"name":"my-devcontainer","image":"debian:12","features":{}}');
-    const k1 = c.provision_devcontainer(cfg, 128 * 1024 * 1024);
+    const k1 = c.provision_devcontainer(cfg, "riscv64", 128 * 1024 * 1024);
     const k2 = new window.hs.Console();
     k2.sign_in(new TextEncoder().encode("operator-self-sovereign-key"));
-    const k1b = k2.provision_devcontainer(cfg, 128 * 1024 * 1024);
+    const k1b = k2.provision_devcontainer(cfg, "riscv64", 128 * 1024 * 1024);
+    // The architecture is part of the holospace identity (Law L1): the SAME
+    // devcontainer config under a different ISA is a DISTINCT holospace.
+    const k1arm = k2.provision_devcontainer(cfg, "aarch64", 128 * 1024 * 1024);
     let rejected = false;
-    try { c.provision_devcontainer(new TextEncoder().encode("not json"), 1); } catch { rejected = true; }
+    try { c.provision_devcontainer(new TextEncoder().encode("not json"), "riscv64", 1); } catch { rejected = true; }
     return {
       holospace: k1,
       reproducible: k1 === k1b,
+      archDistinct: k1arm !== k1,
       listed: JSON.parse(c.view()).holospaces.includes(k1),
       rejected,
       hasTable: !!document.querySelector("#rows") || !!document.querySelector("#holospaces"),
+      hasArchPicker: !!document.querySelector("#harch") && document.querySelector("#harch").options.length >= 2,
+      hasSettings: !!document.querySelector("#drawer"),
     };
   });
   check(dash.holospace.startsWith("blake3:") && dash.listed, `provisioned a devcontainer holospace (${dash.holospace.slice(0, 24)}…)`);
   check(dash.reproducible, "same devcontainer ⇒ same holospace κ (reproducible, L1/Q4)");
+  check(dash.archDistinct, "the launch-time architecture is part of identity — same config under aarch64 ≠ riscv64 (ADR-021)");
   check(dash.rejected, "an invalid devcontainer.json is refused (CC-4)");
   check(dash.hasTable, "the management console renders the holospaces dashboard");
+  check(dash.hasArchPicker, "the launch form offers the architecture picker (riscv64/aarch64)");
+  check(dash.hasSettings, "the console exposes a per-guest settings drawer");
 
   console.log(failed ? "MANAGER-TEST: FAILED" : "MANAGER-TEST: PASS (browser peer + Platform Manager console)");
 } finally {
