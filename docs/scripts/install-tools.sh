@@ -125,7 +125,13 @@ download_if_needed() {
         return
     fi
     info "downloading $label ($approx_size)"
-    curl --fail --silent --show-error --location --output "$dest" "$url"
+    # Bounded + retried so a slow/stalled mirror fails fast (and recovers from a
+    # transient blip) instead of hanging the CI job indefinitely (no timeout =
+    # a wedged connection stalls the whole V&V run for hours).
+    curl --fail --silent --show-error --location \
+        --connect-timeout 30 --max-time 1800 \
+        --retry 3 --retry-delay 5 --retry-all-errors \
+        --output "$dest" "$url"
     ( cd "$TOOLS_DIR" && grep "[[:space:]]$basename\$" checksums.txt | sha256sum --quiet --check ) || {
         err "$basename SHA-256 mismatch against tools/checksums.txt"
         rm -f "$dest"
@@ -289,8 +295,10 @@ PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_DIR" \
 
 if ! command -v dot >/dev/null 2>&1; then
     info "installing graphviz (sudo apt-get install -y graphviz)"
-    sudo apt-get update -qq >/dev/null 2>&1 || true
-    sudo apt-get install -y graphviz >/dev/null 2>&1 \
+    # Bound the dpkg-lock wait (a runner's unattended-upgrades can hold it) so
+    # this fails fast rather than blocking the V&V job indefinitely.
+    sudo apt-get -o DPkg::Lock::Timeout=300 update -qq >/dev/null 2>&1 || true
+    sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y graphviz >/dev/null 2>&1 \
         || { err "apt-get install graphviz failed"; exit 1; }
 fi
 GRAPHVIZ_REPORTED=$(dot -V 2>&1 | head -1)
