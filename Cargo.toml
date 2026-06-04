@@ -39,6 +39,12 @@ hologram-runtime-bare   = { git = "https://github.com/Hologram-Technologies/holo
 # no_std + alloc, so the κ-disk is part of the portable peer core. Consumed by
 # reference (ADR-006).
 hologram-bare-hal       = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-bare-hal", default-features = false }
+# The substrate's no_std content-addressed network — `BareNetSync`, a `KappaSync`
+# over the `NetworkInterface` HAL (the uor-native fetch/announce/discover frame
+# protocol, verify-on-receipt). The SAME implementation a browser peer and a
+# bare-metal peer use, so they interoperate by construction (the "browser as a
+# router" content network). no_std + alloc — part of the portable peer core.
+hologram-net-bare       = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-net-bare", default-features = false }
 prism                   = { version = "0.4", package = "uor-prism" }
 # The async trait emitter the HAL traits use, and a no_std spin lock for the
 # κ-disk's in-memory sector index — versions matched to hologram's own.

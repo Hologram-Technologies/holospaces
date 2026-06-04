@@ -224,7 +224,15 @@ try {
     let recvRefusesTamper = false;
     try { c.receive(new TextEncoder().encode("tampered bytes"), blobK); } catch { recvRefusesTamper = true; }
 
+    // The uor-native content network in the browser ("browser as a router",
+    // CC-38): two peers over an in-process link (the same content_net::peer code
+    // a bare-metal peer runs) exchange content, fetched by κ and verified on
+    // receipt. Proves the browser peer speaks the same protocol as bare-metal.
+    const cn = JSON.parse(c.content_network_selftest());
+
     return {
+      contentNetFetched: cn.fetched,
+      contentNetNoForge: cn.absent_is_none,
       holospace: k1,
       reproducible: k1 === k1b,
       archDistinct: k1arm !== k1,
@@ -256,6 +264,8 @@ try {
   check(dash.repoVsPaste, "a repo-identified holospace differs from the bare-config one (CC-20 source identity)");
   check(dash.recvRoundTrips, "the browser receives gateway content by κ, verified on receipt, and resolves it (CC-20 /cas client)");
   check(dash.recvRefusesTamper, "gateway content that does not re-derive to the requested κ is refused (Law L5)");
+  check(dash.contentNetFetched, "the browser peer fetches content from another peer over the uor-native network (CC-38, browser↔bare-metal protocol)");
+  check(dash.contentNetNoForge, "a κ no peer holds resolves to nothing on the content network (no forging)");
   check(dash.defaultImage.includes("buildpack-deps"), `the usable default image is exposed to the page (${dash.defaultImage})`);
   check(dash.hasTable, "the management console renders the holospaces dashboard");
   check(dash.hasArchPicker, "the launch form offers the architecture picker (riscv64/aarch64)");
