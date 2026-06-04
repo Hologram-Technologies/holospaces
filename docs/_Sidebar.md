@@ -26,6 +26,8 @@
 
 - [12. Glossary](12-Glossary)
 
+- [13. Product Security & Threat Model](13-Product-Security)
+
 # Conceptual Model (OPM ISO 19450)
 
 - [Conceptual Model](Conceptual-Model)
