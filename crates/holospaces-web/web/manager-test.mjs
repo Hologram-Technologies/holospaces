@@ -214,6 +214,16 @@ try {
     const r2 = k2.provision_repo("https://github.com/octocat/Spoon-Knife", "master", cfgPath, cfg, "riscv64", 128 * 1024 * 1024);
     const rRef = k2.provision_repo("https://github.com/octocat/Hello-World", "develop", cfgPath, cfg, "riscv64", 128 * 1024 * 1024);
 
+    // Browser CAS receive (the consumer side of get_with_fetch): content the
+    // page fetched from a /cas gateway is admitted ONLY if it re-derives to the
+    // requested κ (verify-on-receipt, Law L5); a tampered byte is refused.
+    const blob = new TextEncoder().encode("substrate content delivered from a gateway");
+    const blobK = window.hs.kappa(blob);
+    const recvK = c.receive(blob, blobK);
+    const recvRoundTrips = recvK === blobK && !!c.resolve(blobK);
+    let recvRefusesTamper = false;
+    try { c.receive(new TextEncoder().encode("tampered bytes"), blobK); } catch { recvRefusesTamper = true; }
+
     return {
       holospace: k1,
       reproducible: k1 === k1b,
@@ -225,6 +235,8 @@ try {
       repoDistinct: r2 !== r1,
       refDistinct: rRef !== r1,
       repoVsPaste: r1 !== k1, // a repo-identified holospace ≠ the bare-config one
+      recvRoundTrips,
+      recvRefusesTamper,
       defaultImage: window.hs.default_devcontainer_image(),
       hasTable: !!document.querySelector("#rows") || !!document.querySelector("#holospaces"),
       hasArchPicker: !!document.querySelector("#harch") && document.querySelector("#harch").options.length >= 2,
@@ -242,6 +254,8 @@ try {
   check(dash.repoDistinct, "a different repository is a distinct holospace (repo is part of identity)");
   check(dash.refDistinct, "a different git reference is a distinct holospace (reference is part of identity)");
   check(dash.repoVsPaste, "a repo-identified holospace differs from the bare-config one (CC-20 source identity)");
+  check(dash.recvRoundTrips, "the browser receives gateway content by κ, verified on receipt, and resolves it (CC-20 /cas client)");
+  check(dash.recvRefusesTamper, "gateway content that does not re-derive to the requested κ is refused (Law L5)");
   check(dash.defaultImage.includes("buildpack-deps"), `the usable default image is exposed to the page (${dash.defaultImage})`);
   check(dash.hasTable, "the management console renders the holospaces dashboard");
   check(dash.hasArchPicker, "the launch form offers the architecture picker (riscv64/aarch64)");
