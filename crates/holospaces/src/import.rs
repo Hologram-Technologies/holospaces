@@ -31,20 +31,11 @@ use crate::oci::{ingest_image, IngestedImage, OciError};
 use crate::{compose, dockerfile};
 use alloc::collections::BTreeMap;
 
-/// The default Dev Container base image, used when a repository declares no
-/// `devcontainer.json` (the Dev Container spec's fallback) — the Codespaces
-/// model, where a repo with no config still opens into a *usable* environment.
-///
-/// `buildpack-deps:trixie-scm` is the official Debian-based image the language
-/// runtime images build on: it ships the basic developer utilities an operator
-/// expects on entry — `curl`, `wget`, `ca-certificates`, and the SCM clients
-/// (`git`, …) — over a real `apt` userland, so the booted holospace is
-/// immediately functional (not a bare base where "not even `curl` works"). It
-/// is multi-arch and, crucially, publishes **both** `riscv64` **and** `arm64`
-/// variants, so the same default boots on either emulator target (`CC-9`,
-/// `CC-35`) — the selected manifest follows the operator's architecture (Law
-/// L1, ADR-021). Heavier `apt install`s layer on top over the network (`CC-16`).
-pub const DEFAULT_DEVCONTAINER_IMAGE: &str = "buildpack-deps:trixie-scm";
+/// The default Dev Container base image (re-exported from the crate root, where
+/// it is always compiled so the browser peer shares the same value) — used when
+/// a repository declares no `devcontainer.json`. See
+/// [`crate::DEFAULT_DEVCONTAINER_IMAGE`].
+pub use crate::DEFAULT_DEVCONTAINER_IMAGE;
 
 /// What can go wrong crossing the import boundary.
 #[derive(Debug)]
