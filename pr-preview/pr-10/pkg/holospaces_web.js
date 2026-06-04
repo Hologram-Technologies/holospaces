@@ -127,27 +127,30 @@ export class Console {
      * operator *enters* it to boot its OS in the workspace IDE (`CC-13`).
      * Returns the holospace identity κ.
      * @param {Uint8Array} config_json
+     * @param {string} arch
      * @param {number} memory_bytes
      * @returns {string}
      */
-    provision_devcontainer(config_json, memory_bytes) {
-        let deferred3_0;
-        let deferred3_1;
+    provision_devcontainer(config_json, arch, memory_bytes) {
+        let deferred4_0;
+        let deferred4_1;
         try {
             const ptr0 = passArray8ToWasm0(config_json, wasm.__wbindgen_malloc);
             const len0 = WASM_VECTOR_LEN;
-            const ret = wasm.console_provision_devcontainer(this.__wbg_ptr, ptr0, len0, memory_bytes);
-            var ptr2 = ret[0];
-            var len2 = ret[1];
+            const ptr1 = passStringToWasm0(arch, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len1 = WASM_VECTOR_LEN;
+            const ret = wasm.console_provision_devcontainer(this.__wbg_ptr, ptr0, len0, ptr1, len1, memory_bytes);
+            var ptr3 = ret[0];
+            var len3 = ret[1];
             if (ret[3]) {
-                ptr2 = 0; len2 = 0;
+                ptr3 = 0; len3 = 0;
                 throw takeFromExternrefTable0(ret[2]);
             }
-            deferred3_0 = ptr2;
-            deferred3_1 = len2;
-            return getStringFromWasm0(ptr2, len2);
+            deferred4_0 = ptr3;
+            deferred4_1 = len3;
+            return getStringFromWasm0(ptr3, len3);
         } finally {
-            wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+            wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
         }
     }
     /**
