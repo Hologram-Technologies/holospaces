@@ -247,4 +247,38 @@ mod tests {
         assert_eq!(resp, vec![header(OP_FAILED, 3)]);
         assert_eq!(node.open_connections(), 0);
     }
+
+    /// SEC-7 (boundary) — the egress is **content-blind**: it forwards the guest's
+    /// payload as opaque bytes and never perceives or alters it. The
+    /// `EgressServer` holds only sockets — no `KappaStore`, no identity, no
+    /// base-frame — so an arbitrary binary payload (every byte value, including
+    /// bytes that resemble frame opcodes or κ-content) is delivered byte-identical
+    /// through the node. The node is a pipe, not an observer.
+    #[test]
+    fn the_egress_forwards_opaque_content_without_perceiving_it() {
+        let addr = echo_server();
+        let mut node = EgressServer::new();
+        node.handle_frame(&open_frame(9, addr));
+
+        // Every byte value 0..=255 — opaque payload the node must not interpret.
+        let payload: Vec<u8> = (0u16..256).map(|b| b as u8).collect();
+        node.handle_frame(&data_frame(9, &payload));
+
+        let mut got = Vec::new();
+        for _ in 0..200 {
+            for frame in node.poll() {
+                if frame.first() == Some(&OP_RDATA) {
+                    got.extend_from_slice(&frame[5..]);
+                }
+            }
+            if got.len() >= payload.len() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            got, payload,
+            "opaque content is forwarded byte-identical, never perceived"
+        );
+    }
 }
