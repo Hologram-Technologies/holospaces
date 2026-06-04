@@ -275,15 +275,32 @@ fi
 # Ubuntu arm64, so delegate the full dep selection to Playwright's installer.
 # Idempotent: re-runs are no-ops once packages are present.
 
+# Bounded + retried: the Playwright browser CDN (and npx's own package fetch)
+# can stall with no timeout, wedging the V&V job for hours. `timeout` caps each
+# attempt so a stalled download fails fast and a transient blip recovers on retry.
 info "ensuring Playwright system libraries are installed (sudo env PATH=... npx ${PLAYWRIGHT_NPM} install-deps)"
-sudo env "PATH=$PATH" npx -y "$PLAYWRIGHT_NPM" install-deps >/dev/null 2>&1 \
-    || { err "playwright install-deps failed"; exit 1; }
+pw_ok=
+for attempt in 1 2 3; do
+    if sudo env "PATH=$PATH" timeout 900 npx -y "$PLAYWRIGHT_NPM" install-deps >/dev/null 2>&1; then
+        pw_ok=1; break
+    fi
+    info "playwright install-deps attempt $attempt failed/stalled; retrying"
+    sleep 10
+done
+[ -n "$pw_ok" ] || { err "playwright install-deps failed"; exit 1; }
 
 info "ensuring Playwright browsers are installed in tools/playwright-browsers"
 mkdir -p "$PLAYWRIGHT_BROWSERS_DIR"
-PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_DIR" \
-    npx -y "$PLAYWRIGHT_NPM" install >/dev/null 2>&1 \
-    || { err "playwright install failed"; exit 1; }
+pw_ok=
+for attempt in 1 2 3; do
+    if PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_DIR" \
+        timeout 900 npx -y "$PLAYWRIGHT_NPM" install >/dev/null 2>&1; then
+        pw_ok=1; break
+    fi
+    info "playwright browser install attempt $attempt failed/stalled; retrying"
+    sleep 10
+done
+[ -n "$pw_ok" ] || { err "playwright install failed"; exit 1; }
 
 # ---- 6b. Install Graphviz for tools/opl-to-svg.rb ------------------------
 # Graphviz's `dot` is the renderer behind tools/opl-to-svg.rb, the
