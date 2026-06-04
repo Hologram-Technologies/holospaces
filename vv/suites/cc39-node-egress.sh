@@ -1,20 +1,24 @@
 #!/usr/bin/env bash
 #
-# CC-39 — the holospaces node: the egress exit a browser tab routes through
+# CC-39 — the holospaces node: a flashed bare-metal peer (egress + storage-sync
+#         + OTA) a browser tab routes through
 #
 # Component conformance suite (arc42 ch.10). A browser tab cannot open raw
-# sockets, so a guest's arbitrary internet traffic (apt/pip/npm, a git clone, an
-# outbound socket) leaves the tab through a holospaces node — a flashed
-# low-powered device you own, the mesh's exit, NOT a bespoke external proxy. The
-# browser already speaks the egress protocol (WsEgress, CC-16); the node is the
-# peer it talks to.
+# sockets, has no durable storage, and cannot update a fleet. A holospaces node —
+# a flashed low-powered device you own, the mesh's peer, NOT a bespoke external
+# proxy — provides all three. The browser already speaks the egress protocol
+# (WsEgress, CC-16); the node is the peer it talks to.
 #
-# Witnessed:
-#   * the egress protocol handler forwards a guest connection to a real host and
-#     frames the reply back; an unreachable host reports FAILED (no silent drop).
-#   * end-to-end over the REAL WebSocket transport the browser uses — a WebSocket
-#     client opens a guest connection through the node to a real host and gets the
-#     reply back (crates/holospaces-node/tests/ws_egress.rs).
+# Witnessed (crates/holospaces-node):
+#   * EGRESS — the protocol handler forwards a guest connection to a real host and
+#     frames the reply back; an unreachable host reports FAILED; the egress is
+#     content-blind (an arbitrary binary payload is forwarded byte-identical —
+#     SEC-7); and end-to-end over the REAL WebSocket the browser uses
+#     (tests/ws_egress.rs).
+#   * STORAGE-SYNC — content persists across a node restart, and the node serves
+#     it over HTTP-CAS (GET /cas/{κ}), verified on receipt (CC-38/CC-20).
+#   * OTA — the node fetches a κ-addressed update from the Pages site, verifies it
+#     re-derives (Law L5), and stages it; a forged update is refused.
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

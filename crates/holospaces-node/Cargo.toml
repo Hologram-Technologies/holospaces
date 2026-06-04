@@ -25,7 +25,15 @@ path = "src/lib.rs"
 # A synchronous WebSocket server (no async runtime — right for a low-powered
 # node): the browser peer's egress WebSocket connects here.
 tungstenite = "0.24"
-# (storage-sync + OTA, the next node capabilities, add hologram-store-native +
-# holospaces; the egress exit needs neither — it is plain std socket I/O.)
+# Storage-sync: a persistent, file-backed KappaStore on the device's flash/SD,
+# served over the substrate's HTTP-CAS protocol (the same /cas/{κ} the browser
+# peer fetches by), so the node is a durable content peer (CC-38).
+hologram-store-native = { workspace = true }
+hologram-net-http = { workspace = true, features = ["live"] }
+hologram-substrate-core = { workspace = true, features = ["std"] }
+# OTA: the node fetches its own κ-addressed updates from the Pages site and
+# verifies them by re-derivation (Law L5) before staging — an HTTP(S) client.
+ureq = "2"
 
 [dev-dependencies]
+hologram-store-mem = { workspace = true, features = ["std"] }
