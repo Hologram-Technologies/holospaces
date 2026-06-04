@@ -28,9 +28,13 @@ container daemon, no POSIX checkout.
     `.devcontainer.json`) from the Repository and validates it against
     the Dev Container spec (`CC-4`), yielding the **Devcontainer
     Config** (a reproducible κ). **If the repository declares no
-    devcontainer**, holospaces supplies a **default Dev Container** (a
-    standard base image — the Dev Container spec’s fallback), so any
-    repository runs. The config’s `image` field names the base image (a
+    devcontainer**, holospaces supplies a **default Dev Container** — a
+    *usable* base image (`buildpack-deps`: `curl`, `wget`, `git`, and the
+    SCM clients over a real `apt` userland), the Dev Container spec’s
+    fallback in the Codespaces sense (open any repo and it just works, not
+    a bare base where “not even `curl` works”); it is multi-arch
+    (`riscv64`/`aarch64`), so the default boots on either emulator target.
+    So any repository runs. The config’s `image` field names the base image (a
     registry reference — a *location*, resolved next).
 
 3.  **Image Ingestion.** The Image Ingestor pulls the named OCI image
