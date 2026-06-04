@@ -214,6 +214,61 @@ fn sec_confidentiality_content_is_reachable_only_by_its_kappa() {
     );
 }
 
+// ── SEC-3 (deepened) — content has ONE identity network-wide ──────────────────
+// The foundation of the dense-matrix cost model: content's identity is its κ,
+// computed identically on every peer, so the same artifact is the *same content*
+// everywhere — resolved once and shared, never re-identified per peer. This is
+// what makes "resolved once, deduplicated network-wide" hold across independent
+// peers, not just within one store (idempotent put, SEC-3).
+#[test]
+fn sec_cost_content_has_one_identity_on_every_peer() {
+    let peer_a = MemKappaStore::new();
+    let peer_b = MemKappaStore::new();
+    let content = b"a package, identified by its content, the same on every node";
+
+    let on_a = peer_a.put("blake3", content).unwrap();
+    let on_b = peer_b.put("blake3", content).unwrap();
+    assert_eq!(
+        on_a, on_b,
+        "the same content has one identity across independent peers (network-wide dedup)"
+    );
+    // And it is the peer-independent address any peer computes for the bytes.
+    assert_eq!(
+        on_a,
+        address(content),
+        "the identity is the content address, not a peer's choice"
+    );
+}
+
+// ── SEC-6 — Reference resolution: verified against the κ, not the reference ────
+// "this URL/name → this κ" is the trust-sensitive boundary (ADR-013). The located
+// reference is the *request*; the κ is the *identity*. Whatever a reference points
+// at, the content is **verified by re-derivation against the κ on the κ's own
+// axis** before it is accepted — an OCI `sha256:` digest IS a κ on the `sha256`
+// axis (`CC-10`/`CC-20`), so a tampered blob is refused regardless of where the
+// reference led.
+#[test]
+fn sec_reference_resolution_verifies_against_the_kappa_on_its_axis() {
+    use holospaces::realizations::{address_on, Axis};
+    let blob = b"an image layer a manifest references by its sha256 digest";
+
+    // The OCI digest a reference names is the κ on the sha256 axis.
+    let digest = address_on(blob, Axis::Sha256).unwrap();
+    assert!(
+        hologram_substrate_core::verify_kappa_axis(blob, &digest).unwrap(),
+        "the content re-derives to the digest the reference named"
+    );
+
+    // A tampered blob does not re-derive — refused at the import boundary, no
+    // matter that the reference resolved to it.
+    let mut tampered = blob.to_vec();
+    tampered[0] ^= 0x01;
+    assert!(
+        !hologram_substrate_core::verify_kappa_axis(&tampered, &digest).unwrap(),
+        "a tampered blob is refused on the referenced axis"
+    );
+}
+
 /// The canonical bytes of a roster (the form its κ addresses), via the
 /// substrate's `Realization` contract.
 fn roster_canonical(roster: &Roster) -> Vec<u8> {

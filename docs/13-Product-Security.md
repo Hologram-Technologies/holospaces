@@ -93,11 +93,15 @@ unbounded budget under a bounded parent, a foreign storage root) is refused.
 The UOR cost model resolves content **once** and shares it; idempotent `put` is
 its holospaces-observable form. *Enforced by* the content-addressed store.
 *Witness:* `sec_cost_identical_content_deduplicates` — re-storing identical
-content yields the same κ and does not grow the store. The deeper dense-matrix
-**structural** dedup (cost by unique structure, not bits) and the **decreasing
-per-node resource floor** are substrate properties holospaces inherits (hologram
-conformance); the holospaces-observable consequence — repetition collapses to a κ
-already resolved — is what makes DoS-by-repetition uneconomic here.
+content yields the same κ and does not grow the store. Content also has **one
+identity network-wide** — every peer computes the same κ for the same bytes — so
+the same artifact is *the same content everywhere*, resolved once and shared, not
+re-identified per peer (*witness:* `sec_cost_content_has_one_identity_on_every_peer`).
+The deeper dense-matrix **structural** dedup (cost by unique structure, not bits)
+and the **decreasing per-node resource floor** are substrate properties holospaces
+inherits (hologram conformance, §13.9); the holospaces-observable consequence —
+repetition collapses to a κ already resolved, and the same κ on every node — is
+what makes DoS-by-repetition uneconomic and the network cheaper-with-scale.
 
 ### SEC-4 — Identity: self-sovereign and unforgeable
 
@@ -116,8 +120,31 @@ content-addressed store (an unknown κ is absent). *Witness:*
 `sec_confidentiality_content_is_reachable_only_by_its_kappa`. The deeper property
 — content is UOR-encoded and meaningful only in the observer's **base-frame**, so
 a routing/storage peer without the frame perceives nothing (no ciphertext, no key
-to steal) — is the UOR/substrate layer this builds on; the enforced,
-holospaces-observable property is **κ-as-capability**.
+to steal) — is realized at the **UOR/Prism layer** (`uor-prism-crypto`,
+`uor-prism-fhe`: frame-encoded / homomorphically-operable content), which
+holospaces may compose but does not yet (§13.9). The property holospaces enforces
+today is **κ-as-capability**.
+
+### SEC-6 — Reference resolution: verified against the κ, not the reference
+
+"this URL / name → this κ" is the trust-sensitive boundary (ADR-013): the located
+reference is the *request*; the κ is the *identity*. Whatever a reference points
+at, the content is **verified by re-derivation against the κ on the κ's own axis**
+before it is accepted — an OCI `sha256:` digest *is* a κ on the `sha256` axis
+(`CC-10`/`CC-20`), so a tampered blob is refused regardless of where the reference
+led. *Enforced by* `verify_kappa_axis` at the import boundary. *Witness:*
+`sec_reference_resolution_verifies_against_the_kappa_on_its_axis`.
+
+### SEC-7 — Egress boundary: the exit is content-blind
+
+An egress peer forwards a guest's payload as **opaque bytes** and never perceives
+or alters it. The node holds only sockets — no `KappaStore`, no identity, no
+base-frame — so it is a pipe, not an observer. *Enforced by* the `EgressServer`'s
+structure (it forwards bytes it cannot interpret). *Witness:*
+`the_egress_forwards_opaque_content_without_perceiving_it` (`CC-39`,
+`crates/holospaces-node`) — an arbitrary binary payload (every byte value,
+including bytes resembling frame opcodes or κ-content) is delivered byte-identical
+through the node.
 
 ## 13.6 The legacy-internet boundary (named, not wished away)
 
@@ -144,10 +171,51 @@ the far end observes what any legacy server observes of its own clients.
   compromises its identity and capabilities. There is, by design, no central
   recovery — the mitigation is key custody, not a server.
 
-## 13.8 Verification & validation
+## 13.8 Adversary → defense
 
-`CC-40` (`vv/suites/cc40-product-security.sh`) runs the witness battery; the
-quality-requirements catalog (chapter 10) lists it `live`. The properties are
+| Adversary | Defeated by | Residual |
+|---|---|---|
+| Malicious peer / node (forge, tamper) | SEC-1 (re-derivation), SEC-7 (egress content-blind) | may withhold/delay (availability) |
+| Compromised cold-start gateway / CDN | SEC-1 (every byte re-derived on load) | availability only |
+| Passive observer / routing peer | SEC-5 (κ-as-capability; frame at Prism) | network metadata (timing/volume); legacy-internet destinations on the egress outside leg (§13.6) |
+| Malicious guest / holospace | SEC-2 (capabilities only attenuate) | resource use bounded by quota |
+| Sybil / eclipse | SEC-1 holds regardless | availability/routing (substrate DHT, §13.9) |
+| Key thief | — | self-sovereign = self-responsible (key custody) |
+
+## 13.9 Enforcement layering (what is proven where)
+
+The threat model spans three layers; this chapter is explicit about which holds
+each property so nothing is over-claimed:
+
+- **holospaces-enforced + witnessed here** (`CC-40`/`CC-39`): SEC-1 integrity,
+  SEC-2 authority, SEC-3 dedup (idempotent + network-wide identity), SEC-4
+  identity, SEC-5 κ-as-capability, SEC-6 reference resolution, SEC-7 egress
+  content-blindness.
+- **Substrate-inherited** (hologram conformance): the dense-matrix **structural**
+  dedup (cost by unique structure, not bits), the **decreasing per-node resource
+  floor**, and DHT eclipse/Sybil resistance. holospaces witnesses their
+  *observable consequences* (one κ per content, repetition collapses) but does not
+  re-prove the substrate.
+- **Prism-available, not yet composed**: frame-relative / homomorphic
+  confidentiality (`uor-prism-crypto`, `uor-prism-fhe`). When holospaces composes
+  it, SEC-5 graduates from κ-as-capability to the full base-frame property, with a
+  witness added here.
+
+## 13.10 Verification & validation
+
+`CC-40` (`vv/suites/cc40-product-security.sh`) + `CC-39`
+(`vv/suites/cc39-node-egress.sh`) run the witness battery; the
+quality-requirements catalog (chapter 10) lists them `live`. The properties are
 enforced *by construction*, so the witnesses assert what the substrate
 **refuses** — a tampered byte, an escalated capability, a fabricated κ — rather
-than a bolted-on check. A change that weakened any property would fail `CC-40`.
+than a bolted-on check. A change that weakened any property would fail the gate.
+
+| Req | Property | Witness | Suite |
+|---|---|---|---|
+| SEC-1 | Integrity (no forgery) | `sec_integrity_tampered_content_does_not_re_derive`, `sec_integrity_the_network_refuses_a_forging_responder` | `CC-40` |
+| SEC-2 | Authority (attenuation only) | `sec_authority_capabilities_only_attenuate_never_escalate` | `CC-40` |
+| SEC-3 | Cost / dedup (one κ, network-wide) | `sec_cost_identical_content_deduplicates`, `sec_cost_content_has_one_identity_on_every_peer` | `CC-40` |
+| SEC-4 | Identity (self-sovereign) | `sec_identity_is_self_sovereign_and_unforgeable` | `CC-40` |
+| SEC-5 | Confidentiality (κ-as-capability) | `sec_confidentiality_content_is_reachable_only_by_its_kappa` | `CC-40` |
+| SEC-6 | Reference resolution (verified vs κ) | `sec_reference_resolution_verifies_against_the_kappa_on_its_axis` | `CC-40` |
+| SEC-7 | Egress boundary (content-blind) | `the_egress_forwards_opaque_content_without_perceiving_it` | `CC-39` |
