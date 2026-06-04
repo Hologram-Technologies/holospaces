@@ -114,3 +114,7 @@ runs:
         scripts/build-extension.sh
         mkdir -p "$SITE/extension"
         cp crates/holospaces-web/extension/dist/*.zip "$SITE/extension/"
+        # A stable filename the Manager console links to (the versioned zip is
+        # also kept). Until the extension is in the Chrome store, the console
+        # offers this for a manual (load-unpacked) install.
+        cp crates/holospaces-web/extension/dist/*.zip "$SITE/extension/holospaces-egress-extension.zip"

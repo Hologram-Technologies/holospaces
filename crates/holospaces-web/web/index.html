@@ -176,6 +176,9 @@
             <button class="sm" id="d-egress-apply">Set egress</button>
           </div>
           <p class="hint">Forwarded guest ports become app-preview URLs; fetch/announce govern the guest's substrate connectivity. <strong>Egress node:</strong> a tab has no NIC, so the guest's internet (curl/apt) routes through a <em>holospaces-node you own</em> (CC-39) — the mesh's exit, not a proxy. Leave blank for content-only (no live egress).</p>
+          <p class="hint" id="ext-egress">No node? Install the <strong>local egress extension</strong> — it opens raw sockets in your own browser (Direct Sockets, CC-41), so a Chromebook reaches the internet with nothing else.
+            <a id="ext-dl" href="extension/holospaces-egress-extension.zip" download>⬇ Download extension</a>.
+            Manual install (until it's in the Chrome Web Store): download → unzip → <code>chrome://extensions</code> → enable Developer mode → <em>Load unpacked</em> → pick the unzipped folder.</p>
         </section>
 
         <section>

@@ -250,6 +250,10 @@ try {
       hasArchPicker: !!document.querySelector("#harch") && document.querySelector("#harch").options.length >= 2,
       hasSettings: !!document.querySelector("#drawer"),
       hasEgressField: !!document.querySelector("#d-egress"),
+      hasExtDownload: (() => {
+        const a = document.querySelector("#ext-dl");
+        return !!a && a.hasAttribute("download") && (a.getAttribute("href") || "").includes("extension/holospaces-egress-extension.zip");
+      })(),
       hasRepoInput: !!document.querySelector("#hrepo"),
       defImgShown: (document.querySelector("#defimg")?.textContent || "").includes("buildpack-deps"),
     };
@@ -272,6 +276,7 @@ try {
   check(dash.hasArchPicker, "the launch form offers the architecture picker (riscv64/aarch64)");
   check(dash.hasSettings, "the console exposes a per-guest settings drawer");
   check(dash.hasEgressField, "the settings drawer offers a per-guest egress node (the holospaces-node the guest's internet routes through, CC-39)");
+  check(dash.hasExtDownload, "the console offers the local egress extension for download + manual install (CC-41, until it is in the Chrome store)");
   check(dash.hasRepoInput, "the launch form takes a git repository URL (Codespaces/Gitpod flow)");
   check(dash.defImgShown, "the launch form shows the usable default image");
 
