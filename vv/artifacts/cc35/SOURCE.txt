@@ -33,6 +33,11 @@ Coverage:
   control  — the branch family: a CBNZ countdown loop computing sum(1..=100)=5050,
              a BL/RET subroutine call, and the TBNZ/TBZ/CBZ bit-test branches,
              with the NZCV condition codes via B.cond.
+  simd     — the SIMD&FP execution unit (Arm-ARM C7): the lane moves DUP/UMOV,
+             the three-same logical + arithmetic (AND/ORR/EOR/ADD), CMEQ #0, the
+             modified immediate MOVI, the shifts SHL/USHR, EXT, scalar
+             floating-point FADD/FSUB/FMUL/FDIV (single + double), the
+             general<->SIMD FMOV, the int<->fp conversions SCVTF/FCVTZS, and FCMP.
 
 Witness: crates/holospaces/tests/cc35_aarch64.rs (the core runs each real binary
 to "PASS\n" + status 0); the qemu-aarch64 differential is run by

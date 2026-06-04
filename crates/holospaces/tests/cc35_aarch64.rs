@@ -30,6 +30,7 @@ fn run_battery(image: &[u8]) -> (Vec<u8>, u64) {
 const ARITH: &[u8] = include_bytes!("../../../vv/artifacts/cc35/arith.bin");
 const MEMORY: &[u8] = include_bytes!("../../../vv/artifacts/cc35/memory.bin");
 const CONTROL: &[u8] = include_bytes!("../../../vv/artifacts/cc35/control.bin");
+const SIMD: &[u8] = include_bytes!("../../../vv/artifacts/cc35/simd.bin");
 
 /// The data-processing battery: every A64 data-processing group's result equals
 /// the Arm-ARM-defined value.
@@ -57,4 +58,14 @@ fn the_a64_control_flow_battery_passes() {
     let (console, status) = run_battery(CONTROL);
     assert_eq!(console, b"PASS\n", "control battery verdict");
     assert_eq!(status, 0, "control battery exit status");
+}
+
+/// The SIMD&FP battery: the Advanced-SIMD (NEON) data-processing forms +
+/// scalar floating-point (FADD/FSUB/FMUL/FDIV, the general↔SIMD `FMOV`, the
+/// int↔fp conversions, `FCMP`) each equal their Arm-ARM-defined result.
+#[test]
+fn the_a64_simd_fp_battery_passes() {
+    let (console, status) = run_battery(SIMD);
+    assert_eq!(console, b"PASS\n", "simd/fp battery verdict");
+    assert_eq!(status, 0, "simd/fp battery exit status");
 }
