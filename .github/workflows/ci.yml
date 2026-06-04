@@ -29,6 +29,7 @@ jobs:
   vv:
     name: V&V (CS spec conformance V1–V8 + CC component conformance)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -73,6 +74,7 @@ jobs:
             docs/tools/bin
             docs/tools/cmark-prefix
             docs/tools/pandoc-prefix
+            docs/tools/playwright-browsers
           key: doc-tools-${{ hashFiles('docs/tools/checksums.txt', 'docs/scripts/install-tools.sh') }}
       - name: Provision the pinned doc toolchain
         run: docs/scripts/install-tools.sh
@@ -103,6 +105,7 @@ jobs:
   rust:
     name: Rust quality + tests (unit · integration · e2e)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Configure git for the hologram substrate dependency
@@ -136,6 +139,7 @@ jobs:
   browser:
     name: Browser peer + Platform Manager (Chromium/Playwright)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Configure git for the hologram substrate dependency
