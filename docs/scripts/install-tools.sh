@@ -289,18 +289,23 @@ for attempt in 1 2 3; do
 done
 [ -n "$pw_ok" ] || { err "playwright install-deps failed"; exit 1; }
 
-info "ensuring Playwright browsers are installed in tools/playwright-browsers"
+# Install ONLY Chromium — structurizr.war's SVG exporter launches Chromium and
+# nothing else. A bare `playwright install` downloads Chromium *and* Firefox *and*
+# WebKit; the Firefox/WebKit downloads are pure waste here and were stalling the
+# CDN fetch for hours (the doc-toolchain hang). `chromium` scopes it to what is
+# actually used.
+info "ensuring Playwright Chromium is installed in tools/playwright-browsers"
 mkdir -p "$PLAYWRIGHT_BROWSERS_DIR"
 pw_ok=
 for attempt in 1 2 3; do
     if PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_DIR" \
-        timeout 900 npx -y "$PLAYWRIGHT_NPM" install >/dev/null 2>&1; then
+        timeout 900 npx -y "$PLAYWRIGHT_NPM" install chromium >/dev/null 2>&1; then
         pw_ok=1; break
     fi
-    info "playwright browser install attempt $attempt failed/stalled; retrying"
+    info "playwright chromium install attempt $attempt failed/stalled; retrying"
     sleep 10
 done
-[ -n "$pw_ok" ] || { err "playwright install failed"; exit 1; }
+[ -n "$pw_ok" ] || { err "playwright chromium install failed"; exit 1; }
 
 # ---- 6b. Install Graphviz for tools/opl-to-svg.rb ------------------------
 # Graphviz's `dot` is the renderer behind tools/opl-to-svg.rb, the
