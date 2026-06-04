@@ -1,0 +1,31 @@
+[package]
+name = "holospaces-node"
+description = "holospaces bare-metal/edge peer — an egress + storage-sync node for low-powered devices (browser-peer's mesh exit + persistence; OTA-updated from the holospaces GitHub Pages site)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# A flashable node binary. It runs the holospaces peer that a browser tab (e.g. a
+# Chromebook) routes through: the EGRESS exit (the device has a real NIC, the tab
+# does not) and a persistent STORAGE-SYNC peer. The browser already speaks the
+# egress protocol (the `WsEgress` OPEN/DATA/CLOSE framing); this node is the peer
+# it talks to — a device you own, not a bespoke external proxy. The node fetches
+# its own updates from the holospaces GitHub Pages site (κ-addressed, verified by
+# re-derivation — the cold-start gateway as the OTA source).
+[[bin]]
+name = "holospaces-node"
+path = "src/main.rs"
+
+[lib]
+name = "holospaces_node"
+path = "src/lib.rs"
+
+[dependencies]
+# A synchronous WebSocket server (no async runtime — right for a low-powered
+# node): the browser peer's egress WebSocket connects here.
+tungstenite = "0.24"
+# (storage-sync + OTA, the next node capabilities, add hologram-store-native +
+# holospaces; the egress exit needs neither — it is plain std socket I/O.)
+
+[dev-dependencies]
