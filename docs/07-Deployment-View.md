@@ -40,7 +40,16 @@ mechanisms:
 
 - **Network** — content-addressed routing between peers (no host/peer-id
   naming, Law L1); the rendezvous/routing mechanism is hologram’s (see
-  [hologram](https://github.com/Hologram-Technologies/hologram)).
+  [hologram](https://github.com/Hologram-Technologies/hologram)). A
+  *sandboxed* peer (a browser tab) has no NIC, so a guest’s arbitrary
+  internet (`curl`/`apt`, a `git` clone, an outbound socket) exits through
+  one of three surfaces, all speaking the same egress protocol (CC-16) and
+  all **content-blind** (SEC-7): a **holospaces-node** you flash (CC-39); the
+  **mesh** to an exit peer (CC-38); or — making a Chromebook fully
+  self-contained — a **local Chrome extension** that opens the raw sockets a
+  tab cannot, via the Direct Sockets API
+  (`crates/holospaces-web/extension/`). A *sovereign* peer (a bare-metal
+  holospace, Chromium-on-device) has a real NIC and needs none of them.
 
 - **Execution** — two engines: a `ContainerEngine` boots Wasm code
   modules — including the system-emulator codemodule that computes an
