@@ -127,27 +127,30 @@ export class Console {
      * operator *enters* it to boot its OS in the workspace IDE (`CC-13`).
      * Returns the holospace identity κ.
      * @param {Uint8Array} config_json
+     * @param {string} arch
      * @param {number} memory_bytes
      * @returns {string}
      */
-    provision_devcontainer(config_json, memory_bytes) {
-        let deferred3_0;
-        let deferred3_1;
+    provision_devcontainer(config_json, arch, memory_bytes) {
+        let deferred4_0;
+        let deferred4_1;
         try {
             const ptr0 = passArray8ToWasm0(config_json, wasm.__wbindgen_malloc);
             const len0 = WASM_VECTOR_LEN;
-            const ret = wasm.console_provision_devcontainer(this.__wbg_ptr, ptr0, len0, memory_bytes);
-            var ptr2 = ret[0];
-            var len2 = ret[1];
+            const ptr1 = passStringToWasm0(arch, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len1 = WASM_VECTOR_LEN;
+            const ret = wasm.console_provision_devcontainer(this.__wbg_ptr, ptr0, len0, ptr1, len1, memory_bytes);
+            var ptr3 = ret[0];
+            var len3 = ret[1];
             if (ret[3]) {
-                ptr2 = 0; len2 = 0;
+                ptr3 = 0; len3 = 0;
                 throw takeFromExternrefTable0(ret[2]);
             }
-            deferred3_0 = ptr2;
-            deferred3_1 = len2;
-            return getStringFromWasm0(ptr2, len2);
+            deferred4_0 = ptr3;
+            deferred4_1 = len3;
+            return getStringFromWasm0(ptr3, len3);
         } finally {
-            wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+            wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
         }
     }
     /**
@@ -230,17 +233,23 @@ export class Console {
      * its config selects is validated against the host-ABI surface (`CC-6`) and
      * booted through the substrate runtime over the interpreter engine — same
      * lifecycle as a native or remote peer (Q6). Returns the suspend snapshot κ.
+     *
+     * `arch` is the operator's **architecture selection** (the Manager GUI's
+     * arch picker; ADR-021) — `"riscv64"` or `"aarch64"`. It becomes part of the
+     * holospace's content-addressed identity, so it is fixed for the holospace's
+     * lifetime (an unknown id falls back to the default RISC-V target).
      * @param {string} repo
      * @param {string} reference
      * @param {string} config_path
      * @param {Uint8Array} config_json
      * @param {Uint8Array} userland_module
+     * @param {string} arch
      * @param {number} memory_bytes
      * @returns {string}
      */
-    run_devcontainer(repo, reference, config_path, config_json, userland_module, memory_bytes) {
-        let deferred7_0;
-        let deferred7_1;
+    run_devcontainer(repo, reference, config_path, config_json, userland_module, arch, memory_bytes) {
+        let deferred8_0;
+        let deferred8_1;
         try {
             const ptr0 = passStringToWasm0(repo, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
             const len0 = WASM_VECTOR_LEN;
@@ -252,18 +261,20 @@ export class Console {
             const len3 = WASM_VECTOR_LEN;
             const ptr4 = passArray8ToWasm0(userland_module, wasm.__wbindgen_malloc);
             const len4 = WASM_VECTOR_LEN;
-            const ret = wasm.console_run_devcontainer(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, memory_bytes);
-            var ptr6 = ret[0];
-            var len6 = ret[1];
+            const ptr5 = passStringToWasm0(arch, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len5 = WASM_VECTOR_LEN;
+            const ret = wasm.console_run_devcontainer(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5, memory_bytes);
+            var ptr7 = ret[0];
+            var len7 = ret[1];
             if (ret[3]) {
-                ptr6 = 0; len6 = 0;
+                ptr7 = 0; len7 = 0;
                 throw takeFromExternrefTable0(ret[2]);
             }
-            deferred7_0 = ptr6;
-            deferred7_1 = len6;
-            return getStringFromWasm0(ptr6, len6);
+            deferred8_0 = ptr7;
+            deferred8_1 = len7;
+            return getStringFromWasm0(ptr7, len7);
         } finally {
-            wasm.__wbindgen_free(deferred7_0, deferred7_1, 1);
+            wasm.__wbindgen_free(deferred8_0, deferred8_1, 1);
         }
     }
     /**
@@ -1087,12 +1098,12 @@ function __wbg_get_imports() {
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
             // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 8, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h433d5e4bea598df1);
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h15352190dad911f6);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
             // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 8, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h433d5e4bea598df1_1);
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h15352190dad911f6_1);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
@@ -1116,12 +1127,12 @@ function __wbg_get_imports() {
     };
 }
 
-function wasm_bindgen__convert__closures_____invoke__h433d5e4bea598df1(arg0, arg1, arg2) {
-    wasm.wasm_bindgen__convert__closures_____invoke__h433d5e4bea598df1(arg0, arg1, arg2);
+function wasm_bindgen__convert__closures_____invoke__h15352190dad911f6(arg0, arg1, arg2) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h15352190dad911f6(arg0, arg1, arg2);
 }
 
-function wasm_bindgen__convert__closures_____invoke__h433d5e4bea598df1_1(arg0, arg1, arg2) {
-    wasm.wasm_bindgen__convert__closures_____invoke__h433d5e4bea598df1_1(arg0, arg1, arg2);
+function wasm_bindgen__convert__closures_____invoke__h15352190dad911f6_1(arg0, arg1, arg2) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h15352190dad911f6_1(arg0, arg1, arg2);
 }
 
 
