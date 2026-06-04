@@ -1407,7 +1407,9 @@ impl Cpu {
         let scale = 64 - ((inst >> 10) & 0x3f);
         let rn = (inst >> 5) & 0x1f;
         let rd = inst & 0x1f;
-        let factor = (2.0_f64).powi(scale as i32);
+        // 2^scale built from the IEEE-754 exponent (f64::powi is std-only and the
+        // crate is no_std). `scale` is 1..=64, so the exponent never overflows.
+        let factor = f64::from_bits((1023u64 + u64::from(scale)) << 52);
         match opcode {
             0b010 | 0b011 => {
                 // SCVTF / UCVTF (fixed → float).
