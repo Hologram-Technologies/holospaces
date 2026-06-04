@@ -268,17 +268,23 @@ fi
 [ -f "$ARC42_TEMPLATE_DIR/EN/adoc/01_introduction_and_goals.adoc" ] \
     || { err "$ARC42_TEMPLATE_DIR/EN/adoc/ layout not found at pinned SHA — pin may be too old"; exit 1; }
 
-# ---- 6. Install Playwright + Chromium ----------------------------------
-# structurizr.war's SVG exporter launches a headless Chromium (and nothing
-# else) the first time `export -format svg` runs against a workspace with views.
+# ---- 6. Install Playwright's Chromium system libraries -----------------
+# structurizr.war's SVG exporter launches a headless Chromium via its bundled
+# Playwright *Java*, which downloads the browser binary itself at export time
+# (docs/scripts/v3-structurizr.sh sets PLAYWRIGHT_BROWSERS_PATH for it). All we
+# provision here are the system libraries that Chromium links against.
 #
-# Install the pinned Playwright CLI ONCE with a plain `npm install` into a
-# scratch dir, then drive it directly. `npx -y playwright@VER ...` re-resolves
-# and re-fetches the package on every invocation and has wedged indefinitely in
-# CI (a hung doc-toolchain run); a local install is fetched once, deterministic,
-# and runs from node_modules/.bin like the project's own Playwright. Skip the
-# npm postinstall's implicit all-browser download (PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD)
-# — Chromium alone is installed explicitly below.
+# We deliberately do NOT pre-download the browser binary with the Node CLI:
+# `playwright install chromium` fetches Chromium to 100% and then wedges in CI
+# on its post-download step (the ffmpeg fetch + unpack), hanging the V&V job for
+# hours — the regression a recent devcontainer/tooling change introduced by
+# adding that pre-download. The Java exporter fetches just the browser at
+# runtime, as it always has, with no such hang.
+#
+# Install the pinned Playwright CLI once via a plain local `npm install` (npx
+# -y playwright@VER re-resolves/re-fetches per call and itself wedges as the
+# runner user), skipping the npm postinstall's implicit browser download, and
+# run only `install-deps`.
 PW_CLI_DIR="$TOOLS_DIR/playwright-cli"
 info "installing the pinned Playwright CLI ($PLAYWRIGHT_NPM) into tools/playwright-cli"
 mkdir -p "$PW_CLI_DIR"
@@ -290,36 +296,9 @@ mkdir -p "$PW_CLI_DIR"
 PW_BIN="$PW_CLI_DIR/node_modules/.bin/playwright"
 [ -x "$PW_BIN" ] || { err "Playwright CLI not found at $PW_BIN after install"; exit 1; }
 
-info "ensuring Playwright system libraries are installed ($PW_BIN install-deps)"
-sudo env "PATH=$PATH" timeout 600 "$PW_BIN" install-deps >/dev/null 2>&1 \
-    || { err "playwright install-deps failed"; exit 1; }
-
-# Chromium only, and only the full browser — `--no-shell`. `playwright install
-# chromium` also pulls `chromium-headless-shell`, and *that* artifact's CDN fetch
-# is what hangs (the full Chromium downloads to 100%, then the shell stalls
-# forever). structurizr's exporter launches the full Chromium headless and never
-# uses the shell, so `--no-shell` drops the hanging download with no loss.
-#
-# The remaining download is just the full Chromium (~167 MiB) + ffmpeg. The CDN
-# can throttle it to several minutes, and since `--no-shell` removed the *only*
-# artifact that actually hangs, the per-attempt timeout is generous (10 min) —
-# it bounds a genuine wedge without aborting a slow-but-progressing download and
-# re-downloading from scratch (Playwright does not resume).
-info "ensuring Playwright Chromium is installed in tools/playwright-browsers"
-mkdir -p "$PLAYWRIGHT_BROWSERS_DIR"
-pw_log=$(mktemp)
-pw_ok=
-for attempt in 1 2 3; do
-    if PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_DIR" \
-        timeout 600 "$PW_BIN" install chromium --no-shell >"$pw_log" 2>&1; then
-        pw_ok=1; break
-    fi
-    info "playwright chromium install attempt $attempt stalled/failed; retrying. last output:"
-    tail -4 "$pw_log" 2>/dev/null || true
-    sleep 5
-done
-[ -n "$pw_ok" ] || { err "playwright chromium install failed after retries"; tail -20 "$pw_log"; exit 1; }
-rm -f "$pw_log"
+info "ensuring Playwright Chromium system libraries are installed ($PW_BIN install-deps chromium)"
+sudo env "PATH=$PATH" timeout 600 "$PW_BIN" install-deps chromium >/dev/null 2>&1 \
+    || { err "playwright install-deps chromium failed"; exit 1; }
 
 # ---- 6b. Install Graphviz for tools/opl-to-svg.rb ------------------------
 # Graphviz's `dot` is the renderer behind tools/opl-to-svg.rb, the
