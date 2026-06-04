@@ -334,7 +334,7 @@ impl Cpu {
             Ok(v) => v as u32,
             Err(t) => {
                 if self.sys.is_some() {
-                    self.take_mem_abort(pc, pc, true, false);
+                    self.take_mem_abort(pc, pc, true, false, false);
                     return Ok(());
                 }
                 return Err(Halt::Trap(t));
@@ -3266,6 +3266,10 @@ struct TlbEntry {
     tag: u64,
     frame: u64,
     gen: u64,
+    /// The page is writable (descriptor `AP[2]` == 0). A store to a read-only
+    /// page raises a permission fault — the write-protect fault the kernel uses
+    /// for copy-on-write *and* dirty-bit tracking (no hardware AF/DBM here).
+    writable: bool,
 }
 
 const TLB_SETS: usize = 1024;
@@ -3366,7 +3370,7 @@ struct Sys {
     /// by the packed system-register id.
     regs: BTreeMap<u32, u64>,
     /// A translation faulted: `(faulting VA, is-write)` — consumed by the abort.
-    fault: Option<(u64, bool)>,
+    fault: Option<(u64, bool, bool)>,
     cntfrq: u64,
     counter: u64,
     cntp_ctl: u64,
@@ -3422,7 +3426,8 @@ impl Sys {
                 TlbEntry {
                     tag: 0,
                     frame: 0,
-                    gen: 0
+                    gen: 0,
+                    writable: false,
                 };
                 TLB_SETS
             ],
@@ -3869,7 +3874,7 @@ impl Cpu {
     }
 
     /// Take a memory abort (instruction or data) to EL1, building `ESR_EL1`/`FAR_EL1`.
-    fn take_mem_abort(&mut self, ret: u64, far: u64, is_fetch: bool, is_write: bool) {
+    fn take_mem_abort(&mut self, ret: u64, far: u64, is_fetch: bool, is_write: bool, is_perm: bool) {
         let from_el0 = self.sys().el == 0;
         let spsr = self.pack_pstate();
         let group = if from_el0 {
@@ -3887,8 +3892,10 @@ impl Cpu {
             (false, true) => 0x24,
             (false, false) => 0x25,
         };
-        // ISS: a translation fault, with the write bit for data aborts.
-        let dfsc = 0b000101u64; // translation fault, level 1
+        // ISS DFSC: a permission fault (level 3) for a write-protect violation
+        // (copy-on-write / dirty tracking), otherwise a translation fault (level
+        // 1). The write bit (WnR) is set for write data aborts.
+        let dfsc = if is_perm { 0b001111u64 } else { 0b000101u64 };
         let iss = dfsc | (if !is_fetch && is_write { 1 << 6 } else { 0 });
         self.sys_mut().elr_el1 = ret;
         self.sys_mut().spsr_el1 = spsr;
@@ -3927,8 +3934,8 @@ impl Cpu {
     /// Route an `exec` trap in system mode to the right exception: a translation
     /// fault recorded by the MMU becomes a data abort; anything else is undefined.
     fn take_exec_trap(&mut self, pc: u64, inst: u32, _t: Trap) {
-        if let Some((far, is_write)) = self.sys().fault {
-            self.take_mem_abort(pc, far, false, is_write);
+        if let Some((far, is_write, is_perm)) = self.sys().fault {
+            self.take_mem_abort(pc, far, false, is_write, is_perm);
         } else {
             self.take_undef(pc, inst);
         }
@@ -3974,20 +3981,31 @@ impl Cpu {
         let gen = self.sys().tlb_gen;
         let e = self.sys().tlb[set];
         if e.gen == gen && e.tag == page {
+            if acc == Access::Store && !e.writable {
+                // Write to a read-only page → write-permission fault (copy-on-write
+                // / dirty-bit tracking). The kernel resolves it and re-executes.
+                self.sys_mut().fault = Some((va, true, true));
+                return Err(Trap::AccessFault(va));
+            }
             return Ok(e.frame | (va & 0xfff));
         }
         match self.walk(va) {
-            Some(pa) => {
+            Some((pa, writable)) => {
                 self.sys_mut().tlb[set] = TlbEntry {
                     tag: page,
                     frame: pa & !0xfff,
                     gen,
+                    writable,
                 };
+                if acc == Access::Store && !writable {
+                    self.sys_mut().fault = Some((va, true, true));
+                    return Err(Trap::AccessFault(va));
+                }
                 Ok(pa)
             }
             None => {
                 let is_write = acc == Access::Store;
-                self.sys_mut().fault = Some((va, is_write));
+                self.sys_mut().fault = Some((va, is_write, false));
                 Err(Trap::AccessFault(va))
             }
         }
@@ -3995,7 +4013,9 @@ impl Cpu {
 
     /// Walk the page tables (4 KiB granule). Returns the physical address, or
     /// `None` on a translation fault.
-    fn walk(&self, va: u64) -> Option<u64> {
+    /// Walk the page tables for `va`, returning `(physical address, writable)`.
+    /// `writable` is the descriptor's `AP[2]` bit inverted (0 = read/write).
+    fn walk(&self, va: u64) -> Option<(u64, bool)> {
         let tcr = self.sys().tcr_el1;
         let t0sz = (tcr & 0x3f) as u32;
         let t1sz = ((tcr >> 16) & 0x3f) as u32;
@@ -4025,12 +4045,12 @@ impl Cpu {
                     return None;
                 }
                 let out = desc & 0x0000_ffff_ffff_f000;
-                return Some(out | (va & 0xfff));
+                return Some((out | (va & 0xfff), (desc >> 7) & 1 == 0));
             }
             if is_block {
                 let blk_mask = (1u64 << shift) - 1;
                 let out = desc & !blk_mask & 0x0000_ffff_ffff_ffff;
-                return Some(out | (va & blk_mask));
+                return Some((out | (va & blk_mask), (desc >> 7) & 1 == 0));
             }
             table = desc & 0x0000_ffff_ffff_f000;
             level += 1;
@@ -4111,7 +4131,7 @@ impl Cpu {
                 // AT (address translate) — record the result in PAR_EL1.
                 let va = self.rx(rt);
                 match self.walk(va) {
-                    Some(pa) => self.sys_mut().par_el1 = pa & 0x0000_ffff_ffff_f000,
+                    Some((pa, _)) => self.sys_mut().par_el1 = pa & 0x0000_ffff_ffff_f000,
                     None => self.sys_mut().par_el1 = 1, // F bit: translation aborted
                 }
             } else if crn == 0x7 && crm == 0x4 && op2 == 1 {
@@ -4126,8 +4146,8 @@ impl Cpu {
                     if let Err(t) = self.write(base.wrapping_add(i * 8), 8, 0) {
                         // Fault on an unmapped page → take the data abort; the
                         // kernel demand-pages and re-executes DC ZVA.
-                        let far = self.sys().fault.map_or(base, |(f, _)| f);
-                        self.take_mem_abort(self.pc, far, false, true);
+                        let (far, is_perm) = self.sys().fault.map_or((base, false), |(f, _, p)| (f, p));
+                        self.take_mem_abort(self.pc, far, false, true, is_perm);
                         let _ = t;
                         return Ok(());
                     }
