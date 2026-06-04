@@ -38,5 +38,5 @@ echo "== [3/3] OCI image layer (tar+gzip of /bin/busybox) =="
 ldir="$(mktemp -d)"; mkdir -p "$ldir/bin"
 cp "$CC37/rootfs/busybox" "$ldir/bin/busybox"
 ( cd "$ldir" && tar --numeric-owner --owner=0 --group=0 --mtime='2026-05-31 00:00:00 UTC' --sort=name -cf - bin ) | gzip -9 -n > "$CC37/rootfs/layer.tar.gz"
-( cd "$CC37" && sha256sum linux/Image.gz linux/kernel.config rootfs/busybox rootfs/layer.tar.gz > cc37.sha256 )
+( cd "$CC37" && sha256sum linux/Image.gz linux/kernel.config rootfs/busybox rootfs/layer.tar.gz init.sh > cc37.sha256 )
 echo "DONE"

@@ -17,31 +17,25 @@ linux/Image.gz
   HOST=cc37, .version=0); the resolved kernel/.config is committed.
   Toolchain: aarch64-linux-gnu-gcc (Ubuntu 13.3.0).
 
-init.c, init
-  The witnessed arm64 devcontainer PID 1: a **stock linux-arm64 toolchain
-  binary** built by the upstream `aarch64-linux-gnu` GCC
-  (`aarch64-linux-gnu-gcc -O2 -static -nostdlib -ffreestanding init.c -o init`,
-  stripped — a real, unmodified `linux-arm64` ELF). Freestanding (raw arm64
-  syscalls, no libc) so it exercises the base A64 + system ISA the emulator
-  implements: it boots from the κ-disk virtio-blk rootfs, runs a real
-  computation (sum 1..=1000 == 500500), reports the guest arch via the `uname`
-  syscall (aarch64), reads the real /proc/version, and reboots (→ PSCI
-  SYSTEM_OFF → the emulator halts). The witness asserts these markers, and
-  qemu-system-aarch64 -M virt produces them byte-for-byte on the same rootfs.
-
 rootfs/busybox, rootfs/layer.tar.gz
-  A **static linux-arm64 busybox 1.36.1** (the canonical glibc stock binary —
-  the same busybox the CC-22 riscv64 devcontainer uses, here built for arm64
+  A **static linux-arm64 busybox 1.36.1** — the canonical glibc stock binary
+  (the same busybox the CC-22 riscv64 devcontainer uses, here built for arm64
   with `make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig` +
-  CONFIG_STATIC=y, stripped; layer.tar.gz a reproducible tar+gzip of
-  /bin/busybox). Committed as the stock-glibc artifact: it boots and `/init`
-  runs (the rootfs mounts, EL0 userspace starts) but glibc's Advanced-SIMD
-  (NEON) ifunc string routines are the documented frontier — the same frontier
-  the heavier `linux-arm64` binaries (Node, openvscode-server) reach (CC-34).
+  CONFIG_STATIC=y, stripped). layer.tar.gz is a reproducible tar+gzip of
+  /bin/busybox, the OCI image layer the Layer Assembler overlays into the rootfs.
+  This is the real binary the witness runs: it executes its baseline NEON
+  memcpy/memset/strlen (Advanced SIMD is mandatory on AArch64), forks children
+  that fault copy-on-write pages, and dispatches applets over fork+exec — all on
+  the emulator, with no freestanding shim and no riscv64 workaround.
 
 init.sh
-  The busybox-shell PID 1 (kept for provenance) the stock-glibc busybox path
-  would run once the Advanced-SIMD frontier is implemented.
+  The arm64 devcontainer's PID 1: the busybox shell brings up the
+  pseudo-filesystems, installs the applet symlinks, then runs **unmodified
+  linux-arm64 applets** over fork+exec and command substitution — `uname -m`
+  (→ aarch64), a shell computation (sum 1..1000 == 500500), and `head` reading
+  the real /proc/version — before powering off (busybox `poweroff` → reboot
+  syscall → PSCI SYSTEM_OFF → the emulator halts). The witness asserts these
+  markers, and qemu-system-aarch64 -M virt produces them on the same rootfs.
 
 cc37.sha256
   Checksums of the committed artifacts.

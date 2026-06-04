@@ -3874,7 +3874,14 @@ impl Cpu {
     }
 
     /// Take a memory abort (instruction or data) to EL1, building `ESR_EL1`/`FAR_EL1`.
-    fn take_mem_abort(&mut self, ret: u64, far: u64, is_fetch: bool, is_write: bool, is_perm: bool) {
+    fn take_mem_abort(
+        &mut self,
+        ret: u64,
+        far: u64,
+        is_fetch: bool,
+        is_write: bool,
+        is_perm: bool,
+    ) {
         let from_el0 = self.sys().el == 0;
         let spsr = self.pack_pstate();
         let group = if from_el0 {
@@ -4146,7 +4153,8 @@ impl Cpu {
                     if let Err(t) = self.write(base.wrapping_add(i * 8), 8, 0) {
                         // Fault on an unmapped page → take the data abort; the
                         // kernel demand-pages and re-executes DC ZVA.
-                        let (far, is_perm) = self.sys().fault.map_or((base, false), |(f, _, p)| (f, p));
+                        let (far, is_perm) =
+                            self.sys().fault.map_or((base, false), |(f, _, p)| (f, p));
                         self.take_mem_abort(self.pc, far, false, true, is_perm);
                         let _ = t;
                         return Ok(());
