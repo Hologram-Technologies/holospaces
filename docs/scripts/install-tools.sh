@@ -298,15 +298,20 @@ sudo env "PATH=$PATH" timeout 600 "$PW_BIN" install-deps >/dev/null 2>&1 \
 # chromium` also pulls `chromium-headless-shell`, and *that* artifact's CDN fetch
 # is what hangs (the full Chromium downloads to 100%, then the shell stalls
 # forever). structurizr's exporter launches the full Chromium headless and never
-# uses the shell, so `--no-shell` drops the hanging download with no loss. (A
-# tight per-attempt timeout + retry remains as a backstop.)
+# uses the shell, so `--no-shell` drops the hanging download with no loss.
+#
+# The remaining download is just the full Chromium (~167 MiB) + ffmpeg. The CDN
+# can throttle it to several minutes, and since `--no-shell` removed the *only*
+# artifact that actually hangs, the per-attempt timeout is generous (10 min) —
+# it bounds a genuine wedge without aborting a slow-but-progressing download and
+# re-downloading from scratch (Playwright does not resume).
 info "ensuring Playwright Chromium is installed in tools/playwright-browsers"
 mkdir -p "$PLAYWRIGHT_BROWSERS_DIR"
 pw_log=$(mktemp)
 pw_ok=
 for attempt in 1 2 3; do
     if PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_DIR" \
-        timeout 300 "$PW_BIN" install chromium --no-shell >"$pw_log" 2>&1; then
+        timeout 600 "$PW_BIN" install chromium --no-shell >"$pw_log" 2>&1; then
         pw_ok=1; break
     fi
     info "playwright chromium install attempt $attempt stalled/failed; retrying. last output:"
