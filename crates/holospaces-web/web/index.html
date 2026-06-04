@@ -170,7 +170,12 @@
             <label class="toggle"><input type="checkbox" id="d-announce" /> announce</label>
             <button class="sm" id="d-network">Apply network</button>
           </div>
-          <p class="hint">Forwarded guest ports become app-preview URLs; fetch/announce govern the guest's substrate connectivity.</p>
+          <div class="field">
+            <label for="d-egress">Egress node</label>
+            <input id="d-egress" placeholder="wss://my-node:9000 (a holospaces-node you own)" />
+            <button class="sm" id="d-egress-apply">Set egress</button>
+          </div>
+          <p class="hint">Forwarded guest ports become app-preview URLs; fetch/announce govern the guest's substrate connectivity. <strong>Egress node:</strong> a tab has no NIC, so the guest's internet (curl/apt) routes through a <em>holospaces-node you own</em> (CC-39) — the mesh's exit, not a proxy. Leave blank for content-only (no live egress).</p>
         </section>
 
         <section>
@@ -271,7 +276,8 @@
           // workbench over the running holospace (CC-17; ADR-012 supersedes the
           // CC-13 Monaco fallback at workspace.html).
           const ext = m.extensions && m.extensions.length ? "&ext=" + encodeURIComponent(m.extensions.join(",")) : "";
-          window.open(`workbench.html?id=${encodeURIComponent(k)}&name=${encodeURIComponent(m.name)}&arch=${encodeURIComponent(m.arch)}${ext}`, "_blank");
+          const egress = m.egress ? "&egress=" + encodeURIComponent(m.egress) : "";
+          window.open(`workbench.html?id=${encodeURIComponent(k)}&name=${encodeURIComponent(m.name)}&arch=${encodeURIComponent(m.arch)}${ext}${egress}`, "_blank");
           toast("entering " + m.name + " — the VS Code workbench opens in a new tab");
         } else if (act === "suspend") {
           // Real: publish a lifecycle configuration the instance applies (no stub).
@@ -302,6 +308,7 @@
         $("d-arch").textContent = m.arch;
         $("d-kappa").textContent = k;
         $("d-source").textContent = m.source;
+        $("d-egress").value = m.egress || "";
         $("d-status").innerHTML = `<span class="badge ${m.status}">${m.status}</span>`;
         $("drawer").classList.add("open");
         $("drawer").setAttribute("aria-hidden", "false");
@@ -350,6 +357,18 @@
       };
       $("d-network").onclick = () =>
         applyToDrawer([{ network: { fetch: $("d-fetch").checked, announce: $("d-announce").checked } }], "network");
+      // The per-guest egress node — a holospaces-node the guest's internet routes
+      // through (CC-39). Stored on the guest and carried to the workbench on Enter,
+      // where the boot tunnels guest TCP to it (the WsEgress path, CC-16). Cleared
+      // by an empty value (content-only, no live egress).
+      $("d-egress-apply").onclick = () => {
+        const k = drawerKappa; if (!k) return;
+        const m = meta.get(k);
+        const url = $("d-egress").value.trim();
+        m.egress = url || undefined;
+        toast(url ? (m.name + " — egress via " + url + " (applies on next Enter)")
+                  : (m.name + " — egress cleared (content-only)"));
+      };
       $("d-quota-apply").onclick = () => {
         const mb = parseInt($("d-quota").value, 10);
         if (!Number.isInteger(mb) || mb < 0) return toast("enter a quota in MB");
