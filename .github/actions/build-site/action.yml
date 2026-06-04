@@ -103,3 +103,14 @@ runs:
     - name: Compose the real VS Code workbench (CC-17 Phase 3)
       shell: bash
       run: node crates/holospaces-web/web/build-workbench.mjs ${{ inputs.out-dir }}
+    # The holospaces egress extension (CC-41) — built into its publishable upload
+    # zip and offered for download from the site, so an operator gets the local
+    # egress with one download → Chrome Developer Console upload (or load unpacked).
+    - name: Build the egress extension upload zip (CC-41)
+      shell: bash
+      env:
+        SITE: ${{ inputs.out-dir }}
+      run: |
+        scripts/build-extension.sh
+        mkdir -p "$SITE/extension"
+        cp crates/holospaces-web/extension/dist/*.zip "$SITE/extension/"

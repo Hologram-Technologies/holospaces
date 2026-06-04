@@ -30,4 +30,13 @@ fi
 
 node "$ROOT/crates/holospaces-web/extension/egress-test.mjs" || exit 1
 
+# The extension must build into a publishable upload zip containing EXACTLY the
+# runtime files (the build script validates the manifest is MV3 + minimal-
+# permission and that no dev/test/page files leak into the artifact).
+if command -v zip >/dev/null 2>&1 && command -v unzip >/dev/null 2>&1; then
+    "$ROOT/scripts/build-extension.sh" || exit 1
+else
+    echo "cc41-extension-egress: zip/unzip absent — skipping the package build (logic witnessed above)" >&2
+fi
+
 echo "cc41-extension-egress: PASS"

@@ -27,3 +27,6 @@ crates/holospaces-emulator/target/
 /crates/holospaces-web/web/.vscode-test-web
 /vv/artifacts/cc18/lsp-demo/target
 /.claude
+
+# The built Chrome extension upload zip (produced by scripts/build-extension.sh).
+crates/holospaces-web/extension/dist/
