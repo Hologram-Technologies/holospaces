@@ -13,7 +13,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-BATTERIES="arith memory control"
+BATTERIES="arith memory control simd"
 
 asm_bin() {
     local s="$1.s" obj="$1.o" bin="$1.bin"

@@ -40,7 +40,7 @@ cargo test --manifest-path "$ROOT/Cargo.toml" -p holospaces \
 # oracle is never stale; pinned by the committed expected verdict otherwise.
 if command -v qemu-aarch64 >/dev/null 2>&1; then
     if WITH_ELF=1 "$CC35/build.sh" >/dev/null 2>&1 && [ -e "$CC35/arith.elf" ]; then
-        for b in arith memory control; do
+        for b in arith memory control simd; do
             out="$(qemu-aarch64 "$CC35/$b.elf" 2>/dev/null)"; status=$?
             if [ "$out" != "PASS" ] || [ "$status" -ne 0 ]; then
                 echo "cc35-aarch64-core: qemu-aarch64 differential FAILED for $b (out='$out' status=$status)" >&2
