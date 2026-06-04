@@ -1,0 +1,121 @@
+== Product Security & Threat Model
+
+This chapter is the product-security and threat-modeling authority for
+holospaces. Its purpose is not to _describe_ a security posture but to make one
+*enforced and proven*: every security property stated here has a
+verification-and-validation witness in code (`CC-40`,
+`crates/holospaces/tests/cc40_product_security.rs`,
+`vv/suites/cc40-product-security.sh`), so a claim that holospaces holds a
+property is a claim the test battery refuses to let regress.
+
+holospaces is *UOR-native* — built on the hologram substrate, content-addressed,
+trust-less, and able to run on bare metal. Its security properties are intrinsic
+to the model, not a perimeter bolted around it. The threat model is understood by
+*dropping the internet's assumptions* (trusted servers, transport encryption over
+plaintext, per-request cost) and reasoning from the substrate's primitives.
+
+=== Security posture (what is different)
+
+[cols="1,2,2"]
+|===
+| Property | The internet's model | holospaces (UOR-native)
+
+| *Integrity / authenticity* | TLS + a trusted server you must not be MITM'd from | Content _is_ its κ; the receiver re-derives every byte (Law L5). Forgery is structurally impossible — no trusted intermediary to subvert.
+| *Confidentiality* | Encrypt plaintext under a key an attacker may steal/break | Content is UOR-encoded, _perceivable only in the observer's base-frame_; the κ is the capability to address it. A router/store without the frame perceives nothing — no key-attack surface.
+| *Authority* | Ambient authority + ACLs checked at each call | _Object-capabilities_: a holospace runs under exactly its κ-addressed capability set; authority can only be _attenuated_, never escalated.
+| *Identity* | A server account in a central database | _Self-sovereign_: a content-addressed identity (`CC-1`); no central account to breach, none to forge without the key.
+| *Cost / availability* | Per-request, per-byte; more clients → more load → congestion | The hologram _dense-matrix hierarchy_ deduplicates by _unique structure_, not bits; the per-node resource floor _decreases_ as the network grows. Repetition collapses; DoS economics invert.
+|===
+
+=== Assets
+
+* *The operator's content* — holospaces, configurations, workspace files,
+  secrets, dotfiles — held as κ-addressed content in the store (Law L3).
+* *The operator's identity* — a self-sovereign key and the κ it addresses.
+* *Authority* — the capability sets that bound what a holospace may do.
+* *Availability* — resolving content and reaching the network (and, for a
+  sandboxed peer, an egress route to the legacy internet).
+
+=== Trust boundaries and the peer taxonomy
+
+[cols="1,1,1,1,2"]
+|===
+| Peer | NIC? | Egress | Content | Trust boundary
+
+| *Sovereign* (bare-metal holospace — a flashed device, a node, Chromium-on-device) | yes | direct | direct + serves the mesh | speaks to the legacy internet _and_ the hologram network with no intermediary
+| *Sandboxed* (browser tab — e.g. a Chromebook) | no | routes through a sovereign peer | over the mesh | compute is local; the network is reached through peers
+|===
+
+Egress-via-a-peer is a property of the *browser sandbox*, not of holospaces. As
+sovereign peers multiply, *no operator depends on any specific egress peer* —
+egress is a commodity mesh service and the egress-trust surface _shrinks_ with
+growth. The *cold-start gateway* (GitHub Pages) is an explicitly _untrusted_
+boundary (ADR-005): it may serve any bytes, but every byte is verified by
+re-derivation on load, so a compromised CDN cannot inject content a peer accepts.
+
+=== Adversaries
+
+A malicious *peer / node* (egress, content, storage); a compromised *cold-start
+gateway / CDN*; a passive *network observer*; a malicious *guest / holospace*
+(seeking to exceed its authority); a *Sybil / eclipse* adversary; a *key thief*.
+
+=== Security requirements (each enforced + proven)
+
+*SEC-1 — Integrity.* Any byte that does not re-derive to the requested κ is
+refused on receipt (Law L5, SPINE-4) — forgery is structurally impossible.
+_Enforced by_ re-derivation at every boundary (import `CC-20`, content network
+`CC-38`, browser `Console::receive`). _Witnesses:_
+`sec_integrity_tampered_content_does_not_re_derive`,
+`sec_integrity_the_network_refuses_a_forging_responder`.
+
+*SEC-2 — Authority.* A holospace runs under exactly its capability set; authority
+can only be attenuated. _Enforced by_ `Capabilities::admits` (subset of
+roots/channels; budget containment under 0 = unbounded; a flag granted only if
+the parent holds it). _Witness:_
+`sec_authority_capabilities_only_attenuate_never_escalate` — every escalation
+vector is refused.
+
+*SEC-3 — Cost / dedup.* Content resolves once and is shared; idempotent `put` is
+its observable form. _Witness:_ `sec_cost_identical_content_deduplicates`. The
+dense-matrix _structural_ dedup and the _decreasing per-node floor_ are substrate
+properties holospaces inherits; the observable consequence — repetition collapses
+to a κ already resolved — is what makes DoS-by-repetition uneconomic.
+
+*SEC-4 — Identity.* An operator is a content-addressed identity (`CC-1`),
+deterministic from the key; a roster binds its operator. _Witness:_
+`sec_identity_is_self_sovereign_and_unforgeable`.
+
+*SEC-5 — Confidentiality.* Content is addressable — perceivable — only via its κ;
+an unknown κ is absent (no enumeration, no fabrication). _Witness:_
+`sec_confidentiality_content_is_reachable_only_by_its_kappa`. The deeper property
+— content meaningful only in the observer's _base-frame_, so a peer without the
+frame perceives nothing — is the UOR/substrate layer this builds on; the enforced
+property is *κ-as-capability*.
+
+=== The legacy-internet boundary (named, not wished away)
+
+The UOR-native properties hold _inside_ the holospaces network. An egress peer's
+_outside_ leg still touches the legacy internet: the destination host sees the
+exit peer's IP and speaks legacy TLS to it. Frame-relative perception and dedup
+are network-internal; the egress is a _translation point_ where old-world
+properties reappear on the outside leg only — an egress peer forwards content it
+cannot perceive, but the legacy host observes what any legacy server observes of
+its clients.
+
+=== Residual threats
+
+* *Availability / eclipse.* Integrity always holds (verify-on-receipt); a
+  Sybil/eclipse adversary can degrade _availability and routing_. The cost model
+  makes flooding uneconomic; eclipse resistance is a substrate (DHT) property.
+* *Reference resolution* is the trust-sensitive boundary: the located reference
+  is the _request_, the κ is the _identity_ (ADR-013); trust decisions live there.
+* *Key compromise* — self-sovereign means self-responsible; the mitigation is key
+  custody, not a server.
+
+=== Verification & validation
+
+`CC-40` (`vv/suites/cc40-product-security.sh`) runs the witness battery; chapter
+10 lists it `live`. The properties are enforced _by construction_, so the
+witnesses assert what the substrate *refuses* — a tampered byte, an escalated
+capability, a fabricated κ — rather than a bolted-on check. A change weakening any
+property fails `CC-40`.
