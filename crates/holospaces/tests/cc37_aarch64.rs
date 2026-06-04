@@ -16,7 +16,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use holospaces::assembly::assemble_ext4_bootable;
+use holospaces::assembly::{assemble_ext4_bootable, Layer};
 use holospaces::emulator::aarch64::{Cpu, Halt};
 
 fn cc37_dir() -> PathBuf {
@@ -31,15 +31,20 @@ fn gunzip(path: &Path) -> Vec<u8> {
     out
 }
 
-/// Assemble the arm64 devcontainer rootfs: the stock `linux-arm64` toolchain
-/// `/init` binary (built by `aarch64-linux-gnu-gcc`) into an `ext4` image (taken
-/// into the κ-disk on attach). The stock glibc busybox layer is committed
-/// alongside (`rootfs/layer.tar.gz`) as the artifact whose full execution needs
-/// the Advanced-SIMD frontier; the freestanding `/init` exercises the base A64 +
-/// system ISA the emulator implements.
+/// Assemble the arm64 devcontainer rootfs: the **stock `linux-arm64` busybox**
+/// layer (`rootfs/layer.tar.gz`, the canonical glibc binary — Advanced-SIMD
+/// ifunc string routines and all) overlaid into an `ext4` image, with the
+/// busybox-shell `/init` injected — a bootable, writable disk taken into the
+/// κ-disk on attach. No freestanding shim: the stock glibc binary itself runs.
 fn assemble_rootfs() -> Vec<u8> {
-    let init = std::fs::read(cc37_dir().join("init")).expect("cc37 arm64 init binary");
-    assemble_ext4_bootable(&[], &init, 64 * 1024 * 1024).expect("assemble the arm64 rootfs")
+    let init = std::fs::read(cc37_dir().join("init.sh")).expect("cc37 busybox init.sh");
+    let layer = std::fs::read(cc37_dir().join("rootfs/layer.tar.gz")).expect("cc37 busybox layer");
+    let layers = [Layer {
+        media_type: "application/vnd.oci.image.layer.v1.tar+gzip",
+        blob: &layer,
+    }];
+    assemble_ext4_bootable(&layers, &init, 64 * 1024 * 1024)
+        .expect("assemble the arm64 busybox rootfs")
 }
 
 /// The flagship `CC-37` witness: an arm64 devcontainer boots from its κ-disk
