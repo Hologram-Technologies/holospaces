@@ -203,24 +203,51 @@ try {
     const k1arm = k2.provision_devcontainer(cfg, "aarch64", 128 * 1024 * 1024);
     let rejected = false;
     try { c.provision_devcontainer(new TextEncoder().encode("not json"), "riscv64", 1); } catch { rejected = true; }
+
+    // Repo-URL launch (the Codespaces/Gitpod flow): the (repo, reference,
+    // config, arch) tuple is the holospace identity (Law L1). The page fetches
+    // the repo's devcontainer.json and passes its bytes here; identity is
+    // reproducible and repo/reference-distinct.
+    const cfgPath = ".devcontainer/devcontainer.json";
+    const r1 = c.provision_repo("https://github.com/octocat/Hello-World", "master", cfgPath, cfg, "riscv64", 128 * 1024 * 1024);
+    const r1b = k2.provision_repo("https://github.com/octocat/Hello-World", "master", cfgPath, cfg, "riscv64", 128 * 1024 * 1024);
+    const r2 = k2.provision_repo("https://github.com/octocat/Spoon-Knife", "master", cfgPath, cfg, "riscv64", 128 * 1024 * 1024);
+    const rRef = k2.provision_repo("https://github.com/octocat/Hello-World", "develop", cfgPath, cfg, "riscv64", 128 * 1024 * 1024);
+
     return {
       holospace: k1,
       reproducible: k1 === k1b,
       archDistinct: k1arm !== k1,
       listed: JSON.parse(c.view()).holospaces.includes(k1),
       rejected,
+      repoHolospace: r1,
+      repoReproducible: r1 === r1b,
+      repoDistinct: r2 !== r1,
+      refDistinct: rRef !== r1,
+      repoVsPaste: r1 !== k1, // a repo-identified holospace ≠ the bare-config one
+      defaultImage: window.hs.default_devcontainer_image(),
       hasTable: !!document.querySelector("#rows") || !!document.querySelector("#holospaces"),
       hasArchPicker: !!document.querySelector("#harch") && document.querySelector("#harch").options.length >= 2,
       hasSettings: !!document.querySelector("#drawer"),
+      hasRepoInput: !!document.querySelector("#hrepo"),
+      defImgShown: (document.querySelector("#defimg")?.textContent || "").includes("buildpack-deps"),
     };
   });
   check(dash.holospace.startsWith("blake3:") && dash.listed, `provisioned a devcontainer holospace (${dash.holospace.slice(0, 24)}…)`);
   check(dash.reproducible, "same devcontainer ⇒ same holospace κ (reproducible, L1/Q4)");
   check(dash.archDistinct, "the launch-time architecture is part of identity — same config under aarch64 ≠ riscv64 (ADR-021)");
   check(dash.rejected, "an invalid devcontainer.json is refused (CC-4)");
+  check(dash.repoHolospace.startsWith("blake3:"), `provisioned a holospace from a repository URL (${dash.repoHolospace.slice(0, 24)}…)`);
+  check(dash.repoReproducible, "same repo+ref+config+arch ⇒ same holospace κ (reproducible, L1)");
+  check(dash.repoDistinct, "a different repository is a distinct holospace (repo is part of identity)");
+  check(dash.refDistinct, "a different git reference is a distinct holospace (reference is part of identity)");
+  check(dash.repoVsPaste, "a repo-identified holospace differs from the bare-config one (CC-20 source identity)");
+  check(dash.defaultImage.includes("buildpack-deps"), `the usable default image is exposed to the page (${dash.defaultImage})`);
   check(dash.hasTable, "the management console renders the holospaces dashboard");
   check(dash.hasArchPicker, "the launch form offers the architecture picker (riscv64/aarch64)");
   check(dash.hasSettings, "the console exposes a per-guest settings drawer");
+  check(dash.hasRepoInput, "the launch form takes a git repository URL (Codespaces/Gitpod flow)");
+  check(dash.defImgShown, "the launch form shows the usable default image");
 
   console.log(failed ? "MANAGER-TEST: FAILED" : "MANAGER-TEST: PASS (browser peer + Platform Manager console)");
 } finally {

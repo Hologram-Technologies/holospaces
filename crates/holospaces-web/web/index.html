@@ -73,9 +73,13 @@
       <h2>New holospace</h2>
       <div class="new">
         <div class="row">
-          <div style="flex:1; min-width:14rem">
-            <label for="hname">Name</label>
-            <input id="hname" value="my-devcontainer" style="width:100%" />
+          <div style="flex:1; min-width:18rem">
+            <label for="hrepo">Repository URL</label>
+            <input id="hrepo" placeholder="https://github.com/owner/repo" value="https://github.com/octocat/Hello-World" style="width:100%" />
+          </div>
+          <div style="width:9rem">
+            <label for="href">Reference</label>
+            <input id="href" value="master" style="width:100%" />
           </div>
           <div>
             <label for="harch">Architecture</label>
@@ -84,15 +88,25 @@
               <option value="aarch64">aarch64 (ARMv8-A)</option>
             </select>
           </div>
-          <button id="create" class="primary" disabled>Create devcontainer</button>
+          <button id="create" class="primary" disabled>Launch repository</button>
         </div>
-        <p class="hint">The architecture is chosen once, at launch — like an instance type in a cloud console. It is part of the holospace's identity (the same config under two ISAs is two distinct holospaces), so it cannot be changed afterward. Everything else (lifecycle · network · storage · access) is editable per guest in its settings.</p>
-        <label for="dcjson">devcontainer.json (validated against the Dev Container spec — CC-4)</label>
-        <textarea id="dcjson" spellcheck="false">{
+        <p class="hint">Name a git repository — like Codespaces or Gitpod. holospaces fetches its <code>.devcontainer/devcontainer.json</code> (verified on receipt, Law L5) and runs it; a repository with <em>no</em> devcontainer opens in the <strong>usable default</strong> image (<span id="defimg" class="k">…</span> — curl, git over apt), so any repo just works. The architecture is chosen once, at launch (part of the holospace's identity, ADR-021); everything else is editable per guest in its settings.</p>
+        <details>
+          <summary class="muted" style="cursor:pointer; font-size:0.85em">Advanced — paste a devcontainer.json instead</summary>
+          <div class="row" style="margin-top:0.5rem">
+            <div style="flex:1; min-width:14rem">
+              <label for="hname">Name</label>
+              <input id="hname" value="my-devcontainer" style="width:100%" />
+            </div>
+            <button id="createPaste" class="sm" disabled>Create from pasted config</button>
+          </div>
+          <label for="dcjson">devcontainer.json (validated against the Dev Container spec — CC-4)</label>
+          <textarea id="dcjson" spellcheck="false">{
   "name": "my-devcontainer",
-  "image": "mcr.microsoft.com/devcontainers/base:debian-12",
+  "image": "buildpack-deps:trixie-scm",
   "features": {}
 }</textarea>
+        </details>
       </div>
 
       <h2>Holospaces</h2>
@@ -184,10 +198,11 @@
     <div id="toast"></div>
 
     <script type="module">
-      import init, { kappa, verify_kappa, run_holo, validate_userland, Console, Workspace, DevcontainerImage }
+      import init, { kappa, verify_kappa, run_holo, validate_userland, default_devcontainer_image, Console, Workspace, DevcontainerImage }
         from "./pkg/holospaces_web.js";
       await init();
-      window.hs = { kappa, verify_kappa, run_holo, validate_userland, Console, Workspace, DevcontainerImage };
+      window.hs = { kappa, verify_kappa, run_holo, validate_userland, default_devcontainer_image, Console, Workspace, DevcontainerImage };
+      document.getElementById("defimg").textContent = default_devcontainer_image();
 
       const console0 = new Console();
       const $ = (id) => document.getElementById(id);
@@ -375,25 +390,109 @@
       $("signin").onclick = () => {
         console0.sign_in(new TextEncoder().encode("operator-self-sovereign-key"));
         $("create").disabled = false;
+        $("createPaste").disabled = false;
         render();
         toast("signed in — a self-sovereign, content-addressed identity (CC-1)");
       };
 
-      $("create").onclick = () => {
+      // ── Repository devcontainer discovery (the import boundary, Law L5) ───────
+      // Derive the raw-content URL(s) for a repository's devcontainer.json at a
+      // reference. The page fetches over the repo host's own CORS-permitted raw
+      // surface (github/gitlab) — the operator's browser IS the peer, fetch IS
+      // its transport (ADR-013); the bytes are addressed to a κ on receipt.
+      function rawCandidates(repoUrl, ref) {
+        let u;
+        try { u = new URL(repoUrl); } catch { return []; }
+        const path = u.pathname.replace(/^\/+|\/+$/g, "").replace(/\.git$/, "");
+        const enc = encodeURIComponent(ref);
+        if (u.hostname === "github.com") {
+          const b = `https://raw.githubusercontent.com/${path}/${enc}`;
+          return [[`${b}/.devcontainer/devcontainer.json`, ".devcontainer/devcontainer.json"],
+                  [`${b}/.devcontainer.json`, ".devcontainer.json"]];
+        }
+        if (u.hostname === "gitlab.com") {
+          const b = `https://gitlab.com/${path}/-/raw/${enc}`;
+          return [[`${b}/.devcontainer/devcontainer.json`, ".devcontainer/devcontainer.json"],
+                  [`${b}/.devcontainer.json`, ".devcontainer.json"]];
+        }
+        const b = `${repoUrl.replace(/\/+$/, "")}/raw/${enc}`;
+        return [[`${b}/.devcontainer/devcontainer.json`, ".devcontainer/devcontainer.json"],
+                [`${b}/.devcontainer.json`, ".devcontainer.json"]];
+      }
+
+      // Fetch a repository's devcontainer.json bytes (verified on receipt — the
+      // κ derived from the bytes IS the config's identity, Law L5), or null when
+      // the repository declares none (→ the usable default image).
+      async function discoverDevcontainer(repoUrl, ref) {
+        for (const [url, path] of rawCandidates(repoUrl, ref)) {
+          let resp;
+          try { resp = await fetch(url); } catch { continue; }
+          if (resp.ok) {
+            const bytes = new Uint8Array(await resp.arrayBuffer());
+            return { bytes, path };
+          }
+        }
+        return null;
+      }
+
+      function repoName(repoUrl) {
+        const m = String(repoUrl).replace(/\.git$/, "").replace(/\/+$/, "").match(/([^/]+)$/);
+        return (m && m[1]) || "devcontainer";
+      }
+
+      // Launch a holospace from a repository URL — the Codespaces/Gitpod flow.
+      $("create").onclick = async () => {
+        const repo = $("hrepo").value.trim();
+        const ref = $("href").value.trim() || "main";
+        const arch = $("harch").value;
+        if (!repo) return toast("enter a repository URL");
+        $("create").disabled = true;
+        try {
+          toast("fetching " + repo + " @ " + ref + " …");
+          const found = await discoverDevcontainer(repo, ref);
+          let configBytes, configPath, usedDefault = false;
+          if (found) {
+            configBytes = found.bytes;
+            configPath = found.path;
+          } else {
+            // No devcontainer in the repo → the usable default image (the same
+            // default the host importer uses — one source of truth via wasm).
+            usedDefault = true;
+            configPath = ".devcontainer/devcontainer.json";
+            configBytes = new TextEncoder().encode(
+              JSON.stringify({ name: repoName(repo), image: default_devcontainer_image() }));
+          }
+          // (repo, reference, config, arch) is the source → the holospace's
+          // content-addressed identity (Law L1; reproducible, repo/ref/arch-distinct).
+          const k = console0.provision_repo(repo, ref, configPath, configBytes, arch, 128 * 1024 * 1024);
+          let extensions = [];
+          try { extensions = JSON.parse(new TextDecoder().decode(configBytes))?.customizations?.vscode?.extensions || []; } catch {}
+          meta.set(k, {
+            name: repoName(repo), repo, reference: ref, arch,
+            source: usedDefault ? "repo · default image" : "repo",
+            status: "stopped", extensions,
+          });
+          render();
+          toast("provisioned " + repoName(repo) + " (" + arch + ")" +
+            (usedDefault ? " · usable default image" : " · " + configPath) + " → " + k.slice(0, 22) + "…");
+        } catch (e) {
+          toast("launch failed: " + e);
+        } finally {
+          $("create").disabled = false;
+        }
+      };
+
+      // Advanced: provision directly from a pasted devcontainer.json (no repo).
+      $("createPaste").onclick = () => {
         const name = $("hname").value.trim() || "devcontainer";
         const arch = $("harch").value;
         const text = $("dcjson").value;
         const json = new TextEncoder().encode(text);
         try {
-          // The operator's architecture choice is part of the holospace identity
-          // (Law L1): the same config under two ISAs yields two distinct κ.
           const k = console0.provision_devcontainer(json, arch, 128 * 1024 * 1024);
-          // The devcontainer's declared VS Code extensions
-          // (customizations.vscode.extensions, CC-4): carried to the workbench on
-          // launch, which installs the web-capable ones from the open gallery.
           let extensions = [];
           try { extensions = JSON.parse(text)?.customizations?.vscode?.extensions || []; } catch {}
-          meta.set(k, { name, arch, source: "devcontainer", status: "stopped", extensions });
+          meta.set(k, { name, arch, source: "devcontainer (pasted)", status: "stopped", extensions });
           render();
           toast("provisioned " + name + " (" + arch + ") → " + k.slice(0, 28) + "…");
         } catch (e) {

@@ -105,6 +105,16 @@ pub fn verify_kappa(bytes: &[u8], kappa: &str) -> Result<bool, JsValue> {
     verify(bytes, &parse_kappa(kappa)?).map_err(js_err)
 }
 
+/// The **usable default** Dev Container base image the peer provisions when a
+/// repository declares no `devcontainer.json` (`buildpack-deps` — `curl`/`git`
+/// over apt; the Dev Container spec's default, `CC-20`). Exposed so the
+/// operator's page names the same default the host importer does — one source
+/// of truth across native and wasm ([`holospaces::DEFAULT_DEVCONTAINER_IMAGE`]).
+#[wasm_bindgen]
+pub fn default_devcontainer_image() -> String {
+    holospaces::DEFAULT_DEVCONTAINER_IMAGE.to_owned()
+}
+
 /// Run a `.holo` compute artifact in the browser via the hologram executor
 /// compiled to wasm — the *browser `.holo` engine* (arc42 chapter 11, RT2;
 /// conformance `CC-2`). Returns the κ-label of the first output. Because the
@@ -287,6 +297,51 @@ impl Console {
             repo: String::new(),
             reference: String::new(),
             config_path: "devcontainer.json".to_owned(),
+            config,
+            userland: config,
+            arch: holospaces::Arch::from_id(arch).unwrap_or_default(),
+        };
+        self.provision_source(source, memory_bytes)
+    }
+
+    /// Provision a holospace from a **git repository reference** — the
+    /// Codespaces/Gitpod launch: the operator names a repository URL + reference
+    /// (not a pasted config) and holospaces runs it as a devcontainer.
+    ///
+    /// The repository's own `.devcontainer/devcontainer.json` is fetched by the
+    /// operator's page from the repository host and **verified on receipt** (Law
+    /// L5) before it crosses into the peer here as `config_json`; when the
+    /// repository declares none, the page passes the **usable default** config
+    /// (`buildpack-deps` — `curl`/`git` over apt; the Dev Container spec's
+    /// default, `CC-20`/[`import`]) so *any* repository runs. The `(repo,
+    /// reference, config, arch)` tuple is the [`Source::Devcontainer`], hence the
+    /// holospace's content-addressed identity (Law L1): the same repository at
+    /// the same reference under the same ISA is the **same** holospace
+    /// (reproducible), and a different repository / reference / architecture is a
+    /// **distinct** one. Returns the holospace identity κ.
+    ///
+    /// The architecture (`arch`: `"riscv64"` / `"aarch64"`) is the operator's
+    /// launch-time selection and is fixed for the holospace's lifetime (ADR-021).
+    #[allow(clippy::too_many_arguments)]
+    pub fn provision_repo(
+        &mut self,
+        repo: &str,
+        reference: &str,
+        config_path: &str,
+        config_json: &[u8],
+        arch: &str,
+        memory_bytes: f64,
+    ) -> Result<String, JsValue> {
+        devcontainer::parse(config_json).map_err(js_err)?;
+        let config = self
+            .runtime
+            .store()
+            .put("blake3", config_json)
+            .map_err(js_err)?;
+        let source = Source::Devcontainer {
+            repo: repo.to_owned(),
+            reference: reference.to_owned(),
+            config_path: config_path.to_owned(),
             config,
             userland: config,
             arch: holospaces::Arch::from_id(arch).unwrap_or_default(),
