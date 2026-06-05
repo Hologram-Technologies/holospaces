@@ -295,9 +295,66 @@
         return cfg;
       }
 
-      function action(act, k) {
+      // Fetch a URL through the router extension (its CORS-free fetch) — the
+      // transport for pulling a repo's CORS-blocked image layers (CC-41/CC-42).
+      async function routerFetch(url, headers) {
+        const extId = window.holospacesEgressExtensionId;
+        if (!extId || typeof chrome === "undefined" || !chrome.runtime) return null;
+        return new Promise((resolve) => {
+          try {
+            chrome.runtime.sendMessage(extId, { type: "holospaces-fetch", url, headers: headers || {} }, (resp) => {
+              if (chrome.runtime.lastError || !resp || !resp.ok) resolve(null);
+              else resolve({ status: resp.status, contentType: resp.contentType || "", body: Uint8Array.from(resp.body) });
+            });
+          } catch { resolve(null); }
+        });
+      }
+
+      // Provision a holospace's REAL OCI image in the browser and stage the
+      // bootable rootfs in OPFS, where holospace-fs reads it (CC-42). The router
+      // is the transport; the pull re-derives every blob (Law L5).
+      async function provisionToOpfs(kappa, image, arch) {
+        const prov = new window.hs.DevcontainerProvision(image, arch);
+        let steps = 0;
+        while (!prov.isDone()) {
+          const url = prov.nextUrl();
+          if (!url) break;
+          const headers = {};
+          const a = prov.nextAccept(); if (a) headers["Accept"] = a;
+          const b = prov.nextBearer(); if (b) headers["Authorization"] = "Bearer " + b;
+          const resp = await routerFetch(url, headers);
+          if (!resp) throw new Error("the router could not fetch " + url + " — is the extension enabled for this site?");
+          prov.deliver(resp.status, resp.contentType, resp.body);
+          if (++steps > 300) throw new Error("the image pull did not converge");
+        }
+        const rootfs = prov.assemble();
+        const root = await navigator.storage.getDirectory();
+        const dir = await root.getDirectoryHandle("provisioned", { create: true });
+        const h = await dir.getFileHandle(kappa, { create: true });
+        const w = await h.createWritable();
+        await w.write(rootfs);
+        await w.close();
+      }
+
+      async function action(act, k) {
         const m = meta.get(k);
         if (act === "enter") {
+          // Provision the repository's REAL image in the browser via the router,
+          // stage it in OPFS, then open the workbench on it — the launched
+          // holospace is the actual devcontainer (CC-42), not a demo.
+          if (m.image) {
+            if (!window.holospacesEgressExtensionId) {
+              toast("install the router extension to provision " + m.name + " — it pulls the repo's image (the ⬇ link in a guest's Network settings)");
+              return;
+            }
+            try {
+              toast("provisioning " + m.name + " — pulling " + m.image + " via the router…");
+              await provisionToOpfs(k, m.image, m.arch);
+            } catch (e) {
+              toast("provisioning " + m.name + " failed: " + e);
+              return;
+            }
+          }
           m.status = "running"; render();
           // Launch the Workspace Projection in a new tab — the REAL VS Code web
           // workbench over the running holospace (CC-17; ADR-012 supersedes the
@@ -511,10 +568,14 @@
           // (repo, reference, config, arch) is the source → the holospace's
           // content-addressed identity (Law L1; reproducible, repo/ref/arch-distinct).
           const k = console0.provision_repo(repo, ref, configPath, configBytes, arch, 128 * 1024 * 1024);
-          let extensions = [];
-          try { extensions = JSON.parse(new TextDecoder().decode(configBytes))?.customizations?.vscode?.extensions || []; } catch {}
+          let extensions = [], image = default_devcontainer_image();
+          try {
+            const cfg = JSON.parse(new TextDecoder().decode(configBytes));
+            extensions = cfg?.customizations?.vscode?.extensions || [];
+            if (typeof cfg?.image === "string" && cfg.image) image = cfg.image;
+          } catch {}
           meta.set(k, {
-            name: repoName(repo), repo, reference: ref, arch,
+            name: repoName(repo), repo, reference: ref, arch, image,
             source: usedDefault ? "repo · default image" : "repo",
             status: "stopped", extensions,
           });
