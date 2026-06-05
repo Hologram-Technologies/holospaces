@@ -17,13 +17,16 @@
 #   responder rejected; an unheld κ resolves to nothing).
 # Witness: crates/holospaces-web/web/webrtc-content-net-test.mjs — two browser
 #   contexts connect a real RTCDataChannel (out-of-band SDP/ICE signaling, no
-#   server) and one peer fetches a κ from the other through the product API
+#   server) and drive the FULL content-network frame set through the product API:
+#   one peer ANNOUNCES a κ it holds (cn_announce + cn_pump); the other DISCOVERS
+#   that holder over the channel (cn_discover + cn_pump); then it FETCHES the κ
 #   (cn_fetch_start + cn_pump + cn_fetch_poll), verified by re-derivation; a
 #   forging responder is rejected; an unheld κ is absent; the exchange is
 #   symmetric (either direction).
 #
-# GREEN when: a browser peer fetches content-addressed bytes from another browser
-#   peer over a real RTCDataChannel, accepted only after re-derivation.
+# GREEN when: announce + discover + fetch all cross a real RTCDataChannel through
+#   the product path, a browser peer fetching content-addressed bytes from another
+#   accepted only after re-derivation.
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -33,11 +36,13 @@ if ! command -v node >/dev/null 2>&1; then echo "cc49-webrtc-content-net: SKIP �
 if ! command -v wasm-pack >/dev/null 2>&1; then echo "cc49-webrtc-content-net: SKIP — wasm-pack unavailable" >&2; exit 127; fi
 
 # The wasm peer carrying the content-network seam, the WebRTC transport
-# (WebRtcLink), and the PRODUCT pump (Console::cn_pump). Rebuild unless both are
-# present, so the witness always runs against the product path (not test glue).
+# (WebRtcLink), the PRODUCT pump (Console::cn_pump) and the announce/discover
+# product API (cn_announce / cn_discover). Rebuild unless all are present, so the
+# witness always runs against the product path (not test glue).
 if [ ! -f "$WEB/pkg/holospaces_web_bg.wasm" ] || \
    ! grep -q "WebRtcLink" "$WEB/pkg/holospaces_web.js" 2>/dev/null || \
-   ! grep -q "cn_pump" "$WEB/pkg/holospaces_web.js" 2>/dev/null; then
+   ! grep -q "cn_pump" "$WEB/pkg/holospaces_web.js" 2>/dev/null || \
+   ! grep -q "cn_discover" "$WEB/pkg/holospaces_web.js" 2>/dev/null; then
   ( cd "$ROOT/crates/holospaces-web" && wasm-pack build --release --target web --out-dir web/pkg ) || exit 1
 fi
 # A real witness installs its prerequisites — it does not skip.
