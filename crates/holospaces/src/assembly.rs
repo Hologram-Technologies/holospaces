@@ -54,6 +54,9 @@ pub enum AssemblyError {
     BadPath(String),
     /// The ext4 writer could not serialize the tree (see [`ext4::Ext4Error`]).
     Ext4(ext4::Ext4Error),
+    /// The κ-disk rejected a streamed block (geometry mismatch / out of range) —
+    /// only reachable on the streaming assembly path (`CC-50`).
+    Disk(crate::disk::DeviceError),
 }
 
 impl core::fmt::Display for AssemblyError {
@@ -67,6 +70,7 @@ impl core::fmt::Display for AssemblyError {
             AssemblyError::BadTar(m) => write!(f, "malformed tar: {m}"),
             AssemblyError::BadPath(m) => write!(f, "path escapes root: {m}"),
             AssemblyError::Ext4(e) => write!(f, "ext4 serialization: {e}"),
+            AssemblyError::Disk(e) => write!(f, "κ-disk streamed-block write: {e:?}"),
         }
     }
 }
@@ -202,6 +206,103 @@ pub fn assemble_ext4_bootable(
     let min_blocks = disk_bytes / 4096;
     let min_inodes = u32::try_from(disk_bytes / 16384).unwrap_or(u32::MAX);
     Ok(ext4::write_image_with_free(&tree, min_inodes, min_blocks)?)
+}
+
+/// Stream a **bootable, writable** devcontainer rootfs's ext4 image **block by
+/// block** to a caller-supplied sink — the sparse, streaming Rootfs Assembly
+/// (`CC-50`) as a raw byte stream (no store/disk dependency). Same overlaid
+/// `layers` + injected `/init` + `disk_bytes` sizing as [`assemble_ext4_bootable`],
+/// but `emit(block_index, &block_bytes)` is called once per **non-zero** 4 KiB
+/// block, in ascending index order — the dense image is never materialized, so
+/// peak working memory tracks the image's *content*, not its declared size (Laws
+/// L3/L4). Returns the full [`ext4::ImageGeometry`] so the sink knows the image's
+/// total size (its sparse, never-emitted blocks are all-zero).
+///
+/// The emitted blocks placed at their byte offsets over a zero-filled
+/// `image_len()` reproduce `assemble_ext4_bootable(...)` byte-for-byte (Law L1).
+pub fn stream_ext4_image_bootable(
+    layers: &[Layer],
+    init: &[u8],
+    disk_bytes: u64,
+    emit: impl FnMut(u64, &[u8]),
+) -> Result<ext4::ImageGeometry, AssemblyError> {
+    let mut tree = overlay_layers(layers)?;
+    let id = tree.contents.keys().copied().max().map_or(0, |m| m + 1);
+    tree.contents.insert(id, init.to_vec());
+    insert_file_at(&mut tree.root, "init", 0o755, id);
+    let min_blocks = disk_bytes / 4096;
+    let min_inodes = u32::try_from(disk_bytes / 16384).unwrap_or(u32::MAX);
+    Ok(ext4::stream_image_with_free(
+        &tree, min_inodes, min_blocks, emit,
+    )?)
+}
+
+/// Stream a **bootable, writable** devcontainer rootfs straight into a κ-disk
+/// over `store`, sector-by-sector — the *sparse, streaming* Rootfs Assembly
+/// (`CC-50`): the same overlaid `layers` + injected `/init` + `disk_bytes` sizing
+/// as [`assemble_ext4_bootable`], but the ext4 image is **never materialized as a
+/// dense buffer**. Only the non-zero blocks are produced (the assembler skips
+/// holes and the free data region), so peak working memory tracks the image's
+/// *content*, not its declared size — a multi-GiB disk whose free space is sparse
+/// assembles without a multi-GiB allocation ("the KappaStore IS the memory, RAM
+/// is a cache", Laws L3/L4).
+///
+/// The resulting [`KappaDisk`](crate::disk::KappaDisk) is byte-identical to the
+/// dense path: its sectors equal `assemble_ext4_bootable(...)`'s bytes and its
+/// [`image_kappa`](crate::disk::KappaDisk::image_kappa) matches the dense disk's
+/// (the same content yields the same κ-set, Law L1). `sector_size` must divide the
+/// 4 KiB ext4 block (e.g. 512).
+///
+/// # Errors
+///
+/// [`AssemblyError`] if the layers do not overlay / serialize; a
+/// [`crate::disk::DeviceError`] surfaced as [`AssemblyError::Ext4`]-adjacent is
+/// returned via the disk error type.
+pub fn stream_ext4_bootable_into_disk<'a>(
+    store: &'a dyn hologram_substrate_core::KappaStore,
+    sector_size: u32,
+    layers: &[Layer],
+    init: &[u8],
+    disk_bytes: u64,
+) -> Result<crate::disk::KappaDisk<'a>, AssemblyError> {
+    use crate::disk::KappaDisk;
+
+    let mut tree = overlay_layers(layers)?;
+    let id = tree.contents.keys().copied().max().map_or(0, |m| m + 1);
+    tree.contents.insert(id, init.to_vec());
+    insert_file_at(&mut tree.root, "init", 0o755, id);
+    let min_blocks = disk_bytes / 4096;
+    let min_inodes = u32::try_from(disk_bytes / 16384).unwrap_or(u32::MAX);
+
+    // One assembly pass yields the geometry + the sparse non-zero blocks. The map
+    // holds only materialized content (never the dense image), so peak working
+    // memory is the content working set; we stream the map into the sized disk and
+    // drop it. The block contents are freed as they go (`remove`) so we do not hold
+    // both the map and the disk's cache copies of the same content at once.
+    let (geom, mut blocks) = ext4::sparse_blocks_with_free(&tree, min_inodes, min_blocks)?;
+    // The overlaid tree's contents are no longer needed once serialized.
+    drop(tree);
+    let total_sectors = geom.image_len() / sector_size as u64;
+
+    let mut keys: Vec<u64> = blocks.keys().copied().collect();
+    let disk = KappaDisk::from_block_stream(
+        store,
+        sector_size,
+        total_sectors,
+        ext4::BLOCK_SIZE_BYTES,
+        |emit| {
+            for idx in keys.drain(..) {
+                // Move each block out of the map and emit it; the map shrinks as the
+                // disk fills, bounding concurrent residency to the content.
+                if let Some(bytes) = blocks.remove(&idx) {
+                    emit(idx, &bytes)?;
+                }
+            }
+            Ok(())
+        },
+    )
+    .map_err(AssemblyError::Disk)?;
+    Ok(disk)
 }
 
 /// Insert a file at `rel` (a `/`-separated path relative to `dir`), creating any

@@ -229,6 +229,76 @@ impl DevcontainerProvision {
         )
         .map_err(js_err)
     }
+
+    /// Assemble the bootable rootfs **straight into an OPFS file**, sparse and
+    /// streaming — the `CC-50` provisioning path that never materializes a dense
+    /// in-RAM image. Equivalent in content to [`assemble`](Self::assemble), but
+    /// instead of returning a `Vec` sized to the whole (possibly multi-GiB) disk,
+    /// it writes only the **non-zero 4 KiB blocks** to `rootfs_handle` at their
+    /// byte offsets; the OPFS file's free space stays sparse (zero on read). Peak
+    /// wasm heap tracks the image's *content*, not its declared size ("the
+    /// KappaStore IS the memory, RAM is a cache", Laws L3/L4).
+    ///
+    /// Returns the total image length in bytes (a whole number of sectors). The
+    /// page then boots from the file with
+    /// [`boot_devcontainer_routed_opfs_streamed`](Workspace::boot_devcontainer_routed_opfs_streamed),
+    /// which pages the disk sector-by-sector — so neither provisioning nor boot
+    /// ever holds the whole image in RAM.
+    #[wasm_bindgen(js_name = assembleIntoOpfs)]
+    pub fn assemble_into_opfs(
+        &self,
+        rootfs_handle: web_sys::FileSystemSyncAccessHandle,
+        disk_bytes: f64,
+    ) -> Result<f64, JsValue> {
+        let image = self.pull.ingest(&self.store).map_err(js_err)?;
+        let mut owned: Vec<(String, Vec<u8>)> = Vec::new();
+        for (k, mt) in image.layers().iter().zip(image.layer_media_types()) {
+            let bytes = self
+                .store
+                .get(k)
+                .map_err(js_err)?
+                .ok_or_else(|| JsValue::from_str("an ingested layer is missing from the store"))?
+                .as_ref()
+                .to_vec();
+            owned.push((mt.clone(), bytes));
+        }
+        let layers: Vec<Layer> = owned
+            .iter()
+            .map(|(mt, b)| Layer {
+                media_type: mt,
+                blob: b,
+            })
+            .collect();
+
+        // Stream the ext4 image block-by-block into the OPFS file. Only non-zero
+        // blocks are written (the free space stays sparse), so the wasm heap holds
+        // the assembler's content working set, never the whole image.
+        let mut io_err: Option<JsValue> = None;
+        let geom = holospaces::assembly::stream_ext4_image_bootable(
+            &layers,
+            holospaces::machine::REAL_IMAGE_INIT,
+            disk_bytes as u64,
+            |block_index, bytes| {
+                if io_err.is_some() {
+                    return;
+                }
+                let opts = web_sys::FileSystemReadWriteOptions::new();
+                opts.set_at((block_index * bytes.len() as u64) as f64);
+                if let Err(e) = rootfs_handle.write_with_u8_array_and_options(bytes, &opts) {
+                    io_err = Some(e);
+                }
+            },
+        )
+        .map_err(js_err)?;
+        if let Some(e) = io_err {
+            return Err(e);
+        }
+        let image_len = geom.image_len();
+        // Ensure the file spans the full image so the trailing sparse region reads
+        // back as zeros (OPFS truncate grows with a hole).
+        rootfs_handle.truncate_with_f64(image_len as f64)?;
+        Ok(image_len as f64)
+    }
 }
 
 /// Run a `.holo` compute artifact in the browser via the hologram executor

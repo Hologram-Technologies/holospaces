@@ -109,6 +109,92 @@ impl<'a> KappaDisk<'a> {
         Ok(disk)
     }
 
+    /// Open a κ-disk of `total_sectors` × `sector_size` and populate it from a
+    /// **stream of non-zero blocks** — the streaming, sparse counterpart of
+    /// [`from_image`](KappaDisk::from_image) that never materializes a dense image
+    /// (`CC-50`). `populate(&mut emit)` drives the producer (e.g. the ext4
+    /// assembler), calling `emit(block_index, &block_bytes)` for each non-zero
+    /// `block_bytes`-sized block; `block_bytes` must be a whole number of sectors.
+    /// Blocks never emitted stay sparse (read back as zeros), so the disk's peak
+    /// state holds only the *content*, not the full geometry (Law L3/L4).
+    ///
+    /// The same content yields the same [`image_kappa`](KappaDisk::image_kappa) as
+    /// the dense [`from_image`](KappaDisk::from_image) path: identity is the sector
+    /// κ-set, and the streamed disk's sectors are byte-identical to the dense image's.
+    ///
+    /// # Errors
+    ///
+    /// [`DeviceError::OutOfRange`] if `block_size` is not a positive multiple of
+    /// `sector_size`, or an emitted block lands past the device.
+    pub fn from_block_stream<F>(
+        store: &'a dyn KappaStore,
+        sector_size: u32,
+        total_sectors: u64,
+        block_size: u32,
+        mut populate: F,
+    ) -> Result<KappaDisk<'a>, DeviceError>
+    where
+        F: FnMut(&mut dyn FnMut(u64, &[u8]) -> Result<(), DeviceError>) -> Result<(), DeviceError>,
+    {
+        if sector_size == 0 || block_size == 0 || !block_size.is_multiple_of(sector_size) {
+            return Err(DeviceError::OutOfRange);
+        }
+        let sectors_per_block = (block_size / sector_size) as u64;
+        let disk = KappaDisk::open(store, sector_size, total_sectors);
+        // Write each emitted block at its sector offset. The write path is the
+        // synchronous core of [`BlockDevice::write`]: it content-addresses every
+        // sector through the store (dedup, Laws L2/L3) and updates the sparse index
+        // — never a dense buffer. (Streaming is sync: the producer's callback is
+        // sync, and the store is sync, so no executor is involved.)
+        {
+            let mut sink = |block_index: u64, bytes: &[u8]| -> Result<(), DeviceError> {
+                if bytes.len() != block_size as usize {
+                    return Err(DeviceError::OutOfRange);
+                }
+                let lba = block_index * sectors_per_block;
+                disk.write_sectors_sync(lba, sectors_per_block as u32, bytes)
+            };
+            populate(&mut sink)?;
+        }
+        Ok(disk)
+    }
+
+    /// The synchronous core of [`BlockDevice::write`]: content-address each sector
+    /// of `buffer` (sized `sectors` × `sector_size`) through the store and update
+    /// the sparse index at `lba`. The async trait method delegates to this; the
+    /// streaming assembler calls it directly (no executor needed, the store is sync).
+    fn write_sectors_sync(&self, lba: u64, sectors: u32, buffer: &[u8]) -> Result<(), DeviceError> {
+        self.sector_range(lba, sectors, buffer.len())?;
+        let ss = self.sector_size as usize;
+        let blank = empty_kappa();
+        let mut index = self.index.lock();
+        let mut cache = self.cache.lock();
+        for i in 0..sectors as usize {
+            let slot = &buffer[i * ss..(i + 1) * ss];
+            // An all-zero sector is *sparse*: it stores nothing and the index holds
+            // the sentinel (read back as zeros). This makes a written-zeros sector
+            // and a never-written sector canonically identical (Laws L1/L3/L4) — so
+            // the dense [`from_image`] path and the streaming assembly produce the
+            // *same* sector κ-set and the same [`image_kappa`] for the same content,
+            // and the disk's free space costs nothing.
+            if slot.iter().all(|&b| b == 0) {
+                index[lba as usize + i] = blank;
+                continue;
+            }
+            // Content-address the sector through the store (idempotent: identical
+            // sectors store once — dedup, Laws L2/L3).
+            let kappa = self
+                .store
+                .put("blake3", slot)
+                .map_err(|_| DeviceError::HardwareFault(4))?;
+            index[lba as usize + i] = kappa;
+            // Write-through: a just-written sector is immediately readable from the
+            // cache without re-hitting the store.
+            cache_insert(&mut cache, kappa, Bytes::from(slot.to_vec()));
+        }
+        Ok(())
+    }
+
     /// The disk image's identity: the κ-label of its canonical form — the IRI
     /// tag followed by every sector's κ-label in order (Law L1). Reproducible:
     /// the same sector contents yield the same image κ on any peer, so a κ-disk
@@ -226,24 +312,10 @@ impl BlockDevice for KappaDisk<'_> {
     }
 
     async fn write(&self, lba: u64, sectors: u32, buffer: &[u8]) -> Result<(), DeviceError> {
-        self.sector_range(lba, sectors, buffer.len())?;
-        let ss = self.sector_size as usize;
-        let mut index = self.index.lock();
-        let mut cache = self.cache.lock();
-        for i in 0..sectors as usize {
-            let slot = &buffer[i * ss..(i + 1) * ss];
-            // Content-address the sector through the store (idempotent: identical
-            // sectors store once — dedup, Laws L2/L3).
-            let kappa = self
-                .store
-                .put("blake3", slot)
-                .map_err(|_| DeviceError::HardwareFault(4))?;
-            index[lba as usize + i] = kappa;
-            // Write-through: a just-written sector is immediately readable from
-            // the cache without re-hitting the store.
-            cache_insert(&mut cache, kappa, Bytes::from(slot.to_vec()));
-        }
-        Ok(())
+        // The whole write is bounded local work (content-address each sector
+        // through the sync store, update the sparse index, write-through the
+        // cache); the async core is shared with the streaming assembler.
+        self.write_sectors_sync(lba, sectors, buffer)
     }
 
     async fn flush(&self) -> Result<(), DeviceError> {
