@@ -16,6 +16,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   release:
     types: [published]
 
@@ -28,6 +29,8 @@ concurrency:
 jobs:
   vv:
     name: V&V (CS spec conformance V1–V8 + CC component conformance)
+    # Heavy gate: skip on DRAFT PRs (WIP churn); runs on ready PRs, main, release.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -138,6 +141,7 @@ jobs:
 
   browser:
     name: Browser peer + Platform Manager (Chromium/Playwright)
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
