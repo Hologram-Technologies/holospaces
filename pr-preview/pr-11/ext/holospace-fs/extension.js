@@ -191,6 +191,21 @@ async function openDiskStore(id) {
   }
 }
 
+// A synchronous read handle on the provisioned rootfs file — so the κ-disk can be
+// streamed sector-by-sector into its store without ever reading the whole image
+// into RAM. `null` if it was not provisioned or sync access is unavailable.
+async function openProvisionedHandle(id) {
+  const root = await opfsRoot();
+  if (!root || !id) return null;
+  try {
+    const dir = await root.getDirectoryHandle("provisioned", { create: false });
+    const fh = await dir.getFileHandle(id, { create: false });
+    return await fh.createSyncAccessHandle();
+  } catch {
+    return null;
+  }
+}
+
 let persisting = false;
 async function saveSnapshot() {
   if (!ws || ws.halted || persisting) return;
@@ -249,51 +264,63 @@ async function bootHolospace() {
   const holoId = folder && folder.uri ? folder.uri.authority : "";
 
   // The Manager provisions the repository's REAL OCI image and stages the
-  // bootable rootfs in OPFS (keyed by the holospace id) before opening this
-  // workbench (CC-42) — so the launched holospace is the repository's *actual*
-  // devcontainer. When it is absent — the workbench-machinery tests open the
-  // workbench directly with no Manager — fall back to the language-server base
-  // image (the test fixture); a real, no-router launch is gated in the Manager,
-  // so a user never sees the fixture in place of their repo.
-  let rootfs = holoId ? await readProvisioned(holoId) : null;
-  const provisioned = !!rootfs;
-  if (!rootfs) {
-    const layer = await fetchBytes(`${base}/devcontainer-lsp-layer.tar.gz`);
-    const image = new wasm.DevcontainerImage();
-    image.add_layer("application/vnd.oci.image.layer.v1.tar+gzip", layer);
-    // The fixture's disk is sized for room to work (it is not a content-tight
-    // assembly); the provisioned image carries its own assembled (CC-42) rootfs.
-    const DISK_BYTES = 128 * 1024 * 1024;
-    rootfs = image.assemble_bootable(DISK_BYTES);
-  }
-
-  // The per-guest egress: an egress node URL (CC-39) carried on the folder URI
-  // query (the drawer's Network → Egress node) tunnels the guest's TCP over the
-  // WsEgress WebSocket (CC-16); a provisioned holospace otherwise routes through
-  // the router (ChannelEgress); the fixture boots the in-process bridge.
+  // bootable rootfs in OPFS (provisioned/<id>) before opening this workbench
+  // (CC-42) — so the launched holospace is the repository's *actual* devcontainer.
+  // The per-guest egress node (CC-39), if set, is carried on the folder URI query.
   const egress = folder && folder.uri && folder.uri.query
     ? new URLSearchParams(folder.uri.query).get("egress")
     : null;
-  bridged = !egress && !provisioned;
-  // A provisioned holospace pages its disk from an OPFS-backed κ-store (the
-  // paged κ-disk): the disk's sectors live off the wasm heap, so a real image
-  // boots without holding it all in RAM ("the KappaStore IS the memory, RAM is a
-  // cache"). The store is one OPFS pack file behind a sync access handle (worker-
-  // only — which is where this runs).
-  const diskHandle = provisioned && !egress ? await openDiskStore(holoId) : null;
-  ws = egress
-    ? wasm.Workspace.boot_devcontainer_net(kernel, rootfs, egress)
-    : provisioned
-      ? diskHandle
-        ? wasm.Workspace.boot_devcontainer_routed_opfs(kernel, rootfs, diskHandle)
-        : wasm.Workspace.boot_devcontainer_routed(kernel, rootfs)
-      : wasm.Workspace.boot_devcontainer_bridged(kernel, rootfs);
-  if (out) {
-    out.appendLine(provisioned
-      ? (diskHandle
-        ? "holospace: booted the provisioned devcontainer image (CC-42) — disk paged from OPFS (RAM is a cache)"
-        : "holospace: booted the provisioned devcontainer image (CC-42) — the repository's real environment")
-      : "holospace: booted the language-server base fixture");
+
+  // PREFERRED: the streaming **paged κ-disk**. Page the provisioned rootfs
+  // straight from its OPFS file into an OPFS-backed κ-store, sector-by-sector —
+  // neither the full image nor the assembled disk is ever held in wasm RAM
+  // ("the KappaStore IS the memory, RAM is a cache"), so a large image boots
+  // without OOM. Needs sync access handles (worker-only — which is where this
+  // runs) on both the rootfs and the store pack, and no egress-node override.
+  if (holoId && !egress) {
+    const rootfsHandle = await openProvisionedHandle(holoId);
+    if (rootfsHandle) {
+      const diskHandle = await openDiskStore(holoId);
+      if (diskHandle) {
+        ws = wasm.Workspace.boot_devcontainer_routed_opfs_streamed(kernel, rootfsHandle, diskHandle);
+        bridged = false;
+        out && out.appendLine("holospace: booted the provisioned image (CC-42) — streamed paged κ-disk from OPFS (no full image in RAM)");
+      } else {
+        try { rootfsHandle.close(); } catch {}
+      }
+    }
+  }
+
+  // FALLBACK: read the rootfs into RAM and boot the in-RAM / node-egress path —
+  // an egress-node override, or OPFS sync access unavailable, or no provisioned
+  // image (the workbench-machinery tests open the workbench directly with no
+  // Manager → the language-server base fixture; a real no-router launch is gated
+  // in the Manager, so a user never sees the fixture in place of their repo).
+  if (!ws) {
+    let rootfs = holoId ? await readProvisioned(holoId) : null;
+    const provisioned = !!rootfs;
+    if (!rootfs) {
+      const layer = await fetchBytes(`${base}/devcontainer-lsp-layer.tar.gz`);
+      const image = new wasm.DevcontainerImage();
+      image.add_layer("application/vnd.oci.image.layer.v1.tar+gzip", layer);
+      const DISK_BYTES = 128 * 1024 * 1024;
+      rootfs = image.assemble_bootable(DISK_BYTES);
+    }
+    bridged = !egress && !provisioned;
+    const diskHandle = provisioned && !egress ? await openDiskStore(holoId) : null;
+    ws = egress
+      ? wasm.Workspace.boot_devcontainer_net(kernel, rootfs, egress)
+      : provisioned
+        ? diskHandle
+          ? wasm.Workspace.boot_devcontainer_routed_opfs(kernel, rootfs, diskHandle)
+          : wasm.Workspace.boot_devcontainer_routed(kernel, rootfs)
+        : wasm.Workspace.boot_devcontainer_bridged(kernel, rootfs);
+    if (out) {
+      out.appendLine(provisioned
+        ? (diskHandle ? "holospace: booted the provisioned image (CC-42) — disk paged from OPFS"
+                      : "holospace: booted the provisioned image (CC-42)")
+        : "holospace: booted the language-server base fixture");
+    }
   }
   // Seed a welcome note into the shared workspace so the editor and the OS both
   // see it (the editor writes by κ; the OS reads it over 9p).
