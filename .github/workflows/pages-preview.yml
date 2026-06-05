@@ -13,7 +13,7 @@ name: pages-preview
 
 on:
   pull_request:
-    types: [opened, reopened, synchronize, closed]
+    types: [opened, reopened, synchronize, closed, ready_for_review]
 
 permissions:
   contents: write
@@ -29,7 +29,7 @@ jobs:
     # Same-repo PRs only: a fork has no access to the `HOLOGRAM` build secret, so
     # it cannot build the wasm bundle (and must not push to gh-pages). Fork PRs
     # simply get no preview rather than a failed run.
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event.pull_request.head.repo.full_name == github.repository && (github.event.pull_request.draft == false || github.event.action == 'closed')
     steps:
       - uses: actions/checkout@v4
       - name: Build the Platform Manager site
