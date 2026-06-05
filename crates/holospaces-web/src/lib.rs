@@ -393,6 +393,66 @@ impl DevcontainerImage {
         )
         .map_err(js_err)
     }
+
+    /// Assemble the **bootable** rootfs of [`Self::assemble_bootable`] **straight
+    /// into an OPFS file**, sparse and streaming — the `CC-50` provisioning path
+    /// that never materializes a dense in-RAM image. The content is identical to
+    /// [`assemble_bootable`](Self::assemble_bootable) (the same overlay + injected
+    /// [`DEVCONTAINER_INIT`](holospaces::machine::DEVCONTAINER_INIT) + `disk_bytes`
+    /// sizing), but instead of returning a `Vec` sized to the whole disk it writes
+    /// only the **non-zero 4 KiB blocks** to `rootfs_handle` at their byte offsets
+    /// via the shared streaming serializer
+    /// ([`stream_ext4_image_bootable`](holospaces::assembly::stream_ext4_image_bootable)) —
+    /// the very primitive [`DevcontainerProvision::assemble_into_opfs`] uses. The
+    /// file's free space stays sparse (zero on read); peak wasm heap tracks the
+    /// image's *content*, not its declared size ("the KappaStore IS the memory, RAM
+    /// is a cache", Laws L3/L4).
+    ///
+    /// Returns the total image length in bytes. The page then boots the file with
+    /// [`boot_devcontainer_routed_opfs_streamed`](Workspace::boot_devcontainer_routed_opfs_streamed),
+    /// which pages the disk sector-by-sector — so the streamed-into-OPFS image is
+    /// what actually boots (not a dense image that merely shares its bytes).
+    #[wasm_bindgen(js_name = assembleBootableIntoOpfs)]
+    pub fn assemble_bootable_into_opfs(
+        &self,
+        rootfs_handle: web_sys::FileSystemSyncAccessHandle,
+        disk_bytes: f64,
+    ) -> Result<f64, JsValue> {
+        let layers: Vec<Layer> = self
+            .layers
+            .iter()
+            .map(|(mt, b)| Layer {
+                media_type: mt,
+                blob: b,
+            })
+            .collect();
+
+        let mut io_err: Option<JsValue> = None;
+        let geom = holospaces::assembly::stream_ext4_image_bootable(
+            &layers,
+            holospaces::machine::DEVCONTAINER_INIT,
+            disk_bytes as u64,
+            |block_index, bytes| {
+                if io_err.is_some() {
+                    return;
+                }
+                let opts = web_sys::FileSystemReadWriteOptions::new();
+                opts.set_at((block_index * bytes.len() as u64) as f64);
+                if let Err(e) = rootfs_handle.write_with_u8_array_and_options(bytes, &opts) {
+                    io_err = Some(e);
+                }
+            },
+        )
+        .map_err(js_err)?;
+        if let Some(e) = io_err {
+            return Err(e);
+        }
+        let image_len = geom.image_len();
+        // Grow the file to span the full image so the trailing sparse region reads
+        // back as zeros (OPFS truncate grows with a hole).
+        rootfs_handle.truncate_with_f64(image_len as f64)?;
+        Ok(image_len as f64)
+    }
 }
 
 impl Default for DevcontainerImage {

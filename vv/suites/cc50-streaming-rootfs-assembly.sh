@@ -27,6 +27,14 @@
 # with_free) consumers, so they are byte-identical by construction; KappaDisk
 # treats a written all-zero sector as sparse, so dense from_image and streaming
 # from_block_stream yield the same sector κ-set for the same content (Law L1).
+#
+# The *deployed browser* path is witnessed by the browser job (the CI browser job
+# / scripts/browser-manager-test.sh → crates/holospaces-web/web/cc50-streaming-
+# boot-test.mjs): in Chromium, a dedicated worker streams the bootable rootfs
+# straight into an OPFS file (the shared stream_ext4_image_bootable serializer the
+# wasm assembleIntoOpfs uses) and BOOTS it to a userspace marker via the shipped
+# Workspace.boot_devcontainer_routed_opfs_streamed paged-κ-disk path — so the
+# streamed-into-OPFS image is proven to BOOT for real, not only κ-identical.
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
