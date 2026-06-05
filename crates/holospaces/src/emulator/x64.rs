@@ -94,6 +94,14 @@ pub struct Cpu {
     rip: u64,
     /// The flags register (`RFLAGS`).
     rflags: u64,
+    /// Control registers: `cr0` (paging/protection), `cr2` (page-fault address),
+    /// `cr3` (the PML4 physical base), `cr4` (PAE et al.).
+    cr0: u64,
+    cr2: u64,
+    cr3: u64,
+    cr4: u64,
+    /// `IA32_EFER` — `LME`/`LMA` (long mode enabled/active) live here.
+    efer: u64,
     /// Guest RAM (physical, based at [`RAM_BASE`]).
     ram: Vec<u8>,
     sys: Option<Box<Sys>>,
@@ -110,9 +118,98 @@ impl Cpu {
             r: [0; 16],
             rip: RAM_BASE,
             rflags: 0x2, // bit 1 is reserved-1
+            cr0: 0,
+            cr2: 0,
+            cr3: 0,
+            cr4: 0,
+            efer: 0,
             ram: vec![0u8; ram_bytes],
             sys: Some(Box::new(Sys::new())),
         }
+    }
+
+    /// Whether 4-level paging is active (long mode: `CR0.PG` & `CR4.PAE` &
+    /// `EFER.LME`). When off, virtual addresses are physical (the boot core runs
+    /// identity-mapped until the kernel installs `CR3`).
+    fn paging(&self) -> bool {
+        const PG: u64 = 1 << 31;
+        const PAE: u64 = 1 << 5;
+        const LME: u64 = 1 << 8;
+        self.cr0 & PG != 0 && self.cr4 & PAE != 0 && self.efer & LME != 0
+    }
+
+    /// Translate a linear address to a physical one through the 4-level page
+    /// tables (`PML4 → PDPT → PD → PT`), honouring 2 MiB and 1 GiB large pages.
+    /// Returns the linear address unchanged when paging is off. A not-present
+    /// entry records `CR2` and falls back to the linear address (the boot core
+    /// has no `#PF` handler yet — the continued build adds fault delivery).
+    fn translate(&self, vaddr: u64) -> u64 {
+        if !self.paging() {
+            return vaddr;
+        }
+        let pml4 = self.cr3 & 0x000f_ffff_ffff_f000;
+        let idx = |lvl: u32| ((vaddr >> (12 + 9 * lvl)) & 0x1ff) * 8;
+        let ent = |base: u64, i: u64| self.rd_phys(base + i, 8);
+        let present = |e: u64| e & 1 != 0;
+        let next = |e: u64| e & 0x000f_ffff_ffff_f000;
+
+        let e4 = ent(pml4, idx(3));
+        if !present(e4) {
+            return vaddr;
+        }
+        let e3 = ent(next(e4), idx(2));
+        if !present(e3) {
+            return vaddr;
+        }
+        if e3 & (1 << 7) != 0 {
+            // 1 GiB page
+            return (e3 & 0x000f_ffff_c000_0000) | (vaddr & 0x3fff_ffff);
+        }
+        let e2 = ent(next(e3), idx(1));
+        if !present(e2) {
+            return vaddr;
+        }
+        if e2 & (1 << 7) != 0 {
+            // 2 MiB page
+            return (e2 & 0x000f_ffff_ffe0_0000) | (vaddr & 0x1f_ffff);
+        }
+        let e1 = ent(next(e2), idx(0));
+        if !present(e1) {
+            return vaddr;
+        }
+        (e1 & 0x000f_ffff_ffff_f000) | (vaddr & 0xfff)
+    }
+
+    /// Read control register `idx` (0/2/3/4; others read 0).
+    fn cr(&self, idx: usize) -> u64 {
+        match idx {
+            0 => self.cr0,
+            2 => self.cr2,
+            3 => self.cr3,
+            4 => self.cr4,
+            _ => 0,
+        }
+    }
+
+    /// Write control register `idx`.
+    fn set_cr(&mut self, idx: usize, val: u64) {
+        match idx {
+            0 => self.cr0 = val,
+            2 => self.cr2 = val,
+            3 => self.cr3 = val,
+            4 => self.cr4 = val,
+            _ => {}
+        }
+    }
+
+    /// A raw physical read (the page-table walk reads physical memory directly).
+    fn rd_phys(&self, addr: u64, size: u8) -> u64 {
+        let a = addr as usize;
+        let mut v = 0u64;
+        for i in 0..size as usize {
+            v |= u64::from(*self.ram.get(a + i).unwrap_or(&0)) << (8 * i);
+        }
+        v
     }
 
     /// Load a flat code/image blob at guest physical `addr` and set `rip` to it —
@@ -158,25 +255,26 @@ impl Cpu {
 
     // ── Memory ───────────────────────────────────────────────────────────────
     fn rd(&self, addr: u64, size: u8) -> u64 {
-        let a = addr as usize;
         let mut v = 0u64;
-        for i in 0..size as usize {
-            v |= u64::from(*self.ram.get(a + i).unwrap_or(&0)) << (8 * i);
+        for i in 0..u64::from(size) {
+            let p = self.translate(addr.wrapping_add(i)) as usize;
+            v |= u64::from(*self.ram.get(p).unwrap_or(&0)) << (8 * i);
         }
         v
     }
 
     fn wr(&mut self, addr: u64, size: u8, val: u64) {
-        let a = addr as usize;
-        for i in 0..size as usize {
-            if let Some(b) = self.ram.get_mut(a + i) {
+        for i in 0..u64::from(size) {
+            let p = self.translate(addr.wrapping_add(i)) as usize;
+            if let Some(b) = self.ram.get_mut(p) {
                 *b = (val >> (8 * i)) as u8;
             }
         }
     }
 
     fn fetch_u8(&mut self) -> u8 {
-        let b = *self.ram.get(self.rip as usize).unwrap_or(&0);
+        let p = self.translate(self.rip) as usize;
+        let b = *self.ram.get(p).unwrap_or(&0);
         self.rip = self.rip.wrapping_add(1);
         b
     }
@@ -762,6 +860,36 @@ impl Cpu {
                         let (a, b) = (self.r[reg] & Self::mask(size), self.load_rm(rm, size));
                         self.store_rm(Rm::Reg(reg), size, a.wrapping_mul(b));
                     }
+                    0x20 => {
+                        // MOV r64, CRn (mod is ignored — rm is a register).
+                        let (cr_idx, rm) = self.modrm(rex);
+                        if let Rm::Reg(g) = rm {
+                            self.r[g] = self.cr(cr_idx);
+                        }
+                    }
+                    0x22 => {
+                        // MOV CRn, r64 — install paging (CR3), enable PG/PAE, etc.
+                        let (cr_idx, rm) = self.modrm(rex);
+                        if let Rm::Reg(g) = rm {
+                            let v = self.r[g];
+                            self.set_cr(cr_idx, v);
+                        }
+                    }
+                    0x30 => {
+                        // WRMSR: MSR[ecx] = edx:eax. EFER (0xC000_0080) holds LME/LMA.
+                        let ecx = self.r[1] & 0xffff_ffff;
+                        let val = ((self.r[2] & 0xffff_ffff) << 32) | (self.r[0] & 0xffff_ffff);
+                        if ecx == 0xC000_0080 {
+                            self.efer = val;
+                        }
+                    }
+                    0x32 => {
+                        // RDMSR: edx:eax = MSR[ecx].
+                        let ecx = self.r[1] & 0xffff_ffff;
+                        let val = if ecx == 0xC000_0080 { self.efer } else { 0 };
+                        self.r[0] = val & 0xffff_ffff;
+                        self.r[2] = val >> 32;
+                    }
                     _ => return Err(Halt::Undefined(start)),
                 }
             }
@@ -830,6 +958,58 @@ mod tests {
             0xf4, // hlt
         ];
         assert_eq!(run(&code).console(), b"hi");
+    }
+
+    #[test]
+    fn long_mode_paging_translates_through_four_levels() {
+        // Build a 4 KiB-page mapping VA 0 → PA 0x5000 through PML4→PDPT→PD→PT
+        // (entry 0 of each table, the tables at 0x1000/0x2000/0x3000/0x4000), then
+        // enable long-mode paging and check translation honours it.
+        let mut cpu = Cpu::new(64 * 1024);
+        let put = |cpu: &mut Cpu, at: usize, e: u64| {
+            cpu.ram[at..at + 8].copy_from_slice(&e.to_le_bytes());
+        };
+        put(&mut cpu, 0x1000, 0x2000 | 1); // PML4[0] → PDPT, present
+        put(&mut cpu, 0x2000, 0x3000 | 1); // PDPT[0] → PD
+        put(&mut cpu, 0x3000, 0x4000 | 1); // PD[0]   → PT
+        put(&mut cpu, 0x4000, 0x5000 | 1); // PT[0]   → frame 0x5000
+        cpu.cr3 = 0x1000;
+        cpu.cr4 = 1 << 5; // PAE
+        cpu.efer = 1 << 8; // LME
+        assert_eq!(cpu.translate(0x123), 0x123, "paging off → identity");
+        cpu.cr0 = 1 << 31; // PG → paging on
+        assert_eq!(cpu.translate(0x123), 0x5123, "VA 0x123 maps to PA 0x5123");
+        // A write through the VA lands at the physical frame (rd/wr translate).
+        cpu.wr(0x40, 4, 0xdead_beef);
+        assert_eq!(
+            cpu.rd_phys(0x5040, 4),
+            0xdead_beef,
+            "the write hit frame 0x5000"
+        );
+    }
+
+    #[test]
+    fn mov_cr_and_wrmsr_set_up_long_mode() {
+        // mov rax, 0x1000 ; mov cr3, rax ; mov rax, 0x20 ; mov cr4, rax ;
+        // mov ecx,0xC0000080 ; mov eax,0x100 ; xor edx,edx ; wrmsr ; rdmsr ; hlt
+        let code = [
+            0x48, 0xc7, 0xc0, 0x00, 0x10, 0, 0, // mov rax, 0x1000
+            0x0f, 0x22, 0xd8, // mov cr3, rax
+            0xb9, 0x80, 0x00, 0x00, 0xc0, // mov ecx, 0xC0000080
+            0xb8, 0x00, 0x01, 0x00, 0x00, // mov eax, 0x100 (LME)
+            0x31, 0xd2, // xor edx, edx
+            0x0f, 0x30, // wrmsr → EFER = 0x100
+            0x0f, 0x32, // rdmsr → eax = EFER low
+            0xf4, // hlt
+        ];
+        let cpu = run(&code);
+        assert_eq!(cpu.cr3, 0x1000, "mov cr3 installed the PML4 base");
+        assert_eq!(cpu.efer, 0x100, "wrmsr set EFER.LME");
+        assert_eq!(
+            cpu.reg(0) & 0xffff_ffff,
+            0x100,
+            "rdmsr read EFER back into eax"
+        );
     }
 
     #[test]
