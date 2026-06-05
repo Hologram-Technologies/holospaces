@@ -58,6 +58,15 @@ scrutinise:
 > explicit consent (so the base install stays lean), or run it in a separate,
 > clearly-scoped extension.
 
+## Configure for your deployment
+
+`manifest.json` lists **one** origin in both `externally_connectable.matches` and
+`content_scripts.matches` — the project's Pages site. A self-host sets it to its
+own origin(s); narrower is faster to review, and only those origins can reach the
+router (self-sovereign). `optional_host_permissions` (`*://*/*`) is the content
+role's host access — **requested at runtime with consent**, not at install, so the
+base install stays minimal.
+
 ## Files
 
 - `manifest.json` — MV3; **minimal**: no host permissions, no tabs, no storage —

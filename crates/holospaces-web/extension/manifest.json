@@ -12,17 +12,12 @@
     "128": "icons/icon128.png"
   },
 
-  "_comment_minimal": "Requested permissions are kept to the MINIMUM for a fast Chrome Web Store review. The egress role connects to an IP:port the guest's NAT already chose and forwards opaque bytes — it never calls fetch(), reads a tab, injects a content script, or stores data. So this extension requests NO host_permissions, NO tabs, NO storage, NO scripting, NO webRequest. Its only capability is raw sockets (Direct Sockets), and its only inbound surface is a message port from the operator's own holospaces origin.",
-
-  "_comment_direct_sockets": "Direct Sockets (TCPSocket/UDPSocket) is a powerful, gated capability. It is enabled OUT OF BAND — for an enterprise/managed device via the DirectSocketsAllowedForUrls policy, or for development via chrome://flags — NOT via a broad store permission, which keeps the store-facing permission surface minimal. Confirm the exact gating for your Chrome version/channel.",
-
-  "_comment_connect": "Only the operator's own holospaces origin(s) may reach this extension — the egress is the operator's, self-sovereign, not open to any page. The matches list is the deployment's origin(s): set it to yours (the default below is the project's Pages site; a self-host sets its own). The content script (presence beacon) and externally_connectable share that one list — there are no other origins.",
-  "_holospaces_origins": ["https://hologram-technologies.github.io/*"],
   "externally_connectable": {
     "matches": ["https://hologram-technologies.github.io/*"]
   },
-  "_comment_optional_host": "The content role (pulling CORS-blocked registries/CDNs for the browser peer to assemble) needs host access. It is OPTIONAL — requested at runtime with the operator's consent the first time a repo is provisioned — so the base install stays minimal and reviews fast; it is NOT requested at install.",
+
   "optional_host_permissions": ["*://*/*"],
+
   "content_scripts": [
     {
       "matches": ["https://hologram-technologies.github.io/*"],
