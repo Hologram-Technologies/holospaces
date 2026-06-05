@@ -20,8 +20,12 @@
 //!
 //! The driver logic is written once against the [`Mmio`] transport trait and run
 //! against both cores; per-core entry points (`*_aarch64` / `*_x86_64`) keep the
-//! failures attributable. Device-level (no full kernel boot), like the RISC-V
-//! witnesses' fast checks; they run in the default test set.
+//! failures attributable. These are **device-level** checks (no full kernel
+//! boot): fast regression coverage that each core's MMIO transport reaches the
+//! shared devbus, run in the default test set. They are *not* the `CC-46`
+//! parity witness — that is the real arm64 boot in `cc46_realboot.rs`
+//! (`CC-15`/`CC-16`/`CC-33` caliber), which a real kernel drives through its VFS
+//! and TCP/IP stack.
 
 use holospaces::emulator::aarch64::Cpu as Aarch64Cpu;
 use holospaces::emulator::net::{ChannelEgress, Egress, RouterChannel};

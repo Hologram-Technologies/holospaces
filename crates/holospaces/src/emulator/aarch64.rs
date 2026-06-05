@@ -848,6 +848,64 @@ impl Cpu {
             return Ok(());
         }
 
+        // ── Floating-point two-register misc (the `a == size<1>` set) ────────
+        // FCVT{N,M,P,Z,A}{S,U}, SCVTF/UCVTF, FABS/FNEG, FSQRT, FRINT*, and the
+        // FP compare-with-zero forms — busybox/glibc reach these (e.g. `sleep`'s
+        // `fcvtzs d, d` parsing a duration). The FP element is single (sz=0) or
+        // double (sz=1); `a` (size<1>) selects the op subgroup, opcode + U the op.
+        let a_bit = size & 0b10 != 0;
+        let fp_opcode = matches!(
+            (a_bit, opcode),
+            (false, 0b11010 | 0b11011 | 0b11100 | 0b11101) | (true, 0b01111 | 0b11010 | 0b11011)
+        );
+        if fp_opcode {
+            let ftype = if size & 1 == 1 { 0b01u32 } else { 0b00u32 };
+            let fsz = if ftype == 0b01 { 3u32 } else { 2 }; // log2 element bytes
+            let fesize = if ftype == 0b01 { 64u32 } else { 32 };
+            let is64 = ftype == 0b01;
+            let felems = if scalar {
+                1
+            } else {
+                (datasize / fesize) as usize
+            };
+            let mut out = 0u128;
+            for i in 0..felems {
+                let xbits = lane(a, fsz, i);
+                let f = if is64 {
+                    f64::from_bits(xbits)
+                } else {
+                    f32::from_bits(xbits as u32) as f64
+                };
+                let r: u64 = match (a_bit, opcode, u) {
+                    // FCVT{N,M,A,P,Z}{S,U}: float → integer with a rounding mode.
+                    (false, 0b11010, false) => fp_to_int(f, Round::Nearest, true, is64), // FCVTNS
+                    (false, 0b11010, true) => fp_to_int(f, Round::Nearest, false, is64), // FCVTNU
+                    (false, 0b11011, false) => fp_to_int(f, Round::Minus, true, is64),   // FCVTMS
+                    (false, 0b11011, true) => fp_to_int(f, Round::Minus, false, is64),   // FCVTMU
+                    (false, 0b11100, false) => fp_to_int(f, Round::Nearest, true, is64), // FCVTAS (ties-away ≈ nearest here)
+                    (false, 0b11100, true) => fp_to_int(f, Round::Nearest, false, is64), // FCVTAU
+                    (true, 0b11010, false) => fp_to_int(f, Round::Plus, true, is64),     // FCVTPS
+                    (true, 0b11010, true) => fp_to_int(f, Round::Plus, false, is64),     // FCVTPU
+                    (true, 0b11011, false) => fp_to_int(f, Round::Zero, true, is64),     // FCVTZS
+                    (true, 0b11011, true) => fp_to_int(f, Round::Zero, false, is64),     // FCVTZU
+                    // SCVTF / UCVTF: integer → float (same lane width).
+                    (false, 0b11101, false) => {
+                        fp_bits(ftype, if is64 { xbits as i64 as f64 } else { xbits as i32 as f64 }) as u64
+                    }
+                    (false, 0b11101, true) => {
+                        fp_bits(ftype, if is64 { xbits as f64 } else { (xbits as u32) as f64 }) as u64
+                    }
+                    // FABS / FNEG.
+                    (true, 0b01111, false) => fp_bits(ftype, f.abs()) as u64,
+                    (true, 0b01111, true) => fp_bits(ftype, -f) as u64,
+                    _ => return Err(Trap::Illegal(inst)),
+                };
+                set_lane(&mut out, fsz, i, r);
+            }
+            self.write_vreg(rd, out, q);
+            return Ok(());
+        }
+
         let elems = if scalar {
             1
         } else {
@@ -3551,7 +3609,7 @@ impl Cpu {
     /// [`Cpu::run`] (a `PSCI SYSTEM_OFF` returns [`Halt::Exit`]).
     #[must_use]
     pub fn boot_linux(ram_bytes: usize, kernel: &[u8], bootargs: &str) -> Self {
-        Self::boot_linux_inner(ram_bytes, kernel, bootargs, None)
+        Self::boot_linux_inner(ram_bytes, kernel, bootargs, None, None, None)
     }
 
     /// Boot like [`Cpu::boot_linux`], additionally attaching a **`virtio-blk`
@@ -3572,6 +3630,8 @@ impl Cpu {
             kernel,
             bootargs,
             Some(super::VirtioBlk::new(rootfs)),
+            None,
+            None,
         )
     }
 
@@ -3596,6 +3656,42 @@ impl Cpu {
             kernel,
             bootargs,
             Some(super::VirtioBlk::with_backing(backing)),
+            None,
+            None,
+        )
+    }
+
+    /// Boot a real arm64 Linux over the **shared `emulator::devbus`** with the
+    /// full devcontainer device complement — the `virtio-blk` κ-disk root **and**
+    /// the shared `virtio-9p` workspace (`CC-15`) **and** the `virtio-net` device
+    /// + the userspace NAT (`CC-16`), each advertised in the devicetree so a real
+    /// kernel probes and drives it. This is the AArch64 analogue of the RISC-V
+    /// machine's [`MachineSpec::boot_workspace_net`](crate::machine::MachineSpec):
+    /// the same one devbus, only the MMIO transport (GIC vs PLIC) differs (Law
+    /// L4). The caller enables the in-process bridge (`CC-33`) with
+    /// [`Cpu::enable_loopback`]. Use a `bootargs` with `root=/dev/vda`, `ip=dhcp`,
+    /// and an `init` that mounts the 9p workspace and uses the network.
+    #[must_use]
+    pub fn boot_linux_devbus(
+        ram_bytes: usize,
+        kernel: &[u8],
+        rootfs: Vec<u8>,
+        seed: &[(&str, &[u8])],
+        egress: Box<dyn super::net::Egress>,
+        ingress: Box<dyn super::net::Ingress>,
+        bootargs: &str,
+    ) -> Self {
+        let mut fs = super::ninep::Fs9p::new();
+        for (name, data) in seed {
+            fs.seed_file(name, data);
+        }
+        Self::boot_linux_inner(
+            ram_bytes,
+            kernel,
+            bootargs,
+            Some(super::VirtioBlk::new(rootfs)),
+            Some(super::Virtio9p::new(fs, super::WORKSPACE_TAG)),
+            Some(super::VirtioNet::new(egress, ingress)),
         )
     }
 
@@ -3604,17 +3700,28 @@ impl Cpu {
         kernel: &[u8],
         bootargs: &str,
         disk: Option<super::VirtioBlk>,
+        virtio9p: Option<super::Virtio9p>,
+        virtionet: Option<super::VirtioNet>,
     ) -> Self {
         let mut cpu = Cpu::new(RAM_BASE, ram_bytes);
         // Load the kernel image at text_offset above the base of RAM.
         let load = KERNEL_OFFSET as usize;
         let n = kernel.len().min(cpu.ram.len() - load);
         cpu.ram[load..load + n].copy_from_slice(&kernel[..n]);
-        // Place the devicetree above the kernel and hand its address in x0. The
-        // `virtio-blk` node is advertised only when a disk is attached (an
-        // unattached `virtio-mmio` slot makes the kernel read magic 0 and stall).
+        // Place the devicetree above the kernel and hand its address in x0. Each
+        // `virtio-mmio` slot is advertised only when its device is attached (an
+        // unattached slot makes the kernel read magic 0 and stall).
         let has_blk = disk.is_some();
-        let dtb = arm64_virt_dtb(RAM_BASE, ram_bytes as u64, bootargs, has_blk, false, false);
+        let has_9p = virtio9p.is_some();
+        let has_net = virtionet.is_some();
+        let dtb = arm64_virt_dtb(
+            RAM_BASE,
+            ram_bytes as u64,
+            bootargs,
+            has_blk,
+            has_9p,
+            has_net,
+        );
         let dtb_off = DTB_OFFSET as usize;
         let dn = dtb.len().min(cpu.ram.len() - dtb_off);
         cpu.ram[dtb_off..dtb_off + dn].copy_from_slice(&dtb[..dn]);
@@ -3623,6 +3730,8 @@ impl Cpu {
         cpu.sp = RAM_BASE + KERNEL_OFFSET;
         let mut sys = Sys::new();
         sys.virtio = disk;
+        sys.virtio9p = virtio9p;
+        sys.virtionet = virtionet;
         cpu.sys = Some(Box::new(sys));
         cpu
     }
@@ -4281,6 +4390,10 @@ impl Cpu {
 
     /// Take an "unknown instruction" exception (`EC` 0x00) to EL1.
     fn take_undef(&mut self, ret: u64, _inst: u32) {
+        #[cfg(feature = "std")]
+        if self.sys().el == 0 {
+            std::eprintln!("UNDEF@{ret:#x} inst={_inst:#010x}");
+        }
         let from_el0 = self.sys().el == 0;
         let spsr = self.pack_pstate();
         let group = if from_el0 {
