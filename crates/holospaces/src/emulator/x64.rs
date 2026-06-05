@@ -345,8 +345,30 @@ pub struct Cpu {
     rex_present: bool,
     /// Guest RAM (physical, based at [`RAM_BASE`]).
     ram: Vec<u8>,
+    /// A page fault latched mid-instruction by the MMU (a not-present page-table
+    /// walk while paging is on). The faulting linear address and the `#PF` error
+    /// code; [`Cpu::step`] restores the pre-instruction register state and
+    /// vectors `#PF` (the kernel's early `do_early_exception` → `early_make_pgtable`
+    /// lazily maps boot data through `early_top_pgt` exactly as on real hardware).
+    fault: Option<PageFault>,
     sys: Option<Box<Sys>>,
 }
+
+/// A page fault latched by the MMU during an instruction's memory access (`#12`):
+/// the faulting linear address (→ `CR2`) and the architectural error code.
+#[derive(Clone, Copy)]
+struct PageFault {
+    addr: u64,
+    error: u64,
+}
+
+/// `#PF` (page fault) — IDT vector 14.
+const VEC_PAGE_FAULT: u8 = 14;
+/// `#PF` error-code bits: P (the fault was a protection violation, not
+/// not-present), W/R (write), U/S (user-mode access).
+const PF_ERR_PRESENT: u64 = 1 << 0;
+const PF_ERR_WRITE: u64 = 1 << 1;
+const PF_ERR_USER: u64 = 1 << 2;
 
 // Register indices.
 const RAX: usize = 0;
@@ -405,6 +427,7 @@ impl Cpu {
             cur_seg: None,
             rex_present: false,
             ram: vec![0u8; ram_bytes],
+            fault: None,
             sys: Some(Box::new(Sys::new())),
         }
     }
@@ -421,13 +444,29 @@ impl Cpu {
 
     /// Translate a linear address to a physical one through the 4-level page
     /// tables (`PML4 → PDPT → PD → PT`), honouring 2 MiB and 1 GiB large pages.
-    /// Returns the linear address unchanged when paging is off. A not-present
-    /// entry records `CR2` and falls back to the linear address (the boot core
-    /// has no `#PF` handler yet — the continued build adds fault delivery).
+    /// Returns the linear address unchanged when paging is off; a not-present
+    /// entry falls back to the linear address. A non-faulting view for tooling
+    /// and tests ([`Cpu::vv_dbg`], the paging unit test); the executing core
+    /// translates through [`Cpu::translate_acc`], which delivers a `#PF` instead.
     fn translate(&self, vaddr: u64) -> u64 {
+        self.walk(vaddr).unwrap_or(vaddr)
+    }
+
+    /// Walk the 4-level page tables for `vaddr`, returning the physical address or
+    /// the `#PF` error code for the first not-present level (the page-fault path a
+    /// real long-mode boot takes — the kernel maps boot data lazily on `#PF`).
+    /// `write`/`user` shape the error code; when paging is off the address is
+    /// physical (the identity-mapped boot core before it installs `CR3`).
+    fn walk(&self, vaddr: u64) -> Result<u64, u64> {
         if !self.paging() {
-            return vaddr;
+            return Ok(vaddr);
         }
+        let err = |present: bool, write: bool, user: bool| {
+            (if present { PF_ERR_PRESENT } else { 0 })
+                | (if write { PF_ERR_WRITE } else { 0 })
+                | (if user { PF_ERR_USER } else { 0 })
+        };
+        let np = err(false, false, false);
         let pml4 = self.cr3 & 0x000f_ffff_ffff_f000;
         let idx = |lvl: u32| ((vaddr >> (12 + 9 * lvl)) & 0x1ff) * 8;
         let ent = |base: u64, i: u64| self.rd_phys(base + i, 8);
@@ -436,29 +475,54 @@ impl Cpu {
 
         let e4 = ent(pml4, idx(3));
         if !present(e4) {
-            return vaddr;
+            return Err(np);
         }
         let e3 = ent(next(e4), idx(2));
         if !present(e3) {
-            return vaddr;
+            return Err(np);
         }
         if e3 & (1 << 7) != 0 {
             // 1 GiB page
-            return (e3 & 0x000f_ffff_c000_0000) | (vaddr & 0x3fff_ffff);
+            return Ok((e3 & 0x000f_ffff_c000_0000) | (vaddr & 0x3fff_ffff));
         }
         let e2 = ent(next(e3), idx(1));
         if !present(e2) {
-            return vaddr;
+            return Err(np);
         }
         if e2 & (1 << 7) != 0 {
             // 2 MiB page
-            return (e2 & 0x000f_ffff_ffe0_0000) | (vaddr & 0x1f_ffff);
+            return Ok((e2 & 0x000f_ffff_ffe0_0000) | (vaddr & 0x1f_ffff));
         }
         let e1 = ent(next(e2), idx(0));
         if !present(e1) {
-            return vaddr;
+            return Err(np);
         }
-        (e1 & 0x000f_ffff_ffff_f000) | (vaddr & 0xfff)
+        Ok((e1 & 0x000f_ffff_ffff_f000) | (vaddr & 0xfff))
+    }
+
+    /// Translate a linear address for the executing core, latching a [`PageFault`]
+    /// (the first level that was not-present) when the walk fails so [`Cpu::step`]
+    /// can roll the instruction back and vector `#PF`. Until the fault is taken,
+    /// returns a benign physical address (`0`) so the in-flight access reads/writes
+    /// harmlessly; the instruction is discarded and restarted after the handler
+    /// maps the page. `write` and `user` set the error-code bits.
+    fn translate_acc(&mut self, vaddr: u64, write: bool, user: bool) -> u64 {
+        if self.fault.is_some() {
+            return 0; // a fault is already pending; do not double-latch
+        }
+        match self.walk(vaddr) {
+            Ok(pa) => pa,
+            Err(mut error) => {
+                if write {
+                    error |= PF_ERR_WRITE;
+                }
+                if user {
+                    error |= PF_ERR_USER;
+                }
+                self.fault = Some(PageFault { addr: vaddr, error });
+                0
+            }
+        }
     }
 
     /// Read control register `idx` (0/2/3/4; others read 0).
@@ -536,7 +600,8 @@ impl Cpu {
 
     // ── Memory ───────────────────────────────────────────────────────────────
     fn rd(&mut self, addr: u64, size: u8) -> u64 {
-        let pa = self.translate(addr);
+        let user = self.cpl == 3;
+        let pa = self.translate_acc(addr, false, user);
         if (VIRTIO_BLK_BASE..VIRTIO_NET_END).contains(&pa) {
             return self.mmio_read(pa, size as usize);
         }
@@ -545,14 +610,15 @@ impl Cpu {
         }
         let mut v = 0u64;
         for i in 0..u64::from(size) {
-            let p = self.translate(addr.wrapping_add(i)) as usize;
+            let p = self.translate_acc(addr.wrapping_add(i), false, user) as usize;
             v |= u64::from(*self.ram.get(p).unwrap_or(&0)) << (8 * i);
         }
         v
     }
 
     fn wr(&mut self, addr: u64, size: u8, val: u64) {
-        let pa = self.translate(addr);
+        let user = self.cpl == 3;
+        let pa = self.translate_acc(addr, true, user);
         if (VIRTIO_BLK_BASE..VIRTIO_NET_END).contains(&pa) {
             self.mmio_write(pa, size as usize, val);
             return;
@@ -562,7 +628,7 @@ impl Cpu {
             return;
         }
         for i in 0..u64::from(size) {
-            let p = self.translate(addr.wrapping_add(i)) as usize;
+            let p = self.translate_acc(addr.wrapping_add(i), true, user) as usize;
             if let Some(b) = self.ram.get_mut(p) {
                 *b = (val >> (8 * i)) as u8;
             }
@@ -570,7 +636,8 @@ impl Cpu {
     }
 
     fn fetch_u8(&mut self) -> u8 {
-        let p = self.translate(self.rip) as usize;
+        let user = self.cpl == 3;
+        let p = self.translate_acc(self.rip, false, user) as usize;
         let b = *self.ram.get(p).unwrap_or(&0);
         self.rip = self.rip.wrapping_add(1);
         b
@@ -1455,13 +1522,20 @@ impl Cpu {
     #[allow(clippy::too_many_lines)]
     fn step(&mut self) -> Result<(), Halt> {
         let start = self.rip;
+        // Snapshot the architectural register state so a `#PF` latched mid-access
+        // can discard this instruction's partial effects and restart it after the
+        // handler maps the page (RAM is not snapshotted — early boot's faulting
+        // accesses touch a fresh page, so any bytes written before the fault are
+        // re-written identically on restart).
+        let snap = self.reg_snapshot();
         let mut rex = 0u8;
         let mut opsz = false; // 0x66 operand-size override
         let mut rep = RepKind::None; // F3 (REP/REPE) / F2 (REPNE)
         self.cur_seg = None;
         self.rex_present = false;
         loop {
-            let p = self.translate(self.rip) as usize;
+            let user = self.cpl == 3;
+            let p = self.translate_acc(self.rip, false, user) as usize;
             let b = *self.ram.get(p).unwrap_or(&0);
             match b {
                 0x66 => opsz = true,
@@ -2136,8 +2210,53 @@ impl Cpu {
             }
             _ => return Err(Halt::Undefined(start)),
         }
+        // A page fault latched while executing this instruction: discard its
+        // partial effects (restore the pre-instruction registers, `rip = start`),
+        // set `CR2`, and vector `#PF` so the kernel's early page-fault handler maps
+        // the page; the instruction re-runs on return (the real long-mode boot's
+        // demand-paging of boot data through `early_top_pgt`).
+        if let Some(pf) = self.fault.take() {
+            self.restore_snapshot(snap);
+            self.rip = start;
+            self.cr2 = pf.addr;
+            self.raise_exception(VEC_PAGE_FAULT, pf.error, true);
+        }
         Ok(())
     }
+
+    /// Capture the architectural register state restored on a mid-instruction
+    /// `#PF` (general registers, `rip`, `rflags`, segments, `cpl`). RAM and the
+    /// device/`sys` state are not snapshotted (see [`Cpu::step`]).
+    fn reg_snapshot(&self) -> RegSnapshot {
+        RegSnapshot {
+            r: self.r,
+            rip: self.rip,
+            rflags: self.rflags,
+            seg: self.seg,
+            cpl: self.cpl,
+        }
+    }
+
+    /// Restore a [`RegSnapshot`] taken at the start of an instruction.
+    fn restore_snapshot(&mut self, s: RegSnapshot) {
+        self.r = s.r;
+        self.rip = s.rip;
+        self.rflags = s.rflags;
+        self.seg = s.seg;
+        self.cpl = s.cpl;
+    }
+}
+
+/// The pre-instruction architectural state restored when a `#PF` is latched
+/// mid-instruction, so the faulting instruction restarts cleanly after the
+/// handler maps the page ([`Cpu::step`]).
+#[derive(Clone, Copy)]
+struct RegSnapshot {
+    r: [u64; 16],
+    rip: u64,
+    rflags: u64,
+    seg: [Seg; 6],
+    cpl: u8,
 }
 
 // The guest-physical layout the 64-bit boot protocol uses (a low region below
