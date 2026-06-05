@@ -27,7 +27,14 @@ use crate::assembly::{
 };
 use crate::boot::devcontainer::{self, ImageSource};
 use crate::emulator::Arch;
-use crate::oci::{ingest_image, IngestedImage, OciError};
+use crate::oci::{
+    ingest_image, is_index, select_platform_manifest, sha256_digest, synth_index, IngestedImage,
+    OciError, ACCEPT_MANIFESTS,
+};
+// The OCI reference parsing + the pull's pure logic live in `crate::oci` (shared
+// with the browser peer's page-driven pull); re-exported here as the import
+// boundary's public surface (ADR-013).
+pub use crate::oci::{parse_image_ref, ImageRef};
 use crate::{compose, dockerfile};
 use alloc::collections::BTreeMap;
 
@@ -49,13 +56,11 @@ pub enum ImportError {
         /// The HTTP status code.
         status: u16,
     },
-    /// A URL or image/registry reference could not be parsed.
-    BadReference(String),
     /// The fetched content was malformed (bad JSON, missing fields).
     BadContent(String),
-    /// The registry has no image for the emulator's architecture.
-    NoPlatform(String),
-    /// Ingestion / verification by re-derivation failed (Law L5).
+    /// Ingestion / verification by re-derivation failed (Law L5) — including a
+    /// malformed reference or no image for the architecture (the OCI pull logic
+    /// is shared with the browser peer; [`crate::oci`]).
     Oci(OciError),
 }
 
@@ -64,9 +69,7 @@ impl core::fmt::Display for ImportError {
         match self {
             ImportError::Transport(m) => write!(f, "network transport: {m}"),
             ImportError::Http { url, status } => write!(f, "HTTP {status} for {url}"),
-            ImportError::BadReference(m) => write!(f, "bad reference: {m}"),
             ImportError::BadContent(m) => write!(f, "bad content: {m}"),
-            ImportError::NoPlatform(m) => write!(f, "no image for the target architecture: {m}"),
             ImportError::Oci(e) => write!(f, "ingestion: {e}"),
         }
     }
@@ -183,79 +186,6 @@ pub fn repo_devcontainer_config(archive_tar_gz: &[u8]) -> Result<Option<Vec<u8>>
 
 // ── OCI image pull (the container registry) ────────────────────────────────
 
-/// A parsed image reference: `registry`, `repository`, and `reference`
-/// (a tag or a `sha256:` digest).
-#[derive(Debug, PartialEq, Eq)]
-pub struct ImageRef {
-    /// The registry host (e.g. `registry-1.docker.io`, `ghcr.io`, `127.0.0.1:5000`).
-    pub registry: String,
-    /// The repository path (e.g. `library/debian`).
-    pub repository: String,
-    /// The tag or digest (e.g. `trixie`, `sha256:…`).
-    pub reference: String,
-}
-
-impl ImageRef {
-    /// The registry's base `/v2` URL — `http` for localhost (the hermetic test),
-    /// `https` otherwise.
-    fn base(&self) -> String {
-        let scheme = if self.registry.starts_with("127.0.0.1")
-            || self.registry.starts_with("localhost")
-            || self.registry.starts_with("[::1]")
-        {
-            "http"
-        } else {
-            "https"
-        };
-        format!("{scheme}://{}/v2/{}", self.registry, self.repository)
-    }
-}
-
-/// Parse an image reference per the Docker/OCI convention (the same rules
-/// `docker pull` uses): an optional registry (a component with a `.` or `:` or
-/// `localhost`), a repository (Docker Hub official images get the `library/`
-/// prefix), and a `:tag` or `@sha256:digest` (defaulting to `latest`).
-pub fn parse_image_ref(s: &str) -> Result<ImageRef, ImportError> {
-    if s.is_empty() {
-        return Err(ImportError::BadReference("empty image reference".into()));
-    }
-    let (head, rest) = match s.split_once('/') {
-        Some((h, r)) if h.contains('.') || h.contains(':') || h == "localhost" => {
-            (h.to_string(), r.to_string())
-        }
-        _ => ("registry-1.docker.io".to_string(), s.to_string()),
-    };
-    // Split the repository from the tag/digest.
-    let (repo, reference) = if let Some((r, d)) = rest.split_once('@') {
-        (r.to_string(), d.to_string())
-    } else if let Some(colon) = rest.rfind(':') {
-        // Only a tag if the colon is after the last '/' (not a port).
-        if rest[colon..].contains('/') {
-            (rest.clone(), "latest".to_string())
-        } else {
-            (rest[..colon].to_string(), rest[colon + 1..].to_string())
-        }
-    } else {
-        (rest.clone(), "latest".to_string())
-    };
-    // Docker Hub official images live under `library/`.
-    let repository = if head == "registry-1.docker.io" && !repo.contains('/') {
-        format!("library/{repo}")
-    } else {
-        repo
-    };
-    Ok(ImageRef {
-        registry: head,
-        repository,
-        reference,
-    })
-}
-
-const ACCEPT_MANIFESTS: &str = "application/vnd.oci.image.index.v1+json, \
-     application/vnd.docker.distribution.manifest.list.v2+json, \
-     application/vnd.oci.image.manifest.v1+json, \
-     application/vnd.docker.distribution.manifest.v2+json";
-
 /// Pull an OCI image from its registry and ingest it into `store`, verifying
 /// every blob by re-derivation against its digest (`CC-10`, Law L5). Handles
 /// the registry's bearer-token auth challenge and multi-architecture image
@@ -333,70 +263,6 @@ fn obtain_token(image: &ImageRef) -> Result<Option<String>, ImportError> {
         return Ok(Some(tok.to_string()));
     }
     Ok(None)
-}
-
-fn is_index(content_type: &str, body: &[u8]) -> bool {
-    if content_type.contains("manifest.list") || content_type.contains("image.index") {
-        return true;
-    }
-    // Fall back to the JSON's mediaType / presence of a `manifests` array.
-    serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .map(|v| v.get("manifests").is_some())
-        .unwrap_or(false)
-}
-
-/// Choose the manifest for the holospace's architecture from an image index.
-fn select_platform_manifest(index_bytes: &[u8], arch: Arch) -> Result<String, ImportError> {
-    let v: serde_json::Value =
-        serde_json::from_slice(index_bytes).map_err(|e| ImportError::BadContent(e.to_string()))?;
-    let manifests = v
-        .get("manifests")
-        .and_then(|m| m.as_array())
-        .ok_or_else(|| ImportError::BadContent("index has no manifests".into()))?;
-    let want = arch.oci_arch();
-    for m in manifests {
-        let plat = m.get("platform");
-        let m_arch = plat
-            .and_then(|p| p.get("architecture"))
-            .and_then(|a| a.as_str());
-        let os = plat.and_then(|p| p.get("os")).and_then(|o| o.as_str());
-        if m_arch == Some(want) && os == Some("linux") {
-            if let Some(d) = m.get("digest").and_then(|d| d.as_str()) {
-                return Ok(d.to_string());
-            }
-        }
-    }
-    Err(ImportError::NoPlatform(format!(
-        "index has no {want}/linux manifest"
-    )))
-}
-
-/// Synthesize an OCI image-index pointing at a single manifest by digest+size —
-/// the `index.json` [`ingest_image`] walks.
-fn synth_index(manifest_digest: &str, manifest_size: usize) -> Vec<u8> {
-    format!(
-        r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{manifest_digest}","size":{manifest_size}}}]}}"#
-    )
-    .into_bytes()
-}
-
-/// Form an **OCI distribution-spec digest** (`sha256:<lowercase-hex>`) — the
-/// *registry's* content-address format used to name a blob in a pull request. This
-/// is the OCI spec's wire format, not a holospace κ; the *trust boundary* (Law L5)
-/// re-derives every fetched blob through the substrate's `verify_kappa_axis`
-/// ("sha256") in [`crate::oci`], so this is a URL-forming helper, not a parallel
-/// content-addressing path.
-fn sha256_digest(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(bytes);
-    let d = h.finalize();
-    let mut s = String::from("sha256:");
-    for b in d {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
 }
 
 // ── The import operation ───────────────────────────────────────────────────
