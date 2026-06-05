@@ -21,7 +21,9 @@ use std::sync::Arc;
 use hologram_store_mem::MemKappaStore;
 use hologram_substrate_core::KappaStore;
 use holospaces::address;
-use holospaces::content_net::{drive_fetch, drive_fetch_over_transport, peer, PacketLink};
+use holospaces::content_net::{
+    drive_fetch, drive_fetch_over_transport, forging_peer, peer, PacketLink,
+};
 
 /// A content store holding `content`, with the κ that addresses it.
 fn store_with(content: &[u8]) -> (Arc<dyn KappaStore>, holospaces::Kappa) {
@@ -109,5 +111,31 @@ fn peers_exchange_content_over_the_transport_seam() {
         address(&got[..]),
         kappa,
         "verified on receipt over the seam"
+    );
+}
+
+/// A **forging responder** is rejected. The responder answers every fetch with
+/// attacker-chosen bytes that do not re-derive to the requested κ; the fetcher
+/// re-derives on receipt (SPINE-4 / Law L5) and refuses them — the fetch resolves
+/// to nothing rather than admitting the forgery. This is the security property
+/// the WebRTC witness (`CC-49`) carries over a real data channel; here it is
+/// pinned in the gated native tier over the same transport seam.
+#[test]
+fn a_forging_responder_is_rejected() {
+    // The fetcher wants the κ of the genuine content; the forger never holds it.
+    let genuine = b"the genuine content the fetcher asked for";
+    let kappa = address(&genuine[..]);
+    let forged = b"forged bytes that do NOT re-derive to the requested kappa".to_vec();
+
+    let (f_link, f_wire) = PacketLink::with_transport(256 * 1024);
+    let (g_link, g_wire) = PacketLink::with_transport(256 * 1024);
+    let fetcher = peer(f_link, Arc::new(MemKappaStore::new()));
+    let forger = forging_peer(g_link, forged);
+
+    // The forger replies FETCH_RES_OK with its bytes; the fetcher rejects them on
+    // re-derivation, so the fetch resolves to nothing — no forging admitted.
+    assert!(
+        drive_fetch_over_transport(&fetcher, &f_wire, &forger, &g_wire, &kappa).is_none(),
+        "a forged response (bytes that do not re-derive to the κ) is rejected"
     );
 }

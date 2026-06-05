@@ -215,6 +215,25 @@ pub fn peer(link: PacketLink, store: Arc<dyn KappaStore>) -> BareNetSync {
     BareNetSync::new(Arc::new(link), local_get, local_iter)
 }
 
+/// A **forging** content-network peer — the adversary the verify-on-receipt law
+/// (SPINE-4 / Law L5) exists to defeat. It answers **every** inbound `fetch`,
+/// for any κ, with the same attacker-chosen `forged` bytes (bytes that do not
+/// re-derive to the requested κ). On the wire this is a well-formed
+/// `FETCH_RES_OK` frame; the fetcher's `BareNetSync` re-derives the bytes against
+/// the requested κ and **rejects** them. This is not a fallback or a mock — it is
+/// a genuine malicious responder, used by the witness to prove a forged response
+/// is refused rather than silently accepted.
+#[must_use]
+pub fn forging_peer(link: PacketLink, forged: Vec<u8>) -> BareNetSync {
+    let forged = Arc::new(forged);
+    // Resolve *any* requested κ to the attacker's bytes — the responder claims to
+    // hold every κ, and serves the forgery.
+    let local_get: LocalResolver = Arc::new(move |_k| Some(Bytes::from(forged.as_ref().clone())));
+    // It advertises nothing truthful; discovery returns no κs.
+    let local_iter: LocalIterator = Arc::new(Vec::new);
+    BareNetSync::new(Arc::new(link), local_get, local_iter)
+}
+
 /// Drive a `fetcher`'s uor-native [`fetch`](KappaSync::fetch) of `kappa` to
 /// completion against a directly-linked `responder`, over an in-process
 /// [`PacketLink`] pair. The fetch future suspends awaiting the response frame;
@@ -272,6 +291,22 @@ impl ContentPeer {
         let (link, wire) = PacketLink::with_transport(mtu);
         Self {
             sync: Arc::new(peer(link, store)),
+            wire,
+        }
+    }
+
+    /// Bind a **forging** content peer over a fresh transport-backed link — a
+    /// malicious responder that answers every fetch with `forged` bytes (which do
+    /// not re-derive to the requested κ). The honest counterpart to [`new`]; the
+    /// witness uses it to prove a forged response is rejected on receipt
+    /// (SPINE-4 / Law L5), carried over a real transport (a WebRTC data channel).
+    ///
+    /// [`new`]: Self::new
+    #[must_use]
+    pub fn new_forging(mtu: u32, forged: Vec<u8>) -> Self {
+        let (link, wire) = PacketLink::with_transport(mtu);
+        Self {
+            sync: Arc::new(forging_peer(link, forged)),
             wire,
         }
     }
