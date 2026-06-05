@@ -24,20 +24,44 @@ export function egressExtensionAvailable() {
 /// `fetch()` pulls registries/CDNs the page cannot (the image layers the browser
 /// peer assembles into the devcontainer rootfs). Returns `{status, body}` (body a
 /// `Uint8Array`), or `null` if no extension is reachable / the fetch failed.
-export async function routerFetch(url, headers = {}, extensionId = HOLOSPACES_EGRESS_EXTENSION_ID) {
+let _contentPort = null, _fetchSeq = 0;
+const _pendingFetch = new Map();
+
+function contentChannel(extensionId) {
+  if (_contentPort) return _contentPort;
   if (!egressExtensionAvailable() || !extensionId) return null;
+  const port = chrome.runtime.connect(extensionId, { name: "holospaces-content" });
+  port.onMessage.addListener((m) => {
+    const p = _pendingFetch.get(m.id);
+    if (!p) return;
+    if (m.type === "head") { p.status = m.status; p.contentType = m.contentType; }
+    else if (m.type === "chunk") { p.chunks.push(Uint8Array.from(m.bytes)); }
+    else if (m.type === "end") {
+      _pendingFetch.delete(m.id);
+      const total = p.chunks.reduce((n, c) => n + c.length, 0);
+      const body = new Uint8Array(total);
+      let o = 0;
+      for (const c of p.chunks) { body.set(c, o); o += c.length; }
+      p.resolve({ status: p.status, contentType: p.contentType, body });
+    } else if (m.type === "error") { _pendingFetch.delete(m.id); p.resolve(null); }
+  });
+  port.onDisconnect.addListener(() => {
+    _contentPort = null;
+    for (const [, p] of _pendingFetch) p.resolve(null);
+    _pendingFetch.clear();
+  });
+  _contentPort = port;
+  return port;
+}
+
+export async function routerFetch(url, headers = {}, extensionId = HOLOSPACES_EGRESS_EXTENSION_ID) {
+  const port = contentChannel(extensionId);
+  if (!port) return null;
+  const id = ++_fetchSeq;
   return new Promise((resolve) => {
-    try {
-      chrome.runtime.sendMessage(extensionId, { type: "holospaces-fetch", url, headers }, (resp) => {
-        if (chrome.runtime.lastError || !resp || !resp.ok) {
-          resolve(null);
-        } else {
-          resolve({ status: resp.status, contentType: resp.contentType || "", body: Uint8Array.from(resp.body) });
-        }
-      });
-    } catch {
-      resolve(null);
-    }
+    _pendingFetch.set(id, { chunks: [], status: 0, contentType: "", resolve });
+    try { port.postMessage({ type: "fetch", id, url, headers }); }
+    catch { _pendingFetch.delete(id); resolve(null); }
   });
 }
 
