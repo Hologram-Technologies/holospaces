@@ -295,6 +295,28 @@ impl MachineSpec {
         Ok(emu)
     }
 
+    /// Boot like [`Self::boot_net_in`], but **stream** the disk's `sector_count`
+    /// sectors from `read` into the supplied store (no full image in RAM) — the
+    /// browser peer reads each sector from the OPFS rootfs file straight into the
+    /// OPFS-backed store, so a large real image boots without materializing the
+    /// whole `Vec` (the paged κ-disk, transient-peak-free).
+    pub fn boot_net_streamed<R: FnMut(u64, &mut [u8])>(
+        &self,
+        kernel: &[u8],
+        sector_count: u64,
+        read: R,
+        egress: alloc::boxed::Box<dyn net::Egress>,
+        disk_store: alloc::boxed::Box<dyn hologram_substrate_core::KappaStore>,
+    ) -> Result<Emulator, crate::emulator::Trap> {
+        let mut emu = Emulator::new(self.base, self.ram_bytes as usize);
+        emu.enable_sbi();
+        emu.attach_disk_streamed(disk_store, sector_count, read);
+        emu.attach_net(egress);
+        let dtb = self.device_tree_for(false, true);
+        emu.boot_kernel(kernel, &dtb, self.base + DTB_OFFSET)?;
+        Ok(emu)
+    }
+
     /// Boot like [`Self::boot_net`], additionally **forwarding ports**: an
     /// `ingress` transport carries inbound connections to a server inside the
     /// devcontainer (`CC-21`) — the running-app preview a Codespace surfaces. Use
