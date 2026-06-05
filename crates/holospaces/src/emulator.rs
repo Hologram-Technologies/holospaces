@@ -69,6 +69,9 @@ pub enum Arch {
     Riscv64,
     /// 64-bit ARM (`AArch64`, ARMv8-A) — `CC-35`/`CC-36`/`CC-37`.
     Aarch64,
+    /// 64-bit x86 (`x86-64`/`amd64`, Intel 64 / AMD64) — the ubiquitous registry
+    /// architecture (`CC-43`).
+    X64,
 }
 
 impl Arch {
@@ -79,6 +82,7 @@ impl Arch {
         match self {
             Arch::Riscv64 => "riscv64",
             Arch::Aarch64 => "arm64",
+            Arch::X64 => "amd64",
         }
     }
 
@@ -88,6 +92,7 @@ impl Arch {
         match self {
             Arch::Riscv64 => "riscv64",
             Arch::Aarch64 => "aarch64",
+            Arch::X64 => "x64",
         }
     }
 
@@ -98,6 +103,7 @@ impl Arch {
         match s {
             "riscv64" | "rv64" | "rv64gc" => Some(Arch::Riscv64),
             "aarch64" | "arm64" => Some(Arch::Aarch64),
+            "x64" | "x86_64" | "x86-64" | "amd64" => Some(Arch::X64),
             _ => None,
         }
     }
@@ -108,6 +114,7 @@ impl Arch {
         match self {
             Arch::Riscv64 => "RISC-V (RV64GC)",
             Arch::Aarch64 => "ARM (AArch64)",
+            Arch::X64 => "x86-64 (amd64)",
         }
     }
 
@@ -115,7 +122,7 @@ impl Arch {
     /// order (the default architecture first).
     #[must_use]
     pub fn all() -> &'static [Arch] {
-        &[Arch::Riscv64, Arch::Aarch64]
+        &[Arch::Riscv64, Arch::Aarch64, Arch::X64]
     }
 }
 

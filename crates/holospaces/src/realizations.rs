@@ -330,6 +330,7 @@ impl Source {
                 p.push(match arch {
                     crate::Arch::Riscv64 => 0,
                     crate::Arch::Aarch64 => 1,
+                    crate::Arch::X64 => 2,
                 });
             }
         }
