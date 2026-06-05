@@ -1,11 +1,11 @@
 //! **The x86-64 (AMD64 / Intel 64) core** — the system emulator's third ISA
 //! target (`CC-43`), alongside the [RISC-V](super) `RV64GC` core and the
-//! [`aarch64`](super::aarch64) `ARMv8-A` core.
+//! [`aarch64`](crate::emulator::aarch64) `ARMv8-A` core.
 //!
 //! x86-64 is the ubiquitous registry architecture: most container images publish
 //! a `linux/amd64` variant, so this is the core that lets the browser peer boot
 //! the largest share of real devcontainers. Like the other cores it is a CPU over
-//! the **shared device bus** ([`super::devbus`]) — the κ-disk (`virtio`), the
+//! the **shared device bus** (`devbus` (`super::devbus`)) — the κ-disk (`virtio`), the
 //! console, the userspace NAT — so the disk, networking, and workspace are not
 //! re-implemented per ISA (Law L4). Deterministic: identical image + input yield
 //! identical console output and final state (Law L1/L5), so a κ snapshot is
@@ -57,12 +57,12 @@ struct Uart {
 
 /// The shared platform the core drives: the console and the κ-disk (the same
 /// [`VirtioBlk`](super::VirtioBlk) the RISC-V/AArch64 machines boot, serviced by
-/// the shared [`devbus`](super::devbus)).
+/// the shared `devbus`).
 struct Sys {
     uart: Uart,
     /// The `virtio-blk` κ-disk rootfs (`CC-7`), when a disk is attached. The
     /// long-mode boot path (which advertises the device and services its MMIO via
-    /// the shared [`devbus`](super::devbus)) wires this; the integer core here
+    /// the shared `devbus`) wires this; the integer core here
     /// holds the seam.
     #[allow(dead_code)]
     virtio: Option<super::VirtioBlk>,
