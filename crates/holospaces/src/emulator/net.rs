@@ -1210,6 +1210,13 @@ impl RouterChannel {
         self.shared.borrow_mut().outbound.drain(..).collect()
     }
 
+    /// Take the next single egress frame for the router, or `None` if none is
+    /// queued — the one-at-a-time form a wasm-bindgen seam drains in a loop.
+    #[must_use]
+    pub fn pop_outbound(&self) -> Option<Vec<u8>> {
+        self.shared.borrow_mut().outbound.pop_front()
+    }
+
     /// Deliver a frame the router returned (`OPENED`/`DATA`/`CLOSED`/`FAILED`)
     /// into the connection state the NAT polls.
     pub fn feed_inbound(&self, frame: &[u8]) {
