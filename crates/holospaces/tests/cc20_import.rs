@@ -44,9 +44,9 @@ fn gunzip(path: &Path) -> Vec<u8> {
     out
 }
 
-/// The manifest digest of the pinned CC-14 OCI image (from its index.json).
-fn image_manifest_digest() -> String {
-    let index = std::fs::read(cc14_dir().join("image/index.json")).unwrap();
+/// The manifest digest of an OCI image fixture (from its `index.json`).
+fn manifest_digest_of(image_dir: &Path) -> String {
+    let index = std::fs::read(image_dir.join("index.json")).unwrap();
     let v: serde_json::Value = serde_json::from_slice(&index).unwrap();
     v["manifests"][0]["digest"].as_str().unwrap().to_string()
 }
@@ -88,8 +88,16 @@ fn make_repo_archive(path: &str, data: &[u8]) -> Vec<u8> {
 /// Serve the repository archive + the pinned OCI image over the real OCI
 /// distribution endpoints on `listener`, in a background thread.
 fn spawn_server(listener: TcpListener, archive: Vec<u8>) {
-    let blobs = cc14_dir().join("image/blobs/sha256");
-    let manifest_digest = image_manifest_digest();
+    spawn_server_for(listener, archive, cc14_dir().join("image"));
+}
+
+/// Serve a repository archive + an arbitrary OCI image fixture over the real OCI
+/// distribution endpoints — so the import client pulls whatever image the repo's
+/// devcontainer.json declares, from any fixture (the basis of the "arbitrary"
+/// proof: different repos, different real images, the same import path).
+fn spawn_server_for(listener: TcpListener, archive: Vec<u8>, image_dir: PathBuf) {
+    let blobs = image_dir.join("blobs/sha256");
+    let manifest_digest = manifest_digest_of(&image_dir);
     let manifest =
         std::fs::read(blobs.join(manifest_digest.strip_prefix("sha256:").unwrap())).unwrap();
     thread::spawn(move || {
@@ -175,6 +183,75 @@ fn a_devcontainer_provisions_from_a_repository_url() {
         console.contains("Mounted root (ext4 filesystem)") && console.contains(marker.trim()),
         "the imported devcontainer boots from its registry image; console:\n{console}"
     );
+}
+
+/// **holospaces boots *arbitrary* real devcontainers** — not one demo image. For
+/// each of two *distinct* real OCI images (the `CC-14` base and the `CC-16`
+/// networked base, different fixtures), a repository declares it in its own
+/// devcontainer.json; the import client pulls + verifies + assembles *that*
+/// image, and a real Linux boots on it (mounts the assembled ext4 root). The same
+/// repo-URL → image → boot path, two different real images — so the launched
+/// holospace is the repository's actual devcontainer, whatever it declares, not a
+/// fixed demo. `#[ignore]` (two real-OS boots; release / the CC-20 vv suite).
+#[test]
+#[ignore]
+fn holospaces_boots_arbitrary_real_devcontainers() {
+    // (fixture image dir, its kernel, an optional content marker proving it is
+    // *that* image's userland, not a stand-in).
+    let cases: &[(PathBuf, PathBuf, Option<String>)] = &[
+        (
+            cc14_dir().join("image"),
+            cc14_dir().join("kernel/Image.gz"),
+            Some(std::fs::read_to_string(cc14_dir().join("expected.txt")).unwrap()),
+        ),
+        (
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vv/artifacts/cc16/image"),
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vv/artifacts/cc16/kernel/Image.gz"),
+            None,
+        ),
+    ];
+
+    for (image_dir, kernel_path, marker) in cases {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // The repository declares THIS image — the path follows the repo, not a
+        // hardcode.
+        let config = format!(r#"{{"image":"127.0.0.1:{port}/img:latest"}}"#);
+        let archive = make_repo_archive(
+            "repo-main/.devcontainer/devcontainer.json",
+            config.as_bytes(),
+        );
+        spawn_server_for(listener, archive, image_dir.clone());
+
+        let store = MemKappaStore::new();
+        let repo_url = format!("http://127.0.0.1:{port}/repo");
+        let (imported, rootfs) = import_and_assemble(&store, &repo_url, "main", Arch::Riscv64)
+            .unwrap_or_else(|e| panic!("import {} failed: {e:?}", image_dir.display()));
+        assert!(
+            !imported.used_default,
+            "the repository's own declared image was used ({})",
+            image_dir.display()
+        );
+
+        let kernel = gunzip(kernel_path);
+        let mut emu = MachineSpec::devcontainer()
+            .boot(&kernel, rootfs)
+            .unwrap_or_else(|e| panic!("boot {} failed: {e:?}", image_dir.display()));
+        emu.run(600_000_000);
+        let console = String::from_utf8_lossy(emu.console()).into_owned();
+        assert!(
+            console.contains("Mounted root (ext4 filesystem)"),
+            "a real Linux booted on the imported image {}; console:\n{console}",
+            image_dir.display()
+        );
+        if let Some(m) = marker {
+            assert!(
+                console.contains(m.trim()),
+                "the booted system is that image's real userland ({}); console:\n{console}",
+                image_dir.display()
+            );
+        }
+    }
 }
 
 /// A real-OS devcontainer's bootable content travels the **substrate's

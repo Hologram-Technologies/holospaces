@@ -34,6 +34,14 @@ cargo test --manifest-path "$ROOT/Cargo.toml" -p holospaces --features net --rel
     --test cc20_import -- --ignored --nocapture \
     a_devcontainer_provisions_from_a_repository_url || exit 1
 
+# ARBITRARY real devcontainers: two DISTINCT real OCI images (CC-14 + CC-16),
+# each declared by its own repo's devcontainer.json, each pulled + assembled +
+# booted to a real Linux — proving the launched holospace is the repository's
+# actual devcontainer (whatever it declares), not a fixed demo. Release, ~21s.
+cargo test --manifest-path "$ROOT/Cargo.toml" -p holospaces --features net --release \
+    --test cc20_import -- --ignored --nocapture \
+    holospaces_boots_arbitrary_real_devcontainers || exit 1
+
 # The substrate content path: an importer peer serves its store as an untrusted
 # HTTP-CAS gateway; a second peer with NO local content fetches the rootfs +
 # kernel by κ (get_with_fetch, verify-on-receipt, Law L5) and boots a real Linux
