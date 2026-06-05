@@ -65,6 +65,7 @@
       <h1>Hologram Platform Manager</h1>
       <span class="muted">manage your holospaces · enter one to work in it</span>
       <span class="op">
+        <span id="ext-status" title="The local egress extension opens raw sockets a tab cannot (Direct Sockets, CC-41) — the guest's internet when no node is set.">egress extension <span id="ext-dot">○</span> <span id="ext-label" class="muted">checking…</span></span>
         <button id="signin" class="primary sm">Sign in</button>
         <span class="muted">operator</span> <span id="operator" class="k">(signed out)</span>
       </span>
@@ -211,6 +212,29 @@
       await init();
       window.hs = { kappa, verify_kappa, run_holo, validate_userland, default_devcontainer_image, Console, Workspace, DevcontainerImage };
       document.getElementById("defimg").textContent = default_devcontainer_image();
+
+      // The local egress extension (CC-41) auto-announces its presence via a
+      // content script that sets `data-holospaces-egress` (the extension id) on
+      // <html>. Reflect it as a live connection indicator and remember the id so
+      // the guest's egress can route through the extension when no node is set.
+      function refreshExtStatus() {
+        const id = document.documentElement.getAttribute("data-holospaces-egress");
+        const dot = document.getElementById("ext-dot");
+        const label = document.getElementById("ext-label");
+        if (id) {
+          window.holospacesEgressExtensionId = id;
+          dot.textContent = "●"; dot.style.color = "#3fb950";
+          label.textContent = "connected"; label.className = "";
+        } else {
+          window.holospacesEgressExtensionId = null;
+          dot.textContent = "○"; dot.style.color = "#8b949e";
+          label.innerHTML = 'not detected · <a href="extension/holospaces-egress-extension.zip" download>install</a>';
+          label.className = "muted";
+        }
+      }
+      window.dispatchEvent(new Event("holospaces-egress-probe"));
+      refreshExtStatus();
+      setInterval(refreshExtStatus, 3000);
 
       const console0 = new Console();
       const $ = (id) => document.getElementById(id);

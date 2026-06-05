@@ -250,6 +250,11 @@ try {
       hasArchPicker: !!document.querySelector("#harch") && document.querySelector("#harch").options.length >= 2,
       hasSettings: !!document.querySelector("#drawer"),
       hasEgressField: !!document.querySelector("#d-egress"),
+      hasExtIndicator: (() => {
+        const s = document.querySelector("#ext-status"), l = document.querySelector("#ext-label");
+        // No extension is installed in CI, so it must render the "not detected" state.
+        return !!s && !!l && /not detected/i.test(l.textContent || "");
+      })(),
       hasExtDownload: (() => {
         const a = document.querySelector("#ext-dl");
         return !!a && a.hasAttribute("download") && (a.getAttribute("href") || "").includes("extension/holospaces-egress-extension.zip");
@@ -277,6 +282,7 @@ try {
   check(dash.hasSettings, "the console exposes a per-guest settings drawer");
   check(dash.hasEgressField, "the settings drawer offers a per-guest egress node (the holospaces-node the guest's internet routes through, CC-39)");
   check(dash.hasExtDownload, "the console offers the local egress extension for download + manual install (CC-41, until it is in the Chrome store)");
+  check(dash.hasExtIndicator, "the console shows a live egress-extension connection indicator (auto-detected; 'not detected · install' when absent)");
   check(dash.hasRepoInput, "the launch form takes a git repository URL (Codespaces/Gitpod flow)");
   check(dash.defImgShown, "the launch form shows the usable default image");
 

@@ -12,7 +12,7 @@ EXT="$ROOT/crates/holospaces-web/extension"
 DIST="$EXT/dist"
 
 # The runtime files Chrome loads — and ONLY these.
-RUNTIME=(manifest.json background.js icons/icon16.png icons/icon48.png icons/icon128.png)
+RUNTIME=(manifest.json background.js content.js icons/icon16.png icons/icon48.png icons/icon128.png)
 
 # Validate the manifest (MV3, minimal, referenced files declared) and read the version.
 VERSION=$(python3 - "$EXT/manifest.json" <<'PY'
