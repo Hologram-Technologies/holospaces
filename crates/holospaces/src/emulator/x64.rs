@@ -1063,6 +1063,33 @@ impl Cpu {
         0
     }
 
+    /// A word/dword (`size` 2/4) port read. The PCI config-data port
+    /// (`0xcfc`..`0xcff`) returns all-ones — no PCI host bridge is present, so the
+    /// kernel's PCI scan finds no devices (it uses `virtio-mmio`, not PCI).
+    /// Other ports compose from byte reads.
+    fn port_in_wide(&mut self, port: u16, size: u8) -> u64 {
+        if (0xcfc..=0xcff).contains(&port) {
+            return Self::mask(size); // no device
+        }
+        let mut v = 0u64;
+        for i in 0..u64::from(size) {
+            v |= u64::from(self.port_in(port.wrapping_add(i as u16))) << (8 * i);
+        }
+        v
+    }
+
+    /// A word/dword port write. The PCI config-address port (`0xcf8`) and config
+    /// data are accepted and discarded (no PCI bridge); other ports compose into
+    /// byte writes.
+    fn port_out_wide(&mut self, port: u16, size: u8, val: u64) {
+        if port == 0xcf8 || (0xcfc..=0xcff).contains(&port) {
+            return; // PCI config — no host bridge
+        }
+        for i in 0..u64::from(size) {
+            self.port_out(port.wrapping_add(i as u16), (val >> (8 * i)) as u8);
+        }
+    }
+
     // ── local APIC MMIO (the long-mode boot path; #12) ─────────────────────────
 
     /// Read a local-APIC register at byte offset `off` (the MMIO window at
@@ -1135,6 +1162,25 @@ impl Cpu {
         } else if (VIRTIO_NET_BASE..VIRTIO_NET_END).contains(&pa) {
             self.virtio_net_write(pa - VIRTIO_NET_BASE, value as u32);
         }
+    }
+
+    #[doc(hidden)]
+    pub fn vv_dbg(&self, vaddr: u64) {
+        let pml4 = self.cr3 & 0x000f_ffff_ffff_f000;
+        let idx = |lvl: u32| ((vaddr >> (12 + 9 * lvl)) & 0x1ff) * 8;
+        let e4 = self.rd_phys(pml4 + idx(3), 8);
+        std::eprintln!(
+            "cr3={:#x} PML4[{}]={:#x}",
+            self.cr3,
+            (vaddr >> 39) & 0x1ff,
+            e4
+        );
+        if e4 & 1 == 0 {
+            std::eprintln!("  PML4 not present");
+            return;
+        }
+        let e3 = self.rd_phys((e4 & 0x000f_ffff_ffff_f000) + idx(2), 8);
+        std::eprintln!("  PDPT[{}]={:#x}", (vaddr >> 30) & 0x1ff, e3);
     }
 
     /// A guest-RAM view for the shared devbus to walk virtqueues over (x86-64 RAM
@@ -1517,8 +1563,12 @@ impl Cpu {
                 }
             }
             0x80 => {
+                // The immediate is fetched *before* the operand is touched so a
+                // RIP-relative `rm` resolves against the instruction-end `rip`
+                // (the same address for the load and the store).
                 let (ext, rm) = self.modrm(rex);
-                let (a, b) = (self.load_rm(rm, 1), self.fetch(1));
+                let b = self.fetch(1);
+                let a = self.load_rm(rm, 1);
                 let res = self.alu((ext & 7) as u8, a, b, 1);
                 if ext & 7 != 7 {
                     self.store_rm(rm, 1, res);
@@ -1526,8 +1576,8 @@ impl Cpu {
             }
             0x81 => {
                 let (ext, rm) = self.modrm(rex);
-                let a = self.load_rm(rm, size);
                 let b = self.fetch_imm_z(size);
+                let a = self.load_rm(rm, size);
                 let res = self.alu((ext & 7) as u8, a, b, size);
                 if ext & 7 != 7 {
                     self.store_rm(rm, size, res);
@@ -1535,8 +1585,8 @@ impl Cpu {
             }
             0x83 => {
                 let (ext, rm) = self.modrm(rex);
-                let a = self.load_rm(rm, size);
                 let b = self.fetch(1) as i8 as i64 as u64;
+                let a = self.load_rm(rm, size);
                 let res = self.alu((ext & 7) as u8, a, b, size);
                 if ext & 7 != 7 {
                     self.store_rm(rm, size, res);
@@ -1623,20 +1673,20 @@ impl Cpu {
             0x69 => {
                 // IMUL r, r/m, imm (imm16 under 0x66, else imm32 sign-extended).
                 let (reg, rm) = self.modrm(rex);
-                let a = sign_extend(self.load_rm(rm, size), size);
                 let imm = if size == 2 {
                     self.fetch(2) as i16 as i64
                 } else {
                     self.fetch(4) as i32 as i64
                 };
+                let a = sign_extend(self.load_rm(rm, size), size);
                 let r = a.wrapping_mul(imm) as u64;
                 self.store_rm(Rm::Reg(reg), size, r & Self::mask(size));
             }
             0x6b => {
                 // IMUL r, r/m, imm8.
                 let (reg, rm) = self.modrm(rex);
-                let a = self.load_rm(rm, size) as i64;
                 let imm = self.fetch(1) as i8 as i64;
+                let a = sign_extend(self.load_rm(rm, size), size);
                 let r = a.wrapping_mul(imm) as u64;
                 self.store_rm(Rm::Reg(reg), size, r & Self::mask(size));
             }
@@ -1815,6 +1865,30 @@ impl Cpu {
                 let v = (self.r[0] & 0xff) as u8;
                 self.port_out(port, v);
             }
+            0xe5 => {
+                // IN eAX, imm8 — a word/dword port read (operand size).
+                let port = self.fetch(1) as u16;
+                let v = self.port_in_wide(port, size);
+                self.store_rm(Rm::Reg(0), size, v);
+            }
+            0xe7 => {
+                // OUT imm8, eAX — a word/dword port write.
+                let port = self.fetch(1) as u16;
+                let v = self.r[0] & Self::mask(size);
+                self.port_out_wide(port, size, v);
+            }
+            0xed => {
+                // IN eAX, dx — a word/dword port read.
+                let port = (self.r[RDX] & 0xffff) as u16;
+                let v = self.port_in_wide(port, size);
+                self.store_rm(Rm::Reg(0), size, v);
+            }
+            0xef => {
+                // OUT dx, eAX — a word/dword port write.
+                let port = (self.r[RDX] & 0xffff) as u16;
+                let v = self.r[0] & Self::mask(size);
+                self.port_out_wide(port, size, v);
+            }
             0xe8 => {
                 let rel = self.fetch(4) as i32 as i64;
                 let ret = self.rip;
@@ -1923,8 +1997,15 @@ impl Cpu {
                         self.store_rm(Rm::Reg(reg), size, v);
                     }
                     0xbe => {
+                        // MOVSX r, r/m8.
                         let (reg, rm) = self.modrm(rex);
                         let v = self.load_rm(rm, 1) as i8 as i64 as u64;
+                        self.store_rm(Rm::Reg(reg), size, v & Self::mask(size));
+                    }
+                    0xbf => {
+                        // MOVSX r, r/m16.
+                        let (reg, rm) = self.modrm(rex);
+                        let v = self.load_rm(rm, 2) as i16 as i64 as u64;
                         self.store_rm(Rm::Reg(reg), size, v & Self::mask(size));
                     }
                     0xaf => {
@@ -2592,13 +2673,14 @@ impl Cpu {
         let m = Self::mask(size);
         match ext & 7 {
             0 | 1 => {
-                // TEST r/m, imm.
-                let a = self.load_rm(rm, size);
+                // TEST r/m, imm. The immediate is fetched first so a RIP-relative
+                // `rm` resolves against the instruction-end `rip`.
                 let imm = if size == 1 {
                     self.fetch(1)
                 } else {
                     self.fetch_imm_z(size)
                 };
+                let a = self.load_rm(rm, size);
                 self.flags_logic(a & imm, size);
             }
             2 => {
