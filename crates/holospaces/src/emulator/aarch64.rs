@@ -178,7 +178,7 @@ impl Cpu {
     /// guest-physical address `pa`, exactly as a guest's `virtio` driver would —
     /// the same private [`phys_write`](Self::phys_write) the executing CPU routes
     /// device stores through. A conformance witness uses it to drive the shared
-    /// [`devbus`](super::devbus) devices over the AArch64 MMIO transport (post the
+    /// `devbus` devices over the AArch64 MMIO transport (post the
     /// virtqueue and ring `QueueNotify`) without booting a full guest kernel.
     #[doc(hidden)]
     pub fn vv_mmio_write(&mut self, pa: u64, width: usize, value: u64) {
@@ -3651,7 +3651,7 @@ impl Cpu {
     /// (`CC-15` parity). `seed` is the files holospaces places on the share (name
     /// → bytes); the guest mounts it (`-t 9p`, tag `hsworkspace`) and the editor
     /// and the running OS read and write the *same* files. The same shared
-    /// [`devbus`](super::devbus) serves it as on the RISC-V machine — one 9P
+    /// `devbus` serves it as on the RISC-V machine — one 9P
     /// implementation, here over the GIC. No-op on the flat (`CC-35`) core.
     pub fn attach_workspace(&mut self, seed: &[(&str, &[u8])]) {
         let Some(sys) = self.sys.as_mut() else {
