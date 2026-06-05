@@ -134,7 +134,11 @@ fn a_sparse_large_rootfs_streams_with_bounded_peak_memory() {
     let store = MemKappaStore::new();
     let disk = stream_ext4_bootable_into_disk(&store, SECTOR, &layers, INIT, disk_bytes)
         .expect("streaming assembly into the κ-disk");
-    assert_eq!(disk.sector_count() * SECTOR as u64, image_len, "same geometry");
+    assert_eq!(
+        disk.sector_count() * SECTOR as u64,
+        image_len,
+        "same geometry"
+    );
 
     eprintln!(
         "CC-50: assembled a {} B disk from {} B of content, materializing only {} B \
