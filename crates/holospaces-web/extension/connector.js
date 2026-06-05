@@ -24,15 +24,15 @@ export function egressExtensionAvailable() {
 /// `fetch()` pulls registries/CDNs the page cannot (the image layers the browser
 /// peer assembles into the devcontainer rootfs). Returns `{status, body}` (body a
 /// `Uint8Array`), or `null` if no extension is reachable / the fetch failed.
-export async function routerFetch(url, extensionId = HOLOSPACES_EGRESS_EXTENSION_ID) {
+export async function routerFetch(url, headers = {}, extensionId = HOLOSPACES_EGRESS_EXTENSION_ID) {
   if (!egressExtensionAvailable() || !extensionId) return null;
   return new Promise((resolve) => {
     try {
-      chrome.runtime.sendMessage(extensionId, { type: "holospaces-fetch", url }, (resp) => {
+      chrome.runtime.sendMessage(extensionId, { type: "holospaces-fetch", url, headers }, (resp) => {
         if (chrome.runtime.lastError || !resp || !resp.ok) {
           resolve(null);
         } else {
-          resolve({ status: resp.status, body: Uint8Array.from(resp.body) });
+          resolve({ status: resp.status, contentType: resp.contentType || "", body: Uint8Array.from(resp.body) });
         }
       });
     } catch {

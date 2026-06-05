@@ -156,6 +156,22 @@ async function writeOpfs(root, name, bytes) {
   await w.close();
 }
 
+// The bootable rootfs the Manager provisioned for this holospace (CC-42), staged
+// in OPFS under `provisioned/<holospace id>`. `null` when none was staged (a
+// direct workbench open with no Manager — the workbench-machinery tests).
+async function readProvisioned(id) {
+  const root = await opfsRoot();
+  if (!root) return null;
+  try {
+    const dir = await root.getDirectoryHandle("provisioned", { create: false });
+    const handle = await dir.getFileHandle(id, { create: false });
+    const file = await handle.getFile();
+    return new Uint8Array(await file.arrayBuffer());
+  } catch {
+    return null; // not provisioned
+  }
+}
+
 let persisting = false;
 async function saveSnapshot() {
   if (!ws || ws.halted || persisting) return;
@@ -208,39 +224,48 @@ async function bootHolospace() {
     return;
   }
 
-  // The bridged devcontainer: the *networked* kernel (virtio-net) + a base image
-  // that ships a language server, so the workbench gets real language intelligence
-  // from a server in the OS over the in-process bridge (ADR-020/CC-33) — no Node.
-  // The init starts the server (`/usr/bin/lsp-demo --listen 7000`) when present.
-  bridged = true;
+  // The networked kernel (virtio-net) — used by every boot path below.
   const kernel = await gunzip(await fetchBytes(`${base}/devcontainer-net-kernel.gz`));
-  const layer = await fetchBytes(`${base}/devcontainer-lsp-layer.tar.gz`);
-  const image = new wasm.DevcontainerImage();
-  image.add_layer("application/vnd.oci.image.layer.v1.tar+gzip", layer);
-  // Assemble a *bootable* rootfs — the persistent devcontainer init is injected,
-  // so the OS comes up as a running dev environment (mounts /workspace, execs a
-  // shell, starts the language server) instead of powering off right after boot —
-  // on a disk with room to work.
-  //
-  // The devcontainer's disk size. A real dev environment needs space (BusyBox
-  // installs its applets, /tmp, the files you create), so this is sized rather
-  // than the content-tight minimum. It is the disk a configured holospace would
-  // get from its storage quota; for the deployed demo it defaults here, sized for
-  // the browser peer (the image lives in wasm memory beside the guest's RAM).
-  const DISK_BYTES = 128 * 1024 * 1024;
-  const rootfs = image.assemble_bootable(DISK_BYTES); // gunzip + untar + overlay + ext4 + /init, in wasm
-  // The per-guest egress node (CC-39), carried on the folder URI query by the
-  // Manager (the drawer's Network → Egress node setting). A tab has no NIC, so
-  // when an egress node is configured the guest's TCP tunnels to it over the
-  // WsEgress WebSocket (CC-16); otherwise the in-process bridge (no live egress,
-  // language-server only) — the default, unchanged.
   const folder = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0];
+  const holoId = folder && folder.uri ? folder.uri.authority : "";
+
+  // The Manager provisions the repository's REAL OCI image and stages the
+  // bootable rootfs in OPFS (keyed by the holospace id) before opening this
+  // workbench (CC-42) — so the launched holospace is the repository's *actual*
+  // devcontainer. When it is absent — the workbench-machinery tests open the
+  // workbench directly with no Manager — fall back to the language-server base
+  // image (the test fixture); a real, no-router launch is gated in the Manager,
+  // so a user never sees the fixture in place of their repo.
+  let rootfs = holoId ? await readProvisioned(holoId) : null;
+  const provisioned = !!rootfs;
+  if (!rootfs) {
+    const layer = await fetchBytes(`${base}/devcontainer-lsp-layer.tar.gz`);
+    const image = new wasm.DevcontainerImage();
+    image.add_layer("application/vnd.oci.image.layer.v1.tar+gzip", layer);
+    // The fixture's disk is sized for room to work (it is not a content-tight
+    // assembly); the provisioned image carries its own assembled (CC-42) rootfs.
+    const DISK_BYTES = 128 * 1024 * 1024;
+    rootfs = image.assemble_bootable(DISK_BYTES);
+  }
+
+  // The per-guest egress: an egress node URL (CC-39) carried on the folder URI
+  // query (the drawer's Network → Egress node) tunnels the guest's TCP over the
+  // WsEgress WebSocket (CC-16); a provisioned holospace otherwise routes through
+  // the router (ChannelEgress); the fixture boots the in-process bridge.
   const egress = folder && folder.uri && folder.uri.query
     ? new URLSearchParams(folder.uri.query).get("egress")
     : null;
+  bridged = !egress && !provisioned;
   ws = egress
     ? wasm.Workspace.boot_devcontainer_net(kernel, rootfs, egress)
-    : wasm.Workspace.boot_devcontainer_bridged(kernel, rootfs);
+    : provisioned
+      ? wasm.Workspace.boot_devcontainer_routed(kernel, rootfs)
+      : wasm.Workspace.boot_devcontainer_bridged(kernel, rootfs);
+  if (out) {
+    out.appendLine(provisioned
+      ? "holospace: booted the provisioned devcontainer image (CC-42) — the repository's real environment"
+      : "holospace: booted the language-server base fixture");
+  }
   // Seed a welcome note into the shared workspace so the editor and the OS both
   // see it (the editor writes by κ; the OS reads it over 9p).
   ws.ws_write(
