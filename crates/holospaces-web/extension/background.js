@@ -55,10 +55,9 @@ chrome.runtime.onMessageExternal.addListener((msg, _sender, sendResponse) => {
   }
   (async () => {
     try {
-      // Ensure host access for this fetch (granted once, with consent).
-      if (chrome.permissions && chrome.permissions.request) {
-        await chrome.permissions.request({ origins: ["<all_urls>"] }).catch(() => {});
-      }
+      // host_permissions makes the service worker's fetch CORS-free (the router's
+      // content role) — no runtime permission request (that needs a user gesture
+      // a message handler doesn't have).
       const resp = await fetch(msg.url, {
         method: msg.method || "GET",
         headers: msg.headers || {},

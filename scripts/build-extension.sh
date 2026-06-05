@@ -21,9 +21,10 @@ m = json.load(open(sys.argv[1]))
 assert m["manifest_version"] == 3, "must be Manifest V3"
 assert m["background"]["service_worker"] == "background.js", "service worker must be background.js"
 assert set(m["icons"].keys()) == {"16", "48", "128"}, "icons 16/48/128 required"
-# Minimal-permission posture: a fast store review.
-assert "host_permissions" not in m, "no host permissions (egress opens sockets, never fetch())"
-assert not m.get("permissions"), "no broad permissions"
+# The router's content role (CORS-free fetch of registry layers) needs host
+# access; the egress role needs none. Keep the rest minimal: no broad
+# `permissions` block, and never tabs/storage/scripting/webRequest.
+assert not m.get("permissions"), "no broad permissions block (content role uses host_permissions)"
 assert len(m.get("name", "")) <= 75 and len(m.get("description", "")) <= 132, "store name/description limits"
 print(m["version"])
 PY

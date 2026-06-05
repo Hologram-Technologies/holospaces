@@ -37,35 +37,30 @@ egress is content-blind — SEC-7).
 
 ## Permissions — minimal by design (fast store review)
 
-The extension requests the **minimum** so it clears Chrome Web Store review
-quickly. The egress role connects to an IP:port the guest's NAT already chose and
-forwards opaque bytes, so it needs **none** of the permissions reviewers
-scrutinise:
+The router has two roles and asks only for what each needs — nothing more:
 
 | Power | Requested? | Why |
 |---|---|---|
-| `host_permissions` / `<all_urls>` | **No** | egress never calls `fetch()` — it opens sockets |
-| `tabs`, `scripting`, content scripts | **No** | it never reads or injects into a page |
-| `storage`, `webRequest` | **No** | it holds no state and intercepts no requests |
-| raw sockets (Direct Sockets) | yes (out-of-band gated) | the one thing only an extension can do |
+| raw sockets (Direct Sockets) | yes (out-of-band gated) | the **egress** role — the one thing only an extension can do |
+| `host_permissions` (`*://*/*`) | yes | the **content** role — a CORS-free `fetch()` to pull the repo's image layers from any registry (Docker Hub/ghcr) the page cannot |
 | `externally_connectable` (one origin) | yes | so *only* the operator's holospaces tab can reach it |
+| `tabs`, `scripting`, `storage`, `webRequest` | **No** | it never reads/injects a page, holds state, or intercepts requests |
+| broad `permissions` block | **No** | not used |
 
-> The **CORS-free content path** — an extension's `fetch()` (with
-> `host_permissions`) can pull CORS-blocked registries/CDNs (Docker Hub, ghcr) the
-> page cannot — is deliberately **out of scope** for this extension: that broad
-> host access is exactly what slows a store review. If you want it, request it as
-> an **`optional_host_permissions`** granted at runtime with the operator's
-> explicit consent (so the base install stays lean), or run it in a separate,
-> clearly-scoped extension.
+> A router fundamentally fetches arbitrary registries, so `host_permissions` is
+> honest for what it does. (An earlier design deferred this as
+> `optional_host_permissions` requested at runtime — but `chrome.permissions.request`
+> needs a user gesture a message handler doesn't have, so the content role would
+> silently fail; declaring it is both correct and reliable.)
 
 ## Configure for your deployment
 
 `manifest.json` lists **one** origin in both `externally_connectable.matches` and
 `content_scripts.matches` — the project's Pages site. A self-host sets it to its
 own origin(s); narrower is faster to review, and only those origins can reach the
-router (self-sovereign). `optional_host_permissions` (`*://*/*`) is the content
-role's host access — **requested at runtime with consent**, not at install, so the
-base install stays minimal.
+router (self-sovereign). `host_permissions` (`*://*/*`) is the content role's host
+access (CORS-free registry fetch); scope it to the registries you use
+(`https://*.docker.io/*`, `https://ghcr.io/*`, …) if you prefer narrower.
 
 ## Files
 

@@ -207,10 +207,10 @@
     <div id="toast"></div>
 
     <script type="module">
-      import init, { kappa, verify_kappa, run_holo, validate_userland, default_devcontainer_image, Console, Workspace, DevcontainerImage }
+      import init, { kappa, verify_kappa, run_holo, validate_userland, default_devcontainer_image, Console, Workspace, DevcontainerImage, DevcontainerProvision }
         from "./pkg/holospaces_web.js";
       await init();
-      window.hs = { kappa, verify_kappa, run_holo, validate_userland, default_devcontainer_image, Console, Workspace, DevcontainerImage };
+      window.hs = { kappa, verify_kappa, run_holo, validate_userland, default_devcontainer_image, Console, Workspace, DevcontainerImage, DevcontainerProvision };
       document.getElementById("defimg").textContent = default_devcontainer_image();
 
       // The local egress extension (CC-41) auto-announces its presence via a
