@@ -1832,6 +1832,16 @@ impl Emulator {
         self.virtio = Some(VirtioBlk::new(image));
     }
 
+    /// Attach the disk over a **caller-supplied** [`KappaStore`] — the browser
+    /// peer passes an OPFS-backed store so the disk's sectors live off the wasm
+    /// heap (paged on demand), instead of the default in-memory store. Otherwise
+    /// identical to [`attach_disk`](Emulator::attach_disk).
+    pub fn attach_disk_in(&mut self, store: Box<dyn KappaStore>, image: Vec<u8>) {
+        self.virtio = Some(VirtioBlk::with_backing(KappaBacking::from_image_in(
+            store, &image,
+        )));
+    }
+
     /// Attach the machine's VirtIO **network** device, bridged to the world over
     /// `egress` (`CC-16`). The guest kernel discovers the NIC through the device
     /// tree's third `virtio_mmio` node, configures it with DHCP, and its frames
