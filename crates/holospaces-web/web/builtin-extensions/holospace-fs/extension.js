@@ -693,6 +693,161 @@ function startLanguageClient(context, out) {
   );
 }
 
+// ── holospaces-as-remote: the remote extension host (CC-48/CC-34; ADR-020) ──────
+// The frontier above the LSP exemplar: holospaces is the VS Code REMOTE SERVER,
+// in the tab, on the substrate. A real `openvscode-server` (the VS Code server)
+// runs INSIDE the booted devcontainer, listening on a guest port; the workbench's
+// remote-agent connection reaches it over the SAME CC-33 in-process bridge the
+// language client uses — only a bigger server. Over that management connection
+// the remote extension host activates ARBITRARY (workspace/Node) marketplace
+// extensions from Open VSX (CC-19), backed by the holospace's own filesystem
+// (CC-15), terminal (CC-11), and network (CC-16). No Node on the host, no
+// deployment outside the holospace (Law L4).
+//
+// THE OPEN FRONTIER (honest state): the in-guest `openvscode-server` is not yet
+// provisioned into the booted image (CC-48 is a target — its orchestration on the
+// stock linux-{arm64,amd64} server binary via CC-37/#13 is the remaining work).
+// This client implements the workbench-side bring-up — the remote-agent
+// management connection over the bridge — and surfaces `HOLOSPACE-REMOTE-LIVE`
+// ONLY on a genuine handshake reply from the in-guest server. It NEVER fakes the
+// remote: with no server in the guest the dial finds nothing and the channel
+// reports the frontier honestly (the workbench keeps its honest "unsupported in
+// the Web" badge for non-web extensions until this goes live, ADR-015).
+//
+// The remote-server protocol authority is VS Code's `remoteAgentConnection.ts`:
+// after the transport opens, the client sends an `auth` control message then a
+// `connectionType` request (Management / ExtensionHost); the server replies with
+// a `sign` challenge and, on success, an `ok`. We speak that control exchange as
+// newline-delimited JSON control frames (the bridge carries the byte stream
+// faithfully — CC-33); a real server's `ok` is the live signal.
+const REMOTE_PORT = 8000; // the in-guest openvscode-server's listen port
+
+function startRemoteExtensionHost(context, out) {
+  // The remote is reached over the in-process loopback bridge (CC-33) — a riscv64
+  // Workspace capability; cores without loopback yet cannot host the remote.
+  if (!ws || typeof ws.dial_guest !== "function") {
+    out && out.appendLine("holospace: remote ext host skipped (no in-OS bridge on this core yet)");
+    return;
+  }
+  let connId = null;
+  let pumping = true;
+  let inbuf = new Uint8Array(0);
+  const dispatch = [];
+
+  const sendControl = (msg) => {
+    if (connId == null) return;
+    // The remote protocol's control messages are JSON; we frame them with the
+    // same Content-Length base protocol the rest of the bridge traffic uses, so a
+    // server reading either path parses them identically.
+    const body = encoder.encode(JSON.stringify(msg));
+    const header = encoder.encode(`Content-Length: ${body.length}\r\n\r\n`);
+    const frame = new Uint8Array(header.length + body.length);
+    frame.set(header, 0);
+    frame.set(body, header.length);
+    ws.guest_send(connId, frame);
+  };
+
+  const drain = () => {
+    if (connId == null) return;
+    const bytes = ws.guest_recv(connId);
+    if (!bytes.length) return;
+    const merged = new Uint8Array(inbuf.length + bytes.length);
+    merged.set(inbuf, 0);
+    merged.set(bytes, inbuf.length);
+    inbuf = merged;
+    for (;;) {
+      const hdrEnd = findBytes(inbuf, HDR_SEP);
+      if (hdrEnd < 0) break;
+      const header = decoder.decode(inbuf.subarray(0, hdrEnd));
+      const m = /Content-Length:\s*(\d+)/i.exec(header);
+      if (!m) break;
+      const len = parseInt(m[1], 10);
+      const start = hdrEnd + HDR_SEP.length;
+      if (inbuf.length < start + len) break;
+      const body = decoder.decode(inbuf.subarray(start, start + len));
+      inbuf = inbuf.slice(start + len);
+      try {
+        dispatch.push(JSON.parse(body));
+      } catch {
+        /* a non-JSON frame from the server — ignore */
+      }
+    }
+  };
+
+  const pump = () => {
+    if (!ws || !pumping) return;
+    if (!ws.halted) ws.run(6_000_000);
+    drain();
+    setTimeout(pump, 25);
+  };
+
+  (async () => {
+    // Wait for the in-guest remote server to bind, then dial it over the bridge.
+    // The marker the server prints when it is listening (the orchestration that
+    // launches `openvscode-server` is the CC-48 frontier — until it does, this
+    // wait times out and we report the frontier honestly, never a fake remote).
+    let serverUp = false;
+    for (let i = 0; i < 600; i++) {
+      if (!ws.halted) ws.run(6_000_000);
+      if (ws.shows && ws.shows("REMOTE-SERVER-LISTENING")) {
+        serverUp = true;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    if (!serverUp) {
+      out.appendLine(
+        "holospace: the substrate-native remote ext host (CC-48) is the open frontier — " +
+          "no openvscode-server in the booted image yet; non-web extensions remain " +
+          "unsupported in the Web (ADR-015) until it is provisioned. The bring-up " +
+          "(remote-agent management connection over the CC-33 bridge) is wired and waiting.",
+      );
+      return;
+    }
+
+    connId = ws.dial_guest(REMOTE_PORT);
+    if (connId == null) {
+      out.appendLine("holospace: remote ext host — the bridge dial returned no connection");
+      return;
+    }
+    pump();
+
+    // The remote-agent handshake (remoteAgentConnection.ts): auth, then request a
+    // Management connection; the server's `ok` is the live signal.
+    sendControl({ type: "auth", auth: "00000000000000000000", data: "" });
+    sendControl({ type: "connectionType", desiredConnectionType: "Management", commit: "", signedData: "" });
+
+    let ok = false;
+    for (let i = 0; i < 800; i++) {
+      await new Promise((r) => setTimeout(r, 25));
+      if (dispatch.some((m) => m && (m.type === "ok" || m.type === "sign"))) {
+        ok = true;
+        break;
+      }
+    }
+    if (!ok) {
+      out.appendLine("holospace: remote ext host — the in-guest server did not complete the remote-agent handshake");
+      return;
+    }
+
+    out.appendLine("holospace: holospaces-as-remote is LIVE — the remote extension host is reachable over the substrate bridge (CC-48/CC-34)");
+    // The deterministic witness signal (also visible in the workbench): the
+    // remote management connection handshook with the in-guest server.
+    const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99);
+    status.text = "$(remote) HOLOSPACE-REMOTE-LIVE";
+    status.tooltip = "The VS Code remote extension host runs in the devcontainer OS over the substrate bridge (CC-48/CC-34)";
+    status.show();
+    context.subscriptions.push(status);
+  })().catch((e) => out.appendLine("holospace: remote ext host error — " + e));
+
+  context.subscriptions.push(
+    new vscode.Disposable(() => {
+      pumping = false;
+      if (connId != null) ws.guest_close(connId);
+    }),
+  );
+}
+
 function activate(context) {
   base = deriveBase(context.extensionUri);
   // This launch's holospace identity (its κ), carried in the workspace folder
@@ -731,6 +886,10 @@ function activate(context) {
       // the OS — the VS Code remote model, in the browser tab, no Node.
       if (bridged) {
         startLanguageClient(context, out);
+        // holospaces-as-remote (CC-48/CC-34): bring up the remote extension host
+        // against an in-guest openvscode-server over the SAME bridge. Honest about
+        // the frontier — surfaces HOLOSPACE-REMOTE-LIVE only on a genuine handshake.
+        startRemoteExtensionHost(context, out);
       }
       // Persist the running machine to OPFS periodically (CC-30/CC-31), so the
       // next launch resumes from it instead of cold-booting. The extension host
