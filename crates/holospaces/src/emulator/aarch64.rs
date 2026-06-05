@@ -4392,7 +4392,6 @@ impl Cpu {
     fn take_undef(&mut self, ret: u64, _inst: u32) {
         #[cfg(feature = "std")]
         if self.sys().el == 0 {
-            std::eprintln!("UNDEF@{ret:#x} inst={_inst:#010x}");
         }
         let from_el0 = self.sys().el == 0;
         let spsr = self.pack_pstate();

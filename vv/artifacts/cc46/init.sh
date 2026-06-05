@@ -16,7 +16,7 @@
 # starts httpd and idles so the host can dial the listener over the bridge — it
 # does NOT power off (the witness drops the machine once the bridge round-trip
 # completes; a power-off would race the host's dial).
-/bin/busybox mkdir -p /proc /sys /dev /bin /sbin /usr/bin /usr/sbin /mnt /www
+/bin/busybox mkdir -p /proc /sys /dev /bin /sbin /usr/bin /usr/sbin /mnt /www /tmp
 /bin/busybox mount -t proc proc /proc
 /bin/busybox mount -t sysfs sysfs /sys
 /bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null
