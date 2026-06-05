@@ -156,9 +156,61 @@ async function writeOpfs(root, name, bytes) {
   await w.close();
 }
 
+// The bootable rootfs the Manager provisioned for this holospace (CC-42), staged
+// in OPFS under `provisioned/<holospace id>`. `null` when none was staged (a
+// direct workbench open with no Manager — the workbench-machinery tests).
+async function readProvisioned(id) {
+  const root = await opfsRoot();
+  if (!root) return null;
+  try {
+    const dir = await root.getDirectoryHandle("provisioned", { create: false });
+    const handle = await dir.getFileHandle(id, { create: false });
+    const file = await handle.getFile();
+    return new Uint8Array(await file.arrayBuffer());
+  } catch {
+    return null; // not provisioned
+  }
+}
+
+// Open the OPFS pack file backing the paged κ-disk's store, behind a synchronous
+// access handle (worker-only — which is where the extension host, and thus the
+// emulator, runs). A fresh pack per boot (truncated); the disk's sectors are
+// content-addressed into it, so they live off the wasm heap. `null` if OPFS sync
+// access is unavailable (then the caller falls back to the in-RAM κ-disk).
+async function openDiskStore(id) {
+  const root = await opfsRoot();
+  if (!root || !id) return null;
+  try {
+    const dir = await root.getDirectoryHandle("disk-store", { create: true });
+    const fh = await dir.getFileHandle(`${id}.pack`, { create: true });
+    const handle = await fh.createSyncAccessHandle();
+    handle.truncate(0); // a fresh pack each boot
+    return handle;
+  } catch {
+    return null; // no sync access handle (not a worker, or unsupported)
+  }
+}
+
+// A synchronous read handle on the provisioned rootfs file — so the κ-disk can be
+// streamed sector-by-sector into its store without ever reading the whole image
+// into RAM. `null` if it was not provisioned or sync access is unavailable.
+async function openProvisionedHandle(id) {
+  const root = await opfsRoot();
+  if (!root || !id) return null;
+  try {
+    const dir = await root.getDirectoryHandle("provisioned", { create: false });
+    const fh = await dir.getFileHandle(id, { create: false });
+    return await fh.createSyncAccessHandle();
+  } catch {
+    return null;
+  }
+}
+
 let persisting = false;
 async function saveSnapshot() {
-  if (!ws || ws.halted || persisting) return;
+  // Snapshot/resume is a riscv64 Workspace capability; the aarch64 terminal core
+  // does not expose `suspend` yet (the continued build), so skip there.
+  if (!ws || ws.halted || persisting || typeof ws.suspend !== "function") return;
   const root = await opfsRoot();
   if (!root) return;
   persisting = true;
@@ -208,43 +260,117 @@ async function bootHolospace() {
     return;
   }
 
-  // The bridged devcontainer: the *networked* kernel (virtio-net) + a base image
-  // that ships a language server, so the workbench gets real language intelligence
-  // from a server in the OS over the in-process bridge (ADR-020/CC-33) — no Node.
-  // The init starts the server (`/usr/bin/lsp-demo --listen 7000`) when present.
-  bridged = true;
-  const kernel = await gunzip(await fetchBytes(`${base}/devcontainer-net-kernel.gz`));
-  const layer = await fetchBytes(`${base}/devcontainer-lsp-layer.tar.gz`);
-  const image = new wasm.DevcontainerImage();
-  image.add_layer("application/vnd.oci.image.layer.v1.tar+gzip", layer);
-  // Assemble a *bootable* rootfs — the persistent devcontainer init is injected,
-  // so the OS comes up as a running dev environment (mounts /workspace, execs a
-  // shell, starts the language server) instead of powering off right after boot —
-  // on a disk with room to work.
-  //
-  // The devcontainer's disk size. A real dev environment needs space (BusyBox
-  // installs its applets, /tmp, the files you create), so this is sized rather
-  // than the content-tight minimum. It is the disk a configured holospace would
-  // get from its storage quota; for the deployed demo it defaults here, sized for
-  // the browser peer (the image lives in wasm memory beside the guest's RAM).
-  const DISK_BYTES = 128 * 1024 * 1024;
-  const rootfs = image.assemble_bootable(DISK_BYTES); // gunzip + untar + overlay + ext4 + /init, in wasm
-  ws = wasm.Workspace.boot_devcontainer_bridged(kernel, rootfs);
-  // Seed a welcome note into the shared workspace so the editor and the OS both
-  // see it (the editor writes by κ; the OS reads it over 9p).
-  ws.ws_write(
-    "WELCOME.md",
-    new TextEncoder().encode(
-      "# holospace\n\nThe real VS Code workbench, over the running devcontainer.\n" +
-        "This file lives on the virtio-9p workspace (CC-15) — the terminal sees it too.\n" +
-        "Open `main.rs` — language intelligence comes from a server in the OS over the substrate bridge (CC-18/CC-33).\n",
+  const folder = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0];
+  const holoId = folder && folder.uri ? folder.uri.authority : "";
+  const query = folder && folder.uri && folder.uri.query
+    ? new URLSearchParams(folder.uri.query)
+    : new URLSearchParams();
+  // The holospace's architecture (ADR-021) selects the guest kernel + the CPU
+  // core; the per-guest egress node (CC-39), if set, rides the same folder query.
+  const arch = query.get("arch") || "riscv64";
+  const egress = query.get("egress");
+  // A real arm64 Linux for aarch64, else the networked RISC-V kernel.
+  const kernel = await gunzip(
+    await fetchBytes(
+      arch === "aarch64"
+        ? `${base}/devcontainer-arm64-kernel.gz`
+        : `${base}/devcontainer-net-kernel.gz`,
     ),
   );
-  // Seed a source file the language server can analyze (the editor + OS share it).
-  ws.ws_write(
-    "main.rs",
-    new TextEncoder().encode("fn greet(name) {\n  // TODO: greet\n  return greet(name)\n}\n"),
-  );
+
+  if (arch === "aarch64") {
+    // aarch64 holospace: boot the provisioned arm64 image on the AArch64 core,
+    // paged from OPFS (CC-37) — a real arm64 devcontainer to a terminal. (The
+    // AArch64 core's net/9p parity is the continued build, so this path drives
+    // the terminal; the riscv64 path below adds the 9p workspace + routed egress.)
+    if (holoId) {
+      const rootfsHandle = await openProvisionedHandle(holoId);
+      if (rootfsHandle) {
+        const diskHandle = await openDiskStore(holoId);
+        if (diskHandle) {
+          ws = wasm.Aarch64Workspace.boot_devcontainer_opfs_streamed(kernel, rootfsHandle, diskHandle);
+          bridged = false;
+          out && out.appendLine("holospace: booted the provisioned arm64 image on the AArch64 core (CC-37) — paged from OPFS");
+        } else {
+          try { rootfsHandle.close(); } catch {}
+        }
+      }
+    }
+    if (!ws && out) {
+      out.appendLine("holospace: an aarch64 holospace needs a provisioned image — Enter it from the Manager (with the router)");
+    }
+  } else {
+  // PREFERRED: the streaming **paged κ-disk**. Page the provisioned rootfs
+  // straight from its OPFS file into an OPFS-backed κ-store, sector-by-sector —
+  // neither the full image nor the assembled disk is ever held in wasm RAM
+  // ("the KappaStore IS the memory, RAM is a cache"), so a large image boots
+  // without OOM. Needs sync access handles (worker-only — which is where this
+  // runs) on both the rootfs and the store pack, and no egress-node override.
+  if (holoId && !egress) {
+    const rootfsHandle = await openProvisionedHandle(holoId);
+    if (rootfsHandle) {
+      const diskHandle = await openDiskStore(holoId);
+      if (diskHandle) {
+        ws = wasm.Workspace.boot_devcontainer_routed_opfs_streamed(kernel, rootfsHandle, diskHandle);
+        bridged = false;
+        out && out.appendLine("holospace: booted the provisioned image (CC-42) — streamed paged κ-disk from OPFS (no full image in RAM)");
+      } else {
+        try { rootfsHandle.close(); } catch {}
+      }
+    }
+  }
+
+  // FALLBACK: read the rootfs into RAM and boot the in-RAM / node-egress path —
+  // an egress-node override, or OPFS sync access unavailable, or no provisioned
+  // image (the workbench-machinery tests open the workbench directly with no
+  // Manager → the language-server base fixture; a real no-router launch is gated
+  // in the Manager, so a user never sees the fixture in place of their repo).
+  if (!ws) {
+    let rootfs = holoId ? await readProvisioned(holoId) : null;
+    const provisioned = !!rootfs;
+    if (!rootfs) {
+      const layer = await fetchBytes(`${base}/devcontainer-lsp-layer.tar.gz`);
+      const image = new wasm.DevcontainerImage();
+      image.add_layer("application/vnd.oci.image.layer.v1.tar+gzip", layer);
+      const DISK_BYTES = 128 * 1024 * 1024;
+      rootfs = image.assemble_bootable(DISK_BYTES);
+    }
+    bridged = !egress && !provisioned;
+    const diskHandle = provisioned && !egress ? await openDiskStore(holoId) : null;
+    ws = egress
+      ? wasm.Workspace.boot_devcontainer_net(kernel, rootfs, egress)
+      : provisioned
+        ? diskHandle
+          ? wasm.Workspace.boot_devcontainer_routed_opfs(kernel, rootfs, diskHandle)
+          : wasm.Workspace.boot_devcontainer_routed(kernel, rootfs)
+        : wasm.Workspace.boot_devcontainer_bridged(kernel, rootfs);
+    if (out) {
+      out.appendLine(provisioned
+        ? (diskHandle ? "holospace: booted the provisioned image (CC-42) — disk paged from OPFS"
+                      : "holospace: booted the provisioned image (CC-42)")
+        : "holospace: booted the language-server base fixture");
+    }
+  }
+  } // end the riscv64 boot branch
+
+  // Seed the shared workspace (the editor + the OS both see these over virtio-9p,
+  // CC-15). The aarch64 terminal path has no 9p workspace yet, so guard on the
+  // capability rather than assume it.
+  if (ws && typeof ws.ws_write === "function") {
+    ws.ws_write(
+      "WELCOME.md",
+      new TextEncoder().encode(
+        "# holospace\n\nThe real VS Code workbench, over the running devcontainer.\n" +
+          "This file lives on the virtio-9p workspace (CC-15) — the terminal sees it too.\n" +
+          "Open `main.rs` — language intelligence comes from a server in the OS over the substrate bridge (CC-18/CC-33).\n",
+      ),
+    );
+    // Seed a source file the language server can analyze (the editor + OS share it).
+    ws.ws_write(
+      "main.rs",
+      new TextEncoder().encode("fn greet(name) {\n  // TODO: greet\n  return greet(name)\n}\n"),
+    );
+  }
 }
 
 // ── FileSystemProvider over the virtio-9p workspace (CC-15) ─────────────────
@@ -253,6 +379,13 @@ const { FileType, FileSystemError, EventEmitter } = vscode;
 function nameOf(uri) {
   const p = uri.path.replace(/^\/+/, "");
   return p.replace(/^workspace\/?/, "");
+}
+
+// Whether the booted core exposes the virtio-9p workspace. The riscv64 Workspace
+// does; the aarch64 terminal core does not yet (its workspace is empty until 9p
+// parity lands) — the editor then reflects the real, empty state, never fakes it.
+function has9p() {
+  return ws && typeof ws.ws_read === "function";
 }
 
 class HolospaceFS {
@@ -269,23 +402,27 @@ class HolospaceFS {
     if (name === "") {
       return { type: FileType.Directory, ctime: 0, mtime: 0, size: 0 };
     }
+    if (!has9p()) throw FileSystemError.FileNotFound(uri);
     const bytes = ws.ws_read(name);
     if (bytes == null) throw FileSystemError.FileNotFound(uri);
     return { type: FileType.File, ctime: 0, mtime: Date.now(), size: bytes.length };
   }
   async readDirectory() {
     await readyPromise;
+    if (!has9p()) return []; // the aarch64 core has no 9p workspace yet
     const list = JSON.parse(ws.ws_list());
     return list.map((e) => [e.name, e.dir ? FileType.Directory : FileType.File]);
   }
   async readFile(uri) {
     await readyPromise;
+    if (!has9p()) throw FileSystemError.FileNotFound(uri);
     const bytes = ws.ws_read(nameOf(uri));
     if (bytes == null) throw FileSystemError.FileNotFound(uri);
     return bytes;
   }
   async writeFile(uri, content) {
     await readyPromise;
+    if (!has9p()) throw FileSystemError.NoPermissions(uri);
     ws.ws_write(nameOf(uri), content);
     this._emitter.fire([{ type: vscode.FileChangeType.Changed, uri }]);
   }
@@ -294,16 +431,19 @@ class HolospaceFS {
   // content the running OS sees over virtio-9p (one content, Law L1).
   async createDirectory(uri) {
     await readyPromise;
+    if (!has9p()) throw FileSystemError.NoPermissions(uri);
     ws.ws_mkdir(nameOf(uri));
     this._emitter.fire([{ type: vscode.FileChangeType.Created, uri }]);
   }
   async delete(uri) {
     await readyPromise;
+    if (!has9p()) throw FileSystemError.FileNotFound(uri);
     if (!ws.ws_delete(nameOf(uri))) throw FileSystemError.FileNotFound(uri);
     this._emitter.fire([{ type: vscode.FileChangeType.Deleted, uri }]);
   }
   async rename(oldUri, newUri) {
     await readyPromise;
+    if (!has9p()) throw FileSystemError.FileNotFound(oldUri);
     if (!ws.ws_rename(nameOf(oldUri), nameOf(newUri))) {
       throw FileSystemError.FileNotFound(oldUri);
     }
@@ -390,6 +530,13 @@ function findBytes(buf, needle) {
 const HDR_SEP = new TextEncoder().encode("\r\n\r\n");
 
 function startLanguageClient(context, out) {
+  // The in-OS language server is reached over the in-process loopback bridge
+  // (CC-33), a riscv64 Workspace capability; the aarch64 terminal core has no
+  // loopback yet (the continued build), so skip the language client there.
+  if (!ws || typeof ws.dial_guest !== "function") {
+    out && out.appendLine("holospace: language client skipped (no in-OS bridge on this core yet)");
+    return;
+  }
   const PORT = 7000;
   const diagnostics = vscode.languages.createDiagnosticCollection("holospace");
   context.subscriptions.push(diagnostics);

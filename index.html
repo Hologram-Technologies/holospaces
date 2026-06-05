@@ -65,6 +65,7 @@
       <h1>Hologram Platform Manager</h1>
       <span class="muted">manage your holospaces · enter one to work in it</span>
       <span class="op">
+        <span id="ext-status" title="The local egress extension opens raw sockets a tab cannot (Direct Sockets, CC-41) — the guest's internet when no node is set.">egress extension <span id="ext-dot">○</span> <span id="ext-label" class="muted">checking…</span></span>
         <button id="signin" class="primary sm">Sign in</button>
         <span class="muted">operator</span> <span id="operator" class="k">(signed out)</span>
       </span>
@@ -73,9 +74,13 @@
       <h2>New holospace</h2>
       <div class="new">
         <div class="row">
-          <div style="flex:1; min-width:14rem">
-            <label for="hname">Name</label>
-            <input id="hname" value="my-devcontainer" style="width:100%" />
+          <div style="flex:1; min-width:18rem">
+            <label for="hrepo">Repository URL</label>
+            <input id="hrepo" placeholder="https://github.com/owner/repo" value="https://github.com/octocat/Hello-World" style="width:100%" />
+          </div>
+          <div style="width:9rem">
+            <label for="href">Reference</label>
+            <input id="href" value="master" style="width:100%" />
           </div>
           <div>
             <label for="harch">Architecture</label>
@@ -84,15 +89,25 @@
               <option value="aarch64">aarch64 (ARMv8-A)</option>
             </select>
           </div>
-          <button id="create" class="primary" disabled>Create devcontainer</button>
+          <button id="create" class="primary" disabled>Launch repository</button>
         </div>
-        <p class="hint">The architecture is chosen once, at launch — like an instance type in a cloud console. It is part of the holospace's identity (the same config under two ISAs is two distinct holospaces), so it cannot be changed afterward. Everything else (lifecycle · network · storage · access) is editable per guest in its settings.</p>
-        <label for="dcjson">devcontainer.json (validated against the Dev Container spec — CC-4)</label>
-        <textarea id="dcjson" spellcheck="false">{
+        <p class="hint">Name a git repository — like Codespaces or Gitpod. holospaces fetches its <code>.devcontainer/devcontainer.json</code> (verified on receipt, Law L5) and runs it; a repository with <em>no</em> devcontainer opens in the <strong>usable default</strong> image (<span id="defimg" class="k">…</span> — curl, git over apt), so any repo just works. The architecture is chosen once, at launch (part of the holospace's identity, ADR-021); everything else is editable per guest in its settings.</p>
+        <details>
+          <summary class="muted" style="cursor:pointer; font-size:0.85em">Advanced — paste a devcontainer.json instead</summary>
+          <div class="row" style="margin-top:0.5rem">
+            <div style="flex:1; min-width:14rem">
+              <label for="hname">Name</label>
+              <input id="hname" value="my-devcontainer" style="width:100%" />
+            </div>
+            <button id="createPaste" class="sm" disabled>Create from pasted config</button>
+          </div>
+          <label for="dcjson">devcontainer.json (validated against the Dev Container spec — CC-4)</label>
+          <textarea id="dcjson" spellcheck="false">{
   "name": "my-devcontainer",
-  "image": "mcr.microsoft.com/devcontainers/base:debian-12",
+  "image": "buildpack-deps:trixie-scm",
   "features": {}
 }</textarea>
+        </details>
       </div>
 
       <h2>Holospaces</h2>
@@ -156,7 +171,15 @@
             <label class="toggle"><input type="checkbox" id="d-announce" /> announce</label>
             <button class="sm" id="d-network">Apply network</button>
           </div>
-          <p class="hint">Forwarded guest ports become app-preview URLs; fetch/announce govern the guest's substrate connectivity.</p>
+          <div class="field">
+            <label for="d-egress">Egress node</label>
+            <input id="d-egress" placeholder="wss://my-node:9000 (a holospaces-node you own)" />
+            <button class="sm" id="d-egress-apply">Set egress</button>
+          </div>
+          <p class="hint">Forwarded guest ports become app-preview URLs; fetch/announce govern the guest's substrate connectivity. <strong>Egress node:</strong> a tab has no NIC, so the guest's internet (curl/apt) routes through a <em>holospaces-node you own</em> (CC-39) — the mesh's exit, not a proxy. Leave blank for content-only (no live egress).</p>
+          <p class="hint" id="ext-egress">No node? Install the <strong>local egress extension</strong> — it opens raw sockets in your own browser (Direct Sockets, CC-41), so a Chromebook reaches the internet with nothing else.
+            <a id="ext-dl" href="extension/holospaces-egress-extension.zip" download>⬇ Download extension</a>.
+            Manual install (until it's in the Chrome Web Store): download → unzip → <code>chrome://extensions</code> → enable Developer mode → <em>Load unpacked</em> → pick the unzipped folder.</p>
         </section>
 
         <section>
@@ -184,10 +207,34 @@
     <div id="toast"></div>
 
     <script type="module">
-      import init, { kappa, verify_kappa, run_holo, validate_userland, Console, Workspace, DevcontainerImage }
+      import init, { kappa, verify_kappa, run_holo, validate_userland, default_devcontainer_image, Console, Workspace, DevcontainerImage, DevcontainerProvision }
         from "./pkg/holospaces_web.js";
       await init();
-      window.hs = { kappa, verify_kappa, run_holo, validate_userland, Console, Workspace, DevcontainerImage };
+      window.hs = { kappa, verify_kappa, run_holo, validate_userland, default_devcontainer_image, Console, Workspace, DevcontainerImage, DevcontainerProvision };
+      document.getElementById("defimg").textContent = default_devcontainer_image();
+
+      // The local egress extension (CC-41) auto-announces its presence via a
+      // content script that sets `data-holospaces-egress` (the extension id) on
+      // <html>. Reflect it as a live connection indicator and remember the id so
+      // the guest's egress can route through the extension when no node is set.
+      function refreshExtStatus() {
+        const id = document.documentElement.getAttribute("data-holospaces-egress");
+        const dot = document.getElementById("ext-dot");
+        const label = document.getElementById("ext-label");
+        if (id) {
+          window.holospacesEgressExtensionId = id;
+          dot.textContent = "●"; dot.style.color = "#3fb950";
+          label.textContent = "connected"; label.className = "";
+        } else {
+          window.holospacesEgressExtensionId = null;
+          dot.textContent = "○"; dot.style.color = "#8b949e";
+          label.innerHTML = 'not detected · <a href="extension/holospaces-egress-extension.zip" download>install</a>';
+          label.className = "muted";
+        }
+      }
+      window.dispatchEvent(new Event("holospaces-egress-probe"));
+      refreshExtStatus();
+      setInterval(refreshExtStatus, 3000);
 
       const console0 = new Console();
       const $ = (id) => document.getElementById(id);
@@ -248,16 +295,117 @@
         return cfg;
       }
 
-      function action(act, k) {
+      // Fetch a URL through the router extension (its CORS-free fetch) — the
+      // transport for pulling a repo's CORS-blocked image layers (CC-41/CC-42).
+      // The body is streamed in chunks over a port (a multi-MB layer would exceed
+      // the one-shot runtime-message size limit), and reassembled here.
+      let _contentPort = null, _fetchSeq = 0;
+      const _pendingFetch = new Map();
+      function contentPort() {
+        if (_contentPort) return _contentPort;
+        const extId = window.holospacesEgressExtensionId;
+        if (!extId || typeof chrome === "undefined" || !chrome.runtime) return null;
+        const port = chrome.runtime.connect(extId, { name: "holospaces-content" });
+        port.onMessage.addListener((m) => {
+          const p = _pendingFetch.get(m.id);
+          if (!p) return;
+          if (m.type === "head") { p.status = m.status; p.contentType = m.contentType; }
+          else if (m.type === "chunk") { p.chunks.push(Uint8Array.from(m.bytes)); }
+          else if (m.type === "end") {
+            _pendingFetch.delete(m.id);
+            const total = p.chunks.reduce((n, c) => n + c.length, 0);
+            const body = new Uint8Array(total);
+            let o = 0;
+            for (const c of p.chunks) { body.set(c, o); o += c.length; }
+            p.resolve({ status: p.status, contentType: p.contentType, body });
+          } else if (m.type === "error") { _pendingFetch.delete(m.id); p.resolve(null); }
+        });
+        port.onDisconnect.addListener(() => {
+          _contentPort = null;
+          for (const [, p] of _pendingFetch) p.resolve(null);
+          _pendingFetch.clear();
+        });
+        _contentPort = port;
+        return port;
+      }
+      async function routerFetch(url, headers) {
+        const port = contentPort();
+        if (!port) return null;
+        const id = ++_fetchSeq;
+        return new Promise((resolve) => {
+          _pendingFetch.set(id, { chunks: [], status: 0, contentType: "", resolve });
+          try { port.postMessage({ type: "fetch", id, url, headers: headers || {} }); }
+          catch { _pendingFetch.delete(id); resolve(null); }
+        });
+      }
+
+      // Provision a holospace's REAL OCI image in the browser and stage the
+      // bootable rootfs in OPFS, where holospace-fs reads it (CC-42). The router
+      // is the transport; the pull re-derives every blob (Law L5).
+      async function provisionToOpfs(kappa, image, arch) {
+        const prov = new window.hs.DevcontainerProvision(image, arch);
+        let steps = 0;
+        while (!prov.isDone()) {
+          const url = prov.nextUrl();
+          if (!url) break;
+          const headers = {};
+          const a = prov.nextAccept(); if (a) headers["Accept"] = a;
+          const b = prov.nextBearer(); if (b) headers["Authorization"] = "Bearer " + b;
+          const resp = await routerFetch(url, headers);
+          if (!resp) throw new Error("the router could not fetch " + url + " — is the extension enabled for this site?");
+          prov.deliver(resp.status, resp.contentType, resp.body);
+          if (++steps > 300) throw new Error("the image pull did not converge");
+        }
+        // Assemble a bootable rootfs with modest room to work. NOTE: the assembled
+        // image is a dense Vec of this size in the Manager tab, so it is kept
+        // bounded (1 GiB) to avoid OOM here — the paged κ-disk stores only the
+        // non-zero sectors, but the window assembles densely. Giving a large disk
+        // without a large Vec needs the streaming sparse assembly (the documented
+        // refinement). 1 GiB gives a typical image headroom for the shell + light work.
+        const rootfs = prov.assemble(1024 * 1024 * 1024);
+        const root = await navigator.storage.getDirectory();
+        const dir = await root.getDirectoryHandle("provisioned", { create: true });
+        const h = await dir.getFileHandle(kappa, { create: true });
+        const w = await h.createWritable();
+        await w.write(rootfs);
+        await w.close();
+      }
+
+      async function action(act, k) {
         const m = meta.get(k);
         if (act === "enter") {
-          m.status = "running"; render();
-          // Launch the Workspace Projection in a new tab — the REAL VS Code web
-          // workbench over the running holospace (CC-17; ADR-012 supersedes the
-          // CC-13 Monaco fallback at workspace.html).
+          // The workbench URL (the REAL VS Code web workbench over the running
+          // holospace — CC-17; ADR-012 supersedes the CC-13 Monaco fallback).
           const ext = m.extensions && m.extensions.length ? "&ext=" + encodeURIComponent(m.extensions.join(",")) : "";
-          window.open(`workbench.html?id=${encodeURIComponent(k)}&name=${encodeURIComponent(m.name)}&arch=${encodeURIComponent(m.arch)}${ext}`, "_blank");
-          toast("entering " + m.name + " — the VS Code workbench opens in a new tab");
+          const egress = m.egress ? "&egress=" + encodeURIComponent(m.egress) : "";
+          const url = `workbench.html?id=${encodeURIComponent(k)}&name=${encodeURIComponent(m.name)}&arch=${encodeURIComponent(m.arch)}${ext}${egress}`;
+          // Open the tab NOW, in the click gesture. (A window.open AFTER the
+          // provisioning `await` is treated as non-user-initiated and pop-up
+          // blocked — so for a repo we open a placeholder tab synchronously, then
+          // navigate it once the image is staged.)
+          const tab = window.open(m.image ? "" : url, "_blank");
+          if (!tab) { toast("allow pop-ups for this site to enter " + m.name); return; }
+          if (m.image) {
+            if (!window.holospacesEgressExtensionId) {
+              tab.close();
+              toast("install the router extension to provision " + m.name + " — the ⬇ link in a guest's Network settings");
+              return;
+            }
+            try {
+              tab.document.write(`<!doctype html><meta charset=utf8><body style="font:14px/1.6 system-ui;background:#0d1117;color:#c9d1d9;padding:2rem">Provisioning <b>${m.name}</b> — pulling <code>${m.image}</code> via the router and assembling its image. This can take a while for a large base; the workbench opens here when it's ready.</body>`);
+            } catch {}
+            toast("provisioning " + m.name + " — pulling " + m.image + " via the router…");
+            try {
+              await provisionToOpfs(k, m.image, m.arch);
+            } catch (e) {
+              try { tab.close(); } catch {}
+              toast("provisioning " + m.name + " failed: " + e);
+              return;
+            }
+            tab.location = url; // navigate the tab we already own (no pop-up block)
+          }
+          m.status = "running"; render();
+          toast("entering " + m.name + " — the VS Code workbench opens in the new tab");
         } else if (act === "suspend") {
           // Real: publish a lifecycle configuration the instance applies (no stub).
           const cfg = configure(k, [{ lifecycle: "suspend" }]);
@@ -287,6 +435,7 @@
         $("d-arch").textContent = m.arch;
         $("d-kappa").textContent = k;
         $("d-source").textContent = m.source;
+        $("d-egress").value = m.egress || "";
         $("d-status").innerHTML = `<span class="badge ${m.status}">${m.status}</span>`;
         $("drawer").classList.add("open");
         $("drawer").setAttribute("aria-hidden", "false");
@@ -335,6 +484,18 @@
       };
       $("d-network").onclick = () =>
         applyToDrawer([{ network: { fetch: $("d-fetch").checked, announce: $("d-announce").checked } }], "network");
+      // The per-guest egress node — a holospaces-node the guest's internet routes
+      // through (CC-39). Stored on the guest and carried to the workbench on Enter,
+      // where the boot tunnels guest TCP to it (the WsEgress path, CC-16). Cleared
+      // by an empty value (content-only, no live egress).
+      $("d-egress-apply").onclick = () => {
+        const k = drawerKappa; if (!k) return;
+        const m = meta.get(k);
+        const url = $("d-egress").value.trim();
+        m.egress = url || undefined;
+        toast(url ? (m.name + " — egress via " + url + " (applies on next Enter)")
+                  : (m.name + " — egress cleared (content-only)"));
+      };
       $("d-quota-apply").onclick = () => {
         const mb = parseInt($("d-quota").value, 10);
         if (!Number.isInteger(mb) || mb < 0) return toast("enter a quota in MB");
@@ -375,25 +536,113 @@
       $("signin").onclick = () => {
         console0.sign_in(new TextEncoder().encode("operator-self-sovereign-key"));
         $("create").disabled = false;
+        $("createPaste").disabled = false;
         render();
         toast("signed in — a self-sovereign, content-addressed identity (CC-1)");
       };
 
-      $("create").onclick = () => {
+      // ── Repository devcontainer discovery (the import boundary, Law L5) ───────
+      // Derive the raw-content URL(s) for a repository's devcontainer.json at a
+      // reference. The page fetches over the repo host's own CORS-permitted raw
+      // surface (github/gitlab) — the operator's browser IS the peer, fetch IS
+      // its transport (ADR-013); the bytes are addressed to a κ on receipt.
+      function rawCandidates(repoUrl, ref) {
+        let u;
+        try { u = new URL(repoUrl); } catch { return []; }
+        const path = u.pathname.replace(/^\/+|\/+$/g, "").replace(/\.git$/, "");
+        const enc = encodeURIComponent(ref);
+        if (u.hostname === "github.com") {
+          const b = `https://raw.githubusercontent.com/${path}/${enc}`;
+          return [[`${b}/.devcontainer/devcontainer.json`, ".devcontainer/devcontainer.json"],
+                  [`${b}/.devcontainer.json`, ".devcontainer.json"]];
+        }
+        if (u.hostname === "gitlab.com") {
+          const b = `https://gitlab.com/${path}/-/raw/${enc}`;
+          return [[`${b}/.devcontainer/devcontainer.json`, ".devcontainer/devcontainer.json"],
+                  [`${b}/.devcontainer.json`, ".devcontainer.json"]];
+        }
+        const b = `${repoUrl.replace(/\/+$/, "")}/raw/${enc}`;
+        return [[`${b}/.devcontainer/devcontainer.json`, ".devcontainer/devcontainer.json"],
+                [`${b}/.devcontainer.json`, ".devcontainer.json"]];
+      }
+
+      // Fetch a repository's devcontainer.json bytes (verified on receipt — the
+      // κ derived from the bytes IS the config's identity, Law L5), or null when
+      // the repository declares none (→ the usable default image).
+      async function discoverDevcontainer(repoUrl, ref) {
+        for (const [url, path] of rawCandidates(repoUrl, ref)) {
+          let resp;
+          try { resp = await fetch(url); } catch { continue; }
+          if (resp.ok) {
+            const bytes = new Uint8Array(await resp.arrayBuffer());
+            return { bytes, path };
+          }
+        }
+        return null;
+      }
+
+      function repoName(repoUrl) {
+        const m = String(repoUrl).replace(/\.git$/, "").replace(/\/+$/, "").match(/([^/]+)$/);
+        return (m && m[1]) || "devcontainer";
+      }
+
+      // Launch a holospace from a repository URL — the Codespaces/Gitpod flow.
+      $("create").onclick = async () => {
+        const repo = $("hrepo").value.trim();
+        const ref = $("href").value.trim() || "main";
+        const arch = $("harch").value;
+        if (!repo) return toast("enter a repository URL");
+        $("create").disabled = true;
+        try {
+          toast("fetching " + repo + " @ " + ref + " …");
+          const found = await discoverDevcontainer(repo, ref);
+          let configBytes, configPath, usedDefault = false;
+          if (found) {
+            configBytes = found.bytes;
+            configPath = found.path;
+          } else {
+            // No devcontainer in the repo → the usable default image (the same
+            // default the host importer uses — one source of truth via wasm).
+            usedDefault = true;
+            configPath = ".devcontainer/devcontainer.json";
+            configBytes = new TextEncoder().encode(
+              JSON.stringify({ name: repoName(repo), image: default_devcontainer_image() }));
+          }
+          // (repo, reference, config, arch) is the source → the holospace's
+          // content-addressed identity (Law L1; reproducible, repo/ref/arch-distinct).
+          const k = console0.provision_repo(repo, ref, configPath, configBytes, arch, 128 * 1024 * 1024);
+          let extensions = [], image = default_devcontainer_image();
+          try {
+            const cfg = JSON.parse(new TextDecoder().decode(configBytes));
+            extensions = cfg?.customizations?.vscode?.extensions || [];
+            if (typeof cfg?.image === "string" && cfg.image) image = cfg.image;
+          } catch {}
+          meta.set(k, {
+            name: repoName(repo), repo, reference: ref, arch, image,
+            source: usedDefault ? "repo · default image" : "repo",
+            status: "stopped", extensions,
+          });
+          render();
+          toast("provisioned " + repoName(repo) + " (" + arch + ")" +
+            (usedDefault ? " · usable default image" : " · " + configPath) + " → " + k.slice(0, 22) + "…");
+        } catch (e) {
+          toast("launch failed: " + e);
+        } finally {
+          $("create").disabled = false;
+        }
+      };
+
+      // Advanced: provision directly from a pasted devcontainer.json (no repo).
+      $("createPaste").onclick = () => {
         const name = $("hname").value.trim() || "devcontainer";
         const arch = $("harch").value;
         const text = $("dcjson").value;
         const json = new TextEncoder().encode(text);
         try {
-          // The operator's architecture choice is part of the holospace identity
-          // (Law L1): the same config under two ISAs yields two distinct κ.
           const k = console0.provision_devcontainer(json, arch, 128 * 1024 * 1024);
-          // The devcontainer's declared VS Code extensions
-          // (customizations.vscode.extensions, CC-4): carried to the workbench on
-          // launch, which installs the web-capable ones from the open gallery.
           let extensions = [];
           try { extensions = JSON.parse(text)?.customizations?.vscode?.extensions || []; } catch {}
-          meta.set(k, { name, arch, source: "devcontainer", status: "stopped", extensions });
+          meta.set(k, { name, arch, source: "devcontainer (pasted)", status: "stopped", extensions });
           render();
           toast("provisioned " + name + " (" + arch + ") → " + k.slice(0, 28) + "…");
         } catch (e) {

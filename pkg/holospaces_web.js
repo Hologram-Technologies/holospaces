@@ -1,6 +1,106 @@
 /* @ts-self-types="./holospaces_web.d.ts" */
 
 /**
+ * **The browser peer's AArch64 holospace** — a real arm64 devcontainer booted on
+ * the [AArch64 core](holospaces::emulator::aarch64) (`CC-36`), its κ-disk paged
+ * from OPFS (the same substrate as the RISC-V [`Workspace`]). Complete for boot +
+ * terminal; the AArch64 core's net/9p parity (router egress, the 9p workspace) is
+ * the continued build, so this surface exposes only what the core does today —
+ * nothing it cannot fulfil.
+ */
+export class Aarch64Workspace {
+    static __wrap(ptr) {
+        const obj = Object.create(Aarch64Workspace.prototype);
+        obj.__wbg_ptr = ptr;
+        Aarch64WorkspaceFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        Aarch64WorkspaceFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_aarch64workspace_free(ptr, 0);
+    }
+    /**
+     * Boot a provisioned arm64 image, **streaming** its κ-disk from OPFS (no full
+     * image in RAM): `rootfs_handle` is the provisioned rootfs (read
+     * sector-by-sector into the OPFS-backed store on `disk_handle`). Drive with
+     * [`run`](Aarch64Workspace::run), rendering [`terminal_delta`] between chunks.
+     * @param {Uint8Array} kernel
+     * @param {FileSystemSyncAccessHandle} rootfs_handle
+     * @param {FileSystemSyncAccessHandle} disk_handle
+     * @returns {Aarch64Workspace}
+     */
+    static boot_devcontainer_opfs_streamed(kernel, rootfs_handle, disk_handle) {
+        const ptr0 = passArray8ToWasm0(kernel, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.aarch64workspace_boot_devcontainer_opfs_streamed(ptr0, len0, rootfs_handle, disk_handle);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return Aarch64Workspace.__wrap(ret[0]);
+    }
+    /**
+     * Feed keystrokes to the guest's serial console.
+     * @param {Uint8Array} bytes
+     */
+    feed_input(bytes) {
+        const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.aarch64workspace_feed_input(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * Whether the machine has powered off.
+     * @returns {boolean}
+     */
+    get halted() {
+        const ret = wasm.aarch64workspace_halted(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
+     * Run a chunk of guest execution; returns `true` once the machine halts.
+     * @param {number} budget
+     * @returns {boolean}
+     */
+    run(budget) {
+        const ret = wasm.aarch64workspace_run(this.__wbg_ptr, budget);
+        return ret !== 0;
+    }
+    /**
+     * The full console the guest has produced.
+     * @returns {string}
+     */
+    terminal() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.aarch64workspace_terminal(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * The console bytes produced since the last call (the integrated terminal
+     * streams these).
+     * @returns {Uint8Array}
+     */
+    terminal_delta() {
+        const ret = wasm.aarch64workspace_terminal_delta(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+}
+if (Symbol.dispose) Aarch64Workspace.prototype[Symbol.dispose] = Aarch64Workspace.prototype.free;
+
+/**
  * The Platform Manager console, running as a browser peer that composes the
  * substrate runtime over the interpreter `ContainerEngine`.
  */
@@ -32,6 +132,89 @@ export class Console {
             const ptr0 = passArray8ToWasm0(module, wasm.__wbindgen_malloc);
             const len0 = WASM_VECTOR_LEN;
             const ret = wasm.console_boot_userland(this.__wbg_ptr, ptr0, len0, memory_bytes);
+            var ptr2 = ret[0];
+            var len2 = ret[1];
+            if (ret[3]) {
+                ptr2 = 0; len2 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred3_0 = ptr2;
+            deferred3_1 = len2;
+            return getStringFromWasm0(ptr2, len2);
+        } finally {
+            wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+        }
+    }
+    /**
+     * Poll the in-flight content-network fetch. Returns `undefined` while it is
+     * pending (pump more frames and poll again), `null` when it completed with
+     * the content absent (no peer holds it — no forging), or the verified bytes
+     * when it resolved. The fetched bytes are also admitted to this peer's
+     * content store (a subsequent fetch of the same κ is local).
+     * @returns {any}
+     */
+    cn_fetch_poll() {
+        const ret = wasm.console_cn_fetch_poll(this.__wbg_ptr);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return takeFromExternrefTable0(ret[0]);
+    }
+    /**
+     * Begin fetching `kappa` from the peer across the transport (verify on
+     * receipt). Drive it by pumping frames and polling [`cn_fetch_poll`]; only
+     * one fetch is in flight at a time.
+     *
+     * [`cn_fetch_poll`]: Self::cn_fetch_poll
+     * @param {string} kappa
+     */
+    cn_fetch_start(kappa) {
+        const ptr0 = passStringToWasm0(kappa, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.console_cn_fetch_start(this.__wbg_ptr, ptr0, len0);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+    /**
+     * Deliver a content-network frame the transport received from the peer, and
+     * service it (answer an inbound fetch from local content, or record a
+     * response for an in-flight `cn_fetch`).
+     * @param {Uint8Array} frame
+     */
+    cn_inbound(frame) {
+        const ptr0 = passArray8ToWasm0(frame, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.console_cn_inbound(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * Drain the next content-network frame this peer wants to send over the
+     * transport, or `undefined` if none is queued.
+     * @returns {Uint8Array | undefined}
+     */
+    cn_outbound() {
+        const ret = wasm.console_cn_outbound(this.__wbg_ptr);
+        let v1;
+        if (ret[0] !== 0) {
+            v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+            wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        }
+        return v1;
+    }
+    /**
+     * Publish bytes into this peer's content store so it can serve them to other
+     * peers over the content network (`CC-38`). Returns the κ that addresses
+     * them — the handle a peer fetches by.
+     * @param {Uint8Array} bytes
+     * @returns {string}
+     */
+    cn_put(bytes) {
+        let deferred3_0;
+        let deferred3_1;
+        try {
+            const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
+            const len0 = WASM_VECTOR_LEN;
+            const ret = wasm.console_cn_put(this.__wbg_ptr, ptr0, len0);
             var ptr2 = ret[0];
             var len2 = ret[1];
             if (ret[3]) {
@@ -78,6 +261,40 @@ export class Console {
             return getStringFromWasm0(ptr3, len3);
         } finally {
             wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
+        }
+    }
+    /**
+     * Witness the **uor-native content network in the browser** — the "browser
+     * as a router" model (ADR-006; the substrate is the network). Two in-process
+     * peers are linked by a [`PacketLink`](netbare::PacketLink) pair (an
+     * in-process stand-in for a WebRTC data channel) and each wrapped in
+     * hologram's [`BareNetSync`] — the substrate's own `KappaSync` over the
+     * `NetworkInterface` HAL. Peer B fetches content it does **not** hold from
+     * peer A over the substrate frame protocol (`fetch`/`announce`/`discover`),
+     * and the bytes are **verified by re-derivation on receipt** (SPINE-4)
+     * before they are accepted — exactly as a bare-metal or std peer does it, no
+     * central operator. Returns a JSON summary (the fetched content matched, an
+     * unheld κ resolves to nothing — no forging). This exercises the real wasm
+     * peer's content-network path; the only browser-specific part still to bind
+     * is the WebRTC transport *pump* that carries a link's frames between tabs.
+     * @returns {string}
+     */
+    content_network_selftest() {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const ret = wasm.console_content_network_selftest(this.__wbg_ptr);
+            var ptr1 = ret[0];
+            var len1 = ret[1];
+            if (ret[3]) {
+                ptr1 = 0; len1 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred2_0 = ptr1;
+            deferred2_1 = len1;
+            return getStringFromWasm0(ptr1, len1);
+        } finally {
+            wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
         }
     }
     /**
@@ -154,6 +371,61 @@ export class Console {
         }
     }
     /**
+     * Provision a holospace from a **git repository reference** — the
+     * Codespaces/Gitpod launch: the operator names a repository URL + reference
+     * (not a pasted config) and holospaces runs it as a devcontainer.
+     *
+     * The repository's own `.devcontainer/devcontainer.json` is fetched by the
+     * operator's page from the repository host and **verified on receipt** (Law
+     * L5) before it crosses into the peer here as `config_json`; when the
+     * repository declares none, the page passes the **usable default** config
+     * (`buildpack-deps` — `curl`/`git` over apt; the Dev Container spec's
+     * default, `CC-20`/[`import`]) so *any* repository runs. The `(repo,
+     * reference, config, arch)` tuple is the [`Source::Devcontainer`], hence the
+     * holospace's content-addressed identity (Law L1): the same repository at
+     * the same reference under the same ISA is the **same** holospace
+     * (reproducible), and a different repository / reference / architecture is a
+     * **distinct** one. Returns the holospace identity κ.
+     *
+     * The architecture (`arch`: `"riscv64"` / `"aarch64"`) is the operator's
+     * launch-time selection and is fixed for the holospace's lifetime (ADR-021).
+     * @param {string} repo
+     * @param {string} reference
+     * @param {string} config_path
+     * @param {Uint8Array} config_json
+     * @param {string} arch
+     * @param {number} memory_bytes
+     * @returns {string}
+     */
+    provision_repo(repo, reference, config_path, config_json, arch, memory_bytes) {
+        let deferred7_0;
+        let deferred7_1;
+        try {
+            const ptr0 = passStringToWasm0(repo, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(reference, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len1 = WASM_VECTOR_LEN;
+            const ptr2 = passStringToWasm0(config_path, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len2 = WASM_VECTOR_LEN;
+            const ptr3 = passArray8ToWasm0(config_json, wasm.__wbindgen_malloc);
+            const len3 = WASM_VECTOR_LEN;
+            const ptr4 = passStringToWasm0(arch, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len4 = WASM_VECTOR_LEN;
+            const ret = wasm.console_provision_repo(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, memory_bytes);
+            var ptr6 = ret[0];
+            var len6 = ret[1];
+            if (ret[3]) {
+                ptr6 = 0; len6 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred7_0 = ptr6;
+            deferred7_1 = len6;
+            return getStringFromWasm0(ptr6, len6);
+        } finally {
+            wasm.__wbindgen_free(deferred7_0, deferred7_1, 1);
+        }
+    }
+    /**
      * Provision a holospace from a *Wasm-recompiled userland* (the execution
      * surface, the second compute form — ADR-008). The module is validated
      * against the surface contract ([`validate_userland`]) before it is
@@ -181,6 +453,50 @@ export class Console {
             return getStringFromWasm0(ptr2, len2);
         } finally {
             wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+        }
+    }
+    /**
+     * Receive content the operator's page fetched from a substrate **HTTP-CAS
+     * gateway** (`GET /cas/{κ}`, `hologram-net-http`) and admit it into this
+     * peer's store — the *receive* side of [`get_with_fetch`], realized for the
+     * browser where the async `fetch` is the page's and the verification is the
+     * peer's. The bytes are **verified by re-derivation against the requested
+     * κ** before they are admitted (Law L5): a gateway is untrusted, so content
+     * that does not re-derive to the κ the page asked for is **refused**, never
+     * stored. On success the content is cached locally (so a subsequent
+     * [`resolve`](Self::resolve) is a trusted read) and the κ is returned.
+     *
+     * This is what lets the browser peer boot a devcontainer it did **not**
+     * assemble locally: the page fetches the rootfs + kernel by κ from any
+     * hologram gateway, hands each blob here for verify-and-cache, and the
+     * content is then trustworthy substrate content — no bespoke server, no
+     * trust in the gateway (`CC-20`).
+     *
+     * [`get_with_fetch`]: hologram_substrate_core::get_with_fetch
+     * @param {Uint8Array} bytes
+     * @param {string} kappa
+     * @returns {string}
+     */
+    receive(bytes, kappa) {
+        let deferred4_0;
+        let deferred4_1;
+        try {
+            const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(kappa, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len1 = WASM_VECTOR_LEN;
+            const ret = wasm.console_receive(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+            var ptr3 = ret[0];
+            var len3 = ret[1];
+            if (ret[3]) {
+                ptr3 = 0; len3 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred4_0 = ptr3;
+            deferred4_1 = len3;
+            return getStringFromWasm0(ptr3, len3);
+        } finally {
+            wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
         }
     }
     /**
@@ -400,6 +716,139 @@ export class DevcontainerImage {
 if (Symbol.dispose) DevcontainerImage.prototype[Symbol.dispose] = DevcontainerImage.prototype.free;
 
 /**
+ * **Provision a devcontainer's real OCI image in the browser** — the deployed
+ * path that makes a launched holospace the repository's *actual* devcontainer,
+ * not a demo. The page drives it with the router as the transport: while
+ * [`is_done`](DevcontainerProvision::is_done) is false, read
+ * [`next_url`](DevcontainerProvision::next_url) /
+ * [`next_accept`](DevcontainerProvision::next_accept) /
+ * [`next_bearer`](DevcontainerProvision::next_bearer), fetch through the router
+ * extension's CORS-free `fetch`, and feed the response back with
+ * [`deliver`](DevcontainerProvision::deliver); then [`assemble`] yields the
+ * bootable rootfs. The pull is the *same* [`ImagePull`] the native importer uses
+ * and re-derives every blob (Law L5) — only the transport differs.
+ */
+export class DevcontainerProvision {
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        DevcontainerProvisionFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_devcontainerprovision_free(ptr, 0);
+    }
+    /**
+     * Ingest the fully-fetched image (re-deriving every blob — Law L5) and
+     * assemble it into a **bootable** ext4 rootfs the emulator boots over
+     * `virtio-blk`. A real OCI image carries no `/init`, so the devcontainer
+     * init for a real image ([`REAL_IMAGE_INIT`](holospaces::machine::REAL_IMAGE_INIT)
+     * — `#!/bin/sh`, the image's own coreutils) is injected, and the filesystem
+     * is sized to `disk_bytes` so the guest has room to work (`apt`, builds, the
+     * files you create). On the paged κ-disk the free space is sparse (zero
+     * sectors are not stored), so a generous size is cheap. Pass the result to
+     * [`boot_devcontainer_routed_opfs`](Workspace::boot_devcontainer_routed_opfs).
+     * @param {number} disk_bytes
+     * @returns {Uint8Array}
+     */
+    assemble(disk_bytes) {
+        const ret = wasm.devcontainerprovision_assemble(this.__wbg_ptr, disk_bytes);
+        if (ret[3]) {
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
+     * Feed the router's response to the current fetch.
+     * @param {number} status
+     * @param {string} content_type
+     * @param {Uint8Array} body
+     */
+    deliver(status, content_type, body) {
+        const ptr0 = passStringToWasm0(content_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passArray8ToWasm0(body, wasm.__wbindgen_malloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.devcontainerprovision_deliver(this.__wbg_ptr, status, ptr0, len0, ptr1, len1);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+    /**
+     * Whether every blob has been delivered and the image is ready to
+     * [`assemble`](DevcontainerProvision::assemble).
+     * @returns {boolean}
+     */
+    isDone() {
+        const ret = wasm.devcontainerprovision_isDone(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
+     * Begin provisioning `image_ref` (e.g. `mcr.microsoft.com/devcontainers/base:debian`)
+     * for `arch` (`"riscv64"` / `"aarch64"`).
+     * @param {string} image_ref
+     * @param {string} arch
+     */
+    constructor(image_ref, arch) {
+        const ptr0 = passStringToWasm0(image_ref, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(arch, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.devcontainerprovision_new(ptr0, len0, ptr1, len1);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        this.__wbg_ptr = ret[0];
+        DevcontainerProvisionFinalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+    /**
+     * The `Accept` header for the next fetch (manifests), or `undefined`.
+     * @returns {string | undefined}
+     */
+    nextAccept() {
+        const ret = wasm.devcontainerprovision_nextAccept(this.__wbg_ptr);
+        let v1;
+        if (ret[0] !== 0) {
+            v1 = getStringFromWasm0(ret[0], ret[1]).slice();
+            wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        }
+        return v1;
+    }
+    /**
+     * The bearer token for the next fetch once one is held, or `undefined`.
+     * @returns {string | undefined}
+     */
+    nextBearer() {
+        const ret = wasm.devcontainerprovision_nextBearer(this.__wbg_ptr);
+        let v1;
+        if (ret[0] !== 0) {
+            v1 = getStringFromWasm0(ret[0], ret[1]).slice();
+            wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        }
+        return v1;
+    }
+    /**
+     * The URL the page must `GET` next through the router, or `undefined` when
+     * [`is_done`](DevcontainerProvision::is_done).
+     * @returns {string | undefined}
+     */
+    nextUrl() {
+        const ret = wasm.devcontainerprovision_nextUrl(this.__wbg_ptr);
+        let v1;
+        if (ret[0] !== 0) {
+            v1 = getStringFromWasm0(ret[0], ret[1]).slice();
+            wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        }
+        return v1;
+    }
+}
+if (Symbol.dispose) DevcontainerProvision.prototype[Symbol.dispose] = DevcontainerProvision.prototype.free;
+
+/**
  * A **workspace** over a running holospace, in the browser tab — the
  * Codespaces/Gitpod experience (ADR-009; `CC-9` + `CC-11`). The operator
  * launches a holospace whose code is the system emulator; it **boots a real
@@ -529,6 +978,76 @@ export class Workspace {
         return Workspace.__wrap(ret[0]);
     }
     /**
+     * Boot a devcontainer whose guest egress is carried by an external
+     * **router** — the router extension (`CC-41`) or a node (`CC-39`) — over the
+     * egress protocol ([`ChannelEgress`](holospaces::emulator::net::ChannelEgress)).
+     * The guest comes up with DHCP and a real TCP stack; the page carries its
+     * traffic to the router by pumping the seam (drain
+     * [`egress_outbound`](Workspace::egress_outbound), feed
+     * [`egress_inbound`](Workspace::egress_inbound)), and the router opens the
+     * real sockets a tab cannot — so the guest's package managers, network
+     * config, and apps reach the internet (Codespaces parity), with no relay and
+     * no proxy. Drive with [`run`](Workspace::run), pumping the seam each tick.
+     * @param {Uint8Array} kernel
+     * @param {Uint8Array} rootfs
+     * @returns {Workspace}
+     */
+    static boot_devcontainer_routed(kernel, rootfs) {
+        const ptr0 = passArray8ToWasm0(kernel, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passArray8ToWasm0(rootfs, wasm.__wbindgen_malloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.workspace_boot_devcontainer_routed(ptr0, len0, ptr1, len1);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return Workspace.__wrap(ret[0]);
+    }
+    /**
+     * Boot like [`boot_devcontainer_routed`](Workspace::boot_devcontainer_routed),
+     * but page the guest's disk from an **OPFS-backed store** (`handle` is an
+     * OPFS `FileSystemSyncAccessHandle` the worker opened) — so the disk's
+     * sectors live off the wasm heap and a large real image boots without holding
+     * it all in RAM (the paged κ-disk; "the KappaStore IS the memory, RAM is a
+     * cache"). Egress is routed (`ChannelEgress`); drive with
+     * [`run`](Workspace::run), pumping the router seam each tick.
+     * @param {Uint8Array} kernel
+     * @param {Uint8Array} rootfs
+     * @param {FileSystemSyncAccessHandle} disk_handle
+     * @returns {Workspace}
+     */
+    static boot_devcontainer_routed_opfs(kernel, rootfs, disk_handle) {
+        const ptr0 = passArray8ToWasm0(kernel, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passArray8ToWasm0(rootfs, wasm.__wbindgen_malloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.workspace_boot_devcontainer_routed_opfs(ptr0, len0, ptr1, len1, disk_handle);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return Workspace.__wrap(ret[0]);
+    }
+    /**
+     * Boot the paged κ-disk by **streaming** the rootfs from one OPFS file into
+     * an OPFS-backed store in another — the *transient-peak-free* path: neither
+     * the full rootfs nor the assembled image is ever held in wasm RAM.
+     * `rootfs_handle` is a sync access handle on the provisioned rootfs file (read
+     * sector-by-sector); `disk_handle` is the κ-store pack. Egress is routed.
+     * @param {Uint8Array} kernel
+     * @param {FileSystemSyncAccessHandle} rootfs_handle
+     * @param {FileSystemSyncAccessHandle} disk_handle
+     * @returns {Workspace}
+     */
+    static boot_devcontainer_routed_opfs_streamed(kernel, rootfs_handle, disk_handle) {
+        const ptr0 = passArray8ToWasm0(kernel, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.workspace_boot_devcontainer_routed_opfs_streamed(ptr0, len0, rootfs_handle, disk_handle);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return Workspace.__wrap(ret[0]);
+    }
+    /**
      * The κ of every operator event published on the terminal channel so far.
      * @returns {any[]}
      */
@@ -552,6 +1071,30 @@ export class Workspace {
     dial_guest(guest_port) {
         const ret = wasm.workspace_dial_guest(this.__wbg_ptr, guest_port);
         return ret === Number.MAX_SAFE_INTEGER ? undefined : ret;
+    }
+    /**
+     * Deliver an egress frame the router returned (the host's bytes / connection
+     * events) into the guest's network. A no-op when this is not a routed boot.
+     * @param {Uint8Array} frame
+     */
+    egress_inbound(frame) {
+        const ptr0 = passArray8ToWasm0(frame, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.workspace_egress_inbound(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * Drain the next egress frame the guest produced, for the page to carry to
+     * the router. `undefined` when none is queued (or this is not a routed boot).
+     * @returns {Uint8Array | undefined}
+     */
+    egress_outbound() {
+        const ret = wasm.workspace_egress_outbound(this.__wbg_ptr);
+        let v1;
+        if (ret[0] !== 0) {
+            v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+            wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        }
+        return v1;
     }
     /**
      * Feed **raw terminal input** to the running holospace — the bytes an
@@ -967,6 +1510,27 @@ export class Workspace {
 if (Symbol.dispose) Workspace.prototype[Symbol.dispose] = Workspace.prototype.free;
 
 /**
+ * The **usable default** Dev Container base image the peer provisions when a
+ * repository declares no `devcontainer.json` (`buildpack-deps` — `curl`/`git`
+ * over apt; the Dev Container spec's default, `CC-20`). Exposed so the
+ * operator's page names the same default the host importer does — one source
+ * of truth across native and wasm ([`holospaces::DEFAULT_DEVCONTAINER_IMAGE`]).
+ * @returns {string}
+ */
+export function default_devcontainer_image() {
+    let deferred1_0;
+    let deferred1_1;
+    try {
+        const ret = wasm.default_devcontainer_image();
+        deferred1_0 = ret[0];
+        deferred1_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+    }
+}
+
+/**
  * The κ-label of bytes on the substrate's default σ-axis (blake3) — the same
  * content address every peer computes (Law L1).
  * @param {Uint8Array} bytes
@@ -1056,6 +1620,13 @@ export function verify_kappa(bytes, kappa) {
 function __wbg_get_imports() {
     const import0 = {
         __proto__: null,
+        __wbg___wbindgen_debug_string_0accd80f45e5faa2: function(arg0, arg1) {
+            const ret = debugString(arg1);
+            const ptr1 = passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len1 = WASM_VECTOR_LEN;
+            getDataViewMemory0().setInt32(arg0 + 4 * 1, len1, true);
+            getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr1, true);
+        },
         __wbg___wbindgen_throw_1506f2235d1bdba0: function(arg0, arg1) {
             throw new Error(getStringFromWasm0(arg0, arg1));
         },
@@ -1066,6 +1637,10 @@ function __wbg_get_imports() {
             const ret = arg0.data;
             return ret;
         },
+        __wbg_getSize_5db8adeff7a4553d: function() { return handleError(function (arg0) {
+            const ret = arg0.getSize();
+            return ret;
+        }, arguments); },
         __wbg_length_4a591ecaa01354d9: function(arg0) {
             const ret = arg0.length;
             return ret;
@@ -1074,16 +1649,31 @@ function __wbg_get_imports() {
             const ret = new Uint8Array(arg0);
             return ret;
         },
+        __wbg_new_ce1ab61c1c2b300d: function() {
+            const ret = new Object();
+            return ret;
+        },
         __wbg_new_d7e476b433a26bea: function() { return handleError(function (arg0, arg1) {
             const ret = new WebSocket(getStringFromWasm0(arg0, arg1));
             return ret;
         }, arguments); },
+        __wbg_new_from_slice_18fa1f71286d66b8: function(arg0, arg1) {
+            const ret = new Uint8Array(getArrayU8FromWasm0(arg0, arg1));
+            return ret;
+        },
         __wbg_prototypesetcall_3249fc62a0fafa30: function(arg0, arg1, arg2) {
             Uint8Array.prototype.set.call(getArrayU8FromWasm0(arg0, arg1), arg2);
         },
+        __wbg_read_34a0958bcc273c55: function() { return handleError(function (arg0, arg1, arg2, arg3) {
+            const ret = arg0.read(getArrayU8FromWasm0(arg1, arg2), arg3);
+            return ret;
+        }, arguments); },
         __wbg_send_4a773f523104d75e: function() { return handleError(function (arg0, arg1, arg2) {
             arg0.send(getArrayU8FromWasm0(arg1, arg2));
         }, arguments); },
+        __wbg_set_at_5b6d1bf4f66bd626: function(arg0, arg1) {
+            arg0.at = arg1;
+        },
         __wbg_set_binaryType_41994c453b95bdd2: function(arg0, arg1) {
             arg0.binaryType = __wbindgen_enum_BinaryType[arg1];
         },
@@ -1096,14 +1686,18 @@ function __wbg_get_imports() {
         __wbg_set_onopen_db452f4233e99d7d: function(arg0, arg1) {
             arg0.onopen = arg1;
         },
+        __wbg_write_948386f6a5cf303f: function() { return handleError(function (arg0, arg1, arg2, arg3) {
+            const ret = arg0.write(getArrayU8FromWasm0(arg1, arg2), arg3);
+            return ret;
+        }, arguments); },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
             // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 8, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h15352190dad911f6);
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h71bffd0d1851400e);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
             // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 8, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h15352190dad911f6_1);
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h71bffd0d1851400e_1);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
@@ -1127,22 +1721,28 @@ function __wbg_get_imports() {
     };
 }
 
-function wasm_bindgen__convert__closures_____invoke__h15352190dad911f6(arg0, arg1, arg2) {
-    wasm.wasm_bindgen__convert__closures_____invoke__h15352190dad911f6(arg0, arg1, arg2);
+function wasm_bindgen__convert__closures_____invoke__h71bffd0d1851400e(arg0, arg1, arg2) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h71bffd0d1851400e(arg0, arg1, arg2);
 }
 
-function wasm_bindgen__convert__closures_____invoke__h15352190dad911f6_1(arg0, arg1, arg2) {
-    wasm.wasm_bindgen__convert__closures_____invoke__h15352190dad911f6_1(arg0, arg1, arg2);
+function wasm_bindgen__convert__closures_____invoke__h71bffd0d1851400e_1(arg0, arg1, arg2) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h71bffd0d1851400e_1(arg0, arg1, arg2);
 }
 
 
 const __wbindgen_enum_BinaryType = ["blob", "arraybuffer"];
+const Aarch64WorkspaceFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_aarch64workspace_free(ptr, 1));
 const ConsoleFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_console_free(ptr, 1));
 const DevcontainerImageFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_devcontainerimage_free(ptr, 1));
+const DevcontainerProvisionFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_devcontainerprovision_free(ptr, 1));
 const WorkspaceFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_workspace_free(ptr, 1));
@@ -1156,6 +1756,71 @@ function addToExternrefTable0(obj) {
 const CLOSURE_DTORS = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(state => wasm.__wbindgen_destroy_closure(state.a, state.b));
+
+function debugString(val) {
+    // primitive types
+    const type = typeof val;
+    if (type == 'number' || type == 'boolean' || val == null) {
+        return  `${val}`;
+    }
+    if (type == 'string') {
+        return `"${val}"`;
+    }
+    if (type == 'symbol') {
+        const description = val.description;
+        if (description == null) {
+            return 'Symbol';
+        } else {
+            return `Symbol(${description})`;
+        }
+    }
+    if (type == 'function') {
+        const name = val.name;
+        if (typeof name == 'string' && name.length > 0) {
+            return `Function(${name})`;
+        } else {
+            return 'Function';
+        }
+    }
+    // objects
+    if (Array.isArray(val)) {
+        const length = val.length;
+        let debug = '[';
+        if (length > 0) {
+            debug += debugString(val[0]);
+        }
+        for(let i = 1; i < length; i++) {
+            debug += ', ' + debugString(val[i]);
+        }
+        debug += ']';
+        return debug;
+    }
+    // Test for built-in
+    const builtInMatches = /\[object ([^\]]+)\]/.exec(toString.call(val));
+    let className;
+    if (builtInMatches && builtInMatches.length > 1) {
+        className = builtInMatches[1];
+    } else {
+        // Failed to match the standard '[object ClassName]'
+        return toString.call(val);
+    }
+    if (className == 'Object') {
+        // we're a user defined class or Object
+        // JSON.stringify avoids problems with cycles, and is generally much
+        // easier than looping through ownProperties of `val`.
+        try {
+            return 'Object(' + JSON.stringify(val) + ')';
+        } catch (_) {
+            return 'Object';
+        }
+    }
+    // errors
+    if (val instanceof Error) {
+        return `${val.name}: ${val.message}\n${val.stack}`;
+    }
+    // TODO we could test for more things here, like `Set`s and `Map`s.
+    return className;
+}
 
 function getArrayJsValueFromWasm0(ptr, len) {
     ptr = ptr >>> 0;
