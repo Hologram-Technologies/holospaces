@@ -208,7 +208,9 @@ async function openProvisionedHandle(id) {
 
 let persisting = false;
 async function saveSnapshot() {
-  if (!ws || ws.halted || persisting) return;
+  // Snapshot/resume is a riscv64 Workspace capability; the aarch64 terminal core
+  // does not expose `suspend` yet (the continued build), so skip there.
+  if (!ws || ws.halted || persisting || typeof ws.suspend !== "function") return;
   const root = await opfsRoot();
   if (!root) return;
   persisting = true;
@@ -258,19 +260,46 @@ async function bootHolospace() {
     return;
   }
 
-  // The networked kernel (virtio-net) — used by every boot path below.
-  const kernel = await gunzip(await fetchBytes(`${base}/devcontainer-net-kernel.gz`));
   const folder = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0];
   const holoId = folder && folder.uri ? folder.uri.authority : "";
+  const query = folder && folder.uri && folder.uri.query
+    ? new URLSearchParams(folder.uri.query)
+    : new URLSearchParams();
+  // The holospace's architecture (ADR-021) selects the guest kernel + the CPU
+  // core; the per-guest egress node (CC-39), if set, rides the same folder query.
+  const arch = query.get("arch") || "riscv64";
+  const egress = query.get("egress");
+  // A real arm64 Linux for aarch64, else the networked RISC-V kernel.
+  const kernel = await gunzip(
+    await fetchBytes(
+      arch === "aarch64"
+        ? `${base}/devcontainer-arm64-kernel.gz`
+        : `${base}/devcontainer-net-kernel.gz`,
+    ),
+  );
 
-  // The Manager provisions the repository's REAL OCI image and stages the
-  // bootable rootfs in OPFS (provisioned/<id>) before opening this workbench
-  // (CC-42) — so the launched holospace is the repository's *actual* devcontainer.
-  // The per-guest egress node (CC-39), if set, is carried on the folder URI query.
-  const egress = folder && folder.uri && folder.uri.query
-    ? new URLSearchParams(folder.uri.query).get("egress")
-    : null;
-
+  if (arch === "aarch64") {
+    // aarch64 holospace: boot the provisioned arm64 image on the AArch64 core,
+    // paged from OPFS (CC-37) — a real arm64 devcontainer to a terminal. (The
+    // AArch64 core's net/9p parity is the continued build, so this path drives
+    // the terminal; the riscv64 path below adds the 9p workspace + routed egress.)
+    if (holoId) {
+      const rootfsHandle = await openProvisionedHandle(holoId);
+      if (rootfsHandle) {
+        const diskHandle = await openDiskStore(holoId);
+        if (diskHandle) {
+          ws = wasm.Aarch64Workspace.boot_devcontainer_opfs_streamed(kernel, rootfsHandle, diskHandle);
+          bridged = false;
+          out && out.appendLine("holospace: booted the provisioned arm64 image on the AArch64 core (CC-37) — paged from OPFS");
+        } else {
+          try { rootfsHandle.close(); } catch {}
+        }
+      }
+    }
+    if (!ws && out) {
+      out.appendLine("holospace: an aarch64 holospace needs a provisioned image — Enter it from the Manager (with the router)");
+    }
+  } else {
   // PREFERRED: the streaming **paged κ-disk**. Page the provisioned rootfs
   // straight from its OPFS file into an OPFS-backed κ-store, sector-by-sector —
   // neither the full image nor the assembled disk is ever held in wasm RAM
@@ -322,21 +351,26 @@ async function bootHolospace() {
         : "holospace: booted the language-server base fixture");
     }
   }
-  // Seed a welcome note into the shared workspace so the editor and the OS both
-  // see it (the editor writes by κ; the OS reads it over 9p).
-  ws.ws_write(
-    "WELCOME.md",
-    new TextEncoder().encode(
-      "# holospace\n\nThe real VS Code workbench, over the running devcontainer.\n" +
-        "This file lives on the virtio-9p workspace (CC-15) — the terminal sees it too.\n" +
-        "Open `main.rs` — language intelligence comes from a server in the OS over the substrate bridge (CC-18/CC-33).\n",
-    ),
-  );
-  // Seed a source file the language server can analyze (the editor + OS share it).
-  ws.ws_write(
-    "main.rs",
-    new TextEncoder().encode("fn greet(name) {\n  // TODO: greet\n  return greet(name)\n}\n"),
-  );
+  } // end the riscv64 boot branch
+
+  // Seed the shared workspace (the editor + the OS both see these over virtio-9p,
+  // CC-15). The aarch64 terminal path has no 9p workspace yet, so guard on the
+  // capability rather than assume it.
+  if (ws && typeof ws.ws_write === "function") {
+    ws.ws_write(
+      "WELCOME.md",
+      new TextEncoder().encode(
+        "# holospace\n\nThe real VS Code workbench, over the running devcontainer.\n" +
+          "This file lives on the virtio-9p workspace (CC-15) — the terminal sees it too.\n" +
+          "Open `main.rs` — language intelligence comes from a server in the OS over the substrate bridge (CC-18/CC-33).\n",
+      ),
+    );
+    // Seed a source file the language server can analyze (the editor + OS share it).
+    ws.ws_write(
+      "main.rs",
+      new TextEncoder().encode("fn greet(name) {\n  // TODO: greet\n  return greet(name)\n}\n"),
+    );
+  }
 }
 
 // ── FileSystemProvider over the virtio-9p workspace (CC-15) ─────────────────
@@ -345,6 +379,13 @@ const { FileType, FileSystemError, EventEmitter } = vscode;
 function nameOf(uri) {
   const p = uri.path.replace(/^\/+/, "");
   return p.replace(/^workspace\/?/, "");
+}
+
+// Whether the booted core exposes the virtio-9p workspace. The riscv64 Workspace
+// does; the aarch64 terminal core does not yet (its workspace is empty until 9p
+// parity lands) — the editor then reflects the real, empty state, never fakes it.
+function has9p() {
+  return ws && typeof ws.ws_read === "function";
 }
 
 class HolospaceFS {
@@ -361,23 +402,27 @@ class HolospaceFS {
     if (name === "") {
       return { type: FileType.Directory, ctime: 0, mtime: 0, size: 0 };
     }
+    if (!has9p()) throw FileSystemError.FileNotFound(uri);
     const bytes = ws.ws_read(name);
     if (bytes == null) throw FileSystemError.FileNotFound(uri);
     return { type: FileType.File, ctime: 0, mtime: Date.now(), size: bytes.length };
   }
   async readDirectory() {
     await readyPromise;
+    if (!has9p()) return []; // the aarch64 core has no 9p workspace yet
     const list = JSON.parse(ws.ws_list());
     return list.map((e) => [e.name, e.dir ? FileType.Directory : FileType.File]);
   }
   async readFile(uri) {
     await readyPromise;
+    if (!has9p()) throw FileSystemError.FileNotFound(uri);
     const bytes = ws.ws_read(nameOf(uri));
     if (bytes == null) throw FileSystemError.FileNotFound(uri);
     return bytes;
   }
   async writeFile(uri, content) {
     await readyPromise;
+    if (!has9p()) throw FileSystemError.NoPermissions(uri);
     ws.ws_write(nameOf(uri), content);
     this._emitter.fire([{ type: vscode.FileChangeType.Changed, uri }]);
   }
@@ -386,16 +431,19 @@ class HolospaceFS {
   // content the running OS sees over virtio-9p (one content, Law L1).
   async createDirectory(uri) {
     await readyPromise;
+    if (!has9p()) throw FileSystemError.NoPermissions(uri);
     ws.ws_mkdir(nameOf(uri));
     this._emitter.fire([{ type: vscode.FileChangeType.Created, uri }]);
   }
   async delete(uri) {
     await readyPromise;
+    if (!has9p()) throw FileSystemError.FileNotFound(uri);
     if (!ws.ws_delete(nameOf(uri))) throw FileSystemError.FileNotFound(uri);
     this._emitter.fire([{ type: vscode.FileChangeType.Deleted, uri }]);
   }
   async rename(oldUri, newUri) {
     await readyPromise;
+    if (!has9p()) throw FileSystemError.FileNotFound(oldUri);
     if (!ws.ws_rename(nameOf(oldUri), nameOf(newUri))) {
       throw FileSystemError.FileNotFound(oldUri);
     }
@@ -482,6 +530,13 @@ function findBytes(buf, needle) {
 const HDR_SEP = new TextEncoder().encode("\r\n\r\n");
 
 function startLanguageClient(context, out) {
+  // The in-OS language server is reached over the in-process loopback bridge
+  // (CC-33), a riscv64 Workspace capability; the aarch64 terminal core has no
+  // loopback yet (the continued build), so skip the language client there.
+  if (!ws || typeof ws.dial_guest !== "function") {
+    out && out.appendLine("holospace: language client skipped (no in-OS bridge on this core yet)");
+    return;
+  }
   const PORT = 7000;
   const diagnostics = vscode.languages.createDiagnosticCollection("holospace");
   context.subscriptions.push(diagnostics);
