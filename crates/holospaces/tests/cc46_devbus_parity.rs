@@ -109,10 +109,7 @@ impl Vq {
     /// Publish descriptor-chain `head` on the available ring and bump the index.
     fn publish(&mut self, cpu: &mut Cpu, head: u16) {
         let slot = self.avail_idx % (Q_SIZE as u16);
-        cpu.vv_ram_write(
-            self.avail + 4 + 2 * u64::from(slot),
-            &head.to_le_bytes(),
-        );
+        cpu.vv_ram_write(self.avail + 4 + 2 * u64::from(slot), &head.to_le_bytes());
         self.avail_idx = self.avail_idx.wrapping_add(1);
         cpu.vv_ram_write(self.avail + 2, &self.avail_idx.to_le_bytes());
     }
@@ -141,7 +138,7 @@ fn device_init(cpu: &mut Cpu, dev_base: u64) {
     cpu.vv_mmio_write(dev_base + R_STATUS, 4, 0); // reset
     cpu.vv_mmio_write(dev_base + R_STATUS, 4, 1); // ACKNOWLEDGE
     cpu.vv_mmio_write(dev_base + R_STATUS, 4, 1 | 2); // + DRIVER
-    // Accept VIRTIO_F_VERSION_1 (feature bit 32 = word 1, bit 0).
+                                                      // Accept VIRTIO_F_VERSION_1 (feature bit 32 = word 1, bit 0).
     cpu.vv_mmio_write(dev_base + R_DEVICE_FEATURES_SEL, 4, 1);
     cpu.vv_mmio_write(dev_base + R_DRIVER_FEATURES_SEL, 4, 1);
     cpu.vv_mmio_write(dev_base + R_DRIVER_FEATURES, 4, 1);
@@ -262,7 +259,11 @@ fn the_aarch64_core_mounts_a_9p_workspace_over_the_shared_devbus() {
     let dev = Cpu::vv_virtio_9p_base();
     // The transport is live and identifies as the 9P device (id 9).
     device_init(&mut cpu, dev);
-    assert_eq!(cpu.vv_mmio_read(dev + R_DEVICE_ID, 4), 9, "virtio-9p device id");
+    assert_eq!(
+        cpu.vv_mmio_read(dev + R_DEVICE_ID, 4),
+        9,
+        "virtio-9p device id"
+    );
 
     let mut vq = Vq::new(RAM_BASE + 0x0080_0000);
     vq.program(&mut cpu, dev);
@@ -275,7 +276,12 @@ fn the_aarch64_core_mounts_a_9p_workspace_over_the_shared_devbus() {
     assert_eq!(rtype(&ra), 105, "Rattach");
 
     // The OS reads the file holospaces seeded: Twalk → Tlopen → Tread.
-    let rw = p9_rpc(&mut cpu, dev, &mut vq, &p9.twalk(1, 2, "from-holospaces.txt"));
+    let rw = p9_rpc(
+        &mut cpu,
+        dev,
+        &mut vq,
+        &p9.twalk(1, 2, "from-holospaces.txt"),
+    );
     assert_eq!(rtype(&rw), 111, "Rwalk");
     let ro = p9_rpc(&mut cpu, dev, &mut vq, &p9.tlopen(2));
     assert_eq!(rtype(&ro), 13, "Rlopen");
@@ -294,7 +300,8 @@ fn the_aarch64_core_mounts_a_9p_workspace_over_the_shared_devbus() {
     let rwr = p9_rpc(&mut cpu, dev, &mut vq, &p9.twrite(2, 0, guest_bytes));
     assert_eq!(rtype(&rwr), 119, "Rwrite");
     assert_eq!(
-        cpu.workspace_file("from-holospaces.txt").map(<[u8]>::to_vec),
+        cpu.workspace_file("from-holospaces.txt")
+            .map(<[u8]>::to_vec),
         Some(guest_bytes.to_vec()),
         "the editor and the OS share the workspace file (one content, Law L1)"
     );
@@ -310,7 +317,11 @@ fn the_aarch64_core_nats_an_outbound_tcp_flow_over_the_shared_devbus() {
 
     let dev = Cpu::vv_virtio_net_base();
     device_init(&mut cpu, dev);
-    assert_eq!(cpu.vv_mmio_read(dev + R_DEVICE_ID, 4), 1, "virtio-net device id");
+    assert_eq!(
+        cpu.vv_mmio_read(dev + R_DEVICE_ID, 4),
+        1,
+        "virtio-net device id"
+    );
     // The device reports its MAC in config space (VIRTIO_NET_F_MAC).
     let mac0 = cpu.vv_mmio_read(dev + 0x100, 1);
     assert_eq!(mac0, 0x52, "virtio_net_config.mac[0]");

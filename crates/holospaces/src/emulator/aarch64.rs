@@ -3831,7 +3831,10 @@ impl Cpu {
             return super::devbus::p9_mmio_read(self.sys().virtio9p.as_ref(), pa - VIRTIO_9P_BASE);
         }
         if (VIRTIO_NET_BASE..VIRTIO_NET_END).contains(&pa) {
-            return super::devbus::net_mmio_read(self.sys().virtionet.as_ref(), pa - VIRTIO_NET_BASE);
+            return super::devbus::net_mmio_read(
+                self.sys().virtionet.as_ref(),
+                pa - VIRTIO_NET_BASE,
+            );
         }
         0
     }
