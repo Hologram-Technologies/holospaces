@@ -23,6 +23,35 @@
 #   deployment.
 #
 # Status: TARGET — not yet live. Expected RED (non-gating).
+#
+# ── Measured environment ceiling (2026-06-05, recorded, not guessed) ──────────
+# Two independent blockers were measured on the substrate as it stands; both are
+# real and both must be lifted before this target can go GREEN for real (no
+# fake-green, no narrowing — AGENTS.md).
+#
+# (A) Interpreter throughput. The riscv64 emulator core sustains ~11 Minsn/s of
+#     active compute (measured: 2.0e9 retired instructions in 180.9 s on an AMD
+#     EPYC 7763, release build; the CC-18 in-OS LSP server — a ~1 MB native
+#     static binary — boots + serves a full session in 15.4 s). The stock
+#     openvscode-server is Node.js/V8: bare Node startup alone is ~1.5e9 native
+#     instructions (~136 s in-guest at this rate); binding :8000 with the bundled
+#     server JS is conservatively ~1.5e10 (~23 min); the remote-agent handshake +
+#     a second V8 ext-host fork + JIT-activating an extension push the total to
+#     ~3e10+ (~45 min+), before browser-side drive. A headless witness cannot run
+#     that in any practical CI budget. (A lower bound: ignores I/O stalls, GC, and
+#     paging a ~120-180 MB server rootfs.)
+#
+# (B) Architecture reach. #16 mandates the stock linux-{arm64,amd64} server via
+#     the CC-37 path (no riscv64 workaround). But the CC-33 bridge (dial_guest /
+#     loopback), virtio-9p (CC-15), and virtio-net (CC-16) are riscv64-only today;
+#     the AArch64 core (Aarch64Workspace) exposes terminal I/O ONLY — no bridge to
+#     reach an in-guest server over. The mandated arm64 path therefore has no
+#     transport to the remote yet. (x64 is #12, not required here.)
+#
+# Lifting the ceiling needs EITHER a JIT/AOT fast core (so Node/V8 boots in
+# seconds, not tens of minutes) OR the bridge+9p+net ported to the AArch64 core
+# (so a stock arm64 server is reachable) — tracked, not faked. Until then this
+# stays a non-gating RED target; CC-48 is NOT flipped to live.
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
