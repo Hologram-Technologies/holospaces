@@ -1099,7 +1099,9 @@ for the ISA**, not the architecture’s answer.
 alongside RV64GC it gains a first-class **AArch64 (ARMv8-A)** target — a
 real A64 core, the EL0–EL1 exception model, VMSAv8-64 paging, and the
 ARM **virt** platform (GIC + generic timer + PSCI) — reusing the
-existing `virtio-mmio` devices, κ-disk, NAT, workbench, and bridge. An
+**shared** device bus (`emulator::devbus`) rather than a per-ISA
+reimplementation: the `virtio-mmio` κ-disk today, with the 9p workspace,
+NAT, and bridge extended to every core via `CC-46`. An
 arm64 holospace boots an `arm64` Linux + rootfs (ADR-009’s κ-addressed
 system emulator, now AArch64) and runs the ecosystem’s `linux-arm64`
 binaries directly, so the substrate-native extension host (ADR-020) and
@@ -1110,8 +1112,9 @@ image, selected at boot, validated independently. Witnessed in phases
 batteries + the qemu differential; `CC-36` the privileged model +
 VMSAv8-64 + the **virt** platform booting a real `arm64` Linux to
 userspace (qemu-system-aarch64 oracle); `CC-37` the arm64 devcontainer
-over the reused `virtio` devices, running an `arm64` toolchain (and the
-Node ext host, closing ADR-020’s frontier).
+over the shared `virtio-blk` κ-disk, running a stock `arm64` binary; the
+9p/network/bridge arch parity is `CC-46`, and the substrate-native
+extension host that closes ADR-020’s frontier is `CC-48`.
 
 **Consequences:** The ecosystem "just runs" because holospaces speaks
 its architecture — the per-`riscv64`-tool tax disappears, closed
