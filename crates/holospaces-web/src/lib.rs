@@ -191,10 +191,15 @@ impl DevcontainerProvision {
     }
 
     /// Ingest the fully-fetched image (re-deriving every blob — Law L5) and
-    /// assemble it into the bootable ext4 rootfs the emulator boots over
-    /// `virtio-blk` — pass the result to
-    /// [`boot_devcontainer_routed`](Workspace::boot_devcontainer_routed).
-    pub fn assemble(&self) -> Result<Vec<u8>, JsValue> {
+    /// assemble it into a **bootable** ext4 rootfs the emulator boots over
+    /// `virtio-blk`. A real OCI image carries no `/init`, so the devcontainer
+    /// init for a real image ([`REAL_IMAGE_INIT`](holospaces::machine::REAL_IMAGE_INIT)
+    /// — `#!/bin/sh`, the image's own coreutils) is injected, and the filesystem
+    /// is sized to `disk_bytes` so the guest has room to work (`apt`, builds, the
+    /// files you create). On the paged κ-disk the free space is sparse (zero
+    /// sectors are not stored), so a generous size is cheap. Pass the result to
+    /// [`boot_devcontainer_routed_opfs`](Workspace::boot_devcontainer_routed_opfs).
+    pub fn assemble(&self, disk_bytes: f64) -> Result<Vec<u8>, JsValue> {
         let image = self.pull.ingest(&self.store).map_err(js_err)?;
         let mut owned: Vec<(String, Vec<u8>)> = Vec::new();
         for (k, mt) in image.layers().iter().zip(image.layer_media_types()) {
@@ -214,7 +219,12 @@ impl DevcontainerProvision {
                 blob: b,
             })
             .collect();
-        assemble_ext4(&layers).map_err(js_err)
+        assemble_ext4_bootable(
+            &layers,
+            holospaces::machine::REAL_IMAGE_INIT,
+            disk_bytes as u64,
+        )
+        .map_err(js_err)
     }
 }
 

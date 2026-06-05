@@ -356,7 +356,13 @@
           prov.deliver(resp.status, resp.contentType, resp.body);
           if (++steps > 300) throw new Error("the image pull did not converge");
         }
-        const rootfs = prov.assemble();
+        // Assemble a bootable rootfs with modest room to work. NOTE: the assembled
+        // image is a dense Vec of this size in the Manager tab, so it is kept
+        // bounded (1 GiB) to avoid OOM here — the paged κ-disk stores only the
+        // non-zero sectors, but the window assembles densely. Giving a large disk
+        // without a large Vec needs the streaming sparse assembly (the documented
+        // refinement). 1 GiB gives a typical image headroom for the shell + light work.
+        const rootfs = prov.assemble(1024 * 1024 * 1024);
         const root = await navigator.storage.getDirectory();
         const dir = await root.getDirectoryHandle("provisioned", { create: true });
         const h = await dir.getFileHandle(kappa, { create: true });
