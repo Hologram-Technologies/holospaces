@@ -110,6 +110,7 @@ try {
 // assembles into the rootfs.
 globalThis.fetch = async (url) => ({
   status: 200,
+  headers: { get: (h) => (h.toLowerCase() === "content-type" ? "application/octet-stream" : null) },
   arrayBuffer: async () => new TextEncoder().encode("layer-bytes-for:" + url).buffer,
 });
 const fetchResp = await new Promise((resolve) => {
