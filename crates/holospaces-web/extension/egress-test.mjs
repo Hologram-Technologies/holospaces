@@ -34,9 +34,16 @@ globalThis.TCPSocket = class {
 
 // ── chrome.runtime.onConnectExternal mock ────────────────────────────────────
 const connectHandlers = [];
-globalThis.chrome = { runtime: { onConnectExternal: { addListener: (h) => connectHandlers.push(h) } } };
+const messageHandlers = [];
+globalThis.chrome = {
+  runtime: {
+    onConnectExternal: { addListener: (h) => connectHandlers.push(h) },
+    onMessageExternal: { addListener: (h) => messageHandlers.push(h) },
+  },
+  permissions: { request: async () => true },
+};
 
-// Load the service worker — it registers the connection handler.
+// Load the service worker — it registers the connection + message handlers.
 eval(readFileSync(path.join(dir, "background.js"), "utf8"));
 
 // ── A fake tab port; capture the frames the extension posts back ─────────────
@@ -96,5 +103,27 @@ try {
   echo.close();
 }
 
-console.log(failed ? "EXTENSION-EGRESS-TEST: FAILED" : "EXTENSION-EGRESS-TEST: PASS (the egress protocol over the Direct Sockets contract)");
+// ── Content role: CORS-free fetch (pull a repo's image layers) ───────────────
+// The router's other half: a registry/CDN fetch a tab can't do (CORS). Polyfill
+// fetch (the real one is the service worker's CORS-free fetch) and drive the
+// onMessageExternal handler — proving it returns the bytes the browser peer
+// assembles into the rootfs.
+globalThis.fetch = async (url) => ({
+  status: 200,
+  arrayBuffer: async () => new TextEncoder().encode("layer-bytes-for:" + url).buffer,
+});
+const fetchResp = await new Promise((resolve) => {
+  messageHandlers[0](
+    { type: "holospaces-fetch", url: "https://registry-1.docker.io/v2/library/debian/blobs/sha256:abc" },
+    {},
+    resolve,
+  );
+});
+check(
+  !!fetchResp && fetchResp.ok && fetchResp.status === 200 &&
+    new TextDecoder().decode(Uint8Array.from(fetchResp.body)).startsWith("layer-bytes-for:"),
+  "the router fetches CORS-blocked content (registry layers) and returns the bytes (content role)",
+);
+
+console.log(failed ? "EXTENSION-EGRESS-TEST: FAILED" : "EXTENSION-EGRESS-TEST: PASS (router: egress over Direct Sockets + content over CORS-free fetch)");
 process.exit(failed ? 1 : 0);

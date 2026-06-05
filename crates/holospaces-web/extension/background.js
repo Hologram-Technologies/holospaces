@@ -42,6 +42,37 @@ function frame(op, id, body) {
 }
 
 // A holospaces tab connected — serve its guest's egress over this port.
+// ── Content role: CORS-free fetch (pull a repo's image layers a tab can't) ───
+// The OTHER thing only an extension can do: a service worker's fetch() is exempt
+// from CORS, so it can pull the CORS-blocked registries/CDNs (Docker Hub, ghcr)
+// the page cannot — the layers the browser peer assembles into the devcontainer
+// rootfs. One-shot request/response over `onMessageExternal`. Broad host access
+// is requested at RUNTIME (optional_host_permissions) with the operator's
+// consent, so the base install stays minimal.
+chrome.runtime.onMessageExternal.addListener((msg, _sender, sendResponse) => {
+  if (!msg || msg.type !== "holospaces-fetch" || typeof msg.url !== "string") {
+    return false;
+  }
+  (async () => {
+    try {
+      // Ensure host access for this fetch (granted once, with consent).
+      if (chrome.permissions && chrome.permissions.request) {
+        await chrome.permissions.request({ origins: ["<all_urls>"] }).catch(() => {});
+      }
+      const resp = await fetch(msg.url, {
+        method: msg.method || "GET",
+        headers: msg.headers || {},
+        redirect: "follow",
+      });
+      const body = new Uint8Array(await resp.arrayBuffer());
+      sendResponse({ ok: true, status: resp.status, body: Array.from(body) });
+    } catch (e) {
+      sendResponse({ ok: false, error: String(e) });
+    }
+  })();
+  return true; // keep the message channel open for the async sendResponse
+});
+
 chrome.runtime.onConnectExternal.addListener((port) => {
   // One set of live sockets per tab connection (keyed by the guest's conn id).
   const conns = new Map(); // id -> { writer, socket }

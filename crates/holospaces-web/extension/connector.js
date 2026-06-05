@@ -20,6 +20,27 @@ export function egressExtensionAvailable() {
   return typeof chrome !== "undefined" && !!chrome.runtime && !!chrome.runtime.connect;
 }
 
+/// Fetch a URL through the router's **content role** — the extension's CORS-free
+/// `fetch()` pulls registries/CDNs the page cannot (the image layers the browser
+/// peer assembles into the devcontainer rootfs). Returns `{status, body}` (body a
+/// `Uint8Array`), or `null` if no extension is reachable / the fetch failed.
+export async function routerFetch(url, extensionId = HOLOSPACES_EGRESS_EXTENSION_ID) {
+  if (!egressExtensionAvailable() || !extensionId) return null;
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage(extensionId, { type: "holospaces-fetch", url }, (resp) => {
+        if (chrome.runtime.lastError || !resp || !resp.ok) {
+          resolve(null);
+        } else {
+          resolve({ status: resp.status, body: Uint8Array.from(resp.body) });
+        }
+      });
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
 /// Open the egress channel to the extension. Returns `{ send, onFrame, close }`:
 /// `send(frame)` posts a guest egress frame (OPEN/DATA/CLOSE), `onFrame(cb)`
 /// delivers the extension's frames (OPENED/DATA/CLOSED/FAILED), `close()` tears

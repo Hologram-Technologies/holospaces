@@ -21,6 +21,8 @@
   "externally_connectable": {
     "matches": ["https://hologram-technologies.github.io/*"]
   },
+  "_comment_optional_host": "The content role (pulling CORS-blocked registries/CDNs for the browser peer to assemble) needs host access. It is OPTIONAL — requested at runtime with the operator's consent the first time a repo is provisioned — so the base install stays minimal and reviews fast; it is NOT requested at install.",
+  "optional_host_permissions": ["*://*/*"],
   "content_scripts": [
     {
       "matches": ["https://hologram-technologies.github.io/*"],
