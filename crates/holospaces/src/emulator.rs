@@ -608,20 +608,28 @@ const DISK_SECTOR: usize = 512;
 /// sync for the emulator's hot path. The disk snapshot is the reconstructed image
 /// (content captured), so resume is faithful.
 struct KappaBacking {
-    /// The owned in-memory canonical store backing the sectors (the substrate).
-    store: MemKappaStore,
+    /// The canonical store backing the sectors (the substrate). A `Box<dyn>` so
+    /// the browser peer can plug an **OPFS-backed** store (sectors live off the
+    /// wasm heap, paged on demand — "the KappaStore IS the memory, RAM is a
+    /// cache"); the default is the owned in-memory store (native, tests).
+    store: Box<dyn KappaStore>,
     /// One entry per sector: the sector's content κ, or `None` for a sparse
     /// (never-written, all-zero) sector.
     index: Vec<Option<KappaLabel71>>,
 }
 
 impl KappaBacking {
-    /// Load a disk image into the κ-disk: each 512-byte sector is content-addressed
-    /// in the store (all-zero sectors stay sparse). The image is padded to a sector
-    /// boundary.
+    /// Load a disk image into a fresh in-memory κ-disk.
     fn from_image(image: &[u8]) -> Self {
+        Self::from_image_in(Box::new(MemKappaStore::new()), image)
+    }
+
+    /// Load a disk image into the κ-disk over a **caller-supplied store**: each
+    /// 512-byte sector is content-addressed in `store` (all-zero sectors stay
+    /// sparse), the image padded to a sector boundary. The browser peer passes an
+    /// OPFS-backed store so the disk's sectors live off the wasm heap.
+    fn from_image_in(store: Box<dyn KappaStore>, image: &[u8]) -> Self {
         let sector_count = image.len().div_ceil(DISK_SECTOR);
-        let store = MemKappaStore::new();
         let mut index = Vec::with_capacity(sector_count);
         let mut sector = [0u8; DISK_SECTOR];
         for i in 0..sector_count {
@@ -629,13 +637,13 @@ impl KappaBacking {
             let end = (start + DISK_SECTOR).min(image.len());
             sector.fill(0);
             sector[..end - start].copy_from_slice(&image[start..end]);
-            index.push(Self::store_sector(&store, &sector));
+            index.push(Self::store_sector(store.as_ref(), &sector));
         }
         KappaBacking { store, index }
     }
 
     /// Content-address a sector through the store (sparse all-zero → `None`).
-    fn store_sector(store: &MemKappaStore, sector: &[u8; DISK_SECTOR]) -> Option<KappaLabel71> {
+    fn store_sector(store: &dyn KappaStore, sector: &[u8; DISK_SECTOR]) -> Option<KappaLabel71> {
         if sector.iter().all(|&b| b == 0) {
             None
         } else {
@@ -687,7 +695,7 @@ impl KappaBacking {
             let so = pos % DISK_SECTOR;
             let n = (DISK_SECTOR - so).min(data.len() - done);
             sector[so..so + n].copy_from_slice(&data[done..done + n]);
-            self.index[si] = Self::store_sector(&self.store, &sector);
+            self.index[si] = Self::store_sector(self.store.as_ref(), &sector);
             done += n;
         }
     }
