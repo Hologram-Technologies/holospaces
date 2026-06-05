@@ -12,16 +12,25 @@
 //! over an existing peer, or relayed by any content-blind channel — never by a
 //! bespoke server.
 //!
-//! [`WebRtcLink`] is purely the **pump**: it owns an
+//! [`WebRtcLink`] is the browser surface's **transport**: it owns an
 //! [`RtcPeerConnection`](web_sys::RtcPeerConnection) and one ordered, reliable
-//! data channel, and shuttles opaque content-network frames across it. The frames
-//! are produced and consumed by a [`Console`](crate::Console)'s content peer
-//! (`cn_outbound` / `cn_inbound`) — the **same** `BareNetSync` a bare-metal peer
-//! runs (`CC-38`). The link never inspects a frame and never touches content
-//! addressing: verify-on-receipt (SPINE-4 / Law L5) happens inside the content
-//! peer, exactly as on every other surface. A forged response carried over the
-//! channel is therefore rejected on re-derivation, and a κ no peer holds resolves
-//! to nothing — the channel changes the carrier, not the law.
+//! data channel and shuttles opaque content-network frames across it
+//! ([`send`](WebRtcLink::send) / [`recv`](WebRtcLink::recv)). It is the
+//! browser-side analog of a real NIC's TX/RX: the `NetworkInterface` the
+//! uor-native `BareNetSync` actually drives is the portable
+//! [`PacketLink`](holospaces::content_net::PacketLink) inside a
+//! [`Console`](crate::Console)'s content peer — the **same** interface, with the
+//! **same** `BareNetSync`, a bare-metal peer drives (`CC-38`). The product pump
+//! [`Console::cn_pump`](crate::Console::cn_pump) couples the two — draining the
+//! link's `PacketLink` onto this channel and feeding the channel's frames back
+//! into it — so a deployed tab fetches over WebRTC entirely through the product
+//! API, with no test glue (`CC-49`).
+//!
+//! The link never inspects a frame and never touches content addressing:
+//! verify-on-receipt (SPINE-4 / Law L5) happens inside the content peer, exactly
+//! as on every other surface. A forged response carried over the channel is
+//! therefore rejected on re-derivation, and a κ no peer holds resolves to nothing
+//! — the channel changes the carrier, not the law.
 //!
 //! [`BareNetSync`]: holospaces::content_net
 
@@ -38,6 +47,11 @@ use web_sys::{
     RtcDataChannelType, RtcIceCandidate, RtcIceCandidateInit, RtcPeerConnection,
     RtcPeerConnectionIceEvent, RtcSdpType, RtcSessionDescriptionInit,
 };
+
+/// The data channel's `onmessage` callback — queues each inbound frame.
+type MessageClosure = Closure<dyn FnMut(MessageEvent)>;
+/// The data channel's `onopen` callback — marks the channel ready.
+type OpenClosure = Closure<dyn FnMut(JsValue)>;
 
 /// State the data-channel callbacks fill and the [`WebRtcLink`] drains: the
 /// frames received from the wire (queued for the content peer) and the local ICE
@@ -58,8 +72,10 @@ struct Shared {
 }
 
 /// One end of a peer-to-peer content-network transport over a real WebRTC data
-/// channel. The browser surface's *pump*: it carries a [`Console`](crate::Console)'s
-/// content-network frames to and from another browser peer, no server between.
+/// channel — the browser surface's wire. It carries a [`Console`](crate::Console)'s
+/// content-network frames to and from another browser peer (no server between);
+/// the product pump [`Console::cn_pump`](crate::Console::cn_pump) couples it to
+/// the `BareNetSync`-driven `NetworkInterface`, so a deployed tab fetches over it.
 #[wasm_bindgen]
 pub struct WebRtcLink {
     pc: RtcPeerConnection,
@@ -69,8 +85,29 @@ pub struct WebRtcLink {
     _on_datachannel: Closure<dyn FnMut(RtcDataChannelEvent)>,
     /// The message/open closures for the channel this end *created* (the offerer);
     /// the answerer's channel arrives via `ondatachannel` and wires its own.
-    _on_message: RefCell<Option<Closure<dyn FnMut(MessageEvent)>>>,
-    _on_open: RefCell<Option<Closure<dyn FnMut(JsValue)>>>,
+    _on_message: RefCell<Option<MessageClosure>>,
+    _on_open: RefCell<Option<OpenClosure>>,
+}
+
+/// Normalize a session description's line endings to CRLF, as RFC 4566 requires.
+/// An SDP carried out of band between peers — pasted into a text box, copied
+/// through the clipboard, or shuttled by a content-blind channel — routinely
+/// loses its `\r`s (browsers normalize text-area input to `\n`). `RTCPeerConnection`
+/// then rejects it ("Failed to parse SessionDescription … Invalid SDP line"), so
+/// the deployed paste-between-tabs signaling needs this hygiene at the seam. A
+/// line already ending in CRLF is left as is (we strip a stray `\r` then re-add).
+fn normalize_sdp(sdp: &str) -> String {
+    let mut out = String::with_capacity(sdp.len() + 16);
+    for line in sdp.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        // SDP terminates every line, including the last, with CRLF.
+        if line.is_empty() && out.ends_with("\r\n") {
+            continue;
+        }
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    out
 }
 
 /// Attach `onmessage` (queue inbound frames) and `onopen` (mark ready) to a data
@@ -79,10 +116,7 @@ pub struct WebRtcLink {
 fn wire_channel(
     channel: &RtcDataChannel,
     shared: &Rc<RefCell<Shared>>,
-) -> (
-    Closure<dyn FnMut(MessageEvent)>,
-    Closure<dyn FnMut(JsValue)>,
-) {
+) -> (MessageClosure, OpenClosure) {
     channel.set_binary_type(RtcDataChannelType::Arraybuffer);
 
     let s_msg = shared.clone();
@@ -151,9 +185,7 @@ impl WebRtcLink {
                 let _ = Reflect::set(
                     &obj,
                     &"sdpMLineIndex".into(),
-                    &cand
-                        .sdp_m_line_index()
-                        .map_or(JsValue::NULL, |i| JsValue::from(i)),
+                    &cand.sdp_m_line_index().map_or(JsValue::NULL, JsValue::from),
                 );
                 if let Ok(json) = js_sys::JSON::stringify(&obj) {
                     if let Some(j) = json.as_string() {
@@ -164,15 +196,14 @@ impl WebRtcLink {
         }) as Box<dyn FnMut(RtcPeerConnectionIceEvent)>);
         pc.set_onicecandidate(Some(on_ice.as_ref().unchecked_ref()));
 
-        let on_message_cell: RefCell<Option<Closure<dyn FnMut(MessageEvent)>>> = RefCell::new(None);
-        let on_open_cell: RefCell<Option<Closure<dyn FnMut(JsValue)>>> = RefCell::new(None);
+        let on_message_cell: RefCell<Option<MessageClosure>> = RefCell::new(None);
+        let on_open_cell: RefCell<Option<OpenClosure>> = RefCell::new(None);
 
         if initiator {
             // The offerer creates the (ordered, reliable) channel up front.
             let init = RtcDataChannelInit::new();
             init.set_ordered(true);
-            let channel =
-                pc.create_data_channel_with_data_channel_dict("uor-content-net", &init);
+            let channel = pc.create_data_channel_with_data_channel_dict("uor-content-net", &init);
             let (m, o) = wire_channel(&channel, &shared);
             *on_message_cell.borrow_mut() = Some(m);
             *on_open_cell.borrow_mut() = Some(o);
@@ -217,7 +248,7 @@ impl WebRtcLink {
     /// and set it local; returns the answer SDP to hand back to the peer.
     pub async fn accept_offer(&self, offer_sdp: String) -> Result<String, JsValue> {
         let remote = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
-        remote.set_sdp(&offer_sdp);
+        remote.set_sdp(&normalize_sdp(&offer_sdp));
         JsFuture::from(self.pc.set_remote_description(&remote)).await?;
 
         let answer = JsFuture::from(self.pc.create_answer()).await?;
@@ -233,7 +264,7 @@ impl WebRtcLink {
     /// (Offerer) Accept the peer's answer SDP, completing the negotiation.
     pub async fn accept_answer(&self, answer_sdp: String) -> Result<(), JsValue> {
         let remote = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
-        remote.set_sdp(&answer_sdp);
+        remote.set_sdp(&normalize_sdp(&answer_sdp));
         JsFuture::from(self.pc.set_remote_description(&remote)).await?;
         Ok(())
     }
@@ -267,10 +298,7 @@ impl WebRtcLink {
     #[must_use]
     pub fn take_ice(&self) -> Vec<JsValue> {
         let mut s = self.shared.borrow_mut();
-        s.local_ice
-            .drain(..)
-            .map(JsValue::from)
-            .collect()
+        s.local_ice.drain(..).map(JsValue::from).collect()
     }
 
     /// Whether the data channel is open and ready to carry frames.

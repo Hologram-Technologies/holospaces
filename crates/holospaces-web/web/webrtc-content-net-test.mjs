@@ -11,7 +11,12 @@
 // own content store, are connected by a real WebRTC data channel (`WebRtcLink`).
 // Signaling (the SDP offer/answer + ICE candidates) is exchanged OUT OF BAND by
 // this harness shuttling the pasted blobs between the two pages — there is no
-// signaling server, exactly as two operators pasting offers to each other. Then:
+// signaling server, exactly as two operators pasting offers to each other. The
+// content exchange itself runs through the PRODUCT pump `Console.cn_pump` (a
+// Rust/wasm method, not harness glue): it drains each peer's outbound
+// content-network frames onto the data channel and feeds the channel's inbound
+// frames back into the peer's `BareNetSync`, so this witness exercises exactly
+// the path a deployed tab uses. Then:
 //
 //   • A fetches a κ that B holds, over the data channel; the bytes are accepted
 //     ONLY after they re-derive to the requested κ (verify-on-receipt / Law L5);
@@ -110,59 +115,28 @@ async function connect(offerer, answerer) {
   return oOpen && aOpen;
 }
 
-// Pump content-network frames between a fetching page and a responding page over
-// their open data channels, polling the fetch to completion. Returns the fetched
-// bytes (as a normal array) or null (absent / rejected). The pump only shuttles
-// opaque frames; all verification happens inside each peer (verify-on-receipt).
-async function fetchOverChannel(fetcherPage, kappa) {
-  return await fetcherPage.evaluate(async (k) => {
-    const c = window.__console;
-    c.cn_fetch_start(k);
-    const deadline = Date.now() + 10000;
-    while (Date.now() < deadline) {
-      // Drain this peer's outbound content-network frames onto the data channel.
-      let f;
-      while ((f = c.cn_outbound()) !== undefined) window.__link.send(f);
-      // Deliver any frames the channel received from the peer into this peer.
-      let g;
-      while ((g = window.__link.recv()) !== undefined) c.cn_inbound(g);
-      const r = c.cn_fetch_poll();
-      if (r === undefined) { await new Promise((res) => setTimeout(res, 10)); continue; }
-      return r === null ? null : Array.from(r);
-    }
-    return null;
-  }, kappa);
-}
-
-// The responder must service inbound requests as frames arrive — run a pump on
-// the responder page in the background for the duration of a fetch. We do this by
-// pumping the responder between fetch polls from the harness side.
-async function pumpResponder(responderPage) {
-  await responderPage.evaluate(() => {
-    const c = window.__console;
-    let g;
-    while ((g = window.__link.recv()) !== undefined) c.cn_inbound(g);
-    let f;
-    while ((f = c.cn_outbound()) !== undefined) window.__link.send(f);
-  });
-}
-
-// Drive a fetch on `fetcher` for `kappa` while pumping `responder`, until done.
+// Drive a fetch on `fetcher` for `kappa` while servicing `responder`, until done.
+//
+// Both sides cross the data channel through the PRODUCT pump — `Console.cn_pump`
+// (a Rust/wasm method, not harness glue): it drains the peer's outbound
+// content-network frames onto the `WebRtcLink` and delivers the channel's inbound
+// frames into the peer, in one product call. The harness only re-polls and steps
+// the two pages; the transport wiring (cn_outbound → channel, channel →
+// cn_inbound) is the product's. So a real deployed tab uses exactly this path.
 async function drive(fetcherPage, responderPage, kappa) {
   // Start the fetch (non-blocking) and step both sides in lockstep.
   await fetcherPage.evaluate((k) => { window.__console.cn_fetch_start(k); }, kappa);
   const deadline = Date.now() + 15000;
   while (Date.now() < deadline) {
-    // Fetcher: drain outbound → channel, channel → inbound, poll.
+    // Fetcher: product pump (outbound → channel, channel → inbound), then poll.
     const r = await fetcherPage.evaluate(() => {
       const c = window.__console;
-      let f; while ((f = c.cn_outbound()) !== undefined) window.__link.send(f);
-      let g; while ((g = window.__link.recv()) !== undefined) c.cn_inbound(g);
+      c.cn_pump(window.__link); // PRODUCT transport pump (CC-49)
       const out = c.cn_fetch_poll();
       return out === undefined ? "pending" : out === null ? "null" : Array.from(out);
     });
-    // Responder: drain channel → inbound (services the request), outbound → channel.
-    await pumpResponder(responderPage);
+    // Responder: product pump services the inbound request and sends its reply.
+    await responderPage.evaluate(() => { window.__console.cn_pump(window.__link); });
     if (r === "pending") { await new Promise((res) => setTimeout(res, 10)); continue; }
     return r === "null" ? null : r;
   }

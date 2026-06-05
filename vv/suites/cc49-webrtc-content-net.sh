@@ -12,12 +12,14 @@
 #
 # Authority: the substrate's content-addressed network (BareNetSync) over the
 #   portable NetworkInterface (content_net::PacketLink / ContentPeer), carried by
-#   a real WebRTC RTCDataChannel (holospaces-web::WebRtcLink — the pump); verify-
-#   on-receipt (a forging responder rejected; an unheld κ resolves to nothing).
+#   a real WebRTC RTCDataChannel (holospaces-web::WebRtcLink) through the PRODUCT
+#   pump (Console::cn_pump) — not test glue; verify-on-receipt (a forging
+#   responder rejected; an unheld κ resolves to nothing).
 # Witness: crates/holospaces-web/web/webrtc-content-net-test.mjs — two browser
 #   contexts connect a real RTCDataChannel (out-of-band SDP/ICE signaling, no
-#   server) and one peer fetches a κ from the other, verified by re-derivation;
-#   a forging responder is rejected; an unheld κ is absent; the exchange is
+#   server) and one peer fetches a κ from the other through the product API
+#   (cn_fetch_start + cn_pump + cn_fetch_poll), verified by re-derivation; a
+#   forging responder is rejected; an unheld κ is absent; the exchange is
 #   symmetric (either direction).
 #
 # GREEN when: a browser peer fetches content-addressed bytes from another browser
@@ -30,8 +32,12 @@ WEB="$ROOT/crates/holospaces-web/web"
 if ! command -v node >/dev/null 2>&1; then echo "cc49-webrtc-content-net: SKIP — node unavailable" >&2; exit 127; fi
 if ! command -v wasm-pack >/dev/null 2>&1; then echo "cc49-webrtc-content-net: SKIP — wasm-pack unavailable" >&2; exit 127; fi
 
-# The wasm peer carrying the content-network seam + the WebRTC pump (WebRtcLink).
-if [ ! -f "$WEB/pkg/holospaces_web_bg.wasm" ] || ! grep -q "WebRtcLink" "$WEB/pkg/holospaces_web.js" 2>/dev/null; then
+# The wasm peer carrying the content-network seam, the WebRTC transport
+# (WebRtcLink), and the PRODUCT pump (Console::cn_pump). Rebuild unless both are
+# present, so the witness always runs against the product path (not test glue).
+if [ ! -f "$WEB/pkg/holospaces_web_bg.wasm" ] || \
+   ! grep -q "WebRtcLink" "$WEB/pkg/holospaces_web.js" 2>/dev/null || \
+   ! grep -q "cn_pump" "$WEB/pkg/holospaces_web.js" 2>/dev/null; then
   ( cd "$ROOT/crates/holospaces-web" && wasm-pack build --release --target web --out-dir web/pkg ) || exit 1
 fi
 # A real witness installs its prerequisites — it does not skip.

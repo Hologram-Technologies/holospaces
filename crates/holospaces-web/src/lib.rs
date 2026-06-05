@@ -134,7 +134,7 @@ pub fn default_devcontainer_image() -> String {
 /// [`next_accept`](DevcontainerProvision::next_accept) /
 /// [`next_bearer`](DevcontainerProvision::next_bearer), fetch through the router
 /// extension's CORS-free `fetch`, and feed the response back with
-/// [`deliver`](DevcontainerProvision::deliver); then [`assemble`] yields the
+/// [`deliver`](DevcontainerProvision::deliver); then `assemble` yields the
 /// bootable rootfs. The pull is the *same* [`ImagePull`] the native importer uses
 /// and re-derives every blob (Law L5) — only the transport differs.
 #[wasm_bindgen]
@@ -344,9 +344,13 @@ pub struct Console {
     /// The content store the content network (`CC-38`) serves + caches into — the
     /// κ-content this peer offers other peers and fetches from them.
     content_store: Arc<MemKappaStore>,
-    /// This peer's content-network endpoint over one transport (a WebRTC data
-    /// channel to another tab, bridged by the page's pump). Drives the uor-native
-    /// `BareNetSync` without naming the substrate sync type here.
+    /// This peer's content-network endpoint over one transport. Its
+    /// [`PacketLink`](holospaces::content_net::PacketLink) is the portable
+    /// `NetworkInterface` the uor-native `BareNetSync` drives — the SAME interface
+    /// a bare-metal peer uses (`CC-38`); the browser surface carries that link's
+    /// frames over a real WebRTC data channel ([`WebRtcLink`]) via the product
+    /// [`cn_pump`](Self::cn_pump) (`CC-49`), exactly as a NIC carries them on bare
+    /// metal. Drives `BareNetSync` without naming the substrate sync type here.
     content: ContentPeer,
     /// An in-flight content-network fetch future, polled as the transport
     /// delivers frames (the browser's sync-poll discipline — no async runtime).
@@ -466,7 +470,7 @@ impl Console {
     /// L5) before it crosses into the peer here as `config_json`; when the
     /// repository declares none, the page passes the **usable default** config
     /// (`buildpack-deps` — `curl`/`git` over apt; the Dev Container spec's
-    /// default, `CC-20`/[`import`]) so *any* repository runs. The `(repo,
+    /// default, `CC-20`/`import`) so *any* repository runs. The `(repo,
     /// reference, config, arch)` tuple is the [`Source::Devcontainer`], hence the
     /// holospace's content-addressed identity (Law L1): the same repository at
     /// the same reference under the same ISA is the **same** holospace
@@ -676,17 +680,18 @@ impl Console {
 
     /// Witness the **uor-native content network in the browser** — the "browser
     /// as a router" model (ADR-006; the substrate is the network). Two in-process
-    /// peers are linked by a [`PacketLink`](netbare::PacketLink) pair (an
-    /// in-process stand-in for a WebRTC data channel) and each wrapped in
-    /// hologram's [`BareNetSync`] — the substrate's own `KappaSync` over the
+    /// peers are linked by a [`PacketLink`](holospaces::content_net::PacketLink)
+    /// pair (an in-process stand-in for a WebRTC data channel) and each wrapped in
+    /// hologram's `BareNetSync` — the substrate's own `KappaSync` over the
     /// `NetworkInterface` HAL. Peer B fetches content it does **not** hold from
     /// peer A over the substrate frame protocol (`fetch`/`announce`/`discover`),
     /// and the bytes are **verified by re-derivation on receipt** (SPINE-4)
     /// before they are accepted — exactly as a bare-metal or std peer does it, no
     /// central operator. Returns a JSON summary (the fetched content matched, an
     /// unheld κ resolves to nothing — no forging). This exercises the real wasm
-    /// peer's content-network path; the only browser-specific part still to bind
-    /// is the WebRTC transport *pump* that carries a link's frames between tabs.
+    /// peer's content-network path against an in-process link; the live
+    /// browser-to-browser transport over a real WebRTC data channel is the product
+    /// [`cn_pump`](Self::cn_pump) (`CC-49`), witnessed across two tabs.
     pub fn content_network_selftest(&self) -> Result<String, JsValue> {
         use holospaces::content_net::{drive_fetch, peer, PacketLink};
 
@@ -715,12 +720,15 @@ impl Console {
         ))
     }
 
-    // ── Content network (CC-38) — the live transport seam ────────────────────
-    // The page's transport *pump* (a WebRTC data channel to another tab, or a
-    // test bridge) carries this peer's content-network frames: it delivers
-    // inbound frames with `cn_inbound` and drains outbound frames with
-    // `cn_outbound`. A fetch is poll-driven (`cn_fetch_start` then `cn_fetch_poll`
-    // as frames flow) — the browser's sync-poll discipline, no async runtime.
+    // ── Content network (CC-38 / CC-49) — the live transport seam ─────────────
+    // This peer's content-network frames cross a real WebRTC data channel to
+    // another browser peer ([`WebRtcLink`]): the product [`cn_pump`] drains this
+    // peer's outbound frames onto the channel and delivers the channel's inbound
+    // frames into this peer, in one product call — no test glue. A fetch is
+    // poll-driven (`cn_fetch_start` then `cn_pump` + `cn_fetch_poll` as frames
+    // flow) — the browser's sync-poll discipline, no async runtime.
+    //
+    // [`cn_pump`]: Self::cn_pump
 
     /// Publish bytes into this peer's content store so it can serve them to other
     /// peers over the content network (`CC-38`). Returns the κ that addresses
@@ -741,6 +749,47 @@ impl Console {
     /// transport, or `undefined` if none is queued.
     pub fn cn_outbound(&self) -> Option<Vec<u8>> {
         self.content.outbound()
+    }
+
+    /// **The product pump (CC-49).** Carry this peer's content-network frames
+    /// across a real WebRTC data channel ([`WebRtcLink`]) to another browser peer:
+    /// drain every frame this peer wants to transmit onto the channel
+    /// ([`WebRtcLink::send`]) and deliver every frame the channel received from the
+    /// peer into this peer ([`WebRtcLink::recv`] → [`cn_inbound`]). This is the
+    /// browser surface's transport pump for the uor-native content network — the
+    /// counterpart to a real NIC's RX/TX on bare metal — and it lives **in the
+    /// product**, not the witness: a deployed tab calls `cn_fetch_start`, then
+    /// `cn_pump(link)` + `cn_fetch_poll` as the channel signals readiness, and so
+    /// fetches a κ from a peer over WebRTC entirely through this API.
+    ///
+    /// The pump moves only opaque frames; it never inspects content or addressing.
+    /// Verify-on-receipt (SPINE-4 / Law L5) happens inside the content peer, so a
+    /// forged response carried over the channel is rejected on re-derivation and a
+    /// κ no peer holds resolves to nothing — the channel changes the carrier, not
+    /// the law. While the channel is not yet open ([`WebRtcLink::is_open`]) there
+    /// are no frames to move and this is a no-op.
+    ///
+    /// Returns the number of frames moved (outbound + inbound) — diagnostic only;
+    /// the caller re-polls regardless until the fetch settles.
+    ///
+    /// [`cn_inbound`]: Self::cn_inbound
+    pub fn cn_pump(&self, link: &WebRtcLink) -> Result<usize, JsValue> {
+        let mut moved = 0usize;
+        // TX: every frame this peer wants to send goes onto the data channel.
+        if link.is_open() {
+            while let Some(frame) = self.content.outbound() {
+                link.send(&frame)?;
+                moved += 1;
+            }
+        }
+        // RX: every frame the channel received from the peer is serviced here
+        // (answer an inbound request from local content, or record a response for
+        // an in-flight `cn_fetch` — verify-on-receipt inside the content peer).
+        while let Some(frame) = link.recv() {
+            self.content.inbound(frame);
+            moved += 1;
+        }
+        Ok(moved)
     }
 
     /// Begin fetching `kappa` from the peer across the transport (verify on
@@ -946,7 +995,7 @@ impl Workspace {
     }
 
     /// Boot a **devcontainer** workspace: the Boot Orchestrator
-    /// ([`MachineSpec`](holospaces::machine::MachineSpec)) generates the device
+    /// ([`MachineSpec`]) generates the device
     /// tree and boots `kernel` on a machine whose `virtio-blk` disk is the
     /// assembled `rootfs` (from [`DevcontainerImage::assemble`]). The guest
     /// kernel mounts the rootfs over `/dev/vda` and runs the devcontainer's real
@@ -1115,7 +1164,9 @@ impl Workspace {
     /// the router. `undefined` when none is queued (or this is not a routed boot).
     #[must_use]
     pub fn egress_outbound(&self) -> Option<Vec<u8>> {
-        self.router.as_ref().and_then(net::RouterChannel::pop_outbound)
+        self.router
+            .as_ref()
+            .and_then(net::RouterChannel::pop_outbound)
     }
 
     /// Deliver an egress frame the router returned (the host's bytes / connection
@@ -1478,7 +1529,8 @@ impl Aarch64Workspace {
     /// Boot a provisioned arm64 image, **streaming** its κ-disk from OPFS (no full
     /// image in RAM): `rootfs_handle` is the provisioned rootfs (read
     /// sector-by-sector into the OPFS-backed store on `disk_handle`). Drive with
-    /// [`run`](Aarch64Workspace::run), rendering [`terminal_delta`] between chunks.
+    /// [`run`](Aarch64Workspace::run), rendering
+    /// [`terminal_delta`](Aarch64Workspace::terminal_delta) between chunks.
     pub fn boot_devcontainer_opfs_streamed(
         kernel: &[u8],
         rootfs_handle: web_sys::FileSystemSyncAccessHandle,
