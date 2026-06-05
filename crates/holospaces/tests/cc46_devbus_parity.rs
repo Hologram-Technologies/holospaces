@@ -1,30 +1,179 @@
 //! `CC-46` — the **shared device bus** serves `virtio-9p`, `virtio-net` + the
-//! userspace NAT, and the in-process guest bridge to the **AArch64** core, at
-//! arch parity with the RISC-V machine (`CC-15`/`CC-16`/`CC-33`).
+//! userspace NAT, and the in-process guest bridge to **every** core, at arch
+//! parity with the RISC-V machine (`CC-15`/`CC-16`/`CC-33`): the **AArch64** core
+//! and the **x86-64** core both reach the one shared devbus.
 //!
 //! Law L4: the substrate's devices are *shared*, not per-ISA. The 9p/net/bridge
 //! servicing lives in the core-agnostic [`emulator::devbus`]; the only per-ISA
-//! difference is the MMIO transport (where RAM is based, and whether the PLIC or
-//! the GIC latches the IRQ). This witness drives the **AArch64** machine's own
-//! `virtio-mmio` slots — the same `phys_read`/`phys_write` device path the
-//! executing A64 CPU routes its loads and stores through — acting as the guest's
-//! `virtio` driver: it negotiates each queue, lays the split virtqueue in guest
-//! RAM, rings `QueueNotify`, and reads the device's reply.
+//! difference is the MMIO transport (where RAM is based, the MMIO window, and
+//! which interrupt controller latches the IRQ). This witness drives each
+//! machine's own `virtio-mmio` slots — the same device path the executing CPU
+//! routes its loads and stores through — acting as the guest's `virtio` driver:
+//! it negotiates each queue, lays the split virtqueue in guest RAM, rings
+//! `QueueNotify`, and reads the device's reply.
 //!
 //! The protocol authorities are the same as the RISC-V witnesses: the 9P2000.L
 //! specification (`CC-15`), the OASIS VirtIO v1.2 `virtio-net` + the `10.0.2.0/24`
 //! userspace NAT model (`CC-16`), and the in-process loopback bridge (ADR-020,
 //! `CC-33`). No per-ISA device code is exercised — the assertions pass *because*
-//! the AArch64 transport reaches the one shared devbus.
+//! each core's transport reaches the one shared devbus.
 //!
-//! Heavy paths are `#[ignore]`d (run by the `CC-46` vv suite); the device-driver
-//! parity checks are fast and run in the default test set too.
+//! The driver logic is written once against the [`Mmio`] transport trait and run
+//! against both cores; per-core entry points (`*_aarch64` / `*_x86_64`) keep the
+//! failures attributable. Device-level (no full kernel boot), like the RISC-V
+//! witnesses' fast checks; they run in the default test set.
 
-use holospaces::emulator::aarch64::Cpu;
-use holospaces::emulator::net::ChannelEgress;
+use holospaces::emulator::aarch64::Cpu as Aarch64Cpu;
+use holospaces::emulator::net::{ChannelEgress, Egress, RouterChannel};
+use holospaces::emulator::x64::Cpu as X64Cpu;
 
-// ── the ARM `virt` machine geometry the AArch64 core advertises ──────────────
-const RAM_BASE: u64 = 0x4000_0000;
+/// The per-ISA `virtio-mmio` transport a witness drives a core through — the
+/// device-driver hooks each core exposes (`vv_*`). The driver logic below is
+/// written once against this trait; the only per-ISA differences are where RAM
+/// is based and which MMIO window the `virtio` slots live in, both supplied here.
+trait Mmio {
+    fn ram_base() -> u64
+    where
+        Self: Sized;
+    fn p9_base(&self) -> u64;
+    fn net_base(&self) -> u64;
+    fn mmio_w(&mut self, pa: u64, width: usize, value: u64);
+    fn mmio_r(&mut self, pa: u64, width: usize) -> u64;
+    fn ram_w(&mut self, pa: u64, bytes: &[u8]);
+    fn ram_r(&self, pa: u64, len: usize) -> Vec<u8>;
+    // The bridge surface (CC-33), shared by both cores.
+    fn attach_net(&mut self, egress: Box<dyn Egress>);
+    fn enable_loopback(&mut self) -> bool;
+    fn dial_guest(&mut self, port: u16) -> Option<u32>;
+    fn guest_send(&mut self, id: u32, data: &[u8]);
+    fn guest_recv(&mut self, id: u32) -> Vec<u8>;
+    fn guest_is_open(&self, id: u32) -> bool;
+    fn guest_close(&mut self, id: u32);
+    fn run(&mut self, steps: u64);
+    // The workspace surface (CC-15) — the editor side holospaces observes.
+    fn attach_workspace(&mut self, seed: &[(&str, &[u8])]);
+    fn workspace_file(&self, name: &str) -> Option<Vec<u8>>;
+}
+
+impl Mmio for Aarch64Cpu {
+    fn ram_base() -> u64 {
+        0x4000_0000
+    }
+    fn p9_base(&self) -> u64 {
+        Aarch64Cpu::vv_virtio_9p_base()
+    }
+    fn net_base(&self) -> u64 {
+        Aarch64Cpu::vv_virtio_net_base()
+    }
+    fn mmio_w(&mut self, pa: u64, width: usize, value: u64) {
+        self.vv_mmio_write(pa, width, value);
+    }
+    fn mmio_r(&mut self, pa: u64, width: usize) -> u64 {
+        self.vv_mmio_read(pa, width)
+    }
+    fn ram_w(&mut self, pa: u64, bytes: &[u8]) {
+        self.vv_ram_write(pa, bytes);
+    }
+    fn ram_r(&self, pa: u64, len: usize) -> Vec<u8> {
+        self.vv_ram_read(pa, len)
+    }
+    fn attach_net(&mut self, egress: Box<dyn Egress>) {
+        Aarch64Cpu::attach_net(self, egress);
+    }
+    fn enable_loopback(&mut self) -> bool {
+        Aarch64Cpu::enable_loopback(self)
+    }
+    fn dial_guest(&mut self, port: u16) -> Option<u32> {
+        Aarch64Cpu::dial_guest(self, port)
+    }
+    fn guest_send(&mut self, id: u32, data: &[u8]) {
+        Aarch64Cpu::guest_send(self, id, data);
+    }
+    fn guest_recv(&mut self, id: u32) -> Vec<u8> {
+        Aarch64Cpu::guest_recv(self, id)
+    }
+    fn guest_is_open(&self, id: u32) -> bool {
+        Aarch64Cpu::guest_is_open(self, id)
+    }
+    fn guest_close(&mut self, id: u32) {
+        Aarch64Cpu::guest_close(self, id);
+    }
+    fn run(&mut self, steps: u64) {
+        let _ = Aarch64Cpu::run(self, steps);
+    }
+    fn attach_workspace(&mut self, seed: &[(&str, &[u8])]) {
+        Aarch64Cpu::attach_workspace(self, seed);
+    }
+    fn workspace_file(&self, name: &str) -> Option<Vec<u8>> {
+        Aarch64Cpu::workspace_file(self, name).map(<[u8]>::to_vec)
+    }
+}
+
+impl Mmio for X64Cpu {
+    fn ram_base() -> u64 {
+        0x0
+    }
+    fn p9_base(&self) -> u64 {
+        X64Cpu::vv_virtio_9p_base()
+    }
+    fn net_base(&self) -> u64 {
+        X64Cpu::vv_virtio_net_base()
+    }
+    fn mmio_w(&mut self, pa: u64, width: usize, value: u64) {
+        self.vv_mmio_write(pa, width, value);
+    }
+    fn mmio_r(&mut self, pa: u64, width: usize) -> u64 {
+        self.vv_mmio_read(pa, width)
+    }
+    fn ram_w(&mut self, pa: u64, bytes: &[u8]) {
+        self.vv_ram_write(pa, bytes);
+    }
+    fn ram_r(&self, pa: u64, len: usize) -> Vec<u8> {
+        self.vv_ram_read(pa, len)
+    }
+    fn attach_net(&mut self, egress: Box<dyn Egress>) {
+        X64Cpu::attach_net(self, egress);
+    }
+    fn enable_loopback(&mut self) -> bool {
+        X64Cpu::enable_loopback(self)
+    }
+    fn dial_guest(&mut self, port: u16) -> Option<u32> {
+        X64Cpu::dial_guest(self, port)
+    }
+    fn guest_send(&mut self, id: u32, data: &[u8]) {
+        X64Cpu::guest_send(self, id, data);
+    }
+    fn guest_recv(&mut self, id: u32) -> Vec<u8> {
+        X64Cpu::guest_recv(self, id)
+    }
+    fn guest_is_open(&self, id: u32) -> bool {
+        X64Cpu::guest_is_open(self, id)
+    }
+    fn guest_close(&mut self, id: u32) {
+        X64Cpu::guest_close(self, id);
+    }
+    fn run(&mut self, steps: u64) {
+        let _ = X64Cpu::run(self, steps);
+    }
+    fn attach_workspace(&mut self, seed: &[(&str, &[u8])]) {
+        X64Cpu::attach_workspace(self, seed);
+    }
+    fn workspace_file(&self, name: &str) -> Option<Vec<u8>> {
+        X64Cpu::workspace_file(self, name).map(<[u8]>::to_vec)
+    }
+}
+
+/// Build a fresh AArch64 machine in system mode (a minimal Linux boot context;
+/// the device-level witness drives only its `virtio-mmio` slots).
+fn aarch64() -> Aarch64Cpu {
+    Aarch64Cpu::boot_linux(128 * 1024 * 1024, &[], "console=ttyAMA0")
+}
+
+/// Build a fresh x86-64 machine with system devices wired (the boot core; the
+/// device-level witness drives only its `virtio-mmio` slots, no kernel boot).
+fn x86_64() -> X64Cpu {
+    X64Cpu::new(128 * 1024 * 1024)
+}
 
 // `virtio-mmio` register offsets (OASIS VirtIO v1.2 §4.2.2), the modern transport.
 const R_MAGIC: u64 = 0x000;
@@ -83,67 +232,67 @@ impl Vq {
 
     /// Program a device's queue registers to point at this virtqueue, and make it
     /// ready (the driver's queue-setup handshake).
-    fn program(&self, cpu: &mut Cpu, dev_base: u64) {
-        cpu.vv_mmio_write(dev_base + R_QUEUE_SEL, 4, 0);
-        cpu.vv_mmio_write(dev_base + R_QUEUE_NUM, 4, u64::from(Q_SIZE));
-        cpu.vv_mmio_write(dev_base + R_DESC_LOW, 4, self.desc & 0xffff_ffff);
-        cpu.vv_mmio_write(dev_base + R_DESC_HIGH, 4, self.desc >> 32);
-        cpu.vv_mmio_write(dev_base + R_AVAIL_LOW, 4, self.avail & 0xffff_ffff);
-        cpu.vv_mmio_write(dev_base + R_AVAIL_HIGH, 4, self.avail >> 32);
-        cpu.vv_mmio_write(dev_base + R_USED_LOW, 4, self.used & 0xffff_ffff);
-        cpu.vv_mmio_write(dev_base + R_USED_HIGH, 4, self.used >> 32);
-        cpu.vv_mmio_write(dev_base + R_QUEUE_READY, 4, 1);
+    fn program(&self, cpu: &mut dyn Mmio, dev_base: u64) {
+        cpu.mmio_w(dev_base + R_QUEUE_SEL, 4, 0);
+        cpu.mmio_w(dev_base + R_QUEUE_NUM, 4, u64::from(Q_SIZE));
+        cpu.mmio_w(dev_base + R_DESC_LOW, 4, self.desc & 0xffff_ffff);
+        cpu.mmio_w(dev_base + R_DESC_HIGH, 4, self.desc >> 32);
+        cpu.mmio_w(dev_base + R_AVAIL_LOW, 4, self.avail & 0xffff_ffff);
+        cpu.mmio_w(dev_base + R_AVAIL_HIGH, 4, self.avail >> 32);
+        cpu.mmio_w(dev_base + R_USED_LOW, 4, self.used & 0xffff_ffff);
+        cpu.mmio_w(dev_base + R_USED_HIGH, 4, self.used >> 32);
+        cpu.mmio_w(dev_base + R_QUEUE_READY, 4, 1);
     }
 
     /// Write one descriptor `i` (16 bytes: addr[8] len[4] flags[2] next[2]).
-    fn set_desc(&self, cpu: &mut Cpu, i: u16, addr: u64, len: u32, flags: u16, next: u16) {
+    fn set_desc(&self, cpu: &mut dyn Mmio, i: u16, addr: u64, len: u32, flags: u16, next: u16) {
         let d = self.desc + 16 * u64::from(i);
         let mut buf = [0u8; 16];
         buf[0..8].copy_from_slice(&addr.to_le_bytes());
         buf[8..12].copy_from_slice(&len.to_le_bytes());
         buf[12..14].copy_from_slice(&flags.to_le_bytes());
         buf[14..16].copy_from_slice(&next.to_le_bytes());
-        cpu.vv_ram_write(d, &buf);
+        cpu.ram_w(d, &buf);
     }
 
     /// Publish descriptor-chain `head` on the available ring and bump the index.
-    fn publish(&mut self, cpu: &mut Cpu, head: u16) {
+    fn publish(&mut self, cpu: &mut dyn Mmio, head: u16) {
         let slot = self.avail_idx % (Q_SIZE as u16);
-        cpu.vv_ram_write(self.avail + 4 + 2 * u64::from(slot), &head.to_le_bytes());
+        cpu.ram_w(self.avail + 4 + 2 * u64::from(slot), &head.to_le_bytes());
         self.avail_idx = self.avail_idx.wrapping_add(1);
-        cpu.vv_ram_write(self.avail + 2, &self.avail_idx.to_le_bytes());
+        cpu.ram_w(self.avail + 2, &self.avail_idx.to_le_bytes());
     }
 
     /// The device's used-ring index (how many chains it has completed).
-    fn used_idx(&self, cpu: &Cpu) -> u16 {
-        let b = cpu.vv_ram_read(self.used + 2, 2);
+    fn used_idx(&self, cpu: &dyn Mmio) -> u16 {
+        let b = cpu.ram_r(self.used + 2, 2);
         u16::from_le_bytes([b[0], b[1]])
     }
 
     /// The used-ring length the device reported for the most recent completion.
-    fn last_used_len(&self, cpu: &Cpu) -> u32 {
+    fn last_used_len(&self, cpu: &dyn Mmio) -> u32 {
         let idx = self.used_idx(cpu).wrapping_sub(1) % (Q_SIZE as u16);
         let ring = self.used + 4 + 8 * u64::from(idx);
-        let b = cpu.vv_ram_read(ring + 4, 4);
+        let b = cpu.ram_r(ring + 4, 4);
         u32::from_le_bytes([b[0], b[1], b[2], b[3]])
     }
 }
 
 /// Bring a `virtio-mmio` device through the status handshake
 /// (ACKNOWLEDGE→DRIVER→FEATURES_OK→DRIVER_OK) and accept `VIRTIO_F_VERSION_1`.
-fn device_init(cpu: &mut Cpu, dev_base: u64) {
+fn device_init(cpu: &mut dyn Mmio, dev_base: u64) {
     // The transport must be live (magic "virt", modern version).
-    assert_eq!(cpu.vv_mmio_read(dev_base + R_MAGIC, 4), 0x7472_6976);
-    assert_eq!(cpu.vv_mmio_read(dev_base + R_VERSION, 4), 2);
-    cpu.vv_mmio_write(dev_base + R_STATUS, 4, 0); // reset
-    cpu.vv_mmio_write(dev_base + R_STATUS, 4, 1); // ACKNOWLEDGE
-    cpu.vv_mmio_write(dev_base + R_STATUS, 4, 1 | 2); // + DRIVER
-                                                      // Accept VIRTIO_F_VERSION_1 (feature bit 32 = word 1, bit 0).
-    cpu.vv_mmio_write(dev_base + R_DEVICE_FEATURES_SEL, 4, 1);
-    cpu.vv_mmio_write(dev_base + R_DRIVER_FEATURES_SEL, 4, 1);
-    cpu.vv_mmio_write(dev_base + R_DRIVER_FEATURES, 4, 1);
-    cpu.vv_mmio_write(dev_base + R_STATUS, 4, 1 | 2 | 8); // + FEATURES_OK
-    cpu.vv_mmio_write(dev_base + R_STATUS, 4, 1 | 2 | 8 | 4); // + DRIVER_OK
+    assert_eq!(cpu.mmio_r(dev_base + R_MAGIC, 4), 0x7472_6976);
+    assert_eq!(cpu.mmio_r(dev_base + R_VERSION, 4), 2);
+    cpu.mmio_w(dev_base + R_STATUS, 4, 0); // reset
+    cpu.mmio_w(dev_base + R_STATUS, 4, 1); // ACKNOWLEDGE
+    cpu.mmio_w(dev_base + R_STATUS, 4, 1 | 2); // + DRIVER
+                                               // Accept VIRTIO_F_VERSION_1 (feature bit 32 = word 1, bit 0).
+    cpu.mmio_w(dev_base + R_DEVICE_FEATURES_SEL, 4, 1);
+    cpu.mmio_w(dev_base + R_DRIVER_FEATURES_SEL, 4, 1);
+    cpu.mmio_w(dev_base + R_DRIVER_FEATURES, 4, 1);
+    cpu.mmio_w(dev_base + R_STATUS, 4, 1 | 2 | 8); // + FEATURES_OK
+    cpu.mmio_w(dev_base + R_STATUS, 4, 1 | 2 | 8 | 4); // + DRIVER_OK
 }
 
 // ── a minimal 9P2000.L client (the same wire format the guest's v9fs speaks) ──
@@ -219,27 +368,27 @@ impl P9 {
     }
 }
 
-/// Submit one 9P T-message over the AArch64 `virtio-9p` queue and return the
+/// Submit one 9P T-message over a core's `virtio-9p` queue and return the
 /// device's R-message (the leading readable descriptor carries the T-message;
 /// the trailing writable descriptor receives the R-message). Drives the *real*
-/// shared devbus through the AArch64 MMIO transport.
-fn p9_rpc(cpu: &mut Cpu, dev_base: u64, vq: &mut Vq, tmsg: &[u8]) -> Vec<u8> {
+/// shared devbus through that core's MMIO transport.
+fn p9_rpc(cpu: &mut dyn Mmio, dev_base: u64, vq: &mut Vq, tmsg: &[u8]) -> Vec<u8> {
     let tbuf = vq.alloc(tmsg.len().max(8));
-    cpu.vv_ram_write(tbuf, tmsg);
+    cpu.ram_w(tbuf, tmsg);
     let rbuf = vq.alloc(8192);
     // Two-descriptor chain: [0] readable T-message → [1] writable R-message.
     vq.set_desc(cpu, 0, tbuf, tmsg.len() as u32, VIRTQ_DESC_F_NEXT, 1);
     vq.set_desc(cpu, 1, rbuf, 8192, VIRTQ_DESC_F_WRITE, 0);
     let before = vq.used_idx(cpu);
     vq.publish(cpu, 0);
-    cpu.vv_mmio_write(dev_base + R_QUEUE_NOTIFY, 4, 0);
+    cpu.mmio_w(dev_base + R_QUEUE_NOTIFY, 4, 0);
     assert_eq!(
         vq.used_idx(cpu),
         before.wrapping_add(1),
-        "the AArch64 virtio-9p device serviced the chain (used ring advanced)"
+        "the virtio-9p device serviced the chain (used ring advanced)"
     );
     let written = vq.last_used_len(cpu) as usize;
-    cpu.vv_ram_read(rbuf, written)
+    cpu.ram_r(rbuf, written)
 }
 
 /// Parse the message type byte (offset 4) of a 9P reply.
@@ -247,25 +396,21 @@ fn rtype(msg: &[u8]) -> u8 {
     msg[4]
 }
 
-/// The AArch64 core mounts a 9p workspace and the editor and the OS share files
-/// — `CC-15` parity, over the shared devbus, through the AArch64 MMIO transport.
-#[test]
-fn the_aarch64_core_mounts_a_9p_workspace_over_the_shared_devbus() {
-    let mut cpu = Cpu::boot_linux(128 * 1024 * 1024, &[], "console=ttyAMA0");
+// ── the three CC-46 device-driver checks, written once against `Mmio` ─────────
+
+/// A core mounts a 9p workspace and the editor and the OS share files — `CC-15`
+/// parity, over the shared devbus, through that core's MMIO transport.
+fn check_9p_workspace<C: Mmio>(mut cpu: C) {
     // holospaces seeds a file on the shared workspace (the editor side).
     let seeded = b"from-holospaces-9p-share-OK\n";
     cpu.attach_workspace(&[("from-holospaces.txt", seeded)]);
 
-    let dev = Cpu::vv_virtio_9p_base();
+    let dev = cpu.p9_base();
     // The transport is live and identifies as the 9P device (id 9).
     device_init(&mut cpu, dev);
-    assert_eq!(
-        cpu.vv_mmio_read(dev + R_DEVICE_ID, 4),
-        9,
-        "virtio-9p device id"
-    );
+    assert_eq!(cpu.mmio_r(dev + R_DEVICE_ID, 4), 9, "virtio-9p device id");
 
-    let mut vq = Vq::new(RAM_BASE + 0x0080_0000);
+    let mut vq = Vq::new(C::ram_base() + 0x0080_0000);
     vq.program(&mut cpu, dev);
     let mut p9 = P9::new();
 
@@ -296,47 +441,46 @@ fn the_aarch64_core_mounts_a_9p_workspace_over_the_shared_devbus() {
     );
 
     // The OS writes the file back (Twrite); the editor observes the same content.
-    let guest_bytes = b"written-by-the-aarch64-guest";
+    // The write fully covers the seeded content (a partial Twrite at offset 0
+    // would leave the file's old tail, per 9p semantics — not what we assert).
+    let guest_bytes = b"written-by-the-guest-over-9pXX";
+    assert!(
+        guest_bytes.len() >= seeded.len(),
+        "the guest write covers the seeded content"
+    );
     let rwr = p9_rpc(&mut cpu, dev, &mut vq, &p9.twrite(2, 0, guest_bytes));
     assert_eq!(rtype(&rwr), 119, "Rwrite");
     assert_eq!(
-        cpu.workspace_file("from-holospaces.txt")
-            .map(<[u8]>::to_vec),
+        cpu.workspace_file("from-holospaces.txt"),
         Some(guest_bytes.to_vec()),
         "the editor and the OS share the workspace file (one content, Law L1)"
     );
 }
 
-/// The AArch64 core completes an outbound TCP flow through the userspace NAT —
-/// `CC-16` parity, over the shared devbus, through the AArch64 MMIO transport.
-#[test]
-fn the_aarch64_core_nats_an_outbound_tcp_flow_over_the_shared_devbus() {
-    let mut cpu = Cpu::boot_linux(128 * 1024 * 1024, &[], "console=ttyAMA0 ip=dhcp");
-    let (egress, router) = ChannelEgress::new();
+/// A core completes an outbound TCP flow through the userspace NAT — `CC-16`
+/// parity, over the shared devbus, through that core's MMIO transport.
+fn check_nat_outbound<C: Mmio>(mut cpu: C) {
+    let (egress, router): (ChannelEgress, RouterChannel) = ChannelEgress::new();
     cpu.attach_net(Box::new(egress));
 
-    let dev = Cpu::vv_virtio_net_base();
+    let dev = cpu.net_base();
     device_init(&mut cpu, dev);
-    assert_eq!(
-        cpu.vv_mmio_read(dev + R_DEVICE_ID, 4),
-        1,
-        "virtio-net device id"
-    );
+    assert_eq!(cpu.mmio_r(dev + R_DEVICE_ID, 4), 1, "virtio-net device id");
     // The device reports its MAC in config space (VIRTIO_NET_F_MAC).
-    let mac0 = cpu.vv_mmio_read(dev + 0x100, 1);
+    let mac0 = cpu.mmio_r(dev + 0x100, 1);
     assert_eq!(mac0, 0x52, "virtio_net_config.mac[0]");
 
     // Set up the transmit queue (index 1).
-    let mut tx = Vq::new(RAM_BASE + 0x0080_0000);
-    cpu.vv_mmio_write(dev + R_QUEUE_SEL, 4, 1);
-    cpu.vv_mmio_write(dev + R_QUEUE_NUM, 4, u64::from(Q_SIZE));
-    cpu.vv_mmio_write(dev + R_DESC_LOW, 4, tx.desc & 0xffff_ffff);
-    cpu.vv_mmio_write(dev + R_DESC_HIGH, 4, tx.desc >> 32);
-    cpu.vv_mmio_write(dev + R_AVAIL_LOW, 4, tx.avail & 0xffff_ffff);
-    cpu.vv_mmio_write(dev + R_AVAIL_HIGH, 4, tx.avail >> 32);
-    cpu.vv_mmio_write(dev + R_USED_LOW, 4, tx.used & 0xffff_ffff);
-    cpu.vv_mmio_write(dev + R_USED_HIGH, 4, tx.used >> 32);
-    cpu.vv_mmio_write(dev + R_QUEUE_READY, 4, 1);
+    let mut tx = Vq::new(C::ram_base() + 0x0080_0000);
+    cpu.mmio_w(dev + R_QUEUE_SEL, 4, 1);
+    cpu.mmio_w(dev + R_QUEUE_NUM, 4, u64::from(Q_SIZE));
+    cpu.mmio_w(dev + R_DESC_LOW, 4, tx.desc & 0xffff_ffff);
+    cpu.mmio_w(dev + R_DESC_HIGH, 4, tx.desc >> 32);
+    cpu.mmio_w(dev + R_AVAIL_LOW, 4, tx.avail & 0xffff_ffff);
+    cpu.mmio_w(dev + R_AVAIL_HIGH, 4, tx.avail >> 32);
+    cpu.mmio_w(dev + R_USED_LOW, 4, tx.used & 0xffff_ffff);
+    cpu.mmio_w(dev + R_USED_HIGH, 4, tx.used >> 32);
+    cpu.mmio_w(dev + R_QUEUE_READY, 4, 1);
 
     // Build a guest TCP SYN to 93.184.216.34:80 (an external host) — a real
     // Ethernet + IPv4 + TCP frame, prefixed with the 12-byte virtio_net_hdr.
@@ -345,10 +489,10 @@ fn the_aarch64_core_nats_an_outbound_tcp_flow_over_the_shared_devbus() {
     let mut buf = vec![0u8; 12]; // virtio_net_hdr_v1 (zeroed)
     buf.extend_from_slice(&frame);
     let fbuf = tx.alloc(buf.len());
-    cpu.vv_ram_write(fbuf, &buf);
+    cpu.ram_w(fbuf, &buf);
     tx.set_desc(&mut cpu, 0, fbuf, buf.len() as u32, 0, 0);
     tx.publish(&mut cpu, 0);
-    cpu.vv_mmio_write(dev + R_QUEUE_NOTIFY, 4, 1); // notify the TX queue
+    cpu.mmio_w(dev + R_QUEUE_NOTIFY, 4, 1); // notify the TX queue
 
     // The NAT terminated the guest's link layer and opened an outbound
     // connection toward the external host over the egress — observable as the
@@ -359,18 +503,16 @@ fn the_aarch64_core_nats_an_outbound_tcp_flow_over_the_shared_devbus() {
         .find(|f| f.len() >= 11 && f[0] == 0x01 && f[5..9] == dst_ip);
     assert!(
         opened.is_some(),
-        "the AArch64 guest's TCP SYN drove an outbound NAT connection to {dst_ip:?} \
+        "the guest's TCP SYN drove an outbound NAT connection to {dst_ip:?} \
          (CC-16 parity); egress frames: {frames:?}"
     );
 }
 
-/// The AArch64 core exposes the in-process guest bridge — `CC-33` parity. The
-/// bridge (dial/send/recv/close) is the core-agnostic loopback surface over the
-/// shared NAT; here it is enabled on the AArch64 net device and a dial opens an
-/// in-process ingress connection toward a guest listener.
-#[test]
-fn the_aarch64_core_exposes_the_in_process_guest_bridge() {
-    let mut cpu = Cpu::boot_linux(128 * 1024 * 1024, &[], "console=ttyAMA0");
+/// A core exposes the in-process guest bridge — `CC-33` parity. The bridge
+/// (dial/send/recv/close) is the core-agnostic loopback surface over the shared
+/// NAT; here it is enabled on the core's net device and a dial opens an in-process
+/// ingress connection toward a guest listener.
+fn check_guest_bridge<C: Mmio>(mut cpu: C) {
     // The bridge requires a network device (it shares the NAT's ingress path).
     assert!(
         !cpu.enable_loopback(),
@@ -380,7 +522,7 @@ fn the_aarch64_core_exposes_the_in_process_guest_bridge() {
     cpu.attach_net(Box::new(egress));
     assert!(
         cpu.enable_loopback(),
-        "the AArch64 net device exposes the in-process loopback bridge (CC-33 parity)"
+        "the net device exposes the in-process loopback bridge (CC-33 parity)"
     );
 
     // The workbench dials a guest listener; the bridge issues a connection id and
@@ -395,9 +537,43 @@ fn the_aarch64_core_exposes_the_in_process_guest_bridge() {
     );
     // Pumping the machine advances the NAT's ingress toward the guest; the host
     // side stays usable and drains cleanly on close (no relay, no socket).
-    let _ = cpu.run(2000);
+    cpu.run(2000);
     let _ = cpu.guest_recv(id);
     cpu.guest_close(id);
+}
+
+// ── AArch64 entry points (CC-15/CC-16/CC-33 parity, over the shared devbus) ───
+
+#[test]
+fn the_aarch64_core_mounts_a_9p_workspace_over_the_shared_devbus() {
+    check_9p_workspace(aarch64());
+}
+
+#[test]
+fn the_aarch64_core_nats_an_outbound_tcp_flow_over_the_shared_devbus() {
+    check_nat_outbound(aarch64());
+}
+
+#[test]
+fn the_aarch64_core_exposes_the_in_process_guest_bridge() {
+    check_guest_bridge(aarch64());
+}
+
+// ── x86-64 entry points — the same three assertions, on the third ISA core ────
+
+#[test]
+fn the_x86_64_core_mounts_a_9p_workspace_over_the_shared_devbus() {
+    check_9p_workspace(x86_64());
+}
+
+#[test]
+fn the_x86_64_core_nats_an_outbound_tcp_flow_over_the_shared_devbus() {
+    check_nat_outbound(x86_64());
+}
+
+#[test]
+fn the_x86_64_core_exposes_the_in_process_guest_bridge() {
+    check_guest_bridge(x86_64());
 }
 
 // ── a hand-built Ethernet + IPv4 + TCP SYN frame (the differential oracle is
