@@ -1695,15 +1695,20 @@ impl Workspace {
 
 /// **The browser peer's AArch64 holospace** — a real arm64 devcontainer booted on
 /// the [AArch64 core](holospaces::emulator::aarch64) (`CC-36`), its κ-disk paged
-/// from OPFS (the same substrate as the RISC-V [`Workspace`]). Complete for boot +
-/// terminal; the AArch64 core's net/9p parity (router egress, the 9p workspace) is
-/// the continued build, so this surface exposes only what the core does today —
-/// nothing it cannot fulfil.
+/// from OPFS (the same substrate as the RISC-V [`Workspace`]). The AArch64 core
+/// reaches the **shared** `emulator::devbus` for the 9p workspace, the network
+/// (router egress), and the in-process guest bridge (`CC-46`) — the same device
+/// surface the RISC-V [`Workspace`] exposes, here over the GIC transport.
 #[wasm_bindgen]
 pub struct Aarch64Workspace {
     cpu: aarch64::Cpu,
     halted: bool,
     console_cursor: usize,
+    /// The router seam, present when the guest's egress is carried by an external
+    /// router (the extension / a node) over the egress protocol (`CC-46` net
+    /// parity). The page pumps it via [`egress_outbound`](Aarch64Workspace::egress_outbound)
+    /// / [`egress_inbound`](Aarch64Workspace::egress_inbound).
+    router: Option<net::RouterChannel>,
 }
 
 #[wasm_bindgen]
@@ -1738,6 +1743,51 @@ impl Aarch64Workspace {
             cpu,
             halted: false,
             console_cursor: 0,
+            router: None,
+        })
+    }
+
+    /// Boot like [`boot_devcontainer_opfs_streamed`](Aarch64Workspace::boot_devcontainer_opfs_streamed),
+    /// additionally attaching the **shared workspace filesystem** (`virtio-9p`,
+    /// `CC-15`/`CC-46`), a **router-backed network** (`virtio-net` + the userspace
+    /// NAT, carried over the egress protocol — `CC-16`/`CC-46`), and the
+    /// **in-process guest bridge** (`CC-33`/`CC-46`). The editor shares files with
+    /// the OS ([`workspace_file`](Aarch64Workspace::workspace_file)/[`workspace_write`](Aarch64Workspace::workspace_write)),
+    /// the page carries the guest's egress to the router, and the workbench can
+    /// [`dial_guest`](Aarch64Workspace::dial_guest) a server inside the
+    /// devcontainer — the full shared-devbus surface the RISC-V workspace exposes.
+    pub fn boot_devcontainer_opfs_full(
+        kernel: &[u8],
+        rootfs_handle: web_sys::FileSystemSyncAccessHandle,
+        disk_handle: web_sys::FileSystemSyncAccessHandle,
+    ) -> Result<Aarch64Workspace, JsValue> {
+        let store = Box::new(opfs_store::OpfsKappaStore::new(disk_handle));
+        let total = rootfs_handle.get_size().map_err(js_err)? as u64;
+        let sector_count = total.div_ceil(512);
+        let read = move |i: u64, buf: &mut [u8]| {
+            let opts = web_sys::FileSystemReadWriteOptions::new();
+            opts.set_at((i * 512) as f64);
+            let _ = rootfs_handle.read_with_u8_array_and_options(buf, &opts);
+        };
+        let mut cpu = aarch64::Cpu::boot_linux_disk_streamed(
+            512 * 1024 * 1024,
+            kernel,
+            "console=ttyAMA0 root=/dev/vda rw init=/init ip=dhcp",
+            store,
+            sector_count,
+            read,
+        );
+        // Seed the shared workspace, attach the router-backed network, and enable
+        // the in-process bridge — all serviced by the shared devbus over the GIC.
+        cpu.attach_workspace(&[]);
+        let (egress, router) = net::ChannelEgress::new();
+        cpu.attach_net(Box::new(egress));
+        cpu.enable_loopback();
+        Ok(Aarch64Workspace {
+            cpu,
+            halted: false,
+            console_cursor: 0,
+            router: Some(router),
         })
     }
 
@@ -1778,5 +1828,63 @@ impl Aarch64Workspace {
     #[must_use]
     pub fn halted(&self) -> bool {
         self.halted
+    }
+
+    // ── the shared-devbus surface (CC-46): 9p workspace, net, bridge ─────────
+
+    /// Drain the next egress frame the guest produced, for the page to carry to
+    /// the router (`CC-46` net parity). `undefined` when none is queued (or this
+    /// is not a `*_full` boot).
+    #[must_use]
+    pub fn egress_outbound(&self) -> Option<Vec<u8>> {
+        self.router.as_ref().and_then(net::RouterChannel::pop_outbound)
+    }
+
+    /// Deliver an egress frame the router returned into the guest's network. A
+    /// no-op when this is not a `*_full` boot.
+    pub fn egress_inbound(&self, frame: &[u8]) {
+        if let Some(r) = &self.router {
+            r.feed_inbound(frame);
+        }
+    }
+
+    /// Read a file from the shared workspace — how the editor observes the OS's
+    /// edits over `virtio-9p` (`CC-15`/`CC-46`). `undefined` if absent / no 9p.
+    #[must_use]
+    pub fn workspace_file(&self, name: &str) -> Option<Vec<u8>> {
+        self.cpu.workspace_file(name).map(<[u8]>::to_vec)
+    }
+
+    /// Write a file into the shared workspace — the editor saving content the OS
+    /// reads over `virtio-9p` (one content, Law L1; `CC-15`/`CC-46`).
+    pub fn workspace_write(&mut self, name: &str, data: &[u8]) {
+        self.cpu.workspace_write(name, data);
+    }
+
+    /// Dial an in-process connection to a server inside the devcontainer over the
+    /// loopback bridge (`CC-33`/`CC-46`). `None` if not a `*_full` boot.
+    pub fn dial_guest(&mut self, guest_port: u16) -> Option<u32> {
+        self.cpu.dial_guest(guest_port)
+    }
+
+    /// Write bytes toward the guest server on a loopback connection (`CC-33`).
+    pub fn guest_send(&mut self, id: u32, data: &[u8]) {
+        self.cpu.guest_send(id, data);
+    }
+
+    /// Drain the guest server's reply bytes on a loopback connection (`CC-33`).
+    pub fn guest_recv(&mut self, id: u32) -> Vec<u8> {
+        self.cpu.guest_recv(id)
+    }
+
+    /// Close the host side of a loopback connection (`CC-33`).
+    pub fn guest_close(&mut self, id: u32) {
+        self.cpu.guest_close(id);
+    }
+
+    /// Whether a loopback connection is still usable (`CC-33`).
+    #[must_use]
+    pub fn guest_is_open(&self, id: u32) -> bool {
+        self.cpu.guest_is_open(id)
     }
 }
