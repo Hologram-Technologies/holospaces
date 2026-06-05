@@ -1,0 +1,288 @@
+<!-- Copyright (C) Microsoft Corporation. All rights reserved. -->
+<!DOCTYPE html>
+<html>
+	<head>
+		<script>
+			performance.mark('code/didStartRenderer');
+		</script>
+		<meta charset="utf-8" />
+
+		<!-- Mobile tweaks -->
+		<meta name="mobile-web-app-capable" content="yes" />
+		<meta name="apple-mobile-web-app-capable" content="yes" />
+		<meta name="apple-mobile-web-app-title" content="Code">
+		<link rel="apple-touch-icon" href="./workbench/resources/server/code-192.png" />
+
+		<!-- Disable pinch zooming -->
+		<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no">
+
+		<!-- Workbench Configuration -->
+		<meta id="vscode-workbench-web-configuration" data-settings="{}">
+<script>(function(){var loc=window.location;var dir=loc.pathname.replace(/\/[^/]*$/,"");var declared=[];var sp=new URLSearchParams(loc.search);var q=sp.get("ext");if(q){declared=declared.concat(q.split(",").filter(Boolean));}var id=sp.get("id")||"";var eg=sp.get("egress")||"";var arch=sp.get("arch")||"riscv64";var fq="arch="+encodeURIComponent(arch)+(eg?("&egress="+encodeURIComponent(eg)):"");var gallery=declared.map(function(id){return {id:id};});var cfg={folderUri:{"$mid":1,scheme:"holospace",authority:id,path:"/workspace",query:fq},additionalBuiltinExtensions:[{scheme:loc.protocol.replace(":",""),authority:loc.host,path:dir+"/ext/holospace-fs"}].concat(gallery),productConfiguration:{nameShort:"holospaces VS Code",nameLong:"holospaces VS Code",applicationName:"code-web",version:"1.91.1",extensionsGallery:{serviceUrl:"https://open-vsx.org/vscode/gallery",itemUrl:"https://open-vsx.org/vscode/item",resourceUrlTemplate:"https://open-vsx.org/vscode/unpkg/{publisher}/{name}/{version}/{path}"}}};document.getElementById("vscode-workbench-web-configuration").setAttribute("data-settings",JSON.stringify(cfg));})();</script>
+
+		<!-- Workbench Auth Session -->
+		<meta id="vscode-workbench-auth-session" data-settings="">
+
+		<!-- Workbench Icon/Manifest/CSS -->
+		<link rel="icon" href="./workbench/resources/server/favicon.ico" type="image/x-icon" />
+		<link rel="manifest" href="./workbench/resources/server/manifest.json" crossorigin="use-credentials" />
+		<link data-name="vs/workbench/workbench.web.main" rel="stylesheet" href="./workbench/out/vs/workbench/workbench.web.main.css">
+
+	</head>
+
+	<body aria-label="">
+	</body>
+
+	<!-- Startup (do not modify order of script tags!) -->
+	<script src="./workbench/out/vs/loader.js"></script>
+	<script src="./workbench/out/vs/webPackagePaths.js"></script>
+	<script>
+		const baseUrl = new URL('./workbench', window.location.href).toString();
+		Object.keys(self.webPackagePaths).map(function (key, index) {
+			self.webPackagePaths[key] = `${baseUrl}/node_modules/${key}/${self.webPackagePaths[key]}`;
+		});
+
+		// Set up nls if the user is not using the default language (English)
+		const nlsConfig = {};
+		// Normalize locale to lowercase because translationServiceUrl is case-sensitive.
+		// ref: https://github.com/microsoft/vscode/issues/187795
+		const locale = localStorage.getItem('vscode.nls.locale') || navigator.language.toLowerCase();
+		if (!locale.startsWith('en')) {
+			nlsConfig['vs/nls'] = {
+				availableLanguages: {
+					'*': locale
+				},
+				translationServiceUrl: ''
+			};
+		}
+
+		require.config({
+			baseUrl: `${baseUrl}/out`,
+			recordStats: true,
+			trustedTypesPolicy: window.trustedTypes?.createPolicy('amdLoader', {
+				createScriptURL(value) {
+					if(value.startsWith(window.location.origin)) {
+						return value;
+					}
+					throw new Error(`Invalid script url: ${value}`)
+				}
+			}),
+			paths: self.webPackagePaths,
+			...nlsConfig
+		});
+	</script>
+	<script>
+		performance.mark('code/willLoadWorkbenchMain');
+	</script>
+	<script src="./workbench/out/vs/workbench/workbench.web.main.nls.js"></script>
+	<script src="./workbench/out/vs/workbench/workbench.web.main.js"></script>
+	<script>define("vscode-web-browser-main", ["require", "exports", "vs/workbench/workbench.web.main"], function (require, exports, workbench_api_1) {
+    "use strict";
+    Object.defineProperty(exports, "__esModule", { value: true });
+    class WorkspaceProvider {
+        workspace;
+        payload;
+        static QUERY_PARAM_EMPTY_WINDOW = 'ew';
+        static QUERY_PARAM_FOLDER = 'folder';
+        static QUERY_PARAM_WORKSPACE = 'workspace';
+        static QUERY_PARAM_PAYLOAD = 'payload';
+        static create(config) {
+            let foundWorkspace = false;
+            let workspace;
+            let payload = Object.create(null);
+            const query = new URL(document.location.href).searchParams;
+            query.forEach((value, key) => {
+                switch (key) {
+                    case WorkspaceProvider.QUERY_PARAM_FOLDER:
+                        workspace = { folderUri: workbench_api_1.URI.parse(value) };
+                        foundWorkspace = true;
+                        break;
+                    case WorkspaceProvider.QUERY_PARAM_WORKSPACE:
+                        workspace = { workspaceUri: workbench_api_1.URI.parse(value) };
+                        foundWorkspace = true;
+                        break;
+                    case WorkspaceProvider.QUERY_PARAM_EMPTY_WINDOW:
+                        workspace = undefined;
+                        foundWorkspace = true;
+                        break;
+                    case WorkspaceProvider.QUERY_PARAM_PAYLOAD:
+                        try {
+                            payload = JSON.parse(value);
+                        }
+                        catch (error) {
+                            console.error(error);
+                        }
+                        break;
+                }
+            });
+            if (!foundWorkspace) {
+                if (config.folderUri) {
+                    workspace = { folderUri: workbench_api_1.URI.revive(config.folderUri) };
+                }
+                else if (config.workspaceUri) {
+                    workspace = { workspaceUri: workbench_api_1.URI.revive(config.workspaceUri) };
+                }
+            }
+            return new WorkspaceProvider(workspace, payload);
+        }
+        trusted = true;
+        constructor(workspace, payload) {
+            this.workspace = workspace;
+            this.payload = payload;
+        }
+        async open(workspace, options) {
+            if (options?.reuse && !options.payload && this.isSame(this.workspace, workspace)) {
+                return true;
+            }
+            const targetHref = this.createTargetUrl(workspace, options);
+            if (targetHref) {
+                if (options?.reuse) {
+                    window.location.href = targetHref;
+                    return true;
+                }
+                else {
+                    return !!window.open(targetHref);
+                }
+            }
+            return false;
+        }
+        createTargetUrl(workspace, options) {
+            let targetHref = undefined;
+            if (!workspace) {
+                targetHref = `${document.location.origin}${document.location.pathname}?${WorkspaceProvider.QUERY_PARAM_EMPTY_WINDOW}=true`;
+            }
+            else if ('folderUri' in workspace) {
+                const queryParamFolder = encodeURIComponent(workspace.folderUri.toString(true));
+                targetHref = `${document.location.origin}${document.location.pathname}?${WorkspaceProvider.QUERY_PARAM_FOLDER}=${queryParamFolder}`;
+            }
+            else if ('workspaceUri' in workspace) {
+                const queryParamWorkspace = encodeURIComponent(workspace.workspaceUri.toString(true));
+                targetHref = `${document.location.origin}${document.location.pathname}?${WorkspaceProvider.QUERY_PARAM_WORKSPACE}=${queryParamWorkspace}`;
+            }
+            if (options?.payload) {
+                targetHref += `&${WorkspaceProvider.QUERY_PARAM_PAYLOAD}=${encodeURIComponent(JSON.stringify(options.payload))}`;
+            }
+            return targetHref;
+        }
+        isSame(workspaceA, workspaceB) {
+            if (!workspaceA || !workspaceB) {
+                return workspaceA === workspaceB;
+            }
+            if ('folderUri' in workspaceA && 'folderUri' in workspaceB) {
+                return this.isEqualURI(workspaceA.folderUri, workspaceB.folderUri);
+            }
+            if ('workspaceUri' in workspaceA && 'workspaceUri' in workspaceB) {
+                return this.isEqualURI(workspaceA.workspaceUri, workspaceB.workspaceUri);
+            }
+            return false;
+        }
+        isEqualURI(a, b) {
+            return a.scheme === b.scheme && a.authority === b.authority && a.path === b.path;
+        }
+    }
+    class LocalStorageURLCallbackProvider {
+        _callbackRoute;
+        static REQUEST_ID = 0;
+        static QUERY_KEYS = [
+            'scheme',
+            'authority',
+            'path',
+            'query',
+            'fragment'
+        ];
+        _onCallback = new workbench_api_1.Emitter();
+        onCallback = this._onCallback.event;
+        pendingCallbacks = new Set();
+        lastTimeChecked = Date.now();
+        checkCallbacksTimeout = undefined;
+        onDidChangeLocalStorageDisposable;
+        constructor(_callbackRoute) {
+            this._callbackRoute = _callbackRoute;
+        }
+        create(options = {}) {
+            const id = ++LocalStorageURLCallbackProvider.REQUEST_ID;
+            const queryParams = [`vscode-reqid=${id}`];
+            for (const key of LocalStorageURLCallbackProvider.QUERY_KEYS) {
+                const value = options[key];
+                if (value) {
+                    queryParams.push(`vscode-${key}=${encodeURIComponent(value)}`);
+                }
+            }
+            if (!(options.authority === 'vscode.github-authentication' && options.path === '/dummy')) {
+                const key = `vscode-web.url-callbacks[${id}]`;
+                localStorage.removeItem(key);
+                this.pendingCallbacks.add(id);
+                this.startListening();
+            }
+            return workbench_api_1.URI.parse(window.location.href).with({ path: this._callbackRoute, query: queryParams.join('&') });
+        }
+        startListening() {
+            if (this.onDidChangeLocalStorageDisposable) {
+                return;
+            }
+            const fn = () => this.onDidChangeLocalStorage();
+            window.addEventListener('storage', fn);
+            this.onDidChangeLocalStorageDisposable = { dispose: () => window.removeEventListener('storage', fn) };
+        }
+        stopListening() {
+            this.onDidChangeLocalStorageDisposable?.dispose();
+            this.onDidChangeLocalStorageDisposable = undefined;
+        }
+        async onDidChangeLocalStorage() {
+            const ellapsed = Date.now() - this.lastTimeChecked;
+            if (ellapsed > 1000) {
+                this.checkCallbacks();
+            }
+            else if (this.checkCallbacksTimeout === undefined) {
+                this.checkCallbacksTimeout = setTimeout(() => {
+                    this.checkCallbacksTimeout = undefined;
+                    this.checkCallbacks();
+                }, 1000 - ellapsed);
+            }
+        }
+        checkCallbacks() {
+            let pendingCallbacks;
+            for (const id of this.pendingCallbacks) {
+                const key = `vscode-web.url-callbacks[${id}]`;
+                const result = localStorage.getItem(key);
+                if (result !== null) {
+                    try {
+                        this._onCallback.fire(workbench_api_1.URI.revive(JSON.parse(result)));
+                    }
+                    catch (error) {
+                        console.error(error);
+                    }
+                    pendingCallbacks = pendingCallbacks ?? new Set(this.pendingCallbacks);
+                    pendingCallbacks.delete(id);
+                    localStorage.removeItem(key);
+                }
+            }
+            if (pendingCallbacks) {
+                this.pendingCallbacks = pendingCallbacks;
+                if (this.pendingCallbacks.size === 0) {
+                    this.stopListening();
+                }
+            }
+            this.lastTimeChecked = Date.now();
+        }
+        dispose() {
+            this._onCallback.dispose();
+        }
+    }
+    (function () {
+        const configElement = window.document.getElementById('vscode-workbench-web-configuration');
+        const configElementAttribute = configElement ? configElement.getAttribute('data-settings') : undefined;
+        if (!configElement || !configElementAttribute) {
+            throw new Error('Missing web configuration element');
+        }
+        const config = JSON.parse(configElementAttribute);
+        (0, workbench_api_1.create)(window.document.body, {
+            ...config,
+            workspaceProvider: WorkspaceProvider.create(config),
+            urlCallbackProvider: new LocalStorageURLCallbackProvider(config.callbackRoute)
+        });
+    })();
+});
+
+require(["vscode-web-browser-main"], function() { });</script>
+</html>
