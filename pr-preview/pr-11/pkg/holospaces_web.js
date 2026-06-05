@@ -745,6 +745,32 @@ export class Workspace {
         return Workspace.__wrap(ret[0]);
     }
     /**
+     * Boot a devcontainer whose guest egress is carried by an external
+     * **router** — the router extension (`CC-41`) or a node (`CC-39`) — over the
+     * egress protocol ([`ChannelEgress`](holospaces::emulator::net::ChannelEgress)).
+     * The guest comes up with DHCP and a real TCP stack; the page carries its
+     * traffic to the router by pumping the seam (drain
+     * [`egress_outbound`](Workspace::egress_outbound), feed
+     * [`egress_inbound`](Workspace::egress_inbound)), and the router opens the
+     * real sockets a tab cannot — so the guest's package managers, network
+     * config, and apps reach the internet (Codespaces parity), with no relay and
+     * no proxy. Drive with [`run`](Workspace::run), pumping the seam each tick.
+     * @param {Uint8Array} kernel
+     * @param {Uint8Array} rootfs
+     * @returns {Workspace}
+     */
+    static boot_devcontainer_routed(kernel, rootfs) {
+        const ptr0 = passArray8ToWasm0(kernel, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passArray8ToWasm0(rootfs, wasm.__wbindgen_malloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.workspace_boot_devcontainer_routed(ptr0, len0, ptr1, len1);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return Workspace.__wrap(ret[0]);
+    }
+    /**
      * The κ of every operator event published on the terminal channel so far.
      * @returns {any[]}
      */
@@ -768,6 +794,30 @@ export class Workspace {
     dial_guest(guest_port) {
         const ret = wasm.workspace_dial_guest(this.__wbg_ptr, guest_port);
         return ret === Number.MAX_SAFE_INTEGER ? undefined : ret;
+    }
+    /**
+     * Deliver an egress frame the router returned (the host's bytes / connection
+     * events) into the guest's network. A no-op when this is not a routed boot.
+     * @param {Uint8Array} frame
+     */
+    egress_inbound(frame) {
+        const ptr0 = passArray8ToWasm0(frame, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.workspace_egress_inbound(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * Drain the next egress frame the guest produced, for the page to carry to
+     * the router. `undefined` when none is queued (or this is not a routed boot).
+     * @returns {Uint8Array | undefined}
+     */
+    egress_outbound() {
+        const ret = wasm.workspace_egress_outbound(this.__wbg_ptr);
+        let v1;
+        if (ret[0] !== 0) {
+            v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+            wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        }
+        return v1;
     }
     /**
      * Feed **raw terminal input** to the running holospace — the bytes an
