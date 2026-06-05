@@ -20,7 +20,7 @@
 #[allow(unused_imports)]
 use alloc::{vec, vec::Vec};
 
-use super::{KappaBacking, VirtioBlk};
+use super::{ninep, KappaBacking, Virtio9p, VirtioBlk, VirtioNet};
 
 // Split-virtqueue descriptor flags (OASIS VirtIO v1.2 §2.7).
 const VIRTQ_DESC_F_NEXT: u16 = 1;
@@ -64,6 +64,9 @@ impl GuestRam<'_> {
                 self.ram[o + i] = (v >> (8 * i)) as u8;
             }
         }
+    }
+    pub(super) fn rd8(&self, a: u64) -> u8 {
+        self.rd(a, 1) as u8
     }
     pub(super) fn rd16(&self, a: u64) -> u16 {
         self.rd(a, 2) as u16
@@ -280,4 +283,340 @@ fn blk_service_chain(mem: &mut GuestRam, dev: &mut VirtioBlk, head: u16) -> u32 
     let _ = VIRTQ_DESC_F_WRITE;
     mem.wr8(status_desc.0, status);
     written + 1
+}
+
+// ── VirtIO 9P device (the shared workspace filesystem; CC-15) ────────────────
+
+/// Read a `virtio-mmio` register / 9P-config field of the 9P device.
+pub(super) fn p9_mmio_read(dev: Option<&Virtio9p>, off: u64) -> u64 {
+    let Some(dev) = dev else {
+        return 0;
+    };
+    match off {
+        0x000 => 0x7472_6976, // MagicValue
+        0x004 => 2,           // Version (modern)
+        0x008 => 9,           // DeviceID = 9P transport
+        0x00c => 0x554d_4551, // VendorID
+        0x010 => match dev.device_features_sel {
+            // word 0: VIRTIO_9P_MOUNT_TAG (bit 0); word 1: VERSION_1 (bit 32).
+            0 => 1,
+            1 => 1,
+            _ => 0,
+        },
+        0x034 => 1024, // QueueNumMax
+        0x044 => u64::from(dev.queue_ready),
+        0x060 => u64::from(dev.interrupt_status),
+        0x070 => u64::from(dev.status),
+        0x0fc => 0, // ConfigGeneration
+        // 9P config: tag length (u16) then the tag bytes.
+        0x100 => dev.tag.len() as u64,
+        0x101 => (dev.tag.len() >> 8) as u64,
+        _ if (0x102..0x102 + dev.tag.len() as u64).contains(&off) => {
+            u64::from(dev.tag.as_bytes()[(off - 0x102) as usize])
+        }
+        _ => 0,
+    }
+}
+
+/// Write a `virtio-mmio` register of the 9P device. Returns `true` if the write
+/// was a `QueueNotify` (the caller then runs [`p9_service_queue`]).
+pub(super) fn p9_mmio_write(dev: &mut Virtio9p, off: u64, value: u32) -> bool {
+    match off {
+        0x014 => dev.device_features_sel = value,
+        0x020 => {
+            let w = dev.driver_features_sel.min(1) as usize;
+            dev.driver_features[w] = value;
+        }
+        0x024 => dev.driver_features_sel = value,
+        0x038 => dev.queue_num = value,
+        0x044 => dev.queue_ready = value,
+        0x064 => dev.interrupt_status &= !value,
+        0x070 => dev.status = value,
+        0x080 => dev.desc_addr = (dev.desc_addr & !0xffff_ffff) | u64::from(value),
+        0x084 => dev.desc_addr = (dev.desc_addr & 0xffff_ffff) | (u64::from(value) << 32),
+        0x090 => dev.avail_addr = (dev.avail_addr & !0xffff_ffff) | u64::from(value),
+        0x094 => dev.avail_addr = (dev.avail_addr & 0xffff_ffff) | (u64::from(value) << 32),
+        0x0a0 => dev.used_addr = (dev.used_addr & !0xffff_ffff) | u64::from(value),
+        0x0a4 => dev.used_addr = (dev.used_addr & 0xffff_ffff) | (u64::from(value) << 32),
+        0x050 => return true, // QueueNotify
+        _ => {}
+    }
+    false
+}
+
+/// Process every newly-available 9P request: gather the T-message from the
+/// chain's readable descriptors, handle it against the workspace filesystem,
+/// scatter the R-message into the writable descriptors. Returns `true` if the
+/// device IRQ must be raised.
+pub(super) fn p9_service_queue(mem: &mut GuestRam, dev: &mut Virtio9p) -> bool {
+    let qsz = dev.queue_num as u16;
+    if dev.queue_ready == 0 || qsz == 0 {
+        return false;
+    }
+    let avail_idx = mem.rd16(dev.avail_addr + 2);
+    let mut raised = false;
+    while dev.last_avail != avail_idx {
+        let slot = dev.last_avail % qsz;
+        let head = mem.rd16(dev.avail_addr + 4 + 2 * u64::from(slot));
+        let written = p9_service_chain(mem, dev, head);
+        let used_idx = mem.rd16(dev.used_addr + 2);
+        let ring = dev.used_addr + 4 + 8 * u64::from(used_idx % qsz);
+        mem.wr32(ring, u32::from(head));
+        mem.wr32(ring + 4, written);
+        mem.wr16(dev.used_addr + 2, used_idx.wrapping_add(1));
+        dev.last_avail = dev.last_avail.wrapping_add(1);
+        dev.interrupt_status |= 1;
+        raised = true;
+    }
+    raised
+}
+
+/// Service one 9P request chain: the leading read-only descriptors carry the
+/// T-message; the trailing write-only descriptors receive the R-message.
+fn p9_service_chain(mem: &mut GuestRam, dev: &mut Virtio9p, head: u16) -> u32 {
+    let mut readable: Vec<u8> = Vec::new();
+    let mut writable: Vec<(u64, u32)> = Vec::new();
+    let mut idx = head;
+    let mut guard = 0u32;
+    loop {
+        let d = dev.desc_addr + 16 * u64::from(idx);
+        let addr = mem.rd64(d);
+        let len = mem.rd32(d + 8);
+        let flags = mem.rd16(d + 12);
+        let next = mem.rd16(d + 14);
+        if flags & VIRTQ_DESC_F_WRITE != 0 {
+            writable.push((addr, len));
+        } else {
+            for i in 0..u64::from(len) {
+                readable.push(mem.rd8(addr + i));
+            }
+        }
+        guard += 1;
+        if flags & VIRTQ_DESC_F_NEXT == 0 || guard > dev.queue_num {
+            break;
+        }
+        idx = next;
+    }
+    // Handle the T-message, producing the R-message.
+    let reply = ninep::handle(&mut dev.fs, &mut dev.fids, &readable);
+    // Scatter the reply into the writable descriptors.
+    let mut written = 0u32;
+    let mut pos = 0usize;
+    for (addr, len) in &writable {
+        if pos >= reply.len() {
+            break;
+        }
+        let n = ((*len as usize).min(reply.len() - pos)) as u32;
+        for i in 0..n {
+            mem.wr8(addr + u64::from(i), reply[pos + i as usize]);
+        }
+        pos += n as usize;
+        written += n;
+    }
+    written
+}
+
+// ── VirtIO network device (the userspace TCP/IP NAT; CC-16) ──────────────────
+
+/// Read a `virtio-mmio` register or net-config field of the network device.
+pub(super) fn net_mmio_read(dev: Option<&VirtioNet>, off: u64) -> u64 {
+    let Some(dev) = dev else {
+        return 0;
+    };
+    match off {
+        0x000 => 0x7472_6976, // MagicValue "virt"
+        0x004 => 2,           // Version (modern)
+        0x008 => 1,           // DeviceID = network
+        0x00c => 0x554d_4551, // VendorID "QEMU"
+        0x010 => match dev.device_features_sel {
+            // word 0: VIRTIO_NET_F_MAC (bit 5); word 1: VERSION_1 (bit 32).
+            0 => 0x20,
+            1 => 1,
+            _ => 0,
+        },
+        0x034 => 1024, // QueueNumMax
+        0x044 => u64::from(dev.queue_ready[(dev.queue_sel.min(1)) as usize]),
+        0x060 => u64::from(dev.interrupt_status),
+        0x070 => u64::from(dev.status),
+        0x0fc => 0, // ConfigGeneration
+        // virtio_net_config: mac[6] at offset 0.
+        _ if (0x100..0x106).contains(&off) => u64::from(dev.mac[(off - 0x100) as usize]),
+        _ => 0,
+    }
+}
+
+/// What a `virtio-net` MMIO write asks the caller to do next (a `QueueNotify`
+/// touched a queue). The transport register state has already been applied.
+pub(super) enum NetNotify {
+    /// Nothing to service (a plain register write).
+    None,
+    /// Service the transmit queue (the guest queued frames) — [`net_service_tx`].
+    Transmit,
+    /// The guest posted receive buffers — pump the NAT — [`net_pump`].
+    Receive,
+}
+
+/// Write a `virtio-mmio` register of the network device. Queue registers apply
+/// to the currently selected queue (0 = receive, 1 = transmit). Returns which
+/// servicing a `QueueNotify` requires.
+pub(super) fn net_mmio_write(dev: &mut VirtioNet, off: u64, value: u32) -> NetNotify {
+    let q = (dev.queue_sel.min(1)) as usize;
+    match off {
+        0x014 => dev.device_features_sel = value,
+        0x020 => {
+            let w = dev.driver_features_sel.min(1) as usize;
+            dev.driver_features[w] = value;
+        }
+        0x024 => dev.driver_features_sel = value,
+        0x030 => dev.queue_sel = value,
+        0x038 => dev.queue_num[q] = value,
+        0x044 => dev.queue_ready[q] = value,
+        0x064 => dev.interrupt_status &= !value,
+        0x070 => dev.status = value,
+        0x080 => dev.desc_addr[q] = (dev.desc_addr[q] & !0xffff_ffff) | u64::from(value),
+        0x084 => dev.desc_addr[q] = (dev.desc_addr[q] & 0xffff_ffff) | (u64::from(value) << 32),
+        0x090 => dev.avail_addr[q] = (dev.avail_addr[q] & !0xffff_ffff) | u64::from(value),
+        0x094 => dev.avail_addr[q] = (dev.avail_addr[q] & 0xffff_ffff) | (u64::from(value) << 32),
+        0x0a0 => dev.used_addr[q] = (dev.used_addr[q] & !0xffff_ffff) | u64::from(value),
+        0x0a4 => dev.used_addr[q] = (dev.used_addr[q] & 0xffff_ffff) | (u64::from(value) << 32),
+        0x050 => {
+            // QueueNotify: `value` is the notified queue index.
+            return if value == 1 {
+                NetNotify::Transmit
+            } else {
+                NetNotify::Receive
+            };
+        }
+        _ => {}
+    }
+    NetNotify::None
+}
+
+/// Service the transmit queue: for each frame the guest queued, strip the
+/// 12-byte `virtio_net_hdr` and hand the Ethernet frame to the NAT. Returns
+/// `true` if the device IRQ must be raised. The caller then runs [`net_pump`] to
+/// deliver any immediate replies (ARP, DHCP, SYN-ACK).
+pub(super) fn net_service_tx(mem: &mut GuestRam, dev: &mut VirtioNet) -> bool {
+    let q = 1usize; // transmit
+    let qsz = dev.queue_num[q] as u16;
+    if dev.queue_ready[q] == 0 || qsz == 0 {
+        return false;
+    }
+    let avail_idx = mem.rd16(dev.avail_addr[q] + 2);
+    let mut raised = false;
+    while dev.last_avail[q] != avail_idx {
+        let slot = dev.last_avail[q] % qsz;
+        let head = mem.rd16(dev.avail_addr[q] + 4 + 2 * u64::from(slot));
+        let frame = net_gather(mem, dev, q, head);
+        // Strip the virtio_net_hdr_v1 (12 bytes) → the Ethernet frame.
+        if frame.len() > 12 {
+            dev.nat.on_guest_frame(&frame[12..], dev.egress.as_mut());
+        }
+        let used_idx = mem.rd16(dev.used_addr[q] + 2);
+        let ring = dev.used_addr[q] + 4 + 8 * u64::from(used_idx % qsz);
+        mem.wr32(ring, u32::from(head));
+        mem.wr32(ring + 4, frame.len() as u32);
+        mem.wr16(dev.used_addr[q] + 2, used_idx.wrapping_add(1));
+        dev.last_avail[q] = dev.last_avail[q].wrapping_add(1);
+        dev.interrupt_status |= 1;
+        raised = true;
+    }
+    raised
+}
+
+/// Pump the NAT (pull host-side bytes + advance connection state) and deliver
+/// any pending receive frames into the guest's receive queue. Returns `true` if
+/// the device IRQ must be raised. Called on a receive-queue notify, after a
+/// transmit, and periodically from the run loop (so host data arrives without
+/// the guest having to transmit first).
+pub(super) fn net_pump(mem: &mut GuestRam, dev: &mut VirtioNet) -> bool {
+    dev.nat.poll(dev.egress.as_mut());
+    // Service forwarded-port (inbound) connections too (CC-21).
+    let VirtioNet { nat, ingress, .. } = dev;
+    nat.poll_ingress(ingress.as_mut());
+    let q = 0usize; // receive
+    let qsz = dev.queue_num[q] as u16;
+    let mut raised = false;
+    if dev.queue_ready[q] != 0 && qsz != 0 {
+        while dev.nat.has_rx() {
+            let avail_idx = mem.rd16(dev.avail_addr[q] + 2);
+            if dev.last_avail[q] == avail_idx {
+                break; // the guest has posted no receive buffer
+            }
+            let frame = dev.nat.take_rx().unwrap();
+            let slot = dev.last_avail[q] % qsz;
+            let head = mem.rd16(dev.avail_addr[q] + 4 + 2 * u64::from(slot));
+            let written = net_scatter_rx(mem, dev, q, head, &frame);
+            let used_idx = mem.rd16(dev.used_addr[q] + 2);
+            let ring = dev.used_addr[q] + 4 + 8 * u64::from(used_idx % qsz);
+            mem.wr32(ring, u32::from(head));
+            mem.wr32(ring + 4, written);
+            mem.wr16(dev.used_addr[q] + 2, used_idx.wrapping_add(1));
+            dev.last_avail[q] = dev.last_avail[q].wrapping_add(1);
+            dev.interrupt_status |= 1;
+            raised = true;
+        }
+    }
+    raised
+}
+
+/// Gather the bytes of a transmit descriptor chain (all descriptors carry
+/// guest-provided data: the `virtio_net_hdr` followed by the frame).
+fn net_gather(mem: &GuestRam, dev: &VirtioNet, q: usize, head: u16) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut idx = head;
+    let mut guard = 0u32;
+    loop {
+        let d = dev.desc_addr[q] + 16 * u64::from(idx);
+        let addr = mem.rd64(d);
+        let len = mem.rd32(d + 8);
+        let flags = mem.rd16(d + 12);
+        let next = mem.rd16(d + 14);
+        for i in 0..u64::from(len) {
+            out.push(mem.rd8(addr + i));
+        }
+        guard += 1;
+        if flags & VIRTQ_DESC_F_NEXT == 0 || guard > dev.queue_num[q] {
+            break;
+        }
+        idx = next;
+    }
+    out
+}
+
+/// Scatter a received frame — prefixed with a 12-byte `virtio_net_hdr_v1`
+/// (zeroed, `num_buffers = 1`) — into the writable descriptors of a receive
+/// chain. Returns the number of bytes written (the used-ring length).
+fn net_scatter_rx(mem: &mut GuestRam, dev: &VirtioNet, q: usize, head: u16, frame: &[u8]) -> u32 {
+    // virtio_net_hdr_v1: 10 zero bytes then num_buffers = 1 (little-endian).
+    let mut buf: Vec<u8> = Vec::with_capacity(12 + frame.len());
+    buf.extend_from_slice(&[0u8; 10]);
+    buf.extend_from_slice(&1u16.to_le_bytes());
+    buf.extend_from_slice(frame);
+
+    let mut idx = head;
+    let mut pos = 0usize;
+    let mut written = 0u32;
+    let mut guard = 0u32;
+    loop {
+        let d = dev.desc_addr[q] + 16 * u64::from(idx);
+        let addr = mem.rd64(d);
+        let len = mem.rd32(d + 8);
+        let flags = mem.rd16(d + 12);
+        let next = mem.rd16(d + 14);
+        if flags & VIRTQ_DESC_F_WRITE != 0 && pos < buf.len() {
+            let n = (len as usize).min(buf.len() - pos);
+            for i in 0..n {
+                mem.wr8(addr + i as u64, buf[pos + i]);
+            }
+            pos += n;
+            written += n as u32;
+        }
+        guard += 1;
+        if flags & VIRTQ_DESC_F_NEXT == 0 || guard > dev.queue_num[q] || pos >= buf.len() {
+            break;
+        }
+        idx = next;
+    }
+    written
 }

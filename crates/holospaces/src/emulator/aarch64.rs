@@ -174,6 +174,60 @@ impl Cpu {
         self.pc = self.base;
     }
 
+    /// **V&V device-driver hook** (`CC-46`): perform a device-MMIO store at the
+    /// guest-physical address `pa`, exactly as a guest's `virtio` driver would —
+    /// the same private [`phys_write`](Self::phys_write) the executing CPU routes
+    /// device stores through. A conformance witness uses it to drive the shared
+    /// [`devbus`](super::devbus) devices over the AArch64 MMIO transport (post the
+    /// virtqueue and ring `QueueNotify`) without booting a full guest kernel.
+    #[doc(hidden)]
+    pub fn vv_mmio_write(&mut self, pa: u64, width: usize, value: u64) {
+        self.phys_write(pa, width, value);
+    }
+
+    /// **V&V device-driver hook** (`CC-46`): perform a device-MMIO load at `pa`
+    /// — the same path the executing CPU routes device loads through. Reads a
+    /// `virtio-mmio` register (magic/device-id/interrupt-status/config space).
+    #[doc(hidden)]
+    pub fn vv_mmio_read(&mut self, pa: u64, width: usize) -> u64 {
+        self.phys_read(pa, width)
+    }
+
+    /// **V&V hook** (`CC-46`): write `bytes` into guest RAM at guest-physical
+    /// `pa` — a witness lays out the virtqueue (descriptor table, avail ring) and
+    /// the T-message buffers a guest driver would build in RAM.
+    #[doc(hidden)]
+    pub fn vv_ram_write(&mut self, pa: u64, bytes: &[u8]) {
+        let o = (pa - self.base) as usize;
+        self.ram[o..o + bytes.len()].copy_from_slice(bytes);
+    }
+
+    /// **V&V hook** (`CC-46`): read `len` bytes of guest RAM at guest-physical
+    /// `pa` — a witness reads back the R-message the device scattered into the
+    /// writable descriptors, and the used-ring the device updated.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn vv_ram_read(&self, pa: u64, len: usize) -> Vec<u8> {
+        let o = (pa - self.base) as usize;
+        self.ram[o..o + len].to_vec()
+    }
+
+    /// **V&V hook** (`CC-46`): the guest-physical base of this machine's first
+    /// `virtio-9p` MMIO slot, and the workspace mount tag — so a witness drives
+    /// the device at the same address the AArch64 `virt` device tree advertises.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn vv_virtio_9p_base() -> u64 {
+        VIRTIO_9P_BASE
+    }
+
+    /// **V&V hook** (`CC-46`): the guest-physical base of the `virtio-net` slot.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn vv_virtio_net_base() -> u64 {
+        VIRTIO_NET_BASE
+    }
+
     /// The bytes the guest has written to the host console (`SVC #0`, `write` to
     /// fd 1/2).
     #[must_use]
@@ -209,6 +263,16 @@ impl Cpu {
     /// core's [`run`](super::Emulator::run).
     pub fn run(&mut self, max_steps: u64) -> Halt {
         for _ in 0..max_steps {
+            // Pump the network periodically so host-side data and connection
+            // events reach the guest without it having to transmit first (the
+            // `virtio-net` receive path; `CC-16` parity, `CC-46`). Gated on the
+            // architected counter, which `sys_tick` advances every step.
+            if self.sys.is_some()
+                && self.sys().virtionet.is_some()
+                && self.sys().counter & 0x3ff == 0
+            {
+                self.virtio_net_pump();
+            }
             if let Err(h) = self.step() {
                 return h;
             }
@@ -3201,6 +3265,14 @@ const DTB_OFFSET: u64 = 0x0400_0000;
 // raising the GIC instead of the PLIC.
 const VIRTIO_BLK_BASE: u64 = 0x0a00_0000;
 const VIRTIO_BLK_END: u64 = 0x0a00_0200;
+/// The second `virtio-mmio` slot (stride 0x200) — the VirtIO **9P** device (the
+/// shared workspace filesystem, `CC-15`), serviced by the shared [`devbus`].
+const VIRTIO_9P_BASE: u64 = 0x0a00_0200;
+const VIRTIO_9P_END: u64 = 0x0a00_0400;
+/// The third `virtio-mmio` slot — the VirtIO **network** device (`CC-16`): the
+/// guest's frames terminate in the shared userspace TCP/IP NAT (`net`).
+const VIRTIO_NET_BASE: u64 = 0x0a00_0400;
+const VIRTIO_NET_END: u64 = 0x0a00_0600;
 
 // GIC interrupt IDs. PPIs are 16..32 (the generic-timer lines); SPIs are 32+.
 const INTID_CNTP: u32 = 30; // the EL1 physical timer (PPI 14)
@@ -3209,6 +3281,10 @@ const INTID_CNTV: u32 = 27; // the virtual timer (PPI 11)
 const SPI_BASE_INTID: u32 = 32;
 // The `virtio-blk` SPI (devicetree `interrupts = <GIC_SPI 16 …>` → INTID 48).
 const INTID_VIRTIO_BLK: u32 = 48;
+// The `virtio-9p` SPI (`GIC_SPI 17` → INTID 49) and `virtio-net` (`GIC_SPI 18`
+// → INTID 50) — the next two `virtio-mmio` slots, each its own GIC source.
+const INTID_VIRTIO_9P: u32 = 49;
+const INTID_VIRTIO_NET: u32 = 50;
 
 /// The packed identifier of an AArch64 system register `(op0,op1,CRn,CRm,op2)` —
 /// the `MRS`/`MSR` operand. A `u32` key for the dispatch table.
@@ -3396,6 +3472,17 @@ struct Sys {
     /// The `virtio-blk` device — the κ-disk rootfs (`CC-7`), when a disk is
     /// attached (`CC-37`); shared with the RISC-V machine via the shared device bus (`devbus`).
     virtio: Option<super::VirtioBlk>,
+    /// The `virtio-9p` device serving the shared workspace filesystem, when
+    /// attached (`CC-15` parity, `CC-46`); `None` otherwise. The same shared
+    /// [`devbus`] services it — no per-ISA re-implementation (Law L4).
+    virtio9p: Option<super::Virtio9p>,
+    /// The `virtio-net` device + the userspace TCP/IP NAT, when networking is
+    /// attached (`CC-16` parity, `CC-46`); `None` for an offline machine.
+    virtionet: Option<super::VirtioNet>,
+    /// The host side of the in-process loopback bridge (ADR-020, `CC-33` parity),
+    /// when the workbench dials guest listeners; `None` until
+    /// [`Cpu::enable_loopback`] attaches it.
+    loopback: Option<super::net::LoopbackHandle>,
     tlb: Vec<TlbEntry>,
     tlb_gen: u64,
     halted: bool,
@@ -3431,6 +3518,9 @@ impl Sys {
             cntvoff: 0,
             gic: Gic::new(),
             virtio: None,
+            virtio9p: None,
+            virtionet: None,
+            loopback: None,
             uart: Pl011 {
                 input: Vec::new(),
                 in_cursor: 0,
@@ -3524,7 +3614,7 @@ impl Cpu {
         // `virtio-blk` node is advertised only when a disk is attached (an
         // unattached `virtio-mmio` slot makes the kernel read magic 0 and stall).
         let has_blk = disk.is_some();
-        let dtb = arm64_virt_dtb(RAM_BASE, ram_bytes as u64, bootargs, has_blk);
+        let dtb = arm64_virt_dtb(RAM_BASE, ram_bytes as u64, bootargs, has_blk, false, false);
         let dtb_off = DTB_OFFSET as usize;
         let dn = dtb.len().min(cpu.ram.len() - dtb_off);
         cpu.ram[dtb_off..dtb_off + dn].copy_from_slice(&dtb[..dn]);
@@ -3553,6 +3643,152 @@ impl Cpu {
         if let Some(sys) = self.sys.as_mut() {
             sys.uart.input.extend_from_slice(bytes);
         }
+    }
+
+    // ── shared workspace filesystem (virtio-9p; CC-15 parity, CC-46) ─────────
+
+    /// Attach a shared **workspace filesystem** to the machine's VirtIO 9P device
+    /// (`CC-15` parity). `seed` is the files holospaces places on the share (name
+    /// → bytes); the guest mounts it (`-t 9p`, tag `hsworkspace`) and the editor
+    /// and the running OS read and write the *same* files. The same shared
+    /// [`devbus`](super::devbus) serves it as on the RISC-V machine — one 9P
+    /// implementation, here over the GIC. No-op on the flat (`CC-35`) core.
+    pub fn attach_workspace(&mut self, seed: &[(&str, &[u8])]) {
+        let Some(sys) = self.sys.as_mut() else {
+            return;
+        };
+        let mut fs = super::ninep::Fs9p::new();
+        for (name, data) in seed {
+            fs.seed_file(name, data);
+        }
+        sys.virtio9p = Some(super::Virtio9p::new(fs, super::WORKSPACE_TAG));
+    }
+
+    /// Read a file from the shared workspace filesystem — how holospaces observes
+    /// the edits the guest made over 9P (`CC-15`). `None` if no 9P device is
+    /// attached or the file is absent.
+    #[must_use]
+    pub fn workspace_file(&self, name: &str) -> Option<&[u8]> {
+        self.sys
+            .as_ref()
+            .and_then(|s| s.virtio9p.as_ref())
+            .and_then(|d| d.fs.read_file(name))
+    }
+
+    /// List the shared workspace's root entries — `(name, is_dir, size)` — the
+    /// editor's directory view over the running holospace (`CC-17`).
+    #[must_use]
+    pub fn workspace_list(&self) -> Vec<(String, bool, usize)> {
+        self.sys
+            .as_ref()
+            .and_then(|s| s.virtio9p.as_ref())
+            .map(|d| d.fs.list_root())
+            .unwrap_or_default()
+    }
+
+    /// Write a file into the shared workspace — the editor saving content the
+    /// running OS reads over `virtio-9p` (one content, Law L1; `CC-17`).
+    pub fn workspace_write(&mut self, name: &str, data: &[u8]) {
+        if let Some(d) = self.sys.as_mut().and_then(|s| s.virtio9p.as_mut()) {
+            d.fs.write_file(name, data);
+        }
+    }
+
+    // ── network device + the in-process bridge (CC-16/CC-33 parity, CC-46) ───
+
+    /// Attach the **VirtIO network device** + the userspace TCP/IP NAT (`CC-16`
+    /// parity): the guest drives a real NIC, its frames terminate in the shared
+    /// [`net`](super::net) NAT and stream out over `egress`. No-op on the flat
+    /// (`CC-35`) core.
+    pub fn attach_net(&mut self, egress: Box<dyn super::net::Egress>) {
+        if let Some(sys) = self.sys.as_mut() {
+            sys.virtionet = Some(super::VirtioNet::new(
+                egress,
+                Box::new(super::net::NoIngress),
+            ));
+        }
+    }
+
+    /// Attach the network device with both an `egress` (outbound) and an
+    /// `ingress` (forwarded-port inbound) transport (`CC-16` + `CC-21` parity).
+    pub fn attach_net_forward(
+        &mut self,
+        egress: Box<dyn super::net::Egress>,
+        ingress: Box<dyn super::net::Ingress>,
+    ) {
+        if let Some(sys) = self.sys.as_mut() {
+            sys.virtionet = Some(super::VirtioNet::new(egress, ingress));
+        }
+    }
+
+    /// Enable the **in-process loopback bridge** (ADR-020, `CC-33` parity) on the
+    /// already-attached network device: the workbench (same process) can
+    /// `dial`/`send`/`recv`/`close` a connection to a server *inside* the guest —
+    /// the inward in-process dual of the egress relay. Keeps the existing egress.
+    /// Returns `false` if no network device is attached.
+    pub fn enable_loopback(&mut self) -> bool {
+        let Some(net) = self.sys.as_mut().and_then(|s| s.virtionet.as_mut()) else {
+            return false;
+        };
+        let (ingress, handle) = super::net::LoopbackIngress::new();
+        net.ingress = Box::new(ingress);
+        self.sys_mut().loopback = Some(handle);
+        true
+    }
+
+    /// Dial an in-process connection to the guest's listening `guest_port` over
+    /// the loopback bridge (`CC-33`). Returns the connection id, or `None` if the
+    /// loopback ingress is not enabled. Pump the machine (`run`) so the NAT opens
+    /// the connection toward the guest and the byte stream flows.
+    pub fn dial_guest(&mut self, guest_port: u16) -> Option<u32> {
+        self.sys
+            .as_ref()
+            .and_then(|s| s.loopback.as_ref())
+            .map(|h| h.dial(guest_port))
+    }
+
+    /// Write host bytes toward the guest server on a loopback connection.
+    pub fn guest_send(&mut self, id: u32, data: &[u8]) {
+        if let Some(h) = self.sys.as_ref().and_then(|s| s.loopback.as_ref()) {
+            h.send(id, data);
+        }
+    }
+
+    /// Drain the guest server's reply bytes on a loopback connection (empty if
+    /// none have arrived yet — pump the machine to advance the stream).
+    pub fn guest_recv(&mut self, id: u32) -> Vec<u8> {
+        self.sys
+            .as_ref()
+            .and_then(|s| s.loopback.as_ref())
+            .map(|h| h.recv(id))
+            .unwrap_or_default()
+    }
+
+    /// Close the host side of a loopback connection.
+    pub fn guest_close(&mut self, id: u32) {
+        if let Some(h) = self.sys.as_ref().and_then(|s| s.loopback.as_ref()) {
+            h.close(id);
+        }
+    }
+
+    /// Whether a loopback connection is still usable (the guest has not closed it,
+    /// or has but unread bytes remain).
+    #[must_use]
+    pub fn guest_is_open(&self, id: u32) -> bool {
+        self.sys
+            .as_ref()
+            .and_then(|s| s.loopback.as_ref())
+            .is_some_and(|h| h.is_open(id))
+    }
+
+    /// **Live** network reconfiguration (`CC-28` parity): begin forwarding
+    /// `guest_port` on the running machine. Returns the host port, or `None` if
+    /// the machine has no network device or its ingress cannot add a forward.
+    pub fn forward_port(&mut self, guest_port: u16) -> Option<u16> {
+        self.sys
+            .as_mut()
+            .and_then(|s| s.virtionet.as_mut())
+            .and_then(|n| n.ingress.add_forward(guest_port))
     }
 
     #[inline]
@@ -3591,6 +3827,12 @@ impl Cpu {
         if (VIRTIO_BLK_BASE..VIRTIO_BLK_END).contains(&pa) {
             return super::devbus::blk_mmio_read(self.sys().virtio.as_ref(), pa - VIRTIO_BLK_BASE);
         }
+        if (VIRTIO_9P_BASE..VIRTIO_9P_END).contains(&pa) {
+            return super::devbus::p9_mmio_read(self.sys().virtio9p.as_ref(), pa - VIRTIO_9P_BASE);
+        }
+        if (VIRTIO_NET_BASE..VIRTIO_NET_END).contains(&pa) {
+            return super::devbus::net_mmio_read(self.sys().virtionet.as_ref(), pa - VIRTIO_NET_BASE);
+        }
         0
     }
 
@@ -3610,6 +3852,10 @@ impl Cpu {
             self.gicc_write(pa - GICC_BASE, value as u32);
         } else if (VIRTIO_BLK_BASE..VIRTIO_BLK_END).contains(&pa) {
             self.virtio_blk_write(pa - VIRTIO_BLK_BASE, value as u32);
+        } else if (VIRTIO_9P_BASE..VIRTIO_9P_END).contains(&pa) {
+            self.virtio_9p_write(pa - VIRTIO_9P_BASE, value as u32);
+        } else if (VIRTIO_NET_BASE..VIRTIO_NET_END).contains(&pa) {
+            self.virtio_net_write(pa - VIRTIO_NET_BASE, value as u32);
         }
     }
 
@@ -3631,6 +3877,80 @@ impl Cpu {
         self.sys_mut().virtio = Some(dev);
         if raise {
             self.sys_mut().gic.raise(INTID_VIRTIO_BLK);
+        }
+    }
+
+    /// A `virtio-9p` MMIO register write; a `QueueNotify` services the workspace
+    /// filesystem queue through the shared [`devbus`] and latches the GIC SPI —
+    /// the same servicing the RISC-V machine drives, here over the GIC (`CC-46`).
+    fn virtio_9p_write(&mut self, off: u64, value: u32) {
+        let Some(mut dev) = self.sys_mut().virtio9p.take() else {
+            return;
+        };
+        let notify = super::devbus::p9_mmio_write(&mut dev, off, value);
+        let mut raise = false;
+        if notify {
+            let mut mem = super::devbus::GuestRam {
+                ram: &mut self.ram,
+                base: self.base,
+            };
+            raise = super::devbus::p9_service_queue(&mut mem, &mut dev);
+        }
+        self.sys_mut().virtio9p = Some(dev);
+        if raise {
+            self.sys_mut().gic.raise(INTID_VIRTIO_9P);
+        }
+    }
+
+    /// A `virtio-net` MMIO register write; a `QueueNotify` services the transmit
+    /// queue or pumps the NAT through the shared [`devbus`] and latches the GIC
+    /// SPI (`CC-46`).
+    fn virtio_net_write(&mut self, off: u64, value: u32) {
+        let Some(mut dev) = self.sys_mut().virtionet.take() else {
+            return;
+        };
+        let notify = super::devbus::net_mmio_write(&mut dev, off, value);
+        let mut raise = false;
+        match notify {
+            super::devbus::NetNotify::Transmit => {
+                let mut mem = super::devbus::GuestRam {
+                    ram: &mut self.ram,
+                    base: self.base,
+                };
+                raise |= super::devbus::net_service_tx(&mut mem, &mut dev);
+                raise |= super::devbus::net_pump(&mut mem, &mut dev);
+            }
+            super::devbus::NetNotify::Receive => {
+                let mut mem = super::devbus::GuestRam {
+                    ram: &mut self.ram,
+                    base: self.base,
+                };
+                raise |= super::devbus::net_pump(&mut mem, &mut dev);
+            }
+            super::devbus::NetNotify::None => {}
+        }
+        self.sys_mut().virtionet = Some(dev);
+        if raise {
+            self.sys_mut().gic.raise(INTID_VIRTIO_NET);
+        }
+    }
+
+    /// Pump the NAT and deliver pending receive frames into the guest's receive
+    /// queue — called periodically from the run loop so host-side data arrives
+    /// without the guest having to transmit first (the AArch64 analogue of the
+    /// RISC-V `virtio_net_pump`, the same shared [`devbus`]).
+    fn virtio_net_pump(&mut self) {
+        let Some(mut dev) = self.sys_mut().virtionet.take() else {
+            return;
+        };
+        let mut mem = super::devbus::GuestRam {
+            ram: &mut self.ram,
+            base: self.base,
+        };
+        let raise = super::devbus::net_pump(&mut mem, &mut dev);
+        self.sys_mut().virtionet = Some(dev);
+        if raise {
+            self.sys_mut().gic.raise(INTID_VIRTIO_NET);
         }
     }
 
@@ -4406,7 +4726,14 @@ impl Cpu {
 /// — the blob the guest kernel parses to find its memory, CPU, GIC, generic
 /// timer, PSCI, and PL011 console. Emitted from the same memory-map constants the
 /// emulator decodes (one source of truth, Law L4).
-fn arm64_virt_dtb(ram_base: u64, ram_size: u64, bootargs: &str, has_blk: bool) -> Vec<u8> {
+fn arm64_virt_dtb(
+    ram_base: u64,
+    ram_size: u64,
+    bootargs: &str,
+    has_blk: bool,
+    has_9p: bool,
+    has_net: bool,
+) -> Vec<u8> {
     const PH_GIC: u32 = 1;
     const PH_CLK: u32 = 2;
     let mut f = Fdt::new();
@@ -4517,6 +4844,27 @@ fn arm64_virt_dtb(ram_base: u64, ram_size: u64, bootargs: &str, has_blk: bool) -
         f.prop_str("compatible", "virtio,mmio");
         f.prop_reg(VIRTIO_BLK_BASE, VIRTIO_BLK_END - VIRTIO_BLK_BASE);
         f.prop_cells("interrupts", &[0, INTID_VIRTIO_BLK - SPI_BASE_INTID, 4]);
+        f.end_node();
+    }
+
+    // The `virtio-9p` (shared workspace, `CC-15` parity) slot — declared only
+    // when a workspace is attached (an unattached slot makes the kernel read
+    // magic 0 and stall). `interrupts = <GIC_SPI 17 LEVEL_HIGH>` → INTID 49.
+    if has_9p {
+        f.begin_node(&alloc::format!("virtio_mmio@{VIRTIO_9P_BASE:x}"));
+        f.prop_str("compatible", "virtio,mmio");
+        f.prop_reg(VIRTIO_9P_BASE, VIRTIO_9P_END - VIRTIO_9P_BASE);
+        f.prop_cells("interrupts", &[0, INTID_VIRTIO_9P - SPI_BASE_INTID, 4]);
+        f.end_node();
+    }
+
+    // The `virtio-net` (`CC-16` parity) slot — declared only when networking is
+    // attached. `interrupts = <GIC_SPI 18 LEVEL_HIGH>` → INTID 50.
+    if has_net {
+        f.begin_node(&alloc::format!("virtio_mmio@{VIRTIO_NET_BASE:x}"));
+        f.prop_str("compatible", "virtio,mmio");
+        f.prop_reg(VIRTIO_NET_BASE, VIRTIO_NET_END - VIRTIO_NET_BASE);
+        f.prop_cells("interrupts", &[0, INTID_VIRTIO_NET - SPI_BASE_INTID, 4]);
         f.end_node();
     }
 

@@ -1077,7 +1077,12 @@ for the ISA**, not the architecture’s answer.
   remote server in the tab (ADR-020). AArch64 is a **second ISA target
   for the same emulator role** — the devices (`virtio-mmio`
   block/9p/net + the userspace NAT), the κ-disk, the workbench, the
-  bridge, and the whole CC-15…CC-34 surface are reused unchanged; only
+  bridge, and the whole CC-15…CC-34 surface are reused unchanged
+  (`CC-46` is the V&V that makes this *true on every core*: the
+  9p/net/bridge servicing lives in the shared `emulator::devbus`, and
+  the AArch64 core wires its `virtio-9p`/`virtio-net` MMIO slots over
+  the GIC and exposes the bridge — one device implementation, two
+  transports); only
   the CPU core, the privileged/exception model, the MMU, and the
   platform (the ARM **virt** machine — `GIC` interrupt controller, the
   ARM generic timer, `PSCI` for boot/reset — in place of RISC-V’s
