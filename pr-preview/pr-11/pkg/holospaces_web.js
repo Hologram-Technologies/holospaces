@@ -616,6 +616,133 @@ export class DevcontainerImage {
 if (Symbol.dispose) DevcontainerImage.prototype[Symbol.dispose] = DevcontainerImage.prototype.free;
 
 /**
+ * **Provision a devcontainer's real OCI image in the browser** — the deployed
+ * path that makes a launched holospace the repository's *actual* devcontainer,
+ * not a demo. The page drives it with the router as the transport: while
+ * [`is_done`](DevcontainerProvision::is_done) is false, read
+ * [`next_url`](DevcontainerProvision::next_url) /
+ * [`next_accept`](DevcontainerProvision::next_accept) /
+ * [`next_bearer`](DevcontainerProvision::next_bearer), fetch through the router
+ * extension's CORS-free `fetch`, and feed the response back with
+ * [`deliver`](DevcontainerProvision::deliver); then [`assemble`] yields the
+ * bootable rootfs. The pull is the *same* [`ImagePull`] the native importer uses
+ * and re-derives every blob (Law L5) — only the transport differs.
+ */
+export class DevcontainerProvision {
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        DevcontainerProvisionFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_devcontainerprovision_free(ptr, 0);
+    }
+    /**
+     * Ingest the fully-fetched image (re-deriving every blob — Law L5) and
+     * assemble it into the bootable ext4 rootfs the emulator boots over
+     * `virtio-blk` — pass the result to
+     * [`boot_devcontainer_routed`](Workspace::boot_devcontainer_routed).
+     * @returns {Uint8Array}
+     */
+    assemble() {
+        const ret = wasm.devcontainerprovision_assemble(this.__wbg_ptr);
+        if (ret[3]) {
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
+     * Feed the router's response to the current fetch.
+     * @param {number} status
+     * @param {string} content_type
+     * @param {Uint8Array} body
+     */
+    deliver(status, content_type, body) {
+        const ptr0 = passStringToWasm0(content_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passArray8ToWasm0(body, wasm.__wbindgen_malloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.devcontainerprovision_deliver(this.__wbg_ptr, status, ptr0, len0, ptr1, len1);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+    /**
+     * Whether every blob has been delivered and the image is ready to
+     * [`assemble`](DevcontainerProvision::assemble).
+     * @returns {boolean}
+     */
+    isDone() {
+        const ret = wasm.devcontainerprovision_isDone(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
+     * Begin provisioning `image_ref` (e.g. `mcr.microsoft.com/devcontainers/base:debian`)
+     * for `arch` (`"riscv64"` / `"aarch64"`).
+     * @param {string} image_ref
+     * @param {string} arch
+     */
+    constructor(image_ref, arch) {
+        const ptr0 = passStringToWasm0(image_ref, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(arch, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.devcontainerprovision_new(ptr0, len0, ptr1, len1);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        this.__wbg_ptr = ret[0];
+        DevcontainerProvisionFinalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+    /**
+     * The `Accept` header for the next fetch (manifests), or `undefined`.
+     * @returns {string | undefined}
+     */
+    nextAccept() {
+        const ret = wasm.devcontainerprovision_nextAccept(this.__wbg_ptr);
+        let v1;
+        if (ret[0] !== 0) {
+            v1 = getStringFromWasm0(ret[0], ret[1]).slice();
+            wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        }
+        return v1;
+    }
+    /**
+     * The bearer token for the next fetch once one is held, or `undefined`.
+     * @returns {string | undefined}
+     */
+    nextBearer() {
+        const ret = wasm.devcontainerprovision_nextBearer(this.__wbg_ptr);
+        let v1;
+        if (ret[0] !== 0) {
+            v1 = getStringFromWasm0(ret[0], ret[1]).slice();
+            wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        }
+        return v1;
+    }
+    /**
+     * The URL the page must `GET` next through the router, or `undefined` when
+     * [`is_done`](DevcontainerProvision::is_done).
+     * @returns {string | undefined}
+     */
+    nextUrl() {
+        const ret = wasm.devcontainerprovision_nextUrl(this.__wbg_ptr);
+        let v1;
+        if (ret[0] !== 0) {
+            v1 = getStringFromWasm0(ret[0], ret[1]).slice();
+            wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        }
+        return v1;
+    }
+}
+if (Symbol.dispose) DevcontainerProvision.prototype[Symbol.dispose] = DevcontainerProvision.prototype.free;
+
+/**
  * A **workspace** over a running holospace, in the browser tab — the
  * Codespaces/Gitpod experience (ADR-009; `CC-9` + `CC-11`). The operator
  * launches a holospace whose code is the system emulator; it **boots a real
@@ -1434,6 +1561,9 @@ const ConsoleFinalization = (typeof FinalizationRegistry === 'undefined')
 const DevcontainerImageFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_devcontainerimage_free(ptr, 1));
+const DevcontainerProvisionFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_devcontainerprovision_free(ptr, 1));
 const WorkspaceFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_workspace_free(ptr, 1));
