@@ -777,6 +777,12 @@ pub struct Workspace {
     /// advances, so the integrated terminal streams only newly-produced output
     /// instead of re-reading the whole console each tick.
     console_cursor: usize,
+    /// The router seam, present when the guest's egress is carried by an external
+    /// router (the extension / a node). The page pumps it via
+    /// [`egress_outbound`](Workspace::egress_outbound) /
+    /// [`egress_inbound`](Workspace::egress_inbound); `None` for the bridged /
+    /// relay boots.
+    router: Option<net::RouterChannel>,
 }
 
 #[wasm_bindgen]
@@ -803,6 +809,7 @@ impl Workspace {
             files: std::collections::BTreeMap::new(),
             halted: false,
             console_cursor: 0,
+            router: None,
         })
     }
 
@@ -827,6 +834,7 @@ impl Workspace {
             files: std::collections::BTreeMap::new(),
             halted: false,
             console_cursor: 0,
+            router: None,
         })
     }
 
@@ -854,6 +862,7 @@ impl Workspace {
             files: std::collections::BTreeMap::new(),
             halted: false,
             console_cursor: 0,
+            router: None,
         })
     }
 
@@ -878,7 +887,49 @@ impl Workspace {
             files: std::collections::BTreeMap::new(),
             halted: false,
             console_cursor: 0,
+            router: None,
         })
+    }
+
+    /// Boot a devcontainer whose guest egress is carried by an external
+    /// **router** — the router extension (`CC-41`) or a node (`CC-39`) — over the
+    /// egress protocol ([`ChannelEgress`](holospaces::emulator::net::ChannelEgress)).
+    /// The guest comes up with DHCP and a real TCP stack; the page carries its
+    /// traffic to the router by pumping the seam (drain
+    /// [`egress_outbound`](Workspace::egress_outbound), feed
+    /// [`egress_inbound`](Workspace::egress_inbound)), and the router opens the
+    /// real sockets a tab cannot — so the guest's package managers, network
+    /// config, and apps reach the internet (Codespaces parity), with no relay and
+    /// no proxy. Drive with [`run`](Workspace::run), pumping the seam each tick.
+    pub fn boot_devcontainer_routed(kernel: &[u8], rootfs: &[u8]) -> Result<Workspace, JsValue> {
+        let (egress, router) = net::ChannelEgress::new();
+        let machine = MachineSpec::devcontainer_net()
+            .boot_net(kernel, rootfs.to_vec(), Box::new(egress))
+            .map_err(js_err)?;
+        Ok(Workspace {
+            machine,
+            store: MemKappaStore::new(),
+            channel: Vec::new(),
+            files: std::collections::BTreeMap::new(),
+            halted: false,
+            console_cursor: 0,
+            router: Some(router),
+        })
+    }
+
+    /// Drain the next egress frame the guest produced, for the page to carry to
+    /// the router. `undefined` when none is queued (or this is not a routed boot).
+    #[must_use]
+    pub fn egress_outbound(&self) -> Option<Vec<u8>> {
+        self.router.as_ref().and_then(net::RouterChannel::pop_outbound)
+    }
+
+    /// Deliver an egress frame the router returned (the host's bytes / connection
+    /// events) into the guest's network. A no-op when this is not a routed boot.
+    pub fn egress_inbound(&self, frame: &[u8]) {
+        if let Some(r) = &self.router {
+            r.feed_inbound(frame);
+        }
     }
 
     /// Suspend the running machine to a κ snapshot — the canonical,
@@ -907,6 +958,7 @@ impl Workspace {
             files: std::collections::BTreeMap::new(),
             halted: false,
             console_cursor: 0,
+            router: None,
         })
     }
 
