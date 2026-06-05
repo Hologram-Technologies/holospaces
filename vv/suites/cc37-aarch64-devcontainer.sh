@@ -33,6 +33,13 @@ cargo test --release --manifest-path "$ROOT/Cargo.toml" -p holospaces \
     --test cc37_aarch64 an_arm64_devcontainer_runs_a_stock_linux_arm64_binary \
     -- --ignored --nocapture || exit 1
 
+# The same boot, but the κ-disk is PAGED from a KappaStore by streaming sectors —
+# the exact path the browser peer's Aarch64Workspace takes from OPFS (no full image
+# in RAM). Proves the streamed paged κ-disk boots the AArch64 core (~release).
+cargo test --release --manifest-path "$ROOT/Cargo.toml" -p holospaces \
+    --test cc37_aarch64 an_arm64_devcontainer_boots_paged_from_a_kappa_store \
+    -- --ignored --nocapture || exit 1
+
 # The differential oracle: qemu-system-aarch64 -M virt booting the same kernel +
 # rootfs must run the same stock binary to the same markers.
 if command -v qemu-system-aarch64 >/dev/null 2>&1; then

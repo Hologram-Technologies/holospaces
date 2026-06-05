@@ -90,3 +90,38 @@ fn an_arm64_devcontainer_runs_a_stock_linux_arm64_binary() {
         "the devcontainer powered off cleanly via PSCI (the init's reboot)"
     );
 }
+
+/// The same arm64 devcontainer, but its κ-disk is **paged from a `KappaStore` by
+/// streaming sectors** — the exact path the browser peer's `Aarch64Workspace`
+/// takes (the rootfs is read sector-by-sector from OPFS into an OPFS-backed store;
+/// here a `MemKappaStore` stands in). The full image is never held as one `Vec`.
+/// Proves the streamed paged κ-disk boots the AArch64 core identically to the
+/// flat-image boot — the substrate-native, OOM-free path for a real arm64 image.
+#[test]
+#[ignore = "boots a real arm64 devcontainer paged from a κ-store (~release) — CC-37 vv suite"]
+fn an_arm64_devcontainer_boots_paged_from_a_kappa_store() {
+    use hologram_store_mem::MemKappaStore;
+    let kernel = gunzip(&cc37_dir().join("linux/Image.gz"));
+    let rootfs = assemble_rootfs();
+    let sector_count = (rootfs.len() as u64).div_ceil(512);
+    let read = move |i: u64, buf: &mut [u8]| {
+        let off = (i * 512) as usize;
+        let n = buf.len().min(rootfs.len().saturating_sub(off));
+        buf[..n].copy_from_slice(&rootfs[off..off + n]); // sparse tail stays zero
+    };
+    let mut cpu = Cpu::boot_linux_disk_streamed(
+        512 * 1024 * 1024,
+        &kernel,
+        "console=ttyAMA0 root=/dev/vda rw init=/init",
+        Box::new(MemKappaStore::new()),
+        sector_count,
+        read,
+    );
+    let halt = cpu.run(40_000_000_000);
+    let console = String::from_utf8_lossy(cpu.console());
+    assert!(
+        console.contains("CC37-DEVCONTAINER-UP"),
+        "the arm64 devcontainer booted from its streamed paged κ-disk; console:\n{console}"
+    );
+    assert_eq!(halt, Halt::Exit(0), "powered off cleanly");
+}

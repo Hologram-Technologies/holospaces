@@ -44,7 +44,7 @@ use holospaces::assembly::{assemble_ext4, assemble_ext4_bootable, Layer};
 use holospaces::boot::{devcontainer, provision, LifecycleError, ReadVerify, Resolver, Session};
 use holospaces::config::{Configuration, Directive, LifecycleAction};
 use holospaces::content_net::ContentPeer;
-use holospaces::emulator::{net, Emulator, Halt};
+use holospaces::emulator::{aarch64, net, Emulator, Halt};
 use holospaces::identity::{Operator, Roster};
 use holospaces::machine::MachineSpec;
 use holospaces::oci::ImagePull;
@@ -1432,5 +1432,92 @@ impl Workspace {
             "unsupported": unsupported,
         })
         .to_string())
+    }
+}
+
+/// **The browser peer's AArch64 holospace** — a real arm64 devcontainer booted on
+/// the [AArch64 core](holospaces::emulator::aarch64) (`CC-36`), its κ-disk paged
+/// from OPFS (the same substrate as the RISC-V [`Workspace`]). Complete for boot +
+/// terminal; the AArch64 core's net/9p parity (router egress, the 9p workspace) is
+/// the continued build, so this surface exposes only what the core does today —
+/// nothing it cannot fulfil.
+#[wasm_bindgen]
+pub struct Aarch64Workspace {
+    cpu: aarch64::Cpu,
+    halted: bool,
+    console_cursor: usize,
+}
+
+#[wasm_bindgen]
+impl Aarch64Workspace {
+    /// Boot a provisioned arm64 image, **streaming** its κ-disk from OPFS (no full
+    /// image in RAM): `rootfs_handle` is the provisioned rootfs (read
+    /// sector-by-sector into the OPFS-backed store on `disk_handle`). Drive with
+    /// [`run`](Aarch64Workspace::run), rendering [`terminal_delta`] between chunks.
+    pub fn boot_devcontainer_opfs_streamed(
+        kernel: &[u8],
+        rootfs_handle: web_sys::FileSystemSyncAccessHandle,
+        disk_handle: web_sys::FileSystemSyncAccessHandle,
+    ) -> Result<Aarch64Workspace, JsValue> {
+        let store = Box::new(opfs_store::OpfsKappaStore::new(disk_handle));
+        let total = rootfs_handle.get_size().map_err(js_err)? as u64;
+        let sector_count = total.div_ceil(512);
+        let read = move |i: u64, buf: &mut [u8]| {
+            let opts = web_sys::FileSystemReadWriteOptions::new();
+            opts.set_at((i * 512) as f64);
+            let _ = rootfs_handle.read_with_u8_array_and_options(buf, &opts);
+        };
+        let cpu = aarch64::Cpu::boot_linux_disk_streamed(
+            512 * 1024 * 1024,
+            kernel,
+            "console=ttyAMA0 root=/dev/vda rw init=/init",
+            store,
+            sector_count,
+            read,
+        );
+        Ok(Aarch64Workspace {
+            cpu,
+            halted: false,
+            console_cursor: 0,
+        })
+    }
+
+    /// Run a chunk of guest execution; returns `true` once the machine halts.
+    pub fn run(&mut self, budget: f64) -> bool {
+        if self.halted {
+            return true;
+        }
+        if !matches!(self.cpu.run(budget as u64), aarch64::Halt::OutOfBudget) {
+            self.halted = true;
+        }
+        self.halted
+    }
+
+    /// The full console the guest has produced.
+    #[must_use]
+    pub fn terminal(&self) -> String {
+        String::from_utf8_lossy(self.cpu.console()).into_owned()
+    }
+
+    /// The console bytes produced since the last call (the integrated terminal
+    /// streams these).
+    pub fn terminal_delta(&mut self) -> Vec<u8> {
+        let console = self.cpu.console();
+        let from = self.console_cursor.min(console.len());
+        let delta = console[from..].to_vec();
+        self.console_cursor = console.len();
+        delta
+    }
+
+    /// Feed keystrokes to the guest's serial console.
+    pub fn feed_input(&mut self, bytes: &[u8]) {
+        self.cpu.feed_console(bytes);
+    }
+
+    /// Whether the machine has powered off.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn halted(&self) -> bool {
+        self.halted
     }
 }
