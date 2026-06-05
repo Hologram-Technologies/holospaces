@@ -65,7 +65,12 @@ chrome.runtime.onMessageExternal.addListener((msg, _sender, sendResponse) => {
         redirect: "follow",
       });
       const body = new Uint8Array(await resp.arrayBuffer());
-      sendResponse({ ok: true, status: resp.status, body: Array.from(body) });
+      sendResponse({
+        ok: true,
+        status: resp.status,
+        contentType: resp.headers.get("content-type") || "",
+        body: Array.from(body),
+      });
     } catch (e) {
       sendResponse({ ok: false, error: String(e) });
     }
