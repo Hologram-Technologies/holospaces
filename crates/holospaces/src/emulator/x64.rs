@@ -117,9 +117,12 @@ struct Sys {
     /// registers a UP boot drives are modelled (`SVR`, `EOI`, the LVT timer, the
     /// timer initial/current count + divide).
     lapic: Lapic,
-    /// The architected timestamp counter (`RDTSC`) — advanced every step so the
-    /// kernel's delay loops and the TSC clocksource make progress.
+    /// The architected timestamp counter (`RDTSC`) — advanced in lockstep with the
+    /// PIT so the kernel's delay loops and the TSC clocksource make progress.
     tsc: u64,
+    /// A free-running step counter that paces the platform timers: they advance
+    /// once every [`TIMER_DIV`] emulator-steps (see [`Cpu::sys_tick`]).
+    timer_div: u64,
     /// `true` once the machine has halted (a `hlt` with interrupts masked, the
     /// guest power-off) — the run loop then returns [`Halt::Halted`].
     halted: bool,
@@ -151,6 +154,7 @@ impl Sys {
             pit: Pit::new(),
             lapic: Lapic::new(),
             tsc: 0,
+            timer_div: 0,
             halted: false,
         }
     }
@@ -230,6 +234,26 @@ struct Pit {
     /// The latched low/high write toggle (the PIT is two byte-wide accesses).
     write_hi: bool,
     enabled: bool,
+    /// Channel-0 mode: `true` = periodic (mode 2/3 — auto-reload, the legacy
+    /// `HZ` tick), `false` = one-shot (mode 0 — fire once, then idle until the
+    /// kernel reprograms a new deadline). The kernel's `clockevent` driver uses
+    /// the PIT in one-shot mode and reprograms it from the tick handler; modelling
+    /// that (rather than always auto-reloading) is what stops the tick handler's
+    /// catch-up loop from re-firing forever and drowning the boot (`#12`).
+    ch0_periodic: bool,
+    /// Channel 2 — the speaker timer the kernel repurposes to *calibrate the TSC*
+    /// (`pit_hpet_ptimer_calibrate_cpu`/`pit_calibrate_tsc`): it is gated on through
+    /// port `0x61` bit 0, counts down once, and raises OUT2 (port `0x61` bit 5)
+    /// when it reaches zero. The calibration busy-polls that OUT2 bit, so this must
+    /// advance for the boot to get past TSC calibration (`#12`).
+    ch2_reload: u16,
+    ch2_counter: u32,
+    ch2_write_hi: bool,
+    /// The channel-2 gate (port `0x61` bit 0): counting only runs while it is set.
+    ch2_gate: bool,
+    /// OUT2 has gone high (the one-shot count expired) — reflected in `IN 0x61`
+    /// bit 5, which the calibration loop waits on.
+    ch2_out: bool,
 }
 
 impl Pit {
@@ -239,6 +263,12 @@ impl Pit {
             counter: 0,
             write_hi: false,
             enabled: false,
+            ch0_periodic: true,
+            ch2_reload: 0,
+            ch2_counter: 0,
+            ch2_write_hi: false,
+            ch2_gate: false,
+            ch2_out: false,
         }
     }
 }
@@ -327,6 +357,11 @@ pub struct Cpu {
     cr4: u64,
     /// `IA32_EFER` — `LME`/`LMA` (long mode enabled/active) live here.
     efer: u64,
+    /// The debug registers `DR0..DR7`. `cpu_init` zeroes them on every CPU bring-up
+    /// (`MOV DRn, r` / `MOV r, DRn` — opcodes `0F 23` / `0F 21`); no hardware
+    /// breakpoints are armed during the boot, so they are plain storage that reads
+    /// back what was written (DR4/DR5 alias DR6/DR7 architecturally, immaterial here).
+    dr: [u64; 8],
     /// The six segment registers (`ES,CS,SS,DS,FS,GS` — indexed by [`SegId`]).
     /// In long mode the bases are 0 except `FS`/`GS`; `CS.long` selects 64-bit.
     seg: [Seg; 6],
@@ -390,6 +425,14 @@ enum SegId {
     Gs = 5,
 }
 
+/// How many emulator-steps pass between platform-timer (PIT/APIC/TSC) advances
+/// (see [`Cpu::sys_tick`]). A periodic kernel tick costs several thousand
+/// instructions; pacing the timers slower than that gives the boot ample headroom
+/// between ticks so it makes forward progress instead of drowning in the timer IRQ
+/// handler. The TSC and PIT advance together, so the guest's calibrated time base
+/// stays self-consistent.
+const TIMER_DIV: u64 = 256;
+
 /// `RFLAGS.IF` — the interrupt-enable flag (`STI`/`CLI`).
 const RFLAGS_IF: u64 = 1 << 9;
 /// `RFLAGS.DF` — the direction flag (string-op increment/decrement).
@@ -417,6 +460,7 @@ impl Cpu {
             r: [0; 16],
             rip: RAM_BASE,
             rflags: 0x2, // bit 1 is reserved-1
+            dr: [0; 8],
             cr0: 0,
             cr2: 0,
             cr3: 0,
@@ -497,6 +541,14 @@ impl Cpu {
         if !present(e1) {
             return Err(np);
         }
+        #[cfg(feature = "cc44-trace")]
+        if (0x5faa_0000_0000..0x5fab_0000_0000).contains(&vaddr) {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "[cc44-trace] WALK va={vaddr:#x} pml4={pml4:#x} e4={e4:#x} e3={e3:#x} e2={e2:#x} e1={e1:#x}",
+            );
+        }
         Ok((e1 & 0x000f_ffff_ffff_f000) | (vaddr & 0xfff))
     }
 
@@ -555,6 +607,18 @@ impl Cpu {
             v |= u64::from(*self.ram.get(a + i).unwrap_or(&0)) << (8 * i);
         }
         v
+    }
+
+    /// Read `size` bytes from a *linear* (virtual) address, walking the page
+    /// tables — the descriptor-table reads (`IDT`, `TSS`) the CPU does on its own
+    /// behalf during interrupt delivery. The `IDTR`/`GDTR`/`TR` bases the kernel
+    /// loads are kernel virtual addresses (e.g. `0xffffffff8347e000`), so reading
+    /// them as raw physical offsets would return zero and vector every fault to
+    /// `RIP 0`. A non-faulting walk (the CPU's own table access never page-faults
+    /// against the kernel's permanently-mapped descriptor tables).
+    fn rd_virt(&self, vaddr: u64, size: u8) -> u64 {
+        let pa = self.sys.as_ref().map_or(vaddr, |_| self.translate(vaddr));
+        self.rd_phys(pa, size)
     }
 
     /// Load a flat code/image blob at guest physical `addr` and set `rip` to it —
@@ -626,6 +690,16 @@ impl Cpu {
         if (LAPIC_BASE..LAPIC_END).contains(&pa) {
             self.lapic_write((pa - LAPIC_BASE) as u32, val as u32);
             return;
+        }
+        #[cfg(feature = "cc44-trace")]
+        if (0x385b6e0..=0x385b700).contains(&pa) {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "[cc44-trace] PTE-SET pa={pa:#x} (va={addr:#x}) size={size} val={val:#x} rip={:#x}",
+                self.rip,
+            );
+            let _ = std::io::stderr().flush();
         }
         for i in 0..u64::from(size) {
             let p = self.translate_acc(addr.wrapping_add(i), true, user) as usize;
@@ -723,6 +797,17 @@ impl Cpu {
     /// Run up to `max_steps` instructions; returns why it stopped.
     pub fn run(&mut self, max_steps: u64) -> Halt {
         for i in 0..max_steps {
+            #[cfg(feature = "cc44-trace")]
+            if i & 0x3ff_ffff == 0 {
+                use std::io::Write as _;
+                let tsc = self.sys.as_ref().map(|s| s.tsc).unwrap_or(0);
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "\n[cc44-trace] step={i} rip={:#x} tsc={tsc} if={}",
+                    self.rip,
+                    self.rflags & RFLAGS_IF != 0
+                );
+            }
             // Pump the network periodically so host-side data and connection
             // events reach the guest without it having to transmit first (the
             // `virtio-net` receive path; `CC-16` parity, `CC-46`) — the same
@@ -738,9 +823,42 @@ impl Cpu {
                 return Halt::Halted;
             }
             self.take_pending_interrupt();
+            #[cfg(feature = "cc44-trace")]
+            let prev_rip = self.rip;
             match self.step() {
                 Ok(()) => {}
                 Err(h) => return h,
+            }
+            #[cfg(feature = "cc44-trace")]
+            if self.rip < 0x1000 && prev_rip >= 0x1000 {
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "\n[cc44-trace] CONTROL→{:#x} from rip={prev_rip:#x} at step={i} \
+                     cr2={:#x} regs: rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} \
+                     rdi={:#x} rbp={:#x} rsp={:#x} cpl={} if={}",
+                    self.rip,
+                    self.cr2,
+                    self.r[0],
+                    self.r[3],
+                    self.r[1],
+                    self.r[2],
+                    self.r[6],
+                    self.r[7],
+                    self.r[RBP],
+                    self.r[RSP],
+                    self.cpl,
+                    self.rflags & RFLAGS_IF != 0,
+                );
+                let idtr = self.sys.as_ref().map(|s| s.idtr).unwrap_or((0, 0));
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[cc44-trace] idtr.base={:#x} idtr.limit={:#x} cr3={:#x}",
+                    idtr.0,
+                    idtr.1,
+                    self.cr3,
+                );
+                panic!("[cc44-trace] control transferred to low memory (rip<0x1000)");
             }
         }
         Halt::OutOfBudget
@@ -1005,7 +1123,16 @@ impl Cpu {
                 // back to the receive register rather than reaching the console.
                 sys.uart.input.push(val);
             }
-            0x3f8 => sys.uart.output.push(val),
+            0x3f8 => {
+                sys.uart.output.push(val);
+                #[cfg(feature = "cc44-trace")]
+                {
+                    use std::io::Write as _;
+                    let mut o = std::io::stderr();
+                    let _ = o.write_all(&[val]);
+                    let _ = o.flush();
+                }
+            }
             0x3f9 if dlab => {
                 sys.uart.divisor = (sys.uart.divisor & 0x00ff) | (u16::from(val) << 8);
             }
@@ -1017,21 +1144,60 @@ impl Cpu {
             // 8259 master/slave command + data ports (ICW/OCW programming).
             0x20 | 0xa0 => Self::pic_command(&mut sys.pic, port == 0xa0, val),
             0x21 | 0xa1 => Self::pic_data(&mut sys.pic, port == 0xa1, val),
-            // 8254 PIT: 0x43 = mode/command, 0x40 = channel-0 counter.
+            // 8254 PIT: 0x43 = mode/command, 0x40 = channel-0, 0x42 = channel-2.
             0x43 => {
-                // A channel-0 write (bits 7:6 == 00) latches a new reload.
-                if val >> 6 == 0 {
-                    sys.pit.write_hi = false;
+                // bits 7:6 select the channel: 00 = ch0 (periodic tick), 10 = ch2
+                // (the TSC-calibration one-shot). A new mode/command resets that
+                // channel's byte toggle (and re-arms channel 2).
+                match val >> 6 {
+                    0 => {
+                        sys.pit.write_hi = false;
+                        // bits 3:1 = mode. Mode 2/3 = periodic (rate generator /
+                        // square wave); anything else (mode 0) = one-shot.
+                        let mode = (val >> 1) & 0x7;
+                        sys.pit.ch0_periodic = mode == 2 || mode == 3 || mode == 6 || mode == 7;
+                    }
+                    2 => {
+                        sys.pit.ch2_write_hi = false;
+                        sys.pit.ch2_out = false;
+                    }
+                    _ => {}
                 }
             }
             0x40 => {
                 if sys.pit.write_hi {
                     sys.pit.reload = (sys.pit.reload & 0x00ff) | (u16::from(val) << 8);
                     sys.pit.enabled = true;
+                    // The high byte completes the count — (re)arm the down-counter.
+                    // For one-shot this is the new deadline the tick handler set.
+                    sys.pit.counter = u32::from(sys.pit.reload);
                 } else {
                     sys.pit.reload = (sys.pit.reload & 0xff00) | u16::from(val);
                 }
                 sys.pit.write_hi = !sys.pit.write_hi;
+            }
+            0x42 => {
+                if sys.pit.ch2_write_hi {
+                    sys.pit.ch2_reload = (sys.pit.ch2_reload & 0x00ff) | (u16::from(val) << 8);
+                } else {
+                    sys.pit.ch2_reload = (sys.pit.ch2_reload & 0xff00) | u16::from(val);
+                }
+                sys.pit.ch2_write_hi = !sys.pit.ch2_write_hi;
+                // The high byte completes the reload → (re)load the one-shot.
+                if !sys.pit.ch2_write_hi {
+                    sys.pit.ch2_counter = u32::from(sys.pit.ch2_reload);
+                    sys.pit.ch2_out = false;
+                }
+            }
+            // NMI status/control (port 0x61): bit 0 gates channel 2, bit 1 the
+            // speaker. A gate rising edge re-arms the one-shot from its reload.
+            0x61 => {
+                let gate = val & 1 != 0;
+                if gate && !sys.pit.ch2_gate {
+                    sys.pit.ch2_counter = u32::from(sys.pit.ch2_reload);
+                    sys.pit.ch2_out = false;
+                }
+                sys.pit.ch2_gate = gate;
             }
             _ => {}
         }
@@ -1124,6 +1290,30 @@ impl Cpu {
                 0x3ff => return sys.uart.scratch,
                 0x21 => return (sys.pic.mask & 0xff) as u8,
                 0xa1 => return (sys.pic.mask >> 8) as u8,
+                // NMI status/control: bit 5 mirrors OUT2 (channel-2 expiry) — the
+                // bit the TSC-calibration loop spins on; the low bits echo the
+                // gate/speaker state we were last told to set.
+                0x61 => {
+                    let mut v = 0u8;
+                    if sys.pit.ch2_gate {
+                        v |= 0x01;
+                    }
+                    if sys.pit.ch2_out {
+                        v |= 0x20;
+                    }
+                    return v;
+                }
+                // Channel-2 counter readback (latched low-then-high) — some
+                // calibration paths read the residual count.
+                0x42 => {
+                    let lo = sys.pit.ch2_write_hi;
+                    sys.pit.ch2_write_hi = !sys.pit.ch2_write_hi;
+                    return if lo {
+                        (sys.pit.ch2_counter & 0xff) as u8
+                    } else {
+                        (sys.pit.ch2_counter >> 8) as u8
+                    };
+                }
                 _ => {}
             }
         }
@@ -1871,7 +2061,13 @@ impl Cpu {
                 self.seg[SegId::Cs as usize].selector = cs as u16;
                 self.seg[SegId::Cs as usize].long = true;
                 self.cpl = (cs & 3) as u8;
-                self.rflags = (rflags & 0x0024_4dd5) | 0x2;
+                // Restore the saved RFLAGS. The mask keeps the user-settable
+                // status/control bits — crucially `IF` (bit 9): the timer/`virtio`
+                // IRQ handlers `IRETQ` back into code that must run with interrupts
+                // *enabled* (e.g. `calibrate_delay` waiting on `jiffies`), so
+                // dropping `IF` here would wedge the boot in that wait. Bit 1 is the
+                // architecturally-always-set reserved bit.
+                self.rflags = (rflags & 0x0024_4fd5) | 0x2;
                 self.r[RSP] = rsp;
                 self.seg[SegId::Ss as usize].selector = ss as u16;
             }
@@ -2102,6 +2298,20 @@ impl Cpu {
                             self.set_cr(cr_idx, v);
                         }
                     }
+                    0x21 => {
+                        // MOV r64, DRn — read a debug register (cpu_init reads DR6/DR7).
+                        let (dr_idx, rm) = self.modrm(rex);
+                        if let Rm::Reg(g) = rm {
+                            self.r[g] = self.dr[dr_idx & 7];
+                        }
+                    }
+                    0x23 => {
+                        // MOV DRn, r64 — write a debug register (cpu_init clears them).
+                        let (dr_idx, rm) = self.modrm(rex);
+                        if let Rm::Reg(g) = rm {
+                            self.dr[dr_idx & 7] = self.r[g];
+                        }
+                    }
                     0x30 => {
                         // WRMSR: MSR[ecx] = edx:eax.
                         let ecx = (self.r[RCX] & 0xffff_ffff) as u32;
@@ -2141,7 +2351,30 @@ impl Cpu {
                             let _ = self.modrm(rex);
                         }
                     }
-                    0x0b => return Err(Halt::Undefined(start)), // UD2
+                    0x0b => {
+                        #[cfg(feature = "cc44-trace")]
+                        {
+                            use std::io::Write as _;
+                            // Dump the bytes around the operands at a UD2 site
+                            // (e.g. __text_poke's BUG() after a failed verify):
+                            // rdi=dest, rsi=src, rdx=len.
+                            let (dst, src, len) = (self.r[7], self.r[6], self.r[2]);
+                            let mut dh = [0u8; 32];
+                            let mut sh = [0u8; 32];
+                            for i in 0..32u64 {
+                                dh[i as usize] = self.rd_virt(dst.wrapping_add(i), 1) as u8;
+                                sh[i as usize] = self.rd_virt(src.wrapping_add(i), 1) as u8;
+                            }
+                            let dpa = self.translate(dst);
+                            let _ = writeln!(
+                                std::io::stderr(),
+                                "\n[cc44-trace] UD2 at {start:#x} rdi(dst)={dst:#x} -> pa={dpa:#x} \
+                                 rsi(src)={src:#x} rdx(len)={len} cr3={:#x}\n  dst={dh:02x?}\n  src={sh:02x?}",
+                                self.cr3,
+                            );
+                        }
+                        return Err(Halt::Undefined(start)); // UD2
+                    }
                     0x40..=0x4f => {
                         // CMOVcc r, r/m.
                         let cc = op2 - 0x40;
@@ -2205,8 +2438,60 @@ impl Cpu {
                             self.cmpxchg16b(rm, rex & 8 != 0);
                         }
                     }
+                    0xc8..=0xcf => {
+                        // BSWAP r32/r64 — reverse the operand's byte order (the
+                        // kernel's RNG/entropy + endian helpers use it). The
+                        // register is the low 3 opcode bits, REX.B-extended.
+                        let g = (op2 as usize - 0xc8) | (((rex & 1) as usize) << 3);
+                        let v = self.r[g] & Self::mask(size);
+                        let swapped = if size == 8 {
+                            v.swap_bytes()
+                        } else {
+                            u64::from((v as u32).swap_bytes())
+                        };
+                        self.store_rm(Rm::Reg(g), size, swapped);
+                    }
                     _ => return Err(Halt::Undefined(start)),
                 }
+            }
+            0xcc => {
+                // INT3 — the software breakpoint. The kernel's boot-time
+                // self-test (`int3_selftest`) and the alternatives/kprobe machinery
+                // execute a real `int3` and expect to vector through IDT[3]. `rip`
+                // already points past the byte (the trap returns to the next insn).
+                self.deliver_interrupt(3, 0, false);
+            }
+            0xcd => {
+                // INT imm8 — software interrupt through IDT[imm8].
+                let vec = self.fetch_u8();
+                self.deliver_interrupt(vec, 0, false);
+            }
+            0x9b => {} // FWAIT/WAIT — no pending unmasked FP exception to service.
+            0xd8..=0xdf => {
+                // x87 FPU escape opcodes. The integer boot path only *initialises*
+                // the FPU (`fpu__init_cpu_generic`: `FNINIT`) and probes the control
+                // word; it never depends on an x87 *computation*. With `CR0.TS/EM`
+                // clear the FPU is "present and usable", so these execute as no-ops
+                // here — but their operands must still be consumed so decoding stays
+                // aligned. A register-form escape (`DB E3` = FNINIT, `DF E0` =
+                // FNSTSW AX, …) is `op,modrm`; a memory form carries a full ModRM.
+                let modrm = self.fetch_u8();
+                if modrm < 0xc0 {
+                    // Memory operand: re-decode it (consume SIB/disp). The byte was
+                    // already fetched, so step rip back over it first.
+                    self.rip = self.rip.wrapping_sub(1);
+                    let (_r, rm) = self.modrm(rex);
+                    // FNSTCW/FNSTSW store a benign control/status word so the
+                    // kernel's read-back probe sees a sane FPU (`0x037f` default CW,
+                    // `0` status); other memory forms are ignored.
+                    match (op, (modrm >> 3) & 7) {
+                        (0xd9, 7) => self.store_rm(rm, 2, 0x037f),        // FNSTCW
+                        (0xdd, 7) | (0xdf, 7) => self.store_rm(rm, 2, 0), // FNSTSW
+                        _ => {}
+                    }
+                }
+                // Register-form escapes (modrm >= 0xc0) are pure FPU-internal ops;
+                // the second byte is already consumed — nothing more to do.
             }
             _ => return Err(Halt::Undefined(start)),
         }
@@ -2490,6 +2775,20 @@ impl Cpu {
         let Some(sys) = self.sys.as_mut() else {
             return;
         };
+        // Advance the down-counter timers (PIT / APIC) and the TSC only once every
+        // `TIMER_DIV` emulator-steps, and keep their rates *locked together* (TSC
+        // += 64 per PIT decrement, the calibrated ratio). A periodic tick costs the
+        // kernel several thousand instructions (`tick_periodic` → scheduler /
+        // timekeeping / RCU / hrtimers); if a tick fell due every few thousand
+        // steps the boot would spend ~all its time in the IRQ handler and never
+        // make forward progress (the "timer storm"). Stretching the period in
+        // emulator-steps — while keeping TSC:PIT consistent — gives the boot
+        // thousands of instructions of headroom between ticks. The guest still sees
+        // a coherent HZ; only the host step:wall ratio changes.
+        sys.timer_div = sys.timer_div.wrapping_add(1);
+        if sys.timer_div % TIMER_DIV != 0 {
+            return;
+        }
         sys.tsc = sys.tsc.wrapping_add(64);
         // The 8254 PIT channel-0 down-counter.
         if sys.pit.enabled && sys.pit.reload != 0 {
@@ -2498,8 +2797,22 @@ impl Cpu {
             }
             sys.pit.counter = sys.pit.counter.saturating_sub(1);
             if sys.pit.counter == 0 {
-                sys.pit.counter = u32::from(sys.pit.reload);
                 sys.pic.raise(0);
+                if sys.pit.ch0_periodic {
+                    sys.pit.counter = u32::from(sys.pit.reload);
+                } else {
+                    // One-shot: stay expired until the kernel reprograms a new
+                    // deadline (the next `OUT 0x40` re-arms `enabled`/`counter`).
+                    sys.pit.enabled = false;
+                }
+            }
+        }
+        // PIT channel 2 — the TSC-calibration one-shot. While gated, count down
+        // to zero, then latch OUT2 (the calibration loop's wait condition).
+        if sys.pit.ch2_gate && !sys.pit.ch2_out && sys.pit.ch2_counter > 0 {
+            sys.pit.ch2_counter = sys.pit.ch2_counter.saturating_sub(1);
+            if sys.pit.ch2_counter == 0 {
+                sys.pit.ch2_out = true;
             }
         }
         // The local-APIC timer.
@@ -2584,8 +2897,8 @@ impl Cpu {
     fn deliver_interrupt(&mut self, vector: u8, error: u64, has_error: bool) {
         let (idt_base, _) = self.sys().idtr;
         let desc = idt_base + u64::from(vector) * 16;
-        let lo = self.rd_phys(desc, 8);
-        let hi = self.rd_phys(desc + 8, 8);
+        let lo = self.rd_virt(desc, 8);
+        let hi = self.rd_virt(desc + 8, 8);
         let off = (lo & 0xffff) | ((lo >> 32) & 0xffff_0000) | ((hi & 0xffff_ffff) << 32);
         let ist = (lo >> 32) & 0x7;
         let old_cs = self.seg[SegId::Cs as usize].selector;
@@ -2627,9 +2940,9 @@ impl Cpu {
             return 0;
         }
         if ist == 0 {
-            self.rd_phys(base + 4, 8) // RSP0 at TSS offset 4
+            self.rd_virt(base + 4, 8) // RSP0 at TSS offset 4
         } else {
-            self.rd_phys(base + 0x24 + (ist - 1) * 8, 8) // IST1.. at offset 0x24
+            self.rd_virt(base + 0x24 + (ist - 1) * 8, 8) // IST1.. at offset 0x24
         }
     }
 
@@ -3136,8 +3449,8 @@ impl Cpu {
     fn load_tr(&mut self, sel: u16) {
         let (gdt, _) = self.sys().gdtr;
         let desc = gdt + u64::from(sel & 0xfff8);
-        let lo = self.rd_phys(desc, 8);
-        let hi = self.rd_phys(desc + 8, 8);
+        let lo = self.rd_virt(desc, 8);
+        let hi = self.rd_virt(desc + 8, 8);
         let base =
             ((lo >> 16) & 0xff_ffff) | (((lo >> 56) & 0xff) << 24) | ((hi & 0xffff_ffff) << 32);
         self.sys_mut().tr_base = base;
