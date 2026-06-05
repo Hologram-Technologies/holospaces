@@ -15,8 +15,34 @@ import { chromium } from "playwright";
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const TYPES = { ".html": "text/html", ".js": "text/javascript", ".wasm": "application/wasm" };
 
+// The CC-14 real OCI image fixture (a real Linux), served over the OCI
+// distribution endpoints so DevcontainerProvision pulls a REAL image in the
+// browser. In production the router extension's CORS-free fetch is the transport;
+// here the same-origin test server stands in for it (the pull logic is identical).
+const IMAGE_DIR = path.join(ROOT, "../../../vv/artifacts/cc14/image");
+
 const server = http.createServer(async (req, res) => {
-  const rel = req.url === "/" ? "/index.html" : req.url.split("?")[0];
+  const url = req.url.split("?")[0];
+  if (url.startsWith("/v2/img/")) {
+    try {
+      if (url.includes("/manifests/")) {
+        const index = JSON.parse(await readFile(path.join(IMAGE_DIR, "index.json")));
+        const digest = index.manifests[0].digest.replace("sha256:", "");
+        const body = await readFile(path.join(IMAGE_DIR, "blobs/sha256", digest));
+        res.writeHead(200, { "content-type": "application/vnd.oci.image.manifest.v1+json" }).end(body);
+      } else if (url.includes("/blobs/")) {
+        const d = url.split("/blobs/")[1].replace("sha256:", "");
+        const body = await readFile(path.join(IMAGE_DIR, "blobs/sha256", d));
+        res.writeHead(200, { "content-type": "application/octet-stream" }).end(body);
+      } else {
+        res.writeHead(404).end();
+      }
+    } catch {
+      res.writeHead(404).end();
+    }
+    return;
+  }
+  const rel = req.url === "/" ? "/index.html" : url;
   try {
     const body = await readFile(path.join(ROOT, rel));
     res.writeHead(200, { "content-type": TYPES[path.extname(rel)] || "application/octet-stream" });
@@ -325,6 +351,39 @@ try {
   });
   check(cross.fetched === cross.expected, "two browser peers exchange content over the live transport seam a WebRTC data channel carries (CC-38)");
   check(cross.absentIsNull, "a κ no peer holds resolves to null over the transport seam (no forging)");
+
+  // CC-42 — the browser provisions a repository's REAL OCI image into a bootable
+  // rootfs, in the tab. DevcontainerProvision drives the page-driven pull
+  // (Unit 1/2) against a real image fixture served over the OCI distribution
+  // endpoints; in production the router extension's CORS-free fetch is the
+  // transport, here the same-origin server stands in for it. Re-derives every
+  // blob (Law L5) and assembles the ext4 rootfs the emulator boots — proving the
+  // launched holospace is the repository's actual devcontainer, not a demo.
+  const provision = await page.evaluate(async (origin) => {
+    const m = await import("./pkg/holospaces_web.js");
+    await m.default("./pkg/holospaces_web_bg.wasm");
+    const prov = new m.DevcontainerProvision(`${origin}/img:latest`, "riscv64");
+    let steps = 0;
+    while (!prov.isDone()) {
+      const url = prov.nextUrl();
+      if (!url) break;
+      const headers = {};
+      const accept = prov.nextAccept();
+      if (accept) headers["Accept"] = accept;
+      const bearer = prov.nextBearer();
+      if (bearer) headers["Authorization"] = `Bearer ${bearer}`;
+      const res = await fetch(url, { headers });
+      const body = new Uint8Array(await res.arrayBuffer());
+      prov.deliver(res.status, res.headers.get("content-type") || "", body);
+      if (++steps > 50) throw new Error("the pull did not converge");
+    }
+    const rootfs = prov.assemble();
+    return { len: rootfs.length, mult4k: rootfs.length % 4096 === 0 };
+  }, `127.0.0.1:${port}`);
+  check(
+    provision.len > 0 && provision.mult4k,
+    "the browser provisions a repository's REAL OCI image into a bootable ext4 rootfs via the page-driven pull (CC-42)",
+  );
 
   console.log(failed ? "MANAGER-TEST: FAILED" : "MANAGER-TEST: PASS (browser peer + Platform Manager console)");
 } finally {
