@@ -103,27 +103,39 @@ try {
   echo.close();
 }
 
-// ── Content role: CORS-free fetch (pull a repo's image layers) ───────────────
-// The router's other half: a registry/CDN fetch a tab can't do (CORS). Polyfill
-// fetch (the real one is the service worker's CORS-free fetch) and drive the
-// onMessageExternal handler — proving it returns the bytes the browser peer
-// assembles into the rootfs.
+// ── Content role: CORS-free fetch, STREAMED over a content port ──────────────
+// The router's other half: a registry/CDN fetch a tab can't do (CORS), streamed
+// in chunks (a multi-MB layer can't cross runtime messaging as one array).
+// Polyfill fetch (the real one is the service worker's CORS-free fetch) and drive
+// a "holospaces-content" port — proving the worker fetches + chunks the bytes the
+// browser peer reassembles into the rootfs.
 globalThis.fetch = async (url) => ({
   status: 200,
   headers: { get: (h) => (h.toLowerCase() === "content-type" ? "application/octet-stream" : null) },
   arrayBuffer: async () => new TextEncoder().encode("layer-bytes-for:" + url).buffer,
 });
-const fetchResp = await new Promise((resolve) => {
-  messageHandlers[0](
-    { type: "holospaces-fetch", url: "https://registry-1.docker.io/v2/library/debian/blobs/sha256:abc" },
-    {},
-    resolve,
-  );
+const contentMsgs = [];
+const contentListeners = [];
+const contentPort = {
+  name: "holospaces-content",
+  postMessage: (m) => contentMsgs.push(m),
+  onMessage: { addListener: (cb) => contentListeners.push(cb) },
+  onDisconnect: { addListener: () => {} },
+};
+connectHandlers[0](contentPort); // serveContent registers its listener on the port
+await contentListeners[0]({
+  type: "fetch",
+  id: 1,
+  url: "https://registry-1.docker.io/v2/library/debian/blobs/sha256:abc",
 });
+const head = contentMsgs.find((m) => m.type === "head" && m.id === 1);
+const end = contentMsgs.find((m) => m.type === "end" && m.id === 1);
+const got = [];
+for (const m of contentMsgs) if (m.type === "chunk" && m.id === 1) got.push(...m.bytes);
 check(
-  !!fetchResp && fetchResp.ok && fetchResp.status === 200 &&
-    new TextDecoder().decode(Uint8Array.from(fetchResp.body)).startsWith("layer-bytes-for:"),
-  "the router fetches CORS-blocked content (registry layers) and returns the bytes (content role)",
+  !!head && head.status === 200 && !!end &&
+    new TextDecoder().decode(Uint8Array.from(got)).startsWith("layer-bytes-for:"),
+  "the router fetches CORS-blocked content and streams the layer back in chunks (content role)",
 );
 
 console.log(failed ? "EXTENSION-EGRESS-TEST: FAILED" : "EXTENSION-EGRESS-TEST: PASS (router: egress over Direct Sockets + content over CORS-free fetch)");

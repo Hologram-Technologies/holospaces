@@ -41,44 +41,49 @@ function frame(op, id, body) {
   return f;
 }
 
-// A holospaces tab connected — serve its guest's egress over this port.
-// ── Content role: CORS-free fetch (pull a repo's image layers a tab can't) ───
-// The OTHER thing only an extension can do: a service worker's fetch() is exempt
-// from CORS, so it can pull the CORS-blocked registries/CDNs (Docker Hub, ghcr)
-// the page cannot — the layers the browser peer assembles into the devcontainer
-// rootfs. One-shot request/response over `onMessageExternal`. Broad host access
-// is requested at RUNTIME (optional_host_permissions) with the operator's
-// consent, so the base install stays minimal.
-chrome.runtime.onMessageExternal.addListener((msg, _sender, sendResponse) => {
-  if (!msg || msg.type !== "holospaces-fetch" || typeof msg.url !== "string") {
-    return false;
-  }
-  (async () => {
+// ── Content role: CORS-free fetch, STREAMED over a port ──────────────────────
+// A service worker's fetch() is CORS-exempt (host_permissions), so it pulls the
+// CORS-blocked registries/CDNs (Docker Hub, ghcr) the page cannot — the image
+// layers the browser peer assembles into the rootfs. Image layers are large, so
+// the body is streamed in chunks: a single JSON array for a multi-MB layer would
+// exceed the runtime-message size limit. The page opens a port named
+// "holospaces-content" and drives one fetch per { type:"fetch", id, url } message.
+function serveContent(port) {
+  port.onMessage.addListener(async (msg) => {
+    if (!msg || msg.type !== "fetch" || typeof msg.url !== "string") return;
     try {
-      // host_permissions makes the service worker's fetch CORS-free (the router's
-      // content role) — no runtime permission request (that needs a user gesture
-      // a message handler doesn't have).
       const resp = await fetch(msg.url, {
         method: msg.method || "GET",
         headers: msg.headers || {},
         redirect: "follow",
       });
-      const body = new Uint8Array(await resp.arrayBuffer());
-      sendResponse({
-        ok: true,
+      const buf = new Uint8Array(await resp.arrayBuffer());
+      const CHUNK = 256 * 1024;
+      port.postMessage({
+        type: "head",
+        id: msg.id,
         status: resp.status,
         contentType: resp.headers.get("content-type") || "",
-        body: Array.from(body),
+        total: buf.length,
       });
+      for (let o = 0; o < buf.length; o += CHUNK) {
+        port.postMessage({ type: "chunk", id: msg.id, bytes: Array.from(buf.subarray(o, o + CHUNK)) });
+      }
+      port.postMessage({ type: "end", id: msg.id });
     } catch (e) {
-      sendResponse({ ok: false, error: String(e) });
+      port.postMessage({ type: "error", id: msg.id, error: String(e) });
     }
-  })();
-  return true; // keep the message channel open for the async sendResponse
-});
+  });
+}
 
 chrome.runtime.onConnectExternal.addListener((port) => {
-  // One set of live sockets per tab connection (keyed by the guest's conn id).
+  // The content channel (chunked registry fetches) vs the egress channel (raw
+  // sockets) — distinguished by the port name.
+  if (port.name === "holospaces-content") {
+    serveContent(port);
+    return;
+  }
+  // ── Egress role: a raw socket per guest connection (keyed by conn id) ──
   const conns = new Map(); // id -> { writer, socket }
   const send = (bytes) => { try { port.postMessage(Array.from(bytes)); } catch {} };
 
