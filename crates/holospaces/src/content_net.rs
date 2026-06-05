@@ -2,22 +2,23 @@
 //!
 //! A peer reaches another peer's content the same content-addressed way on every
 //! deployment surface — browser, bare-metal, or native host. The substrate
-//! supplies the mechanism: [`hologram_net_bare::BareNetSync`] is a [`KappaSync`]
-//! that speaks the uor-native frame protocol (`fetch`/`announce`/`discover`,
-//! **verify-on-receipt** — SPINE-4) over a [`NetworkInterface`] HAL. This module
-//! supplies a *portable* `NetworkInterface` — [`PacketLink`] — so the **same**
-//! `BareNetSync` drives the content network in a wasm tab and on a bare-metal
-//! board alike (the module is `no_std` + `alloc`, in the portable peer core).
-//! Because both surfaces run the identical `BareNetSync` over the identical
+//! supplies the mechanism: [`hologram_net_bare::BareNetSync`] is a
+//! [`KappaSync`](hologram_substrate_core::KappaSync) that speaks the uor-native
+//! frame protocol (`fetch`/`announce`/`discover`, **verify-on-receipt** —
+//! SPINE-4) over a [`NetworkInterface`](hologram_bare_hal::NetworkInterface) HAL.
+//! This module supplies a *portable* `NetworkInterface` — [`PacketLink`](crate::content_net::PacketLink) — so the
+//! **same** `BareNetSync` drives the content network in a wasm tab and on a
+//! bare-metal board alike (the module is `no_std` + `alloc`, in the portable peer
+//! core). Because both surfaces run the identical `BareNetSync` over the identical
 //! frame codec, a **browser peer and a bare-metal peer interoperate by
 //! construction** — the `CC-38` witness exchanges content between two such peers
 //! and the bare-metal build gate (`thumbv7em-none-eabi`) compiles the same path.
 //!
-//! [`PacketLink`] holds only lock-protected frame queues (`Send + Sync`, as the
+//! [`PacketLink`](crate::content_net::PacketLink) holds only lock-protected frame queues (`Send + Sync`, as the
 //! HAL requires) — **no transport, no JS**. A *pump* connects a link to a wire:
 //! a WebRTC data channel between browser tabs (a browser feature, bound in the
 //! `holospaces-web` peer), a real NIC on bare metal, or — for the witness — an
-//! in-process [`loopback_pair`](PacketLink::loopback_pair). The link is portable
+//! in-process [`loopback_pair`](crate::content_net::PacketLink::loopback_pair). The link is portable
 //! substrate code; only the pump is surface-specific.
 
 extern crate alloc;
