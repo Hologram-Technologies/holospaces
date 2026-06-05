@@ -16,7 +16,7 @@
     "matches": ["https://hologram-technologies.github.io/*"]
   },
 
-  "optional_host_permissions": ["*://*/*"],
+  "host_permissions": ["*://*/*"],
 
   "content_scripts": [
     {
