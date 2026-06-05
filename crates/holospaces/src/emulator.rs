@@ -642,6 +642,26 @@ impl KappaBacking {
         KappaBacking { store, index }
     }
 
+    /// Load a κ-disk over a caller-supplied store by **streaming** sectors from a
+    /// reader (`read(i, buf)` fills the 512-byte `buf` for sector `i`) — the full
+    /// image is never materialized in RAM. The browser peer's reader pulls each
+    /// sector from the OPFS rootfs file, so a large image is paged straight into
+    /// the (OPFS-backed) store sector-by-sector.
+    fn from_sectors<R: FnMut(u64, &mut [u8])>(
+        store: Box<dyn KappaStore>,
+        sector_count: u64,
+        mut read: R,
+    ) -> Self {
+        let mut index = Vec::with_capacity(sector_count as usize);
+        let mut sector = [0u8; DISK_SECTOR];
+        for i in 0..sector_count {
+            sector.fill(0);
+            read(i, &mut sector);
+            index.push(Self::store_sector(store.as_ref(), &sector));
+        }
+        KappaBacking { store, index }
+    }
+
     /// Content-address a sector through the store (sparse all-zero → `None`).
     fn store_sector(store: &dyn KappaStore, sector: &[u8; DISK_SECTOR]) -> Option<KappaLabel71> {
         if sector.iter().all(|&b| b == 0) {
@@ -1839,6 +1859,23 @@ impl Emulator {
     pub fn attach_disk_in(&mut self, store: Box<dyn KappaStore>, image: Vec<u8>) {
         self.virtio = Some(VirtioBlk::with_backing(KappaBacking::from_image_in(
             store, &image,
+        )));
+    }
+
+    /// Attach the disk over a supplied store by **streaming** `sector_count`
+    /// sectors from `read` (no full image in RAM) — the browser peer reads each
+    /// sector from the OPFS rootfs file straight into the OPFS-backed store, so a
+    /// large image boots without ever materializing the whole `Vec`.
+    pub fn attach_disk_streamed<R: FnMut(u64, &mut [u8])>(
+        &mut self,
+        store: Box<dyn KappaStore>,
+        sector_count: u64,
+        read: R,
+    ) {
+        self.virtio = Some(VirtioBlk::with_backing(KappaBacking::from_sectors(
+            store,
+            sector_count,
+            read,
         )));
     }
 

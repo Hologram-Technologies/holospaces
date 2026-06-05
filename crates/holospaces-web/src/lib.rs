@@ -1042,6 +1042,40 @@ impl Workspace {
         })
     }
 
+    /// Boot the paged κ-disk by **streaming** the rootfs from one OPFS file into
+    /// an OPFS-backed store in another — the *transient-peak-free* path: neither
+    /// the full rootfs nor the assembled image is ever held in wasm RAM.
+    /// `rootfs_handle` is a sync access handle on the provisioned rootfs file (read
+    /// sector-by-sector); `disk_handle` is the κ-store pack. Egress is routed.
+    pub fn boot_devcontainer_routed_opfs_streamed(
+        kernel: &[u8],
+        rootfs_handle: web_sys::FileSystemSyncAccessHandle,
+        disk_handle: web_sys::FileSystemSyncAccessHandle,
+    ) -> Result<Workspace, JsValue> {
+        let (egress, router) = net::ChannelEgress::new();
+        let store = Box::new(opfs_store::OpfsKappaStore::new(disk_handle));
+        let total = rootfs_handle.get_size().map_err(js_err)? as u64;
+        let sector_count = total.div_ceil(512);
+        let read = move |i: u64, buf: &mut [u8]| {
+            let opts = web_sys::FileSystemReadWriteOptions::new();
+            opts.set_at((i * 512) as f64);
+            // A short read at the tail leaves the rest of `buf` zero (sparse pad).
+            let _ = rootfs_handle.read_with_u8_array_and_options(buf, &opts);
+        };
+        let machine = MachineSpec::devcontainer_net()
+            .boot_net_streamed(kernel, sector_count, read, Box::new(egress), store)
+            .map_err(js_err)?;
+        Ok(Workspace {
+            machine,
+            store: MemKappaStore::new(),
+            channel: Vec::new(),
+            files: std::collections::BTreeMap::new(),
+            halted: false,
+            console_cursor: 0,
+            router: Some(router),
+        })
+    }
+
     /// Drain the next egress frame the guest produced, for the page to carry to
     /// the router. `undefined` when none is queued (or this is not a routed boot).
     #[must_use]
