@@ -368,30 +368,38 @@
       async function action(act, k) {
         const m = meta.get(k);
         if (act === "enter") {
-          // Provision the repository's REAL image in the browser via the router,
-          // stage it in OPFS, then open the workbench on it — the launched
-          // holospace is the actual devcontainer (CC-42), not a demo.
+          // The workbench URL (the REAL VS Code web workbench over the running
+          // holospace — CC-17; ADR-012 supersedes the CC-13 Monaco fallback).
+          const ext = m.extensions && m.extensions.length ? "&ext=" + encodeURIComponent(m.extensions.join(",")) : "";
+          const egress = m.egress ? "&egress=" + encodeURIComponent(m.egress) : "";
+          const url = `workbench.html?id=${encodeURIComponent(k)}&name=${encodeURIComponent(m.name)}&arch=${encodeURIComponent(m.arch)}${ext}${egress}`;
+          // Open the tab NOW, in the click gesture. (A window.open AFTER the
+          // provisioning `await` is treated as non-user-initiated and pop-up
+          // blocked — so for a repo we open a placeholder tab synchronously, then
+          // navigate it once the image is staged.)
+          const tab = window.open(m.image ? "" : url, "_blank");
+          if (!tab) { toast("allow pop-ups for this site to enter " + m.name); return; }
           if (m.image) {
             if (!window.holospacesEgressExtensionId) {
-              toast("install the router extension to provision " + m.name + " — it pulls the repo's image (the ⬇ link in a guest's Network settings)");
+              tab.close();
+              toast("install the router extension to provision " + m.name + " — the ⬇ link in a guest's Network settings");
               return;
             }
             try {
-              toast("provisioning " + m.name + " — pulling " + m.image + " via the router…");
+              tab.document.write(`<!doctype html><meta charset=utf8><body style="font:14px/1.6 system-ui;background:#0d1117;color:#c9d1d9;padding:2rem">Provisioning <b>${m.name}</b> — pulling <code>${m.image}</code> via the router and assembling its image. This can take a while for a large base; the workbench opens here when it's ready.</body>`);
+            } catch {}
+            toast("provisioning " + m.name + " — pulling " + m.image + " via the router…");
+            try {
               await provisionToOpfs(k, m.image, m.arch);
             } catch (e) {
+              try { tab.close(); } catch {}
               toast("provisioning " + m.name + " failed: " + e);
               return;
             }
+            tab.location = url; // navigate the tab we already own (no pop-up block)
           }
           m.status = "running"; render();
-          // Launch the Workspace Projection in a new tab — the REAL VS Code web
-          // workbench over the running holospace (CC-17; ADR-012 supersedes the
-          // CC-13 Monaco fallback at workspace.html).
-          const ext = m.extensions && m.extensions.length ? "&ext=" + encodeURIComponent(m.extensions.join(",")) : "";
-          const egress = m.egress ? "&egress=" + encodeURIComponent(m.egress) : "";
-          window.open(`workbench.html?id=${encodeURIComponent(k)}&name=${encodeURIComponent(m.name)}&arch=${encodeURIComponent(m.arch)}${ext}${egress}`, "_blank");
-          toast("entering " + m.name + " — the VS Code workbench opens in a new tab");
+          toast("entering " + m.name + " — the VS Code workbench opens in the new tab");
         } else if (act === "suspend") {
           // Real: publish a lifecycle configuration the instance applies (no stub).
           const cfg = configure(k, [{ lifecycle: "suspend" }]);
