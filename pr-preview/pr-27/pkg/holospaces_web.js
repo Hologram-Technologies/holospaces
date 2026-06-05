@@ -29,7 +29,8 @@ export class Aarch64Workspace {
      * Boot a provisioned arm64 image, **streaming** its κ-disk from OPFS (no full
      * image in RAM): `rootfs_handle` is the provisioned rootfs (read
      * sector-by-sector into the OPFS-backed store on `disk_handle`). Drive with
-     * [`run`](Aarch64Workspace::run), rendering [`terminal_delta`] between chunks.
+     * [`run`](Aarch64Workspace::run), rendering
+     * [`terminal_delta`](Aarch64Workspace::terminal_delta) between chunks.
      * @param {Uint8Array} kernel
      * @param {FileSystemSyncAccessHandle} rootfs_handle
      * @param {FileSystemSyncAccessHandle} disk_handle
@@ -208,6 +209,40 @@ export class Console {
         return v1;
     }
     /**
+     * **The product pump (CC-49).** Carry this peer's content-network frames
+     * across a real WebRTC data channel ([`WebRtcLink`]) to another browser peer:
+     * drain every frame this peer wants to transmit onto the channel
+     * ([`WebRtcLink::send`]) and deliver every frame the channel received from the
+     * peer into this peer ([`WebRtcLink::recv`] → [`cn_inbound`]). This is the
+     * browser surface's transport pump for the uor-native content network — the
+     * counterpart to a real NIC's RX/TX on bare metal — and it lives **in the
+     * product**, not the witness: a deployed tab calls `cn_fetch_start`, then
+     * `cn_pump(link)` + `cn_fetch_poll` as the channel signals readiness, and so
+     * fetches a κ from a peer over WebRTC entirely through this API.
+     *
+     * The pump moves only opaque frames; it never inspects content or addressing.
+     * Verify-on-receipt (SPINE-4 / Law L5) happens inside the content peer, so a
+     * forged response carried over the channel is rejected on re-derivation and a
+     * κ no peer holds resolves to nothing — the channel changes the carrier, not
+     * the law. While the channel is not yet open ([`WebRtcLink::is_open`]) there
+     * are no frames to move and this is a no-op.
+     *
+     * Returns the number of frames moved (outbound + inbound) — diagnostic only;
+     * the caller re-polls regardless until the fetch settles.
+     *
+     * [`cn_inbound`]: Self::cn_inbound
+     * @param {WebRtcLink} link
+     * @returns {number}
+     */
+    cn_pump(link) {
+        _assertClass(link, WebRtcLink);
+        const ret = wasm.console_cn_pump(this.__wbg_ptr, link.__wbg_ptr);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return ret[0] >>> 0;
+    }
+    /**
      * Publish bytes into this peer's content store so it can serve them to other
      * peers over the content network (`CC-38`). Returns the κ that addresses
      * them — the handle a peer fetches by.
@@ -272,17 +307,18 @@ export class Console {
     /**
      * Witness the **uor-native content network in the browser** — the "browser
      * as a router" model (ADR-006; the substrate is the network). Two in-process
-     * peers are linked by a [`PacketLink`](netbare::PacketLink) pair (an
-     * in-process stand-in for a WebRTC data channel) and each wrapped in
-     * hologram's [`BareNetSync`] — the substrate's own `KappaSync` over the
+     * peers are linked by a [`PacketLink`](holospaces::content_net::PacketLink)
+     * pair (an in-process stand-in for a WebRTC data channel) and each wrapped in
+     * hologram's `BareNetSync` — the substrate's own `KappaSync` over the
      * `NetworkInterface` HAL. Peer B fetches content it does **not** hold from
      * peer A over the substrate frame protocol (`fetch`/`announce`/`discover`),
      * and the bytes are **verified by re-derivation on receipt** (SPINE-4)
      * before they are accepted — exactly as a bare-metal or std peer does it, no
      * central operator. Returns a JSON summary (the fetched content matched, an
      * unheld κ resolves to nothing — no forging). This exercises the real wasm
-     * peer's content-network path; the only browser-specific part still to bind
-     * is the WebRTC transport *pump* that carries a link's frames between tabs.
+     * peer's content-network path against an in-process link; the live
+     * browser-to-browser transport over a real WebRTC data channel is the product
+     * [`cn_pump`](Self::cn_pump) (`CC-49`), witnessed across two tabs.
      * @returns {string}
      */
     content_network_selftest() {
@@ -403,7 +439,7 @@ export class Console {
      * L5) before it crosses into the peer here as `config_json`; when the
      * repository declares none, the page passes the **usable default** config
      * (`buildpack-deps` — `curl`/`git` over apt; the Dev Container spec's
-     * default, `CC-20`/[`import`]) so *any* repository runs. The `(repo,
+     * default, `CC-20`/`import`) so *any* repository runs. The `(repo,
      * reference, config, arch)` tuple is the [`Source::Devcontainer`], hence the
      * holospace's content-addressed identity (Law L1): the same repository at
      * the same reference under the same ISA is the **same** holospace
@@ -747,7 +783,7 @@ if (Symbol.dispose) DevcontainerImage.prototype[Symbol.dispose] = DevcontainerIm
  * [`next_accept`](DevcontainerProvision::next_accept) /
  * [`next_bearer`](DevcontainerProvision::next_bearer), fetch through the router
  * extension's CORS-free `fetch`, and feed the response back with
- * [`deliver`](DevcontainerProvision::deliver); then [`assemble`] yields the
+ * [`deliver`](DevcontainerProvision::deliver); then `assemble` yields the
  * bootable rootfs. The pull is the *same* [`ImagePull`] the native importer uses
  * and re-derives every blob (Law L5) — only the transport differs.
  */
@@ -873,8 +909,10 @@ if (Symbol.dispose) DevcontainerProvision.prototype[Symbol.dispose] = Devcontain
 
 /**
  * One end of a peer-to-peer content-network transport over a real WebRTC data
- * channel. The browser surface's *pump*: it carries a [`Console`](crate::Console)'s
- * content-network frames to and from another browser peer, no server between.
+ * channel — the browser surface's wire. It carries a [`Console`](crate::Console)'s
+ * content-network frames to and from another browser peer (no server between);
+ * the product pump [`Console::cn_pump`](crate::Console::cn_pump) couples it to
+ * the `BareNetSync`-driven `NetworkInterface`, so a deployed tab fetches over it.
  */
 export class WebRtcLink {
     __destroy_into_raw() {
@@ -1070,7 +1108,7 @@ export class Workspace {
     }
     /**
      * Boot a **devcontainer** workspace: the Boot Orchestrator
-     * ([`MachineSpec`](holospaces::machine::MachineSpec)) generates the device
+     * ([`MachineSpec`]) generates the device
      * tree and boots `kernel` on a machine whose `virtio-blk` disk is the
      * assembled `rootfs` (from [`DevcontainerImage::assemble`]). The guest
      * kernel mounts the rootfs over `/dev/vda` and runs the devcontainer's real
@@ -2062,27 +2100,27 @@ function __wbg_get_imports() {
             return ret;
         }, arguments); },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 11, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 12, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h4aecbb93981a4764);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 5, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 6, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__he3db6f405dd0e0d2);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 11, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 12, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h4aecbb93981a4764_2);
             return ret;
         },
         __wbindgen_cast_0000000000000004: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCDataChannelEvent")], shim_idx: 11, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCDataChannelEvent")], shim_idx: 12, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h4aecbb93981a4764_3);
             return ret;
         },
         __wbindgen_cast_0000000000000005: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCPeerConnectionIceEvent")], shim_idx: 11, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCPeerConnectionIceEvent")], shim_idx: 12, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h4aecbb93981a4764_4);
             return ret;
         },
@@ -2170,6 +2208,12 @@ function addToExternrefTable0(obj) {
     const idx = wasm.__externref_table_alloc();
     wasm.__wbindgen_externrefs.set(idx, obj);
     return idx;
+}
+
+function _assertClass(instance, klass) {
+    if (!(instance instanceof klass)) {
+        throw new Error(`expected instance of ${klass.name}`);
+    }
 }
 
 const CLOSURE_DTORS = (typeof FinalizationRegistry === 'undefined')
