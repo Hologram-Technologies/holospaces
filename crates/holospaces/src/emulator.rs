@@ -48,6 +48,12 @@ pub mod net;
 /// `CC-35`/`CC-36`/`CC-37`.
 pub mod aarch64;
 
+/// The **x86-64 (AMD64) core** — the system emulator's third ISA target
+/// (ADR-021), the ubiquitous registry architecture. The long-mode integer
+/// instruction set + the PC serial platform, over this module's shared
+/// `virtio`/κ-disk device substrate. Conformance: `CC-43`.
+pub mod x64;
+
 /// The shared virtio-mmio device bus: the substrate-backed `virtio` devices and
 /// their split-virtqueue servicing, used by **both** the RISC-V and AArch64
 /// machines (one κ-disk/9p/NAT implementation, two thin MMIO transports).
