@@ -22,6 +22,8 @@
 //! (`CC-9`); this module is the ingestion and identity boundary it consumes —
 //! the image's layers become the [κ-disk](crate::disk) the emulator reads.
 
+use std::collections::BTreeMap;
+
 use serde_json::Value;
 
 use hologram_substrate_core::{verify_kappa_axis, KappaStore, StoreError};
@@ -360,6 +362,11 @@ pub enum OciError {
     BadDigest(String),
     /// The store rejected a write.
     Store(StoreError),
+    /// An image reference is not well-formed (`registry/repository:tag`).
+    BadReference(String),
+    /// A registry response was malformed (a bad token reply, a non-2xx status, a
+    /// manifest without config/layers).
+    BadContent(String),
 }
 
 impl core::fmt::Display for OciError {
@@ -383,11 +390,408 @@ impl core::fmt::Display for OciError {
             }
             OciError::BadDigest(d) => write!(f, "OCI digest {d} is not a supported σ-axis label"),
             OciError::Store(e) => write!(f, "store error ingesting an OCI blob: {e:?}"),
+            OciError::BadReference(s) => write!(f, "malformed image reference: {s}"),
+            OciError::BadContent(s) => write!(f, "malformed registry response: {s}"),
         }
     }
 }
 
 impl std::error::Error for OciError {}
+
+// ── Image references + the page-drivable pull ────────────────────────────────
+// The OCI distribution pull, factored so the SAME parse + select + verify +
+// ingest logic runs on every peer. `import.rs` drives it with a blocking HTTP
+// client (the `net` feature, native); the browser peer drives [`ImagePull`] with
+// its router transport (the extension's CORS-free fetch). Both end in
+// [`ingest_image`], which re-derives every blob (Law L5) — so the trust boundary
+// is identical regardless of who fetched the bytes.
+
+/// The `Accept` header offering every manifest/index media type a registry may
+/// answer with.
+pub const ACCEPT_MANIFESTS: &str = "application/vnd.oci.image.index.v1+json, \
+     application/vnd.docker.distribution.manifest.list.v2+json, \
+     application/vnd.oci.image.manifest.v1+json, \
+     application/vnd.docker.distribution.manifest.v2+json";
+
+/// A parsed image reference: `registry`, `repository`, and `reference` (a tag or
+/// a `sha256:` digest).
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct ImageRef {
+    /// The registry host (e.g. `registry-1.docker.io`, `ghcr.io`, `127.0.0.1:5000`).
+    pub registry: String,
+    /// The repository path (e.g. `library/debian`).
+    pub repository: String,
+    /// The tag or digest (e.g. `trixie`, `sha256:…`).
+    pub reference: String,
+}
+
+impl ImageRef {
+    /// The registry's base `/v2` URL — `http` for localhost (the hermetic test),
+    /// `https` otherwise.
+    #[must_use]
+    pub fn base(&self) -> String {
+        let scheme = if self.registry.starts_with("127.0.0.1")
+            || self.registry.starts_with("localhost")
+            || self.registry.starts_with("[::1]")
+        {
+            "http"
+        } else {
+            "https"
+        };
+        format!("{scheme}://{}/v2/{}", self.registry, self.repository)
+    }
+
+    /// The URL of a manifest by tag or digest.
+    #[must_use]
+    pub fn manifest_url(&self, reference: &str) -> String {
+        format!("{}/manifests/{reference}", self.base())
+    }
+
+    /// The URL of a blob by digest.
+    #[must_use]
+    pub fn blob_url(&self, digest: &str) -> String {
+        format!("{}/blobs/{digest}", self.base())
+    }
+
+    /// The Docker token endpoint for this image, when the registry uses
+    /// token-auth (Docker Hub). `None` for registries that need no token (e.g. a
+    /// localhost registry).
+    #[must_use]
+    pub fn token_url(&self) -> Option<String> {
+        if self.registry == "registry-1.docker.io" {
+            Some(format!(
+                "https://auth.docker.io/token?service=registry.docker.io&scope=repository:{}:pull",
+                self.repository
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+/// Parse an image reference per the Docker/OCI convention (the same rules
+/// `docker pull` uses): an optional registry (a component with a `.` or `:` or
+/// `localhost`), a repository (Docker Hub official images get the `library/`
+/// prefix), and a `:tag` or `@sha256:digest` (defaulting to `latest`).
+///
+/// # Errors
+/// [`OciError::BadReference`] if the reference is empty.
+pub fn parse_image_ref(s: &str) -> Result<ImageRef, OciError> {
+    if s.is_empty() {
+        return Err(OciError::BadReference("empty image reference".into()));
+    }
+    let (head, rest) = match s.split_once('/') {
+        Some((h, r)) if h.contains('.') || h.contains(':') || h == "localhost" => {
+            (h.to_string(), r.to_string())
+        }
+        _ => ("registry-1.docker.io".to_string(), s.to_string()),
+    };
+    let (repo, reference) = if let Some((r, d)) = rest.split_once('@') {
+        (r.to_string(), d.to_string())
+    } else if let Some(colon) = rest.rfind(':') {
+        if rest[colon..].contains('/') {
+            (rest.clone(), "latest".to_string())
+        } else {
+            (rest[..colon].to_string(), rest[colon + 1..].to_string())
+        }
+    } else {
+        (rest.clone(), "latest".to_string())
+    };
+    let repository = if head == "registry-1.docker.io" && !repo.contains('/') {
+        format!("library/{repo}")
+    } else {
+        repo
+    };
+    Ok(ImageRef {
+        registry: head,
+        repository,
+        reference,
+    })
+}
+
+/// Whether a manifest response is a multi-platform index (vs a single manifest).
+#[must_use]
+pub fn is_index(content_type: &str, body: &[u8]) -> bool {
+    if content_type.contains("manifest.list") || content_type.contains("image.index") {
+        return true;
+    }
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .map(|v| v.get("manifests").is_some())
+        .unwrap_or(false)
+}
+
+/// Choose the manifest digest for `arch` from a multi-platform image index.
+///
+/// # Errors
+/// [`OciError::NoMatchingPlatform`] if the index offers no `arch`/linux manifest.
+pub fn select_platform_manifest(index_bytes: &[u8], arch: Arch) -> Result<String, OciError> {
+    let v: Value =
+        serde_json::from_slice(index_bytes).map_err(|e| OciError::BadContent(e.to_string()))?;
+    let manifests = v
+        .get("manifests")
+        .and_then(Value::as_array)
+        .ok_or(OciError::BadContent("index has no manifests".into()))?;
+    let want = arch.oci_arch();
+    let mut have = Vec::new();
+    for m in manifests {
+        let plat = m.get("platform");
+        let m_arch = plat
+            .and_then(|p| p.get("architecture"))
+            .and_then(Value::as_str);
+        let os = plat.and_then(|p| p.get("os")).and_then(Value::as_str);
+        if let (Some(a), Some(o)) = (m_arch, os) {
+            have.push(format!("{o}/{a}"));
+        }
+        if m_arch == Some(want) && os == Some("linux") {
+            if let Some(d) = m.get("digest").and_then(Value::as_str) {
+                return Ok(d.to_string());
+            }
+        }
+    }
+    Err(OciError::NoMatchingPlatform {
+        want: format!("linux/{want}"),
+        have,
+    })
+}
+
+/// Synthesize an OCI image-index pointing at a single manifest by digest+size —
+/// the `index.json` [`ingest_image`] walks.
+#[must_use]
+pub fn synth_index(manifest_digest: &str, manifest_size: usize) -> Vec<u8> {
+    format!(
+        r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{manifest_digest}","size":{manifest_size}}}]}}"#
+    )
+    .into_bytes()
+}
+
+/// The OCI distribution-spec digest (`sha256:<lowercase-hex>`) of `bytes` — which
+/// **is** the κ on the substrate's `sha256` axis (CC-10, Law L1): the registry's
+/// content address and the substrate's are the same function, so this needs no
+/// separate hash implementation.
+#[must_use]
+pub fn sha256_digest(bytes: &[u8]) -> String {
+    String::from_utf8(
+        hologram_substrate_core::address_bytes_axis("sha256", bytes)
+            .expect("the sha256 σ-axis is always available"),
+    )
+    .expect("a σ-axis label is ASCII")
+}
+
+/// The blob digests an image manifest references (config + every layer) — what a
+/// puller must fetch before [`ingest_image`].
+///
+/// # Errors
+/// [`OciError::BadManifest`] if the manifest has no config or layers.
+pub fn manifest_blob_digests(manifest_bytes: &[u8]) -> Result<Vec<String>, OciError> {
+    let m: Value = serde_json::from_slice(manifest_bytes).map_err(|_| OciError::BadManifest)?;
+    let mut digests = Vec::new();
+    let config = m
+        .get("config")
+        .and_then(|c| c.get("digest"))
+        .and_then(Value::as_str)
+        .ok_or(OciError::BadManifest)?;
+    digests.push(config.to_string());
+    let layers = m
+        .get("layers")
+        .and_then(Value::as_array)
+        .ok_or(OciError::BadManifest)?;
+    for l in layers {
+        let d = l
+            .get("digest")
+            .and_then(Value::as_str)
+            .ok_or(OciError::BadManifest)?;
+        digests.push(d.to_string());
+    }
+    Ok(digests)
+}
+
+/// One fetch the page must perform on an [`ImagePull`]'s behalf (through the
+/// router): `GET url` with `accept` and, once a token is held, `bearer`.
+#[derive(Debug, Clone)]
+pub struct PullFetch {
+    /// The URL to GET.
+    pub url: String,
+    /// The `Accept` header, or `None` (blobs / the token endpoint).
+    pub accept: Option<String>,
+    /// The bearer token to authorize with, if one was obtained.
+    pub bearer: Option<String>,
+}
+
+enum PullStage {
+    Manifest,
+    Token,
+    PlatformManifest(String),
+    Blobs,
+    Done,
+}
+
+/// A **page-drivable OCI image pull** — the browser peer's pull, driven by a
+/// fetch/deliver loop instead of a blocking HTTP client, so the *same* parse +
+/// select + verify + ingest path that [`crate::import::pull_image`] proves (CC-20)
+/// runs in wasm with the router as the transport. The page loops:
+/// [`next_fetch`](ImagePull::next_fetch) → fetch via the router →
+/// [`deliver`](ImagePull::deliver); when [`is_done`](ImagePull::is_done), it calls
+/// [`ingest`](ImagePull::ingest), which re-derives every blob (Law L5).
+pub struct ImagePull {
+    image: ImageRef,
+    arch: Arch,
+    bearer: Option<String>,
+    stage: PullStage,
+    manifest_bytes: Option<Vec<u8>>,
+    manifest_digest: Option<String>,
+    needed: Vec<String>,
+    blobs: BTreeMap<String, Vec<u8>>,
+}
+
+impl ImagePull {
+    /// Begin a pull of `image_ref` for `arch`.
+    ///
+    /// # Errors
+    /// [`OciError::BadReference`] if the reference is malformed.
+    pub fn new(image_ref: &str, arch: Arch) -> Result<Self, OciError> {
+        Ok(Self {
+            image: parse_image_ref(image_ref)?,
+            arch,
+            bearer: None,
+            stage: PullStage::Manifest,
+            manifest_bytes: None,
+            manifest_digest: None,
+            needed: Vec::new(),
+            blobs: BTreeMap::new(),
+        })
+    }
+
+    /// Whether every blob has been delivered and the image is ready to
+    /// [`ingest`](ImagePull::ingest).
+    #[must_use]
+    pub fn is_done(&self) -> bool {
+        matches!(self.stage, PullStage::Done)
+    }
+
+    /// The next fetch the page must perform, or `None` when [`is_done`](ImagePull::is_done).
+    #[must_use]
+    pub fn next_fetch(&self) -> Option<PullFetch> {
+        match &self.stage {
+            PullStage::Manifest => Some(PullFetch {
+                url: self.image.manifest_url(&self.image.reference),
+                accept: Some(ACCEPT_MANIFESTS.to_string()),
+                bearer: self.bearer.clone(),
+            }),
+            PullStage::Token => self.image.token_url().map(|url| PullFetch {
+                url,
+                accept: None,
+                bearer: None,
+            }),
+            PullStage::PlatformManifest(digest) => Some(PullFetch {
+                url: self.image.manifest_url(digest),
+                accept: Some(ACCEPT_MANIFESTS.to_string()),
+                bearer: self.bearer.clone(),
+            }),
+            PullStage::Blobs => self.needed.first().map(|d| PullFetch {
+                url: self.image.blob_url(d),
+                accept: None,
+                bearer: self.bearer.clone(),
+            }),
+            PullStage::Done => None,
+        }
+    }
+
+    /// Feed the response to the current [`next_fetch`](ImagePull::next_fetch) and
+    /// advance the pull.
+    ///
+    /// # Errors
+    /// [`OciError`] on a non-2xx status, a malformed token/manifest, or no
+    /// `arch` platform in an index.
+    pub fn deliver(
+        &mut self,
+        status: u16,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> Result<(), OciError> {
+        match &self.stage {
+            PullStage::Manifest => {
+                if status == 401 && self.bearer.is_none() && self.image.token_url().is_some() {
+                    self.stage = PullStage::Token;
+                    return Ok(());
+                }
+                if !(200..300).contains(&status) {
+                    return Err(OciError::BadContent(format!("manifest status {status}")));
+                }
+                if is_index(content_type, &body) {
+                    let digest = select_platform_manifest(&body, self.arch)?;
+                    self.stage = PullStage::PlatformManifest(digest);
+                } else {
+                    self.set_manifest(body);
+                }
+            }
+            PullStage::Token => {
+                let v: Value = serde_json::from_slice(&body)
+                    .map_err(|e| OciError::BadContent(e.to_string()))?;
+                let tok = v
+                    .get("token")
+                    .or_else(|| v.get("access_token"))
+                    .and_then(Value::as_str)
+                    .ok_or(OciError::BadContent("no token in auth response".into()))?;
+                self.bearer = Some(tok.to_string());
+                self.stage = PullStage::Manifest;
+            }
+            PullStage::PlatformManifest(_) => {
+                if !(200..300).contains(&status) {
+                    return Err(OciError::BadContent(format!(
+                        "platform manifest status {status}"
+                    )));
+                }
+                self.set_manifest(body);
+            }
+            PullStage::Blobs => {
+                if !(200..300).contains(&status) {
+                    return Err(OciError::BadContent(format!("blob status {status}")));
+                }
+                let digest = self
+                    .needed
+                    .first()
+                    .cloned()
+                    .ok_or(OciError::BadContent("no pending blob".into()))?;
+                self.blobs.insert(digest, body);
+                self.needed.remove(0);
+                if self.needed.is_empty() {
+                    self.stage = PullStage::Done;
+                }
+            }
+            PullStage::Done => {}
+        }
+        Ok(())
+    }
+
+    fn set_manifest(&mut self, body: Vec<u8>) {
+        let digest = sha256_digest(&body);
+        self.needed = manifest_blob_digests(&body).unwrap_or_default();
+        self.blobs.insert(digest.clone(), body.clone());
+        self.manifest_digest = Some(digest);
+        self.manifest_bytes = Some(body);
+        self.stage = if self.needed.is_empty() {
+            PullStage::Done
+        } else {
+            PullStage::Blobs
+        };
+    }
+
+    /// Ingest the fully-fetched image into `store`, **re-deriving every blob**
+    /// (Law L5 — a corrupt or forged blob is refused), and return it ready for
+    /// the Layer Assembler.
+    ///
+    /// # Errors
+    /// [`OciError`] if the pull is incomplete or a blob fails verification.
+    pub fn ingest(&self, store: &dyn KappaStore) -> Result<IngestedImage, OciError> {
+        let manifest_digest = self.manifest_digest.clone().ok_or(OciError::BadManifest)?;
+        let manifest_bytes = self.manifest_bytes.clone().ok_or(OciError::BadManifest)?;
+        let index = synth_index(&manifest_digest, manifest_bytes.len());
+        let layout = br#"{"imageLayoutVersion":"1.0.0"}"#.to_vec();
+        let blobs = &self.blobs;
+        ingest_image(store, &layout, &index, self.arch, |d| blobs.get(d).cloned())
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -451,6 +855,67 @@ mod tests {
         .unwrap();
         assert_eq!(img.identity(), img2.identity());
         assert_eq!(img.digest(), img2.digest());
+    }
+
+    /// The **page-drivable pull** (the browser peer's pull) yields the *identical*
+    /// verified image as a direct `ingest_image` — proving the router-fed pull and
+    /// the native pull share one trust boundary (Law L5) and one identity (Law L1).
+    /// The page loop here is the hermetic stand-in for `holospace-fs` fetching each
+    /// `next_fetch` through the router.
+    #[test]
+    fn the_page_driven_pull_matches_a_direct_ingest() {
+        let (_layout, _index, blobs) = build_layout();
+        // The manifest is the blob that parses as an image manifest (has "config").
+        let manifest_bytes = blobs
+            .values()
+            .find(|b| {
+                serde_json::from_slice::<Value>(b)
+                    .ok()
+                    .and_then(|v| v.get("config").cloned())
+                    .is_some()
+            })
+            .unwrap()
+            .clone();
+
+        // A mock router transport over the in-memory image: a manifest request
+        // returns the manifest; a blob request returns that blob.
+        let serve = |f: &PullFetch| -> (u16, String, Vec<u8>) {
+            if f.url.contains("/manifests/") {
+                (200, media::MANIFEST.to_string(), manifest_bytes.clone())
+            } else if let Some(d) = f.url.split("/blobs/").nth(1) {
+                match blobs.get(d) {
+                    Some(b) => (200, "application/octet-stream".to_string(), b.clone()),
+                    None => (404, String::new(), Vec::new()),
+                }
+            } else {
+                (404, String::new(), Vec::new())
+            }
+        };
+
+        let mut pull = ImagePull::new("127.0.0.1:5000/img:latest", Arch::Riscv64).unwrap();
+        let mut steps = 0;
+        while let Some(f) = pull.next_fetch() {
+            let (status, ct, body) = serve(&f);
+            pull.deliver(status, &ct, body).unwrap();
+            steps += 1;
+            assert!(steps < 50, "the pull did not converge");
+        }
+        assert!(pull.is_done(), "the pull completed");
+
+        let store = MemKappaStore::new();
+        let pulled = pull.ingest(&store).expect("ingest the page-driven pull");
+
+        // Identical to a direct ingest of the same image.
+        let (layout, index, blobs2) = build_layout();
+        let store2 = MemKappaStore::new();
+        let direct = ingest_image(&store2, &layout, &index, Arch::Riscv64, |d| {
+            blobs2.get(d).cloned()
+        })
+        .unwrap();
+        assert_eq!(pulled.identity(), direct.identity(), "same image identity");
+        assert_eq!(pulled.digest(), direct.digest(), "same manifest digest");
+        assert_eq!(pulled.layers().len(), direct.layers().len(), "same layers");
+        assert!(store.contains(pulled.manifest()) && store.contains(pulled.config()));
     }
 
     #[test]
