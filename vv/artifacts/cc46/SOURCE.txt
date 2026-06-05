@@ -1,0 +1,46 @@
+CC-46 — arm64 real-kernel device-bus parity artifacts (a real arm64 Linux boots
+over the shared emulator::devbus and a real guest userspace exercises the 9p
+workspace, the network, and the in-process bridge — CC-15/CC-16/CC-33 caliber).
+
+The witness (crates/holospaces/tests/cc46_realboot.rs) assembles the rootfs below
+into an ext4 image with the in-crate Layer Assembler (CC-7 / κ-disk content) and
+boots the arm64 Linux kernel below on the AArch64 core, attaching the SHARED
+devbus's virtio-blk root, virtio-9p workspace, and virtio-net device (all
+advertised in the devicetree, GIC-routed). A real guest /init then:
+  • CC-15: mounts the holospaces-served virtio-9p share (tag hsworkspace)
+    through its VFS, reads the seeded file, and writes a file back;
+  • CC-16: opens an outbound TCP/HTTP flow over virtio-net through the userspace
+    NAT (wget to the NAT redirect target, carried out the native egress);
+  • CC-33: starts a real server (busybox httpd on :8080) reachable from the host
+    over the in-process bridge.
+The differential oracle is qemu-system-aarch64 -M virt on the same kernel +
+rootfs + the 10.0.2.0/24 user-mode (slirp) NAT model.
+
+linux/Image.gz, linux/kernel.config
+  A real, unmodified Linux 6.6.0 arm64 kernel (torvalds/linux v6.6), IDENTICAL to
+  CC-37's — its config already enables VIRTIO + VIRTIO_MMIO + VIRTIO_BLK + EXT4 +
+  VIRTIO_NET + NET_9P + NET_9P_VIRTIO + 9P_FS + IP_PNP_DHCP, exactly the devbus
+  complement CC-46 exercises. Reproducible build env (KBUILD_BUILD_TIMESTAMP=
+  "Fri 31 May 2026 00:00:00 UTC", USER=holospaces, HOST=cc37, .version=0).
+  Toolchain: aarch64-linux-gnu-gcc (Ubuntu 13.3.0).
+
+rootfs/busybox, rootfs/layer.tar.gz
+  A static linux-arm64 busybox 1.36.1 (the canonical glibc stock binary, the
+  same one CC-37 uses). layer.tar.gz is a reproducible tar+gzip of /bin/busybox,
+  the OCI image layer the Layer Assembler overlays into the rootfs. The applets
+  the witness drives — mount (9p), wget (NAT outbound), httpd (the bridge
+  listener) — are stock busybox, no riscv64 workaround.
+
+init.sh
+  The arm64 devcontainer's PID 1 for the real-boot devbus-parity witness: the
+  busybox shell mounts the 9p workspace and round-trips a file, fetches over the
+  NAT, then starts httpd on :8080 and idles (so the host can dial the listener
+  over the bridge without racing a power-off). The witness asserts the markers,
+  and qemu-system-aarch64 -M virt produces them on the same rootfs.
+
+cc46.sha256
+  Checksums of the committed artifacts.
+
+Reproduce: ./build.sh  (extends CC-37's recipe: rebuilds the v6.6 kernel +
+busybox and mirrors them here; only /init differs). The qemu-system-aarch64
+differential is run by vv/targets/cc46-devbus-arch-parity.sh when qemu is present.
