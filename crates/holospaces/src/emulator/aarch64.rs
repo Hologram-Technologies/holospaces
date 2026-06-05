@@ -3466,14 +3466,43 @@ impl Cpu {
         rootfs: Vec<u8>,
         bootargs: &str,
     ) -> Self {
-        Self::boot_linux_inner(ram_bytes, kernel, bootargs, Some(rootfs))
+        Self::boot_linux_inner(
+            ram_bytes,
+            kernel,
+            bootargs,
+            Some(super::VirtioBlk::new(rootfs)),
+        )
+    }
+
+    /// Boot like [`Cpu::boot_linux_disk`], but page the κ-disk from a supplied
+    /// [`KappaStore`](hologram_substrate_core::KappaStore) by **streaming**
+    /// `sector_count` sectors from `read` (no full image in RAM) — the browser
+    /// peer reads each sector from the OPFS rootfs into the OPFS-backed store, so a
+    /// real arm64 image boots without ever materializing the whole `Vec` (the
+    /// paged κ-disk, the same `KappaBacking` the RISC-V machine uses, `CC-7`).
+    #[must_use]
+    pub fn boot_linux_disk_streamed<R: FnMut(u64, &mut [u8])>(
+        ram_bytes: usize,
+        kernel: &[u8],
+        bootargs: &str,
+        store: alloc::boxed::Box<dyn hologram_substrate_core::KappaStore>,
+        sector_count: u64,
+        read: R,
+    ) -> Self {
+        let backing = super::KappaBacking::from_sectors(store, sector_count, read);
+        Self::boot_linux_inner(
+            ram_bytes,
+            kernel,
+            bootargs,
+            Some(super::VirtioBlk::with_backing(backing)),
+        )
     }
 
     fn boot_linux_inner(
         ram_bytes: usize,
         kernel: &[u8],
         bootargs: &str,
-        rootfs: Option<Vec<u8>>,
+        disk: Option<super::VirtioBlk>,
     ) -> Self {
         let mut cpu = Cpu::new(RAM_BASE, ram_bytes);
         // Load the kernel image at text_offset above the base of RAM.
@@ -3483,7 +3512,7 @@ impl Cpu {
         // Place the devicetree above the kernel and hand its address in x0. The
         // `virtio-blk` node is advertised only when a disk is attached (an
         // unattached `virtio-mmio` slot makes the kernel read magic 0 and stall).
-        let has_blk = rootfs.is_some();
+        let has_blk = disk.is_some();
         let dtb = arm64_virt_dtb(RAM_BASE, ram_bytes as u64, bootargs, has_blk);
         let dtb_off = DTB_OFFSET as usize;
         let dn = dtb.len().min(cpu.ram.len() - dtb_off);
@@ -3492,9 +3521,7 @@ impl Cpu {
         cpu.pc = RAM_BASE + KERNEL_OFFSET;
         cpu.sp = RAM_BASE + KERNEL_OFFSET;
         let mut sys = Sys::new();
-        if let Some(image) = rootfs {
-            sys.virtio = Some(super::VirtioBlk::new(image));
-        }
+        sys.virtio = disk;
         cpu.sys = Some(Box::new(sys));
         cpu
     }
