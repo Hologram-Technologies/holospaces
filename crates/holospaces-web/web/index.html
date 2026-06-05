@@ -123,6 +123,40 @@
         roster κ <span id="roster" class="k">—</span> · the browser is a peer that
         <em>is</em> the substrate (Law L1); your holospaces are content in the store (Law L3).
       </p>
+
+      <!-- Peer content network (CC-49): fetch a κ from another browser peer over a
+           real WebRTC data channel — peer-to-peer, no server. Signaling (the SDP
+           offer/answer + ICE) is pasted between the two operators out of band. -->
+      <details id="cn-panel" style="margin-top:1.5rem">
+        <summary><strong>Peer content network</strong> — fetch a κ from another browser peer over WebRTC</summary>
+        <div class="cn-body" style="margin-top:.75rem">
+          <div class="cn-row">
+            <button class="sm" id="cn-put">Publish content</button>
+            <input id="cn-put-text" placeholder="bytes to offer other peers" />
+            <span class="k" id="cn-put-kappa">—</span>
+          </div>
+          <div class="cn-row" style="margin-top:.5rem">
+            <button class="sm primary" id="cn-offer">① Create offer (initiator)</button>
+            <button class="sm" id="cn-answer">② Accept offer → answer (responder)</button>
+            <button class="sm" id="cn-finish">③ Accept answer (initiator)</button>
+            <span id="cn-status" class="muted">no channel</span>
+          </div>
+          <textarea id="cn-sdp" rows="3" style="width:100%;margin-top:.5rem"
+            placeholder="paste the peer's offer/answer SDP here, then click the matching step; this box also shows the SDP to send back"></textarea>
+          <div class="cn-row" style="margin-top:.5rem">
+            <button class="sm" id="cn-ice-take">Copy my ICE</button>
+            <button class="sm" id="cn-ice-add">Add peer ICE</button>
+            <textarea id="cn-ice" rows="2" style="width:100%;margin-top:.25rem"
+              placeholder="ICE candidates (one JSON per line) — exchange both ways until the channel opens"></textarea>
+          </div>
+          <div class="cn-row" style="margin-top:.5rem">
+            <input id="cn-fetch-kappa" placeholder="blake3:… κ to fetch from the peer" style="flex:1" />
+            <button class="sm primary" id="cn-fetch">Fetch over WebRTC</button>
+            <span id="cn-fetch-out" class="muted">—</span>
+          </div>
+          <p class="hint">A κ fetched here is accepted only after its bytes re-derive to it (verify-on-receipt, Law L5); a forging peer's bytes and an unheld κ both yield nothing. The transport is a genuine <code>RTCDataChannel</code> and the fetch runs through the product pump <code>Console.cn_pump</code> — the same <code>BareNetSync</code> a bare-metal peer drives (CC-38), now over WebRTC (CC-49).</p>
+        </div>
+      </details>
     </main>
 
     <!-- The per-guest settings drawer (VPC-console "instance settings"). -->
@@ -659,6 +693,77 @@
       };
 
       render();
+
+      // ── Peer content network (CC-49) — fetch a κ from another browser peer ────
+      // over a REAL WebRTC data channel, peer-to-peer, no server. This is the
+      // product driver: it builds a `WebRtcLink` (a genuine RTCDataChannel), wires
+      // it to `console0`'s content peer through the product pump `cn_pump`, and
+      // drives the uor-native `BareNetSync` (`cn_fetch_start`/`cn_fetch_poll`) over
+      // it — the same path the witness exercises. Signaling (SDP/ICE) is pasted
+      // between operators out of band; there is no signaling server (Law L1).
+      let cnLink = null;
+      const cnStatus = (m) => { $("cn-status").textContent = m; };
+      $("cn-put").onclick = () => {
+        const text = $("cn-put-text").value || "";
+        const k = console0.cn_put(new TextEncoder().encode(text));
+        $("cn-put-kappa").textContent = k;
+        toast("published — peers can now fetch " + k.slice(0, 24) + "…");
+      };
+      $("cn-offer").onclick = async () => {
+        cnLink = new WebRtcLink(true); // initiator
+        const sdp = await cnLink.create_offer();
+        $("cn-sdp").value = sdp;
+        cnStatus("offer created — send the SDP above to the peer, then paste their answer");
+      };
+      $("cn-answer").onclick = async () => {
+        cnLink = new WebRtcLink(false); // responder
+        const answer = await cnLink.accept_offer($("cn-sdp").value.trim());
+        $("cn-sdp").value = answer;
+        cnStatus("answer created — send the SDP above back to the initiator");
+      };
+      $("cn-finish").onclick = async () => {
+        if (!cnLink) return cnStatus("create an offer first");
+        await cnLink.accept_answer($("cn-sdp").value.trim());
+        cnStatus("answer accepted — exchange ICE until the channel opens");
+      };
+      $("cn-ice-take").onclick = () => {
+        if (!cnLink) return;
+        $("cn-ice").value = cnLink.take_ice().join("\n");
+        cnStatus(cnLink.is_open() ? "channel open" : "ICE copied — send to the peer");
+      };
+      $("cn-ice-add").onclick = async () => {
+        if (!cnLink) return;
+        for (const line of $("cn-ice").value.split("\n")) {
+          const c = line.trim();
+          if (c) { try { await cnLink.add_ice(c); } catch (e) { console.error(e); } }
+        }
+        cnStatus(cnLink.is_open() ? "channel open" : "peer ICE added — keep exchanging until open");
+      };
+      // Background responder pump: once a channel is open, this peer continuously
+      // services inbound fetch requests from the other peer (and flushes its own
+      // outbound frames) through the product pump — so a peer fetches from THIS tab
+      // without it doing anything but stay open. The exchange is symmetric.
+      setInterval(() => { if (cnLink && cnLink.is_open()) console0.cn_pump(cnLink); }, 25);
+      $("cn-fetch").onclick = async () => {
+        if (!cnLink || !cnLink.is_open()) return cnStatus("the data channel is not open yet");
+        const k = $("cn-fetch-kappa").value.trim();
+        $("cn-fetch-out").textContent = "fetching…";
+        try {
+          console0.cn_fetch_start(k);
+        } catch (e) { return ($("cn-fetch-out").textContent = "bad κ: " + e); }
+        const deadline = Date.now() + 15000;
+        while (Date.now() < deadline) {
+          console0.cn_pump(cnLink); // PRODUCT transport pump over the data channel
+          const r = console0.cn_fetch_poll();
+          if (r === undefined) { await new Promise((res) => setTimeout(res, 20)); continue; }
+          if (r === null) { $("cn-fetch-out").textContent = "nothing — no peer holds it (no fabrication)"; return; }
+          $("cn-fetch-out").textContent = "got " + r.length + " bytes (verified): " +
+            new TextDecoder().decode(new Uint8Array(r)).slice(0, 80);
+          return;
+        }
+        $("cn-fetch-out").textContent = "timed out (is the peer pumping its side?)";
+      };
+
       window.__ready = true;
     </script>
   </body>
