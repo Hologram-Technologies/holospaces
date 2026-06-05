@@ -65,6 +65,27 @@ cd /workspace\n\
 /bin/busybox echo 'holospace devcontainer ready \xe2\x80\x94 /workspace is your shared workspace'\n\
 exec /bin/busybox setsid -c /bin/busybox sh\n";
 
+/// The `/init` for a **real OCI devcontainer image** (debian/ubuntu/buildpack-deps
+/// — the image a repository declares, `CC-42`), which ships its own `/bin/sh` +
+/// coreutils + `mount` rather than BusyBox. Unlike [`DEVCONTAINER_INIT`] (which
+/// assumes a static `/bin/busybox`), this uses the image's own tools: it mounts
+/// the pseudo-filesystems and the shared `/workspace` (virtio-9p, CC-15), sets a
+/// sane environment, and execs the image's login shell (`bash` if present, else
+/// `sh`) on the console — so the launched holospace is an interactive, real
+/// devcontainer. `2>/dev/null` keeps a tool the image happens to lack from
+/// aborting the boot.
+pub const REAL_IMAGE_INIT: &[u8] = b"#!/bin/sh\n\
+mkdir -p /proc /sys /dev /tmp /workspace 2>/dev/null\n\
+mount -t proc proc /proc 2>/dev/null\n\
+mount -t sysfs sysfs /sys 2>/dev/null\n\
+mount -t devtmpfs devtmpfs /dev 2>/dev/null\n\
+mount -t tmpfs tmpfs /tmp 2>/dev/null\n\
+mount -t 9p -o trans=virtio,version=9p2000.L,msize=65536 hsworkspace /workspace 2>/dev/null\n\
+export HOME=/root TERM=xterm PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin PS1='holospace:$PWD\\$ '\n\
+cd /workspace 2>/dev/null || cd /root 2>/dev/null || cd /\n\
+echo 'holospace devcontainer ready \xe2\x80\x94 the repository image; /workspace is shared with the editor'\n\
+[ -x /bin/bash ] && exec /bin/bash -l || exec /bin/sh\n";
+
 /// The machine a holospace boots on: a single RV64GC hart over `ram_bytes` of
 /// RAM mapped at `base`, with the CLINT, the PLIC, and one `virtio-mmio` block
 /// device — the device set the [emulator](crate::emulator) implements.

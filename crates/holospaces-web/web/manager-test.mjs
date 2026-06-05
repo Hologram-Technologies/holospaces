@@ -377,7 +377,7 @@ try {
       prov.deliver(res.status, res.headers.get("content-type") || "", body);
       if (++steps > 50) throw new Error("the pull did not converge");
     }
-    const rootfs = prov.assemble();
+    const rootfs = prov.assemble(256 * 1024 * 1024);
     return { len: rootfs.length, mult4k: rootfs.length % 4096 === 0 };
   }, `127.0.0.1:${port}`);
   check(
