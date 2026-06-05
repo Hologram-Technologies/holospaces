@@ -16,8 +16,16 @@
 
   "_comment_direct_sockets": "Direct Sockets (TCPSocket/UDPSocket) is a powerful, gated capability. It is enabled OUT OF BAND — for an enterprise/managed device via the DirectSocketsAllowedForUrls policy, or for development via chrome://flags — NOT via a broad store permission, which keeps the store-facing permission surface minimal. Confirm the exact gating for your Chrome version/channel.",
 
-  "_comment_connect": "Only the operator's own holospaces origin may message this extension — the egress is the operator's, self-sovereign, not open to any page. Trim/extend `matches` to exactly your deployment's origin(s); narrower is faster to review.",
+  "_comment_connect": "Only the operator's own holospaces origin(s) may reach this extension — the egress is the operator's, self-sovereign, not open to any page. The matches list is the deployment's origin(s): set it to yours (the default below is the project's Pages site; a self-host sets its own). The content script (presence beacon) and externally_connectable share that one list — there are no other origins.",
+  "_holospaces_origins": ["https://hologram-technologies.github.io/*"],
   "externally_connectable": {
     "matches": ["https://hologram-technologies.github.io/*"]
-  }
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://hologram-technologies.github.io/*"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ]
 }
