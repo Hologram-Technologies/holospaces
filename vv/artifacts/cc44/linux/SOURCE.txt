@@ -1,0 +1,41 @@
+CC-44 — a real amd64 (x86-64) Linux kernel boots to userspace on the emulator.
+
+The external authority is the Linux kernel itself (a real, unmodified x86-64 OS —
+the most stringent AMD64 + privileged-architecture correctness test for the third
+ISA) booting to userspace on the holospaces x86-64 core, with
+qemu-system-x86_64 as the differential oracle. The emulator adds the 64-bit Linux
+boot protocol (boot_params/zero page, GDT, long-mode entry), an IDT + a minimal
+interrupt controller (PIC/APIC) so the timer and virtio IRQs vector, virtio-mmio
+κ-disk servicing over the shared emulator::devbus, and the instruction tail the
+boot path hits — reaching userspace byte-identically to qemu.
+
+Pins
+  Source   : torvalds/linux, tag v6.6
+  Commit   : ffc253263a1375a65fa6c9f62a893e9767fbebfa
+  Config   : `make ARCH=x86_64 x86_64_defconfig` + the initramfs splice and the
+             virtio-mmio/virtio/9p/ext4/IP-autoconf/8250-console options (see
+             build.sh); committed as kernel.config. x86_64_defconfig is the amd64
+             default.
+  Toolchain: gcc (Ubuntu 13.x), GNU binutils 2.42.
+  PID 1    : init.c — a freestanding static amd64 ELF (raw `syscall`, no libc)
+             that prints HOLOSPACES-LINUX-USERSPACE-OK + the real /proc/version,
+             then reboots (LINUX_REBOOT_CMD_POWER_OFF → native_machine_halt →
+             stop_this_cpu → `hlt` with interrupts masked → the emulator halts).
+
+Artifacts
+  vmlinux.gz     — the gzip-compressed *uncompressed* ELF kernel. The x86-64 core
+                   loads its PT_LOAD segments and enters startup_64 directly (the
+                   64-bit boot protocol: the loader sets up long-mode paging, the
+                   GDT, and boot_params), with no in-guest decompressor. This is
+                   the image the emulator boot witness loads.
+  bzImage        — the standard self-decompressing kernel, the image
+                   qemu-system-x86_64 -kernel boots for the differential oracle
+                   (same source/config as vmlinux).
+  init.c         — the PID-1 source (above).
+  initramfs.list — the gen_init_cpio manifest embedding /init.
+  kernel.config  — the exact config the committed images were built from.
+  linux.sha256   — checksums of the committed artifacts.
+
+Reproduce: ./build.sh  (clones v6.6, builds vmlinux.gz + bzImage reproducibly —
+fixed KBUILD_BUILD_TIMESTAMP/USER/HOST). The qemu-system-x86_64 differential is
+captured/checked by vv/suites/cc44-x64-linux.sh whenever qemu is present.
