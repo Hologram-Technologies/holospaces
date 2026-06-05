@@ -1,3 +1,10 @@
+# This crate is excluded from the host workspace (wasm32-only) and built
+# standalone via `scripts/browser-manager-test.sh` / the Pages deploy. An empty
+# `[workspace]` table makes it its own workspace root, so it builds correctly no
+# matter where the checkout lives (including inside another repo, e.g. a nested
+# worktree) — cargo's workspace search stops here instead of walking up.
+[workspace]
+
 [package]
 name = "holospaces-web"
 description = "The Hologram Platform Manager — holospaces' browser peer (wasm32), served from GitHub Pages"
@@ -25,6 +32,10 @@ hologram-runtime-bare = { git = "https://github.com/Hologram-Technologies/hologr
 # portable `NetworkInterface` a bare-metal peer uses (`CC-38`), so no direct
 # net-bare dependency is needed here; the browser peer just drives it.
 wasm-bindgen = "0.2"
+# The WebRTC negotiation (CC-49) awaits browser promises (createOffer/createAnswer,
+# setLocalDescription, addIceCandidate) — wasm-bindgen-futures bridges JS Promises
+# to Rust futures so the offer/answer handshake is plain async Rust.
+wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 serde_json = "1"
 
@@ -34,7 +45,18 @@ serde_json = "1"
 # needed.
 [dependencies.web-sys]
 version = "0.3"
-features = ["WebSocket", "MessageEvent", "BinaryType", "Event", "CloseEvent", "FileSystemSyncAccessHandle", "FileSystemReadWriteOptions"]
+features = [
+    "WebSocket", "MessageEvent", "BinaryType", "Event", "CloseEvent",
+    "FileSystemSyncAccessHandle", "FileSystemReadWriteOptions",
+    # The uor-native content network's live browser transport (CC-49): a real
+    # peer-to-peer WebRTC data channel carries the BareNetSync frames between two
+    # browser peers — no central operator. Signaling (SDP/ICE) is exchanged out of
+    # band by the peers themselves; the data channel is the wire.
+    "RtcPeerConnection", "RtcConfiguration", "RtcDataChannel", "RtcDataChannelInit",
+    "RtcDataChannelType", "RtcDataChannelEvent", "RtcSessionDescription",
+    "RtcSessionDescriptionInit", "RtcSdpType", "RtcIceCandidate",
+    "RtcIceCandidateInit", "RtcPeerConnectionIceEvent",
+]
 
 [profile.release]
 # This IS the production artifact (served from GitHub Pages). The browser peer

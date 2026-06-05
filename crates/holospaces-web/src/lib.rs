@@ -29,7 +29,10 @@
 //! realized on the browser peer.
 
 mod opfs_store;
+mod webrtc;
 mod wsnet;
+
+pub use webrtc::WebRtcLink;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -365,6 +368,28 @@ impl Console {
     pub fn new() -> Console {
         let content_store = Arc::new(MemKappaStore::new());
         let content = ContentPeer::new(256 * 1024, content_store.clone());
+        Console {
+            runtime: Runtime::new(BareMetalEngine::new(), MemKappaStore::new()),
+            operator: None,
+            holospaces: Vec::new(),
+            configs: Vec::new(),
+            content_store,
+            content,
+            cn_pending: None,
+        }
+    }
+
+    /// Open a **forging** browser peer — a malicious responder that answers every
+    /// content-network fetch with `forged` bytes (which do not re-derive to the
+    /// requested κ). It drives the SAME content-network seam (`cn_inbound` /
+    /// `cn_outbound`) over the same transport, so a real WebRTC peer fetching from
+    /// it receives a well-formed but forged response and **rejects it on receipt**
+    /// (SPINE-4 / Law L5). This is the adversary the `CC-49` witness uses to prove
+    /// a forging responder is refused — a genuine attacker, not a mock.
+    #[must_use]
+    pub fn new_forging(forged: &[u8]) -> Console {
+        let content_store = Arc::new(MemKappaStore::new());
+        let content = ContentPeer::new_forging(256 * 1024, forged.to_vec());
         Console {
             runtime: Runtime::new(BareMetalEngine::new(), MemKappaStore::new()),
             operator: None,
