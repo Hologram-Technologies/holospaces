@@ -898,6 +898,30 @@ export class Workspace {
         return Workspace.__wrap(ret[0]);
     }
     /**
+     * Boot like [`boot_devcontainer_routed`](Workspace::boot_devcontainer_routed),
+     * but page the guest's disk from an **OPFS-backed store** (`handle` is an
+     * OPFS `FileSystemSyncAccessHandle` the worker opened) — so the disk's
+     * sectors live off the wasm heap and a large real image boots without holding
+     * it all in RAM (the paged κ-disk; "the KappaStore IS the memory, RAM is a
+     * cache"). Egress is routed (`ChannelEgress`); drive with
+     * [`run`](Workspace::run), pumping the router seam each tick.
+     * @param {Uint8Array} kernel
+     * @param {Uint8Array} rootfs
+     * @param {FileSystemSyncAccessHandle} disk_handle
+     * @returns {Workspace}
+     */
+    static boot_devcontainer_routed_opfs(kernel, rootfs, disk_handle) {
+        const ptr0 = passArray8ToWasm0(kernel, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passArray8ToWasm0(rootfs, wasm.__wbindgen_malloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.workspace_boot_devcontainer_routed_opfs(ptr0, len0, ptr1, len1, disk_handle);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return Workspace.__wrap(ret[0]);
+    }
+    /**
      * The κ of every operator event published on the terminal channel so far.
      * @returns {any[]}
      */
@@ -1488,6 +1512,10 @@ function __wbg_get_imports() {
             const ret = new Uint8Array(arg0);
             return ret;
         },
+        __wbg_new_ce1ab61c1c2b300d: function() {
+            const ret = new Object();
+            return ret;
+        },
         __wbg_new_d7e476b433a26bea: function() { return handleError(function (arg0, arg1) {
             const ret = new WebSocket(getStringFromWasm0(arg0, arg1));
             return ret;
@@ -1499,9 +1527,16 @@ function __wbg_get_imports() {
         __wbg_prototypesetcall_3249fc62a0fafa30: function(arg0, arg1, arg2) {
             Uint8Array.prototype.set.call(getArrayU8FromWasm0(arg0, arg1), arg2);
         },
+        __wbg_read_34a0958bcc273c55: function() { return handleError(function (arg0, arg1, arg2, arg3) {
+            const ret = arg0.read(getArrayU8FromWasm0(arg1, arg2), arg3);
+            return ret;
+        }, arguments); },
         __wbg_send_4a773f523104d75e: function() { return handleError(function (arg0, arg1, arg2) {
             arg0.send(getArrayU8FromWasm0(arg1, arg2));
         }, arguments); },
+        __wbg_set_at_5b6d1bf4f66bd626: function(arg0, arg1) {
+            arg0.at = arg1;
+        },
         __wbg_set_binaryType_41994c453b95bdd2: function(arg0, arg1) {
             arg0.binaryType = __wbindgen_enum_BinaryType[arg1];
         },
@@ -1514,14 +1549,18 @@ function __wbg_get_imports() {
         __wbg_set_onopen_db452f4233e99d7d: function(arg0, arg1) {
             arg0.onopen = arg1;
         },
+        __wbg_write_948386f6a5cf303f: function() { return handleError(function (arg0, arg1, arg2, arg3) {
+            const ret = arg0.write(getArrayU8FromWasm0(arg1, arg2), arg3);
+            return ret;
+        }, arguments); },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
             // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 8, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h87f7c3e7e6138e77);
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h71bffd0d1851400e);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
             // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 8, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h87f7c3e7e6138e77_1);
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h71bffd0d1851400e_1);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
@@ -1545,12 +1584,12 @@ function __wbg_get_imports() {
     };
 }
 
-function wasm_bindgen__convert__closures_____invoke__h87f7c3e7e6138e77(arg0, arg1, arg2) {
-    wasm.wasm_bindgen__convert__closures_____invoke__h87f7c3e7e6138e77(arg0, arg1, arg2);
+function wasm_bindgen__convert__closures_____invoke__h71bffd0d1851400e(arg0, arg1, arg2) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h71bffd0d1851400e(arg0, arg1, arg2);
 }
 
-function wasm_bindgen__convert__closures_____invoke__h87f7c3e7e6138e77_1(arg0, arg1, arg2) {
-    wasm.wasm_bindgen__convert__closures_____invoke__h87f7c3e7e6138e77_1(arg0, arg1, arg2);
+function wasm_bindgen__convert__closures_____invoke__h71bffd0d1851400e_1(arg0, arg1, arg2) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h71bffd0d1851400e_1(arg0, arg1, arg2);
 }
 
 
