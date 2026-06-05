@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "holospaces egress",
+  "name": "holospaces router",
   "version": "0.0.1",
-  "description": "Local egress for holospaces: raw TCP via Direct Sockets so a browser-tab devcontainer reaches the internet. No node, no proxy.",
+  "description": "The holospaces router: carries a browser-tab guest's traffic to the internet via Direct Sockets (raw TCP). No node, no proxy.",
 
   "background": { "service_worker": "background.js" },
 

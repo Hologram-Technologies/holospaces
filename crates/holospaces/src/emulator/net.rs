@@ -1165,6 +1165,175 @@ impl Egress for NoEgress {
     fn close(&mut self, _id: u32) {}
 }
 
+// ── ChannelEgress — the guest's egress routed through an external router ──────
+// The egress frame protocol: the SAME OPEN/DATA/CLOSE wire the `WsEgress` relay
+// (`CC-16`), the holospaces-node (`CC-39`), and the router extension (`CC-41`)
+// speak. ChannelEgress is the NAT-side endpoint; the page carries these frames to
+// whichever router is configured (the extension's `chrome.runtime` port, or a
+// node's WebSocket), which opens the real sockets a tab cannot — so the guest's
+// package managers, network config, and apps reach the internet (Codespaces
+// parity), the router being the gateway for arbitrary traffic.
+const EGRESS_OP_OPEN: u8 = 0x01;
+const EGRESS_OP_DATA: u8 = 0x02;
+const EGRESS_OP_CLOSE: u8 = 0x03;
+const EGRESS_OP_OPENED: u8 = 0x11;
+const EGRESS_OP_RDATA: u8 = 0x12;
+const EGRESS_OP_CLOSED: u8 = 0x13;
+const EGRESS_OP_FAILED: u8 = 0x14;
+
+struct ChannelConn {
+    status: EgressStatus,
+    inbound: VecDeque<u8>,
+}
+
+struct ChannelShared {
+    conns: BTreeMap<u32, ChannelConn>,
+    /// Egress frames the guest produced, awaiting the page's pump to the router.
+    outbound: VecDeque<Vec<u8>>,
+}
+
+/// The page-side handle to a [`ChannelEgress`] — the seam a transport carries.
+/// The page [`drain_outbound`](RouterChannel::drain_outbound)s the guest's egress
+/// frames to the router (the extension's `chrome.runtime` port, or a node's
+/// WebSocket) and [`feed_inbound`](RouterChannel::feed_inbound)s the router's
+/// replies back. Cloneable; shares the egress state with its `ChannelEgress`.
+#[derive(Clone)]
+pub struct RouterChannel {
+    shared: Rc<RefCell<ChannelShared>>,
+}
+
+impl RouterChannel {
+    /// Take the guest's pending egress frames (`OPEN`/`DATA`/`CLOSE`) for the
+    /// router to act on. Empty when the guest has sent nothing since the last drain.
+    #[must_use]
+    pub fn drain_outbound(&self) -> Vec<Vec<u8>> {
+        self.shared.borrow_mut().outbound.drain(..).collect()
+    }
+
+    /// Deliver a frame the router returned (`OPENED`/`DATA`/`CLOSED`/`FAILED`)
+    /// into the connection state the NAT polls.
+    pub fn feed_inbound(&self, frame: &[u8]) {
+        if frame.len() < 5 {
+            return;
+        }
+        let op = frame[0];
+        let id = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]);
+        let mut s = self.shared.borrow_mut();
+        match op {
+            EGRESS_OP_OPENED => {
+                if let Some(c) = s.conns.get_mut(&id) {
+                    c.status = EgressStatus::Open;
+                }
+            }
+            EGRESS_OP_RDATA => {
+                if let Some(c) = s.conns.get_mut(&id) {
+                    c.inbound.extend(&frame[5..]);
+                }
+            }
+            EGRESS_OP_CLOSED | EGRESS_OP_FAILED => {
+                if let Some(c) = s.conns.get_mut(&id) {
+                    c.status = EgressStatus::Closed;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// An [`Egress`] whose connections are carried by an external **router** over the
+/// egress frame protocol — the browser peer's path to arbitrary internet through
+/// the router extension (`CC-41`) or a node (`CC-39`). The NAT drives it exactly
+/// as any egress (`connect`/`send`/`recv`/`close`); the frames are drained and
+/// fed via the paired [`RouterChannel`]. No transport, no JS — the router seam is
+/// surface-agnostic substrate code.
+pub struct ChannelEgress {
+    shared: Rc<RefCell<ChannelShared>>,
+    next_id: u32,
+}
+
+impl ChannelEgress {
+    /// A router-backed egress and the page-side [`RouterChannel`] that carries its
+    /// frames to the configured router.
+    #[must_use]
+    pub fn new() -> (ChannelEgress, RouterChannel) {
+        let shared = Rc::new(RefCell::new(ChannelShared {
+            conns: BTreeMap::new(),
+            outbound: VecDeque::new(),
+        }));
+        (
+            ChannelEgress {
+                shared: shared.clone(),
+                next_id: 1,
+            },
+            RouterChannel { shared },
+        )
+    }
+}
+
+impl Egress for ChannelEgress {
+    fn connect(&mut self, ip: [u8; 4], port: u16) -> u32 {
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut s = self.shared.borrow_mut();
+        s.conns.insert(
+            id,
+            ChannelConn {
+                status: EgressStatus::Connecting,
+                inbound: VecDeque::new(),
+            },
+        );
+        let mut frame = Vec::with_capacity(11);
+        frame.push(EGRESS_OP_OPEN);
+        frame.extend_from_slice(&id.to_be_bytes());
+        frame.extend_from_slice(&ip);
+        frame.extend_from_slice(&port.to_be_bytes());
+        s.outbound.push_back(frame);
+        id
+    }
+
+    fn status(&mut self, id: u32) -> EgressStatus {
+        self.shared
+            .borrow()
+            .conns
+            .get(&id)
+            .map_or(EgressStatus::Closed, |c| c.status)
+    }
+
+    fn recv(&mut self, id: u32) -> Vec<u8> {
+        let mut s = self.shared.borrow_mut();
+        match s.conns.get_mut(&id) {
+            Some(c) => c.inbound.drain(..).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    fn send(&mut self, id: u32, data: &[u8]) {
+        let mut s = self.shared.borrow_mut();
+        if matches!(
+            s.conns.get(&id).map(|c| c.status),
+            Some(EgressStatus::Closed)
+        ) {
+            return;
+        }
+        let mut frame = Vec::with_capacity(5 + data.len());
+        frame.push(EGRESS_OP_DATA);
+        frame.extend_from_slice(&id.to_be_bytes());
+        frame.extend_from_slice(data);
+        s.outbound.push_back(frame);
+    }
+
+    fn close(&mut self, id: u32) {
+        let mut s = self.shared.borrow_mut();
+        if let Some(c) = s.conns.get_mut(&id) {
+            c.status = EgressStatus::Closed;
+        }
+        let mut frame = Vec::with_capacity(5);
+        frame.push(EGRESS_OP_CLOSE);
+        frame.extend_from_slice(&id.to_be_bytes());
+        s.outbound.push_back(frame);
+    }
+}
+
 /// One in-process loopback connection's buffers, shared between the host side
 /// ([`LoopbackHandle`]) and the NAT side ([`LoopbackIngress`]).
 struct LoopConn {
@@ -1319,6 +1488,48 @@ impl Ingress for LoopbackIngress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The guest's egress routes through an external router over the
+    /// `RouterChannel` seam: a connection opens, data round-trips, and it closes
+    /// — the exact frame exchange the router extension (`CC-41`) and the node
+    /// (`CC-39`) implement, so the guest's package managers / apps reach the
+    /// internet through whichever router the page is wired to.
+    #[test]
+    fn channel_egress_routes_a_connection_through_the_router() {
+        let (mut egress, channel) = ChannelEgress::new();
+
+        // The guest dials out → an OPEN frame is queued for the router.
+        let id = egress.connect([93, 184, 216, 34], 80);
+        let out = channel.drain_outbound();
+        assert_eq!(out.len(), 1, "one OPEN frame queued for the router");
+        assert_eq!(out[0][0], EGRESS_OP_OPEN);
+        assert_eq!(
+            u32::from_be_bytes([out[0][1], out[0][2], out[0][3], out[0][4]]),
+            id
+        );
+        assert!(matches!(egress.status(id), EgressStatus::Connecting));
+
+        // The router opens the socket and reports OPENED → the guest sees Open.
+        let mut opened = vec![EGRESS_OP_OPENED];
+        opened.extend_from_slice(&id.to_be_bytes());
+        channel.feed_inbound(&opened);
+        assert!(matches!(egress.status(id), EgressStatus::Open));
+
+        // The guest sends; the router echoes; the guest receives the reply.
+        egress.send(id, b"GET / HTTP/1.0\r\n\r\n");
+        let out = channel.drain_outbound();
+        assert_eq!(out[0][0], EGRESS_OP_DATA);
+        let mut echo = vec![EGRESS_OP_RDATA];
+        echo.extend_from_slice(&id.to_be_bytes());
+        echo.extend_from_slice(&out[0][5..]);
+        channel.feed_inbound(&echo);
+        assert_eq!(egress.recv(id), b"GET / HTTP/1.0\r\n\r\n");
+
+        // The guest closes → a CLOSE frame, and the connection is closed.
+        egress.close(id);
+        assert_eq!(channel.drain_outbound()[0][0], EGRESS_OP_CLOSE);
+        assert!(matches!(egress.status(id), EgressStatus::Closed));
+    }
 
     /// A do-nothing egress that records connects and replies with a canned
     /// payload once — enough to unit-test the NAT's framing and state machine

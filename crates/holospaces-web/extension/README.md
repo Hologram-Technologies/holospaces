@@ -1,9 +1,11 @@
-# holospaces egress extension — local internet for a browser-tab guest
+# holospaces router — the gateway that carries a browser-tab guest's traffic
 
 A browser tab has no raw sockets, so a holospace's guest (a real Linux + the
 devcontainer's binaries, running in the tab) cannot reach the internet on its
-own. There are three ways to give it one — and this extension is the one that
-needs **no other device at all**:
+own. This extension is the guest's **router** — the gateway that carries
+*arbitrary traffic* for *any* holospace out of the sandbox, so package managers,
+network configuration, and applications work as they do on a Codespace VM. It is
+the one path that needs **no other device at all**:
 
 | Egress surface | How | When |
 |---|---|---|
