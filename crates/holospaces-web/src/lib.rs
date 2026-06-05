@@ -46,6 +46,7 @@ use holospaces::content_net::ContentPeer;
 use holospaces::emulator::{net, Emulator, Halt};
 use holospaces::identity::{Operator, Roster};
 use holospaces::machine::MachineSpec;
+use holospaces::oci::ImagePull;
 use holospaces::projection::{Intent, Workspace as Projection};
 use holospaces::realizations::{address, verify, Holospace, Kappa, Source};
 use holospaces::surface;
@@ -119,6 +120,101 @@ pub fn verify_kappa(bytes: &[u8], kappa: &str) -> Result<bool, JsValue> {
 #[wasm_bindgen]
 pub fn default_devcontainer_image() -> String {
     holospaces::DEFAULT_DEVCONTAINER_IMAGE.to_owned()
+}
+
+/// **Provision a devcontainer's real OCI image in the browser** — the deployed
+/// path that makes a launched holospace the repository's *actual* devcontainer,
+/// not a demo. The page drives it with the router as the transport: while
+/// [`is_done`](DevcontainerProvision::is_done) is false, read
+/// [`next_url`](DevcontainerProvision::next_url) /
+/// [`next_accept`](DevcontainerProvision::next_accept) /
+/// [`next_bearer`](DevcontainerProvision::next_bearer), fetch through the router
+/// extension's CORS-free `fetch`, and feed the response back with
+/// [`deliver`](DevcontainerProvision::deliver); then [`assemble`] yields the
+/// bootable rootfs. The pull is the *same* [`ImagePull`] the native importer uses
+/// and re-derives every blob (Law L5) — only the transport differs.
+#[wasm_bindgen]
+pub struct DevcontainerProvision {
+    pull: ImagePull,
+    store: MemKappaStore,
+}
+
+#[wasm_bindgen]
+impl DevcontainerProvision {
+    /// Begin provisioning `image_ref` (e.g. `mcr.microsoft.com/devcontainers/base:debian`)
+    /// for `arch` (`"riscv64"` / `"aarch64"`).
+    #[wasm_bindgen(constructor)]
+    pub fn new(image_ref: &str, arch: &str) -> Result<DevcontainerProvision, JsValue> {
+        let arch = holospaces::Arch::from_id(arch).unwrap_or_default();
+        Ok(DevcontainerProvision {
+            pull: ImagePull::new(image_ref, arch).map_err(js_err)?,
+            store: MemKappaStore::new(),
+        })
+    }
+
+    /// The URL the page must `GET` next through the router, or `undefined` when
+    /// [`is_done`](DevcontainerProvision::is_done).
+    #[wasm_bindgen(js_name = nextUrl)]
+    #[must_use]
+    pub fn next_url(&self) -> Option<String> {
+        self.pull.next_fetch().map(|f| f.url)
+    }
+
+    /// The `Accept` header for the next fetch (manifests), or `undefined`.
+    #[wasm_bindgen(js_name = nextAccept)]
+    #[must_use]
+    pub fn next_accept(&self) -> Option<String> {
+        self.pull.next_fetch().and_then(|f| f.accept)
+    }
+
+    /// The bearer token for the next fetch once one is held, or `undefined`.
+    #[wasm_bindgen(js_name = nextBearer)]
+    #[must_use]
+    pub fn next_bearer(&self) -> Option<String> {
+        self.pull.next_fetch().and_then(|f| f.bearer)
+    }
+
+    /// Feed the router's response to the current fetch.
+    pub fn deliver(&mut self, status: u16, content_type: &str, body: &[u8]) -> Result<(), JsValue> {
+        self.pull
+            .deliver(status, content_type, body.to_vec())
+            .map_err(js_err)
+    }
+
+    /// Whether every blob has been delivered and the image is ready to
+    /// [`assemble`](DevcontainerProvision::assemble).
+    #[wasm_bindgen(js_name = isDone)]
+    #[must_use]
+    pub fn is_done(&self) -> bool {
+        self.pull.is_done()
+    }
+
+    /// Ingest the fully-fetched image (re-deriving every blob — Law L5) and
+    /// assemble it into the bootable ext4 rootfs the emulator boots over
+    /// `virtio-blk` — pass the result to
+    /// [`boot_devcontainer_routed`](Workspace::boot_devcontainer_routed).
+    pub fn assemble(&self) -> Result<Vec<u8>, JsValue> {
+        let image = self.pull.ingest(&self.store).map_err(js_err)?;
+        let mut owned: Vec<(String, Vec<u8>)> = Vec::new();
+        for (k, mt) in image.layers().iter().zip(image.layer_media_types()) {
+            let bytes = self
+                .store
+                .get(k)
+                .map_err(js_err)?
+                .ok_or_else(|| JsValue::from_str("an ingested layer is missing from the store"))?
+                .as_ref()
+                .to_vec();
+            owned.push((mt.clone(), bytes));
+        }
+        let layers: Vec<Layer> = owned
+            .iter()
+            .map(|(mt, b)| Layer {
+                media_type: mt,
+                blob: b,
+            })
+            .collect();
+        assemble_ext4(&layers).map_err(js_err)
+    }
 }
 
 /// Run a `.holo` compute artifact in the browser via the hologram executor
