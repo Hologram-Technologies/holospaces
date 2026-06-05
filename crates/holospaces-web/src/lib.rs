@@ -28,6 +28,7 @@
 //! reads and edits environment content by κ — the documented launch experience,
 //! realized on the browser peer.
 
+mod opfs_store;
 mod wsnet;
 
 use std::future::Future;
@@ -1001,6 +1002,34 @@ impl Workspace {
         let (egress, router) = net::ChannelEgress::new();
         let machine = MachineSpec::devcontainer_net()
             .boot_net(kernel, rootfs.to_vec(), Box::new(egress))
+            .map_err(js_err)?;
+        Ok(Workspace {
+            machine,
+            store: MemKappaStore::new(),
+            channel: Vec::new(),
+            files: std::collections::BTreeMap::new(),
+            halted: false,
+            console_cursor: 0,
+            router: Some(router),
+        })
+    }
+
+    /// Boot like [`boot_devcontainer_routed`](Workspace::boot_devcontainer_routed),
+    /// but page the guest's disk from an **OPFS-backed store** (`handle` is an
+    /// OPFS `FileSystemSyncAccessHandle` the worker opened) — so the disk's
+    /// sectors live off the wasm heap and a large real image boots without holding
+    /// it all in RAM (the paged κ-disk; "the KappaStore IS the memory, RAM is a
+    /// cache"). Egress is routed (`ChannelEgress`); drive with
+    /// [`run`](Workspace::run), pumping the router seam each tick.
+    pub fn boot_devcontainer_routed_opfs(
+        kernel: &[u8],
+        rootfs: &[u8],
+        disk_handle: web_sys::FileSystemSyncAccessHandle,
+    ) -> Result<Workspace, JsValue> {
+        let (egress, router) = net::ChannelEgress::new();
+        let store = Box::new(opfs_store::OpfsKappaStore::new(disk_handle));
+        let machine = MachineSpec::devcontainer_net()
+            .boot_net_in(kernel, rootfs.to_vec(), Box::new(egress), store)
             .map_err(js_err)?;
         Ok(Workspace {
             machine,

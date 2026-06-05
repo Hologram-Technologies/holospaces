@@ -274,6 +274,27 @@ impl MachineSpec {
         Ok(emu)
     }
 
+    /// Boot like [`Self::boot_net`], but page the disk from a **caller-supplied
+    /// [`KappaStore`](hologram_substrate_core::KappaStore)** — the browser peer
+    /// passes an OPFS-backed store so the disk's sectors live off the wasm heap
+    /// (paged on demand; "the KappaStore IS the memory, RAM is a cache"), which is
+    /// how it boots a real image without holding it all in RAM (the paged κ-disk).
+    pub fn boot_net_in(
+        &self,
+        kernel: &[u8],
+        rootfs: Vec<u8>,
+        egress: alloc::boxed::Box<dyn net::Egress>,
+        disk_store: alloc::boxed::Box<dyn hologram_substrate_core::KappaStore>,
+    ) -> Result<Emulator, crate::emulator::Trap> {
+        let mut emu = Emulator::new(self.base, self.ram_bytes as usize);
+        emu.enable_sbi();
+        emu.attach_disk_in(disk_store, rootfs);
+        emu.attach_net(egress);
+        let dtb = self.device_tree_for(false, true);
+        emu.boot_kernel(kernel, &dtb, self.base + DTB_OFFSET)?;
+        Ok(emu)
+    }
+
     /// Boot like [`Self::boot_net`], additionally **forwarding ports**: an
     /// `ingress` transport carries inbound connections to a server inside the
     /// devcontainer (`CC-21`) — the running-app preview a Codespace surfaces. Use
