@@ -117,13 +117,25 @@ bound to its operator (it cannot be forged for another).
 Content is addressable — hence perceivable — only via its κ; a peer cannot
 enumerate or fabricate content it was not given the κ for. *Enforced by* the
 content-addressed store (an unknown κ is absent). *Witness:*
-`sec_confidentiality_content_is_reachable_only_by_its_kappa`. The deeper property
-— content is UOR-encoded and meaningful only in the observer's **base-frame**, so
-a routing/storage peer without the frame perceives nothing (no ciphertext, no key
-to steal) — is realized at the **UOR/Prism layer** (`uor-prism-crypto`,
-`uor-prism-fhe`: frame-encoded / homomorphically-operable content), which
-holospaces may compose but does not yet (§13.9). The property holospaces enforces
-today is **κ-as-capability**.
+`sec_confidentiality_content_is_reachable_only_by_its_kappa`. This — together with
+content-blind intermediaries (`SEC-7`) — **meets confidentiality for the deployed
+architecture**, and the reason is structural, not a deferral: holospaces has **no
+server** (ADR-001/Law L4), so no *untrusted party* ever holds perceivable content.
+Compute runs in the peer that owns the holospace; routing/storage peers move
+content addressed by κ (an unknown κ is absent) and exits forward opaque bytes
+(`SEC-7`) — none of them *perceive* or *operate on* content.
+
+A *deeper* property — content UOR-encoded so a **storage peer holding the bytes**
+perceives nothing without the observer's **base-frame** — would be realized by
+**frame-relative-at-rest encoding** (`uor-prism-crypto`). holospaces does not
+compose it and **does not need to today**: storage is the operator's own peer
+(OPFS) or a **node the operator owns** (`CC-39`), so there is no untrusted holder
+to defend against. It is a **conditional** item (§13.9), admitted only if the
+threat model later adds untrusted storage peers — not a standing requirement.
+**Homomorphic encryption (`uor-prism-fhe`) is *not needed at all*:** FHE secures
+an *untrusted party's computation* over content it cannot perceive, and holospaces
+has no untrusted computation. The property holospaces enforces today —
+**κ-as-capability + content-blindness** — is sufficient for SEC-5.
 
 ### SEC-6 — Reference resolution: verified against the κ, not the reference
 
@@ -196,10 +208,17 @@ each property so nothing is over-claimed:
   floor**, and DHT eclipse/Sybil resistance. holospaces witnesses their
   *observable consequences* (one κ per content, repetition collapses) but does not
   re-prove the substrate.
-- **Prism-available, not yet composed**: frame-relative / homomorphic
-  confidentiality (`uor-prism-crypto`, `uor-prism-fhe`). When holospaces composes
-  it, SEC-5 graduates from κ-as-capability to the full base-frame property, with a
-  witness added here.
+- **Out of scope by analysis (not a gap)**: *homomorphic* confidentiality
+  (`uor-prism-fhe`) is **not needed**. FHE secures an *untrusted party's
+  computation* over content it cannot perceive; holospaces has none — there is no
+  server (ADR-001/Law L4), compute runs in the holospace-owning peer, and
+  intermediaries route/store (content-blind, `SEC-7`) but never *operate on*
+  content. *Frame-relative-at-rest* encoding (`uor-prism-crypto`) is a
+  **conditional** future item — relevant only if the threat model later admits
+  **untrusted storage peers** (strangers caching your κ). The deployed model
+  stores on the operator's own peer/node (`CC-39`), so κ-as-capability +
+  content-blindness already satisfy SEC-5; if that threat is admitted, the answer
+  is frame-relative encoding (**not** FHE), with a witness added then.
 
 ## 13.10 Verification & validation
 
