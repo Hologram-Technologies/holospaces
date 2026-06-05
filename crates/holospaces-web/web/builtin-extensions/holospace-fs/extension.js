@@ -172,6 +172,25 @@ async function readProvisioned(id) {
   }
 }
 
+// Open the OPFS pack file backing the paged κ-disk's store, behind a synchronous
+// access handle (worker-only — which is where the extension host, and thus the
+// emulator, runs). A fresh pack per boot (truncated); the disk's sectors are
+// content-addressed into it, so they live off the wasm heap. `null` if OPFS sync
+// access is unavailable (then the caller falls back to the in-RAM κ-disk).
+async function openDiskStore(id) {
+  const root = await opfsRoot();
+  if (!root || !id) return null;
+  try {
+    const dir = await root.getDirectoryHandle("disk-store", { create: true });
+    const fh = await dir.getFileHandle(`${id}.pack`, { create: true });
+    const handle = await fh.createSyncAccessHandle();
+    handle.truncate(0); // a fresh pack each boot
+    return handle;
+  } catch {
+    return null; // no sync access handle (not a worker, or unsupported)
+  }
+}
+
 let persisting = false;
 async function saveSnapshot() {
   if (!ws || ws.halted || persisting) return;
@@ -256,14 +275,24 @@ async function bootHolospace() {
     ? new URLSearchParams(folder.uri.query).get("egress")
     : null;
   bridged = !egress && !provisioned;
+  // A provisioned holospace pages its disk from an OPFS-backed κ-store (the
+  // paged κ-disk): the disk's sectors live off the wasm heap, so a real image
+  // boots without holding it all in RAM ("the KappaStore IS the memory, RAM is a
+  // cache"). The store is one OPFS pack file behind a sync access handle (worker-
+  // only — which is where this runs).
+  const diskHandle = provisioned && !egress ? await openDiskStore(holoId) : null;
   ws = egress
     ? wasm.Workspace.boot_devcontainer_net(kernel, rootfs, egress)
     : provisioned
-      ? wasm.Workspace.boot_devcontainer_routed(kernel, rootfs)
+      ? diskHandle
+        ? wasm.Workspace.boot_devcontainer_routed_opfs(kernel, rootfs, diskHandle)
+        : wasm.Workspace.boot_devcontainer_routed(kernel, rootfs)
       : wasm.Workspace.boot_devcontainer_bridged(kernel, rootfs);
   if (out) {
     out.appendLine(provisioned
-      ? "holospace: booted the provisioned devcontainer image (CC-42) — the repository's real environment"
+      ? (diskHandle
+        ? "holospace: booted the provisioned devcontainer image (CC-42) — disk paged from OPFS (RAM is a cache)"
+        : "holospace: booted the provisioned devcontainer image (CC-42) — the repository's real environment")
       : "holospace: booted the language-server base fixture");
   }
   // Seed a welcome note into the shared workspace so the editor and the OS both

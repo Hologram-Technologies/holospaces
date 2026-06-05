@@ -34,7 +34,7 @@ serde_json = "1"
 # needed.
 [dependencies.web-sys]
 version = "0.3"
-features = ["WebSocket", "MessageEvent", "BinaryType", "Event", "CloseEvent"]
+features = ["WebSocket", "MessageEvent", "BinaryType", "Event", "CloseEvent", "FileSystemSyncAccessHandle", "FileSystemReadWriteOptions"]
 
 [profile.release]
 # This IS the production artifact (served from GitHub Pages). The browser peer
