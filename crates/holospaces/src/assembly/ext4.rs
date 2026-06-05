@@ -40,6 +40,9 @@ pub const S_IFCHR: u16 = 0x2000;
 pub const S_IFIFO: u16 = 0x1000;
 
 const BLOCK_SIZE: u64 = 4096;
+/// The ext4 block size in bytes (4 KiB), exposed for a streaming consumer that
+/// sizes its block device to whole ext4 blocks ([`stream_image_with_free`]).
+pub const BLOCK_SIZE_BYTES: u32 = BLOCK_SIZE as u32;
 const LOG_BLOCK_SIZE: u32 = 2; // 1024 << 2 = 4096
 const BLOCKS_PER_GROUP: u64 = BLOCK_SIZE * 8; // 32768 (one block bitmap covers it)
 const INODE_SIZE: u64 = 256;
@@ -155,6 +158,80 @@ pub fn write_image(tree: &Tree) -> Result<Vec<u8>, Ext4Error> {
     write_image_with_free(tree, 0, 0)
 }
 
+/// The geometry of a serialized ext4 image, exposed so a streaming consumer can
+/// pre-size its block device without materializing the image first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageGeometry {
+    /// The block size in bytes (always [`BLOCK_SIZE_BYTES`] = 4 KiB).
+    pub block_size: u64,
+    /// The total number of 4 KiB blocks in the image (image size / block size).
+    pub total_blocks: u64,
+}
+
+impl ImageGeometry {
+    /// The image's total size in bytes.
+    #[must_use]
+    pub fn image_len(&self) -> u64 {
+        self.block_size * self.total_blocks
+    }
+}
+
+/// Serialize `tree` into an ext4 image but emit it **one 4 KiB block at a time**
+/// instead of returning a dense [`Vec`]. `emit(block_index, &block_bytes)` is
+/// called once for every block whose content is **not all-zero**, in strictly
+/// ascending `block_index` order; all-zero blocks are *never materialized* and
+/// never emitted (the disk that consumes this leaves them sparse). The returned
+/// [`ImageGeometry`] reports the full (dense) image dimensions so the consumer
+/// knows how many sectors the device spans.
+///
+/// This is the *sparse, streaming* projection from the κ-tree to the block
+/// device (Law L4, "the KappaStore IS the memory"): peak working memory is bounded
+/// by the **non-zero** content (the materialized blocks), independent of the
+/// image's total size — a multi-GiB disk whose free space is sparse never costs
+/// multi-GiB of RAM to assemble.
+///
+/// Block-for-block identical to [`write_image_with_free`]: concatenating the
+/// emitted blocks at their indices over a zero-filled `image_len()` buffer
+/// reproduces the dense image byte-for-byte.
+pub fn stream_image_with_free(
+    tree: &Tree,
+    min_inodes: u32,
+    min_blocks: u64,
+    mut emit: impl FnMut(u64, &[u8]),
+) -> Result<ImageGeometry, Ext4Error> {
+    let (geom, blocks) = build_sparse_image(tree, min_inodes, min_blocks)?;
+    // Emit the materialized (non-zero) blocks in ascending order. The BTreeMap
+    // already orders by block index; a block in the map is non-zero by
+    // construction (we only insert non-zero blocks).
+    for (idx, bytes) in &blocks {
+        emit(*idx, bytes);
+    }
+    Ok(ImageGeometry {
+        block_size: BLOCK_SIZE,
+        total_blocks: geom.total_blocks,
+    })
+}
+
+/// Serialize `tree` to its sparse non-zero blocks (keyed by block index) plus the
+/// full [`ImageGeometry`] — one assembly pass, the building block both the dense
+/// and streaming consumers share. The returned map holds only materialized
+/// (non-zero) blocks, so its footprint tracks content, not the declared size; a
+/// consumer streams it into a block device and drops it.
+pub fn sparse_blocks_with_free(
+    tree: &Tree,
+    min_inodes: u32,
+    min_blocks: u64,
+) -> Result<(ImageGeometry, BTreeMap<u64, Vec<u8>>), Ext4Error> {
+    let (geom, blocks) = build_sparse_image(tree, min_inodes, min_blocks)?;
+    Ok((
+        ImageGeometry {
+            block_size: BLOCK_SIZE,
+            total_blocks: geom.total_blocks,
+        },
+        blocks,
+    ))
+}
+
 /// Serialize `tree` into an ext4 image sized to *at least* `min_inodes` inodes and
 /// `min_blocks` 4 KiB blocks — so the filesystem has free capacity for the guest
 /// to use at runtime. A minimally-sized image (`write_image`) fits the content
@@ -168,6 +245,33 @@ pub fn write_image_with_free(
     min_inodes: u32,
     min_blocks: u64,
 ) -> Result<Vec<u8>, Ext4Error> {
+    // The dense image is the sparse projection materialized over a zero buffer —
+    // exactly the bytes a `stream_image_with_free` consumer would reconstruct, so
+    // the two paths are byte-identical by construction (Law L1: one canonical
+    // serialization, two consumers).
+    let (geom, blocks) = build_sparse_image(tree, min_inodes, min_blocks)?;
+    let mut img = vec![0u8; (geom.total_blocks * BLOCK_SIZE) as usize];
+    for (idx, bytes) in &blocks {
+        let off = (*idx * BLOCK_SIZE) as usize;
+        img[off..off + bytes.len()].copy_from_slice(bytes);
+    }
+    Ok(img)
+}
+
+/// Serialize `tree` into the **sparse** set of an ext4 image's non-zero 4 KiB
+/// blocks (keyed by block index), together with the full geometry. This is the
+/// single canonical ext4 serializer; both the dense [`write_image_with_free`]
+/// and the streaming [`stream_image_with_free`] are thin consumers of it, so they
+/// are byte-identical by construction.
+///
+/// Only blocks with at least one non-zero byte are inserted into the returned
+/// map — so its memory footprint tracks the image's *content*, not its declared
+/// size. A multi-GiB disk whose free space is sparse yields a small map.
+fn build_sparse_image(
+    tree: &Tree,
+    min_inodes: u32,
+    min_blocks: u64,
+) -> Result<(Geometry, BTreeMap<u64, Vec<u8>>), Ext4Error> {
     let Node::Dir { .. } = &tree.root else {
         return Err(Ext4Error::RootNotDir);
     };
@@ -291,32 +395,35 @@ pub fn write_image_with_free(
         }
     }
 
-    // Pass 5 — emit the image.
-    let mut img = vec![0u8; (geom.total_blocks * BLOCK_SIZE) as usize];
+    // Pass 5 — emit the image as a sparse map of non-zero 4 KiB blocks. A
+    // `Sink` accumulates writes at byte offsets and materializes a block lazily
+    // the first time it is touched, so blocks never written (file holes, the
+    // disk's free data region) are never allocated — peak memory tracks the
+    // image's *content*, not its declared size.
+    let mut sink = Sink::new();
 
     // 5a: data blocks (file contents, directory blocks, symlink spill).
     for (inode, rb) in inodes.iter().zip(rendered.iter()) {
         if rb.blocks == 0 {
             continue;
         }
-        write_extents_data(&mut img, &inode.extents, &rb.bytes);
+        sink_extents_data(&mut sink, &inode.extents, &rb.bytes);
     }
     // 5b: extent-tree leaf blocks.
     for placed in extent_tree_blocks.values() {
         for (blk, bytes) in placed {
-            let off = (blk * BLOCK_SIZE) as usize;
-            img[off..off + bytes.len()].copy_from_slice(bytes);
+            sink.write_at(blk * BLOCK_SIZE, bytes);
         }
     }
 
     // 5c: inode table.
     let mut inode_iter = inodes.iter().peekable();
     for ino in 1..=geom.inodes_count {
-        let off = geom.inode_offset(ino);
+        let off = geom.inode_offset(ino) as u64;
         if let Some(inode) = inode_iter.peek() {
             if inode.ino as u64 == ino {
                 let bytes = encode_inode(inode, extent_tree_blocks.get(&inode.ino));
-                img[off..off + INODE_SIZE as usize].copy_from_slice(&bytes);
+                sink.write_at(off, &bytes);
                 inode_iter.next();
                 continue;
             }
@@ -325,9 +432,57 @@ pub fn write_image_with_free(
     }
 
     // 5d: bitmaps + group descriptors + superblocks.
-    geom.write_bitmaps_descriptors_superblocks(&mut img, &block_use, &inodes);
+    geom.sink_bitmaps_descriptors_superblocks(&mut sink, &block_use, &inodes);
 
-    Ok(img)
+    // Drop blocks that ended up all-zero (e.g. a touched-but-only-zeros region),
+    // so the sparse contract holds: a block in the map has a non-zero byte.
+    let mut blocks = sink.into_blocks();
+    blocks.retain(|_, b| b.iter().any(|&x| x != 0));
+    Ok((geom, blocks))
+}
+
+/// A sparse byte sink: writes land at absolute byte offsets; only the 4 KiB
+/// blocks actually touched are materialized (zero-filled on first touch). This is
+/// what bounds the assembler's peak memory to the image's content rather than its
+/// size — the dense buffer is never allocated.
+struct Sink {
+    blocks: BTreeMap<u64, Vec<u8>>,
+}
+
+impl Sink {
+    fn new() -> Sink {
+        Sink {
+            blocks: BTreeMap::new(),
+        }
+    }
+
+    /// Materialize (zero-filling on first touch) the block at `idx`.
+    fn block_mut(&mut self, idx: u64) -> &mut Vec<u8> {
+        self.blocks
+            .entry(idx)
+            .or_insert_with(|| vec![0u8; BLOCK_SIZE as usize])
+    }
+
+    /// Write `data` starting at absolute byte offset `off`, spanning blocks as
+    /// needed. Equivalent to `img[off..off+len].copy_from_slice(data)` over the
+    /// dense image.
+    fn write_at(&mut self, off: u64, data: &[u8]) {
+        let mut pos = off;
+        let mut rest = data;
+        while !rest.is_empty() {
+            let idx = pos / BLOCK_SIZE;
+            let within = (pos % BLOCK_SIZE) as usize;
+            let n = rest.len().min(BLOCK_SIZE as usize - within);
+            let block = self.block_mut(idx);
+            block[within..within + n].copy_from_slice(&rest[..n]);
+            pos += n as u64;
+            rest = &rest[n..];
+        }
+    }
+
+    fn into_blocks(self) -> BTreeMap<u64, Vec<u8>> {
+        self.blocks
+    }
 }
 
 // ── Pass 1 helper: inode numbering ─────────────────────────────────────────
@@ -713,13 +868,16 @@ fn build_extent_tree(ino: u32, extents: &[(u32, u64, u16)]) -> Result<Vec<Vec<u8
     Ok(out)
 }
 
-fn write_extents_data(img: &mut [u8], extents: &[(u32, u64, u16)], bytes: &[u8]) {
+/// Write an inode's data bytes to their allocated extents via the sparse [`Sink`]
+/// — the streaming analogue of writing into the dense image. A file's trailing
+/// hole (an extent past the data's end) is simply not written, so it stays sparse.
+fn sink_extents_data(sink: &mut Sink, extents: &[(u32, u64, u16)], bytes: &[u8]) {
     for (logical, phys, len) in extents {
         let src_off = (*logical as u64 * BLOCK_SIZE) as usize;
-        let dst_off = (*phys * BLOCK_SIZE) as usize;
+        let dst_off = *phys * BLOCK_SIZE;
         let n = ((*len as u64 * BLOCK_SIZE) as usize).min(bytes.len().saturating_sub(src_off));
         if n > 0 {
-            img[dst_off..dst_off + n].copy_from_slice(&bytes[src_off..src_off + n]);
+            sink.write_at(dst_off, &bytes[src_off..src_off + n]);
         }
     }
 }
@@ -820,9 +978,12 @@ fn encode_extent_root(
 }
 
 impl Geometry {
-    fn write_bitmaps_descriptors_superblocks(
+    /// Emit the per-group bitmaps, the gathered group descriptors, and the
+    /// (primary + backup) superblocks into the sparse [`Sink`] — the streaming
+    /// analogue of writing them into the dense image, byte-for-byte identical.
+    fn sink_bitmaps_descriptors_superblocks(
         &self,
-        img: &mut [u8],
+        sink: &mut Sink,
         block_use: &[bool],
         inodes: &[Inode],
     ) {
@@ -850,52 +1011,48 @@ impl Geometry {
             let base = g * BLOCKS_PER_GROUP;
             let gblocks = self.group_blocks(g);
 
-            // Block bitmap for this group.
+            // Block bitmap for this group (one block, built locally then sunk).
             let bb = self.block_bitmap_block(g);
             let mut free_blocks = 0u64;
-            {
-                let off = (bb * BLOCK_SIZE) as usize;
-                let bitmap = &mut img[off..off + BLOCK_SIZE as usize];
-                for i in 0..BLOCKS_PER_GROUP {
-                    let blk = base + i;
-                    let used = if i >= gblocks {
-                        true // past the group/filesystem end → mark used
-                    } else {
-                        block_use[blk as usize]
-                    };
-                    if used {
-                        bitmap[(i / 8) as usize] |= 1 << (i % 8);
-                    } else {
-                        free_blocks += 1;
-                    }
+            let mut bb_bitmap = vec![0u8; BLOCK_SIZE as usize];
+            for i in 0..BLOCKS_PER_GROUP {
+                let blk = base + i;
+                let used = if i >= gblocks {
+                    true // past the group/filesystem end → mark used
+                } else {
+                    block_use[blk as usize]
+                };
+                if used {
+                    bb_bitmap[(i / 8) as usize] |= 1 << (i % 8);
+                } else {
+                    free_blocks += 1;
                 }
             }
+            sink.write_at(bb * BLOCK_SIZE, &bb_bitmap);
             total_free_blocks += free_blocks;
 
-            // Inode bitmap for this group.
+            // Inode bitmap for this group (one block, built locally then sunk).
             let ib = self.inode_bitmap_block(g);
             let mut free_inodes = 0u64;
             let mut used_dirs = 0u64;
-            {
-                let off = (ib * BLOCK_SIZE) as usize;
-                let bitmap = &mut img[off..off + BLOCK_SIZE as usize];
-                for i in 0..self.inodes_per_group {
-                    let ino = g * self.inodes_per_group + i + 1;
-                    let used = ino <= self.inodes_count && inode_used[ino as usize];
-                    if used {
-                        bitmap[(i / 8) as usize] |= 1 << (i % 8);
-                        if dir_inos.contains(&(ino as u32)) || ino == ROOT_INO as u64 {
-                            used_dirs += 1;
-                        }
-                    } else {
-                        free_inodes += 1;
+            let mut ib_bitmap = vec![0u8; BLOCK_SIZE as usize];
+            for i in 0..self.inodes_per_group {
+                let ino = g * self.inodes_per_group + i + 1;
+                let used = ino <= self.inodes_count && inode_used[ino as usize];
+                if used {
+                    ib_bitmap[(i / 8) as usize] |= 1 << (i % 8);
+                    if dir_inos.contains(&(ino as u32)) || ino == ROOT_INO as u64 {
+                        used_dirs += 1;
                     }
-                }
-                // bits past inodes_per_group within the bitmap byte range: mark used
-                for i in self.inodes_per_group..(BLOCK_SIZE * 8) {
-                    bitmap[(i / 8) as usize] |= 1 << (i % 8);
+                } else {
+                    free_inodes += 1;
                 }
             }
+            // bits past inodes_per_group within the bitmap byte range: mark used
+            for i in self.inodes_per_group..(BLOCK_SIZE * 8) {
+                ib_bitmap[(i / 8) as usize] |= 1 << (i % 8);
+            }
+            sink.write_at(ib * BLOCK_SIZE, &ib_bitmap);
             total_free_inodes += free_inodes;
 
             // Group descriptor (32 bytes).
@@ -922,14 +1079,12 @@ impl Geometry {
             let mut this_sb = sb.clone();
             put16(&mut this_sb, 90, g as u16); // s_block_group_nr
             if g == 0 {
-                img[1024..1024 + 1024].copy_from_slice(&this_sb);
+                sink.write_at(1024, &this_sb);
             } else {
-                let off = (base * BLOCK_SIZE) as usize;
-                img[off..off + 1024].copy_from_slice(&this_sb);
+                sink.write_at(base * BLOCK_SIZE, &this_sb);
             }
             // GDT after the superblock block.
-            let gdt_off = ((base + 1) * BLOCK_SIZE) as usize;
-            img[gdt_off..gdt_off + descriptors.len()].copy_from_slice(&descriptors);
+            sink.write_at((base + 1) * BLOCK_SIZE, &descriptors);
         }
     }
 
