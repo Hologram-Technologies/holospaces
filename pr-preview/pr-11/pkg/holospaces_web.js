@@ -1,6 +1,106 @@
 /* @ts-self-types="./holospaces_web.d.ts" */
 
 /**
+ * **The browser peer's AArch64 holospace** — a real arm64 devcontainer booted on
+ * the [AArch64 core](holospaces::emulator::aarch64) (`CC-36`), its κ-disk paged
+ * from OPFS (the same substrate as the RISC-V [`Workspace`]). Complete for boot +
+ * terminal; the AArch64 core's net/9p parity (router egress, the 9p workspace) is
+ * the continued build, so this surface exposes only what the core does today —
+ * nothing it cannot fulfil.
+ */
+export class Aarch64Workspace {
+    static __wrap(ptr) {
+        const obj = Object.create(Aarch64Workspace.prototype);
+        obj.__wbg_ptr = ptr;
+        Aarch64WorkspaceFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        Aarch64WorkspaceFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_aarch64workspace_free(ptr, 0);
+    }
+    /**
+     * Boot a provisioned arm64 image, **streaming** its κ-disk from OPFS (no full
+     * image in RAM): `rootfs_handle` is the provisioned rootfs (read
+     * sector-by-sector into the OPFS-backed store on `disk_handle`). Drive with
+     * [`run`](Aarch64Workspace::run), rendering [`terminal_delta`] between chunks.
+     * @param {Uint8Array} kernel
+     * @param {FileSystemSyncAccessHandle} rootfs_handle
+     * @param {FileSystemSyncAccessHandle} disk_handle
+     * @returns {Aarch64Workspace}
+     */
+    static boot_devcontainer_opfs_streamed(kernel, rootfs_handle, disk_handle) {
+        const ptr0 = passArray8ToWasm0(kernel, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.aarch64workspace_boot_devcontainer_opfs_streamed(ptr0, len0, rootfs_handle, disk_handle);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return Aarch64Workspace.__wrap(ret[0]);
+    }
+    /**
+     * Feed keystrokes to the guest's serial console.
+     * @param {Uint8Array} bytes
+     */
+    feed_input(bytes) {
+        const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.aarch64workspace_feed_input(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * Whether the machine has powered off.
+     * @returns {boolean}
+     */
+    get halted() {
+        const ret = wasm.aarch64workspace_halted(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
+     * Run a chunk of guest execution; returns `true` once the machine halts.
+     * @param {number} budget
+     * @returns {boolean}
+     */
+    run(budget) {
+        const ret = wasm.aarch64workspace_run(this.__wbg_ptr, budget);
+        return ret !== 0;
+    }
+    /**
+     * The full console the guest has produced.
+     * @returns {string}
+     */
+    terminal() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.aarch64workspace_terminal(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * The console bytes produced since the last call (the integrated terminal
+     * streams these).
+     * @returns {Uint8Array}
+     */
+    terminal_delta() {
+        const ret = wasm.aarch64workspace_terminal_delta(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+}
+if (Symbol.dispose) Aarch64Workspace.prototype[Symbol.dispose] = Aarch64Workspace.prototype.free;
+
+/**
  * The Platform Manager console, running as a browser peer that composes the
  * substrate runtime over the interpreter `ContainerEngine`.
  */
@@ -1631,6 +1731,9 @@ function wasm_bindgen__convert__closures_____invoke__h71bffd0d1851400e_1(arg0, a
 
 
 const __wbindgen_enum_BinaryType = ["blob", "arraybuffer"];
+const Aarch64WorkspaceFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_aarch64workspace_free(ptr, 1));
 const ConsoleFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_console_free(ptr, 1));
