@@ -337,6 +337,33 @@ impl ContentPeer {
         let sync = self.sync.clone();
         Box::pin(async move { sync.fetch(&kappa).await.ok().flatten() })
     }
+
+    /// A future that **announces** to the peer that this node holds `kappa` — the
+    /// uor-native `BareNetSync` [`announce`](KappaSync::announce), which emits a
+    /// `KIND_ANNOUNCE` frame onto the link. The frame leaves over the transport's
+    /// outbound queue ([`outbound`](Self::outbound)); the surface pump carries it
+    /// across the wire (a WebRTC data channel between tabs). The future owns its
+    /// peer handle, so it is `'static` (the caller may store and poll it across
+    /// transport round-trips, exactly like [`fetch`](Self::fetch)).
+    #[must_use]
+    pub fn announce(&self, kappa: KappaLabel71) -> Pin<Box<dyn Future<Output = ()>>> {
+        let sync = self.sync.clone();
+        Box::pin(async move { sync.announce(&kappa).await })
+    }
+
+    /// A future that **discovers** which κs the peer holds — the uor-native
+    /// `BareNetSync` [`discover`](KappaSync::discover). It emits a
+    /// `KIND_DISCOVER_REQ` frame; the responding peer answers with a
+    /// `KIND_DISCOVER_RES` listing its locally-held κs, which this peer records.
+    /// The future resolves to a snapshot of the κs known so far. As with
+    /// [`fetch`](Self::fetch), drive it by pumping frames over the transport
+    /// ([`inbound`](Self::inbound) / [`outbound`](Self::outbound)) and polling; the
+    /// owned peer handle makes it `'static`.
+    #[must_use]
+    pub fn discover(&self) -> Pin<Box<dyn Future<Output = Vec<KappaLabel71>>>> {
+        let sync = self.sync.clone();
+        Box::pin(async move { sync.discover(None, usize::MAX).await })
+    }
 }
 
 /// Drive a `fetcher`'s fetch of `kappa` against a `responder`, carrying frames

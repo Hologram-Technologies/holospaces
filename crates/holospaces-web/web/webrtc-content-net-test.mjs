@@ -18,8 +18,15 @@
 // frames back into the peer's `BareNetSync`, so this witness exercises exactly
 // the path a deployed tab uses. Then:
 //
-//   • A fetches a κ that B holds, over the data channel; the bytes are accepted
-//     ONLY after they re-derive to the requested κ (verify-on-receipt / Law L5);
+// The FULL BareNetSync frame set (fetch / announce / discover) crosses the real
+// channel through the product API — not just fetch:
+//
+//   • B ANNOUNCES (over the channel, via Console.cn_announce + cn_pump) that it
+//     holds a κ;
+//   • A DISCOVERS the holder (over the channel, via Console.cn_discover + cn_pump)
+//     — A learns B's κ from B's discover reply, having held nothing itself;
+//   • A then FETCHES that κ over the data channel; the bytes are accepted ONLY
+//     after they re-derive to the requested κ (verify-on-receipt / Law L5);
 //   • a forging responder's bytes (which do not re-derive) are REJECTED;
 //   • an unheld κ resolves to NOTHING (no fabrication);
 //   • the exchange is SYMMETRIC (B fetches from A as well).
@@ -143,6 +150,41 @@ async function drive(fetcherPage, responderPage, kappa) {
   return null;
 }
 
+// Drive ANNOUNCE + DISCOVER over the data channel, entirely through the product
+// API. `announcer` calls `Console.cn_announce(kappa)` (queues a KIND_ANNOUNCE
+// frame); `discoverer` calls `Console.cn_discover()` (broadcasts KIND_DISCOVER_REQ
+// and snapshots κs learned from peers' KIND_DISCOVER_RES). Both sides cross the
+// channel through the SAME product pump `Console.cn_pump` — no harness glue. The
+// harness only steps the two pages and re-snapshots until the discoverer learns
+// `wantKappa` (or a deadline, fail-loud). Returns the list of κs the discoverer
+// learned over the channel.
+async function discover(discovererPage, announcerPage, wantKappa, announceKappa) {
+  // The announcer advertises the κ it holds (KIND_ANNOUNCE) over the channel.
+  await announcerPage.evaluate((k) => {
+    window.__console.cn_announce(k);
+    window.__console.cn_pump(window.__link); // PRODUCT pump: announce → channel
+  }, announceKappa);
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    // Discoverer: broadcast DISCOVER_REQ + snapshot, then pump it onto the channel.
+    const known = await discovererPage.evaluate(() => {
+      const c = window.__console;
+      const snap = JSON.parse(c.cn_discover()); // PRODUCT discover (sends REQ)
+      c.cn_pump(window.__link); // PRODUCT pump: REQ → channel, RES → peer
+      return snap;
+    });
+    // Announcer: pump services the inbound DISCOVER_REQ and sends DISCOVER_RES.
+    await announcerPage.evaluate(() => { window.__console.cn_pump(window.__link); });
+    if (known.includes(wantKappa)) return known;
+    await new Promise((res) => setTimeout(res, 10));
+  }
+  // Final snapshot after a last round-trip.
+  return await discovererPage.evaluate(() => {
+    window.__console.cn_pump(window.__link);
+    return JSON.parse(window.__console.cn_discover());
+  });
+}
+
 try {
   await pageA.goto(url);
   await pageB.goto(url);
@@ -164,6 +206,16 @@ try {
   check(connectedAB, "a real WebRTC data channel opened between two browser peers (host ICE, no server)");
 
   if (connectedAB) {
+    // ── Announce + discover over the channel (product API) ───────────────────
+    // B announces the κ it holds; A discovers it over the data channel. A holds
+    // NOTHING locally, so a discovered κ can only have come from B's reply across
+    // the real channel.
+    const known = await discover(pageA, pageB, kappa, kappa);
+    check(
+      known.includes(kappa),
+      "peer A discovered the κ peer B announced — announce + discover crossed the data channel (product API)"
+    );
+
     const got = await drive(pageA, pageB, kappa);
     const text = got ? new TextDecoder().decode(new Uint8Array(got)) : null;
     check(
@@ -229,7 +281,7 @@ try {
   console.log(
     failed
       ? "WEBRTC-TEST: FAILED"
-      : "WEBRTC-TEST: PASS (two browser peers exchanged κ-content over a real WebRTC data channel; forgery rejected; unheld κ absent; symmetric)"
+      : "WEBRTC-TEST: PASS (two browser peers ran the full content-network frame set — announce + discover + fetch — over a real WebRTC data channel; forgery rejected; unheld κ absent; symmetric)"
   );
 } finally {
   await browser.close();

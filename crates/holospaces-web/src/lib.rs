@@ -751,6 +751,42 @@ impl Console {
         self.content.outbound()
     }
 
+    /// **Announce** to the peer that this node holds `kappa`, over the content
+    /// network (`CC-38` `announce`). This queues a `KIND_ANNOUNCE` frame for the
+    /// transport; the next [`cn_pump`](Self::cn_pump) carries it across the real
+    /// WebRTC data channel to the peer. A deployed tab calls `cn_announce(κ)` then
+    /// `cn_pump(link)` to advertise content it holds — the same `BareNetSync`
+    /// `announce` a bare-metal peer drives, only the carrier differs (`CC-49`).
+    ///
+    /// The substrate's `announce` emits the frame without awaiting a reply, so the
+    /// future settles immediately (the frame is then in the outbound queue); the
+    /// transport pump moves it. No fabrication, no central operator.
+    pub fn cn_announce(&self, kappa: &str) -> Result<(), JsValue> {
+        let kappa = parse_kappa(kappa)?;
+        block_on(self.content.announce(kappa));
+        Ok(())
+    }
+
+    /// **Discover** which κs the peer holds, over the content network (`CC-38`
+    /// `discover`). This broadcasts a `KIND_DISCOVER_REQ` frame (queued for the
+    /// transport) and returns a snapshot — as a JSON array of κ-strings — of the κs
+    /// learned from peers' `KIND_DISCOVER_RES` replies so far. Because discovery is
+    /// a round-trip, a deployed tab calls `cn_discover()` to send the request,
+    /// `cn_pump(link)` (both peers) to carry the request and the reply across the
+    /// real WebRTC data channel, then `cn_discover()` again to read the now-known
+    /// holders. Re-issuing is idempotent: each call re-broadcasts and re-snapshots,
+    /// so the witness loops it until a holder appears (or a deadline, fail-loud).
+    ///
+    /// This is the SAME `BareNetSync` `discover` a bare-metal peer drives; the
+    /// WebRTC data channel only changes the carrier (`CC-49`). κs returned are
+    /// hints (which peer to fetch from); the bytes themselves are still verified on
+    /// receipt when fetched (Law L5) — discovery fabricates nothing.
+    pub fn cn_discover(&self) -> Result<String, JsValue> {
+        let kappas = block_on(self.content.discover());
+        let list: Vec<String> = kappas.iter().map(|k| k.as_str().to_owned()).collect();
+        serde_json::to_string(&list).map_err(js_err)
+    }
+
     /// **The product pump (CC-49).** Carry this peer's content-network frames
     /// across a real WebRTC data channel ([`WebRtcLink`]) to another browser peer:
     /// drain every frame this peer wants to transmit onto the channel
