@@ -126,8 +126,6 @@ struct Sys {
     /// PIT so the kernel's delay loops and the TSC clocksource make progress.
     tsc: u64,
     /// A free-running step counter that paces the platform timers: they advance
-    /// once every [`TIMER_DIV`] emulator-steps (see [`Cpu::sys_tick`]).
-    timer_div: u64,
     /// `true` once the machine has halted (a `hlt` with interrupts masked, the
     /// guest power-off) — the run loop then returns [`Halt::Halted`].
     halted: bool,
@@ -135,6 +133,9 @@ struct Sys {
     /// constant; each draw also mixes in the TSC so the stream is non-constant
     /// across the boot (the kernel only requires a varying value + `CF=1`).
     rng: u64,
+    /// Free-running step counter pacing the PIT/APIC down-counters once per
+    /// [`TICK_DIV`] steps (see [`Cpu::sys_tick`]).
+    tdiv: u64,
 }
 
 impl Sys {
@@ -163,9 +164,9 @@ impl Sys {
             pit: Pit::new(),
             lapic: Lapic::new(),
             tsc: 0,
-            timer_div: 0,
             halted: false,
             rng: 0x9e37_79b9_7f4a_7c15,
+            tdiv: 0,
         }
     }
 }
@@ -350,6 +351,14 @@ const VIRTIO_BLK_IRQ: u8 = 11;
 const VIRTIO_9P_IRQ: u8 = 10;
 const VIRTIO_NET_IRQ: u8 = 12;
 
+/// Emulator-steps per PIT/APIC down-counter decrement — one shared rate for every
+/// platform timer. Large enough that the tick period (`reload × TICK_DIV` steps)
+/// far exceeds the tick handler (no "timer storm"), small enough that
+/// `quick_pit_calibrate`'s channel-2 poll still expires inside its budget. The TSC
+/// advances every step (fine `sched_clock` resolution); only the down-counters are
+/// paced. One coherent rate keeps the kernel's calibration and its tick in step.
+const TICK_DIV: u64 = 256;
+
 /// A direct-mapped software TLB entry: caches a virtual-page → physical-frame
 /// translation so a hot loop does not re-walk the 4-level page table on every
 /// access. `gen` is matched against [`Cpu::tlb_gen`], bumped (flushing the whole
@@ -458,7 +467,6 @@ enum SegId {
 /// between ticks so it makes forward progress instead of drowning in the timer IRQ
 /// handler. The TSC and PIT advance together, so the guest's calibrated time base
 /// stays self-consistent.
-const TIMER_DIV: u64 = 4096;
 
 /// `RFLAGS.IF` — the interrupt-enable flag (`STI`/`CLI`).
 const RFLAGS_IF: u64 = 1 << 9;
@@ -2923,38 +2931,30 @@ impl Cpu {
     /// periodic tick on them.
     ///
     /// The periodic IRQ sources (PIT channel-0, the APIC-timer LVT) count down
-    /// every `TIMER_DIV` steps *unconditionally* — the same model the riscv64
-    /// (`mtime`) and aarch64 (`counter`) cores use, where the timer advances
-    /// regardless of the interrupt-acceptance state and only *delivery* of the
-    /// latched interrupt is gated on `RFLAGS.IF`. The tick period
-    /// (`reload × TIMER_DIV` steps) is far longer than the handler, so a tick
-    /// cannot re-queue inside its own handler. The TSC and the channel-2
-    /// calibration one-shot advance every step.
+    /// every step *unconditionally* — the same model the riscv64 (`mtime`) and
+    /// aarch64 (`counter`) cores use, where the timer advances regardless of the
+    /// interrupt-acceptance state and only *delivery* of the latched interrupt is
+    /// gated on `RFLAGS.IF`. The TSC and the channel-2 calibration one-shot
+    /// advance at the same rate (one coherent time-base).
     fn sys_tick(&mut self) {
         let Some(sys) = self.sys.as_mut() else {
             return;
         };
-        // Advance the down-counter timers (PIT / APIC) and the TSC only once every
-        // `TIMER_DIV` emulator-steps, and keep their rates *locked together* (TSC
-        // += 64 per PIT decrement, the calibrated ratio). A periodic tick costs the
-        // kernel several thousand instructions (`tick_periodic` → scheduler /
-        // timekeeping / RCU / hrtimers); if a tick fell due every few thousand
-        // steps the boot would spend ~all its time in the IRQ handler and never
-        // make forward progress (the "timer storm"). Stretching the period in
-        // emulator-steps — while keeping TSC:PIT consistent — gives the boot
-        // thousands of instructions of headroom between ticks. The guest still sees
-        // a coherent HZ; only the host step:wall ratio changes.
-        sys.timer_div = sys.timer_div.wrapping_add(1);
-        // The TSC and the PIT channel-2 calibration one-shot advance on *every*
-        // step (un-stretched), at the locked TSC:PIT ratio (TSC += 64 per PIT
-        // tick). Calibration (`pit_hpet_ptimer_calibrate_cpu`, `quick_pit_calibrate`)
-        // busy-polls `IN 0x61` bit 5 (channel-2 OUT2) for at most ~1000 iterations
-        // before giving up; if channel 2 were stretched by `TIMER_DIV` it could not
-        // expire inside that budget and the kernel would loop refining the TSC
-        // forever (#12 — the boot wedged in `tsc_refine_calibration_work`). The
-        // measured frequency stays self-consistent because TSC and channel 2 move
-        // together regardless of the host step:wall ratio.
+        // The TSC advances every step (fine `sched_clock` resolution).
         sys.tsc = sys.tsc.wrapping_add(64);
+        // The PIT/APIC down-counters advance at ONE shared rate — once per
+        // `TICK_DIV` steps. A single rate keeps the calibration reference (PIT
+        // channel 2) and the tick sources (PIT channel 0, the APIC-timer) in
+        // lockstep, so the LAPIC clockevent the kernel calibrates against the PIT
+        // fires at exactly the rate the kernel expects — jiffies advance correctly
+        // (no crawl). The period (`reload × TICK_DIV` steps) is far longer than the
+        // handler (no storm) while channel 2 still expires inside
+        // `quick_pit_calibrate`'s poll budget. One coherent time-base, like the
+        // riscv64 (`mtime`) / aarch64 (`counter`) cores.
+        sys.tdiv = sys.tdiv.wrapping_add(1);
+        if sys.tdiv % TICK_DIV != 0 {
+            return;
+        }
         // PIT channel 2 — the TSC-calibration one-shot. While gated, count down
         // to zero, then latch OUT2 (the calibration loop's wait condition).
         if sys.pit.ch2_gate && !sys.pit.ch2_out && sys.pit.ch2_counter > 0 {
@@ -2962,14 +2962,6 @@ impl Cpu {
             if sys.pit.ch2_counter == 0 {
                 sys.pit.ch2_out = true;
             }
-        }
-        // The periodic *IRQ* sources (PIT channel-0 IRQ0, APIC-timer LVT) are paced
-        // slower — once every `TIMER_DIV` steps — so the kernel's HZ tick handler
-        // (`tick_periodic` → scheduler / timekeeping / RCU / hrtimers, several
-        // thousand instructions) does not drown the boot in back-to-back interrupts
-        // (the "timer storm"). The guest still sees a coherent HZ.
-        if sys.timer_div % TIMER_DIV != 0 {
-            return;
         }
         // The 8254 PIT channel-0 down-counter.
         if sys.pit.enabled && sys.pit.reload != 0 {
@@ -3019,7 +3011,7 @@ impl Cpu {
             return;
         };
         // Decrements remaining until each armed periodic source fires (each source
-        // ticks once per `TIMER_DIV` emulator-steps in `sys_tick`).
+        // decrements once per `TICK_DIV` steps in `sys_tick`).
         let pit = (sys.pit.enabled && sys.pit.reload != 0).then(|| {
             u64::from(if sys.pit.counter == 0 {
                 u32::from(sys.pit.reload)
@@ -3043,18 +3035,19 @@ impl Cpu {
         let Some(ticks) = [pit, apic].into_iter().flatten().min() else {
             return;
         };
-        // Jump time forward by `ticks` decrements = `ticks * TIMER_DIV` steps,
-        // advancing the TSC at its locked ratio (64 per step), then fire the
-        // source(s) that reached the deadline and advance the rest — no iteration.
-        let steps = ticks.saturating_mul(TIMER_DIV);
+        // Jump to the nearest deadline: `ticks` down-counter decrements =
+        // `ticks × TICK_DIV` steps. Advance the (every-step) TSC and the divisor
+        // phase by the step count; the down-counters advance by `ticks`. Then fire
+        // the source(s) that reached the deadline and advance the rest.
+        let steps = ticks.saturating_mul(TICK_DIV);
         sys.tsc = sys.tsc.wrapping_add(steps.saturating_mul(64));
-        sys.timer_div = sys.timer_div.wrapping_add(steps);
+        sys.tdiv = sys.tdiv.wrapping_add(steps);
         if sys.pit.ch2_gate && !sys.pit.ch2_out && sys.pit.ch2_counter > 0 {
-            if u64::from(sys.pit.ch2_counter) <= steps {
+            if u64::from(sys.pit.ch2_counter) <= ticks {
                 sys.pit.ch2_counter = 0;
                 sys.pit.ch2_out = true;
             } else {
-                sys.pit.ch2_counter -= steps as u32;
+                sys.pit.ch2_counter -= ticks as u32;
             }
         }
         if let Some(pt) = pit {
