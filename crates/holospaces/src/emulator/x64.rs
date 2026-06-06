@@ -299,9 +299,13 @@ struct Lapic {
     divide: u32,
     /// The task-priority register — interrupts at or below `TPR` are deferred.
     tpr: u32,
-    /// A latched APIC-timer interrupt vector waiting to be delivered (the LVT
-    /// timer fired) — taken by [`Cpu::take_pending_interrupt`].
-    pending_vector: Option<u8>,
+    /// Interrupt Request Register — the 256-bit pending-interrupt bitmap (the LVT
+    /// timer, and IPIs delivered through the ICR). A real local-APIC IRR.
+    irr: [u64; 4],
+    /// In-Service Register — vectors currently being handled, cleared on `EOI`.
+    /// Provides interrupt priority/nesting exactly as the hardware LAPIC (and the
+    /// AArch64 GIC active-state) do.
+    isr: [u64; 4],
 }
 
 impl Lapic {
@@ -313,11 +317,47 @@ impl Lapic {
             current_count: 0,
             divide: 1,
             tpr: 0,
-            pending_vector: None,
+            irr: [0; 4],
+            isr: [0; 4],
         }
     }
     fn enabled(&self) -> bool {
         self.svr & (1 << 8) != 0
+    }
+    /// Set an Interrupt Request Register bit (a pending interrupt vector).
+    fn set_irr(&mut self, vec: u8) {
+        self.irr[(vec >> 6) as usize] |= 1u64 << (vec & 63);
+    }
+    /// The highest set vector in a 256-bit register, or `None`.
+    fn highest(reg: &[u64; 4]) -> Option<u8> {
+        for w in (0..4).rev() {
+            if reg[w] != 0 {
+                return Some((w as u32 * 64 + (63 - reg[w].leading_zeros())) as u8);
+            }
+        }
+        None
+    }
+    /// The highest pending vector deliverable now: its priority class (`vec >> 4`)
+    /// must exceed both the TPR class and any in-service vector's class.
+    fn deliverable(&self) -> Option<u8> {
+        let v = Self::highest(&self.irr)?;
+        let isr_class = u32::from(Self::highest(&self.isr).map_or(0, |i| i >> 4));
+        if u32::from(v >> 4) > isr_class && u32::from(v >> 4) > (self.tpr >> 4) {
+            Some(v)
+        } else {
+            None
+        }
+    }
+    /// Move a delivered vector IRR -> ISR (in-service until `EOI`).
+    fn take(&mut self, vec: u8) {
+        self.irr[(vec >> 6) as usize] &= !(1u64 << (vec & 63));
+        self.isr[(vec >> 6) as usize] |= 1u64 << (vec & 63);
+    }
+    /// End-of-interrupt: clear the highest in-service vector.
+    fn eoi(&mut self) {
+        if let Some(v) = Self::highest(&self.isr) {
+            self.isr[(v >> 6) as usize] &= !(1u64 << (v & 63));
+        }
     }
 }
 
@@ -460,13 +500,6 @@ enum SegId {
     Fs = 4,
     Gs = 5,
 }
-
-/// How many emulator-steps pass between platform-timer (PIT/APIC/TSC) advances
-/// (see [`Cpu::sys_tick`]). A periodic kernel tick costs several thousand
-/// instructions; pacing the timers slower than that gives the boot ample headroom
-/// between ticks so it makes forward progress instead of drowning in the timer IRQ
-/// handler. The TSC and PIT advance together, so the guest's calibrated time base
-/// stays self-consistent.
 
 /// `RFLAGS.IF` — the interrupt-enable flag (`STI`/`CLI`).
 const RFLAGS_IF: u64 = 1 << 9;
@@ -1523,6 +1556,14 @@ impl Cpu {
             0x380 => l.initial_count, // timer initial count
             0x390 => l.current_count, // timer current count
             0x3e0 => l.divide,        // divide config
+            0x100..=0x170 if off & 0xf == 0 => {
+                let r = ((off - 0x100) / 0x10) as usize; // 8 x 32-bit ISR regs
+                (l.isr[r / 2] >> (32 * (r & 1))) as u32
+            }
+            0x200..=0x270 if off & 0xf == 0 => {
+                let r = ((off - 0x200) / 0x10) as usize; // 8 x 32-bit IRR regs
+                (l.irr[r / 2] >> (32 * (r & 1))) as u32
+            }
             _ => 0,
         }
     }
@@ -1533,7 +1574,7 @@ impl Cpu {
         let l = &mut self.sys_mut().lapic;
         match off {
             0x080 => l.tpr = val,
-            0x0b0 => l.pending_vector = None, // EOI
+            0x0b0 => l.eoi(), // EOI
             0x0f0 => l.svr = val,
             0x320 => {
                 l.lvt_timer = val;
@@ -1543,6 +1584,21 @@ impl Cpu {
                 l.current_count = val;
             }
             0x3e0 => l.divide = val,
+            0x300 => {
+                // Interrupt Command Register (low): send an IPI. Bits 8-10 =
+                // delivery mode (0 = fixed), bits 18-19 = destination shorthand
+                // (1 = self, 2 = all-incl-self, 3 = all-excl-self). On this
+                // uniprocessor the only target is CPU 0, so a fixed IPI to self,
+                // all-incl-self, or a directed destination all deliver the vector
+                // locally — the path the kernel's reschedule and `irq_work`
+                // self-IPIs take. (NMI/INIT/SIPI and all-excl-self: no local
+                // effect here.)
+                let fixed = (val >> 8) & 7 == 0;
+                let not_excl_self = (val >> 18) & 3 != 3;
+                if fixed && not_excl_self {
+                    l.set_irr((val & 0xff) as u8);
+                }
+            }
             _ => {}
         }
     }
@@ -3027,7 +3083,7 @@ impl Cpu {
                 }
                 // The APIC-timer vector is delivered directly through the IDT (it
                 // is a local-APIC source, not a PIC line).
-                sys.lapic.pending_vector = Some((sys.lapic.lvt_timer & 0xff) as u8);
+                sys.lapic.set_irr((sys.lapic.lvt_timer & 0xff) as u8);
             }
         }
     }
@@ -3102,7 +3158,7 @@ impl Cpu {
                 } else {
                     0
                 };
-                sys.lapic.pending_vector = Some((sys.lapic.lvt_timer & 0xff) as u8);
+                sys.lapic.set_irr((sys.lapic.lvt_timer & 0xff) as u8);
             } else {
                 sys.lapic.current_count = (at - ticks) as u32;
             }
@@ -3123,7 +3179,7 @@ impl Cpu {
             if sys.idtr.1 == 0 {
                 return false;
             }
-            if let Some(v) = sys.lapic.pending_vector {
+            if let Some(v) = sys.lapic.deliverable() {
                 (v, None)
             } else if let Some((irq, vec)) = sys.pic.pending() {
                 (vec, Some(irq))
@@ -3136,7 +3192,7 @@ impl Cpu {
             if let Some(irq) = irq {
                 sys.pic.ack(irq);
             } else {
-                sys.lapic.pending_vector = None;
+                sys.lapic.take(vector);
             }
         }
         self.deliver_interrupt(vector, 0, false);
