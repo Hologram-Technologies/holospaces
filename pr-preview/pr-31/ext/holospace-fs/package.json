@@ -1,0 +1,22 @@
+{
+  "name": "holospace-fs",
+  "displayName": "Holospace Workspace",
+  "description": "Binds the real VS Code workbench to the running holospace — a FileSystemProvider over the virtio-9p workspace (CC-15) and the integrated terminal over the booted devcontainer OS console (CC-11). The web-model extension host boots the holospace on the substrate, in the tab (ADR-012/ADR-015).",
+  "version": "0.0.1",
+  "publisher": "holospaces",
+  "engines": { "vscode": "^1.75.0" },
+  "browser": "./extension.js",
+  "capabilities": {
+    "virtualWorkspaces": true,
+    "untrustedWorkspaces": { "supported": true }
+  },
+  "activationEvents": [
+    "onFileSystem:holospace",
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      { "command": "holospace.openTerminal", "title": "Holospace: Open the devcontainer terminal" }
+    ]
+  }
+}
