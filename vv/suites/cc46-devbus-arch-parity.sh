@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 #
 # CC-46 — the shared device bus serves 9p, network, and the guest bridge to
-#         EVERY core (arch device parity)   [behavioral TARGET — expected RED
-#         until the real arm64 boot witness is green, then PROMOTE → vv/suites/]
+#         EVERY core (arch device parity)
 #
-# Component conformance target (arc42 ch.10). OPM process: SD3 Sync (network) +
+# Component conformance suite (arc42 ch.10). OPM process: SD3 Sync (network) +
 # SD4 Working (the 9p workspace + the bridge a projection drives). Law L4: the
 # substrate's devices are shared, not per-ISA. The virtio-9p (CC-15), virtio-net
 # + userspace NAT (CC-16), and the in-process guest bridge (CC-33) servicing
@@ -13,11 +12,11 @@
 # the same slots over its own MMIO window — one devbus, three MMIO transports
 # (RISC-V PLIC, AArch64 GIC, x86-64), no per-ISA device re-implementation.
 #
-# GREEN requires the REAL-KERNEL caliber of CC-15/CC-16/CC-33 (real-OS boots):
+# GREEN at the REAL-KERNEL caliber of CC-15/CC-16/CC-33 (real-OS boots):
 #   • cc46_realboot — a real arm64 Linux boots over the shared devbus and a real
 #     guest userspace mounts the 9p workspace (file round-trip), opens an
 #     outbound TCP/HTTP flow over virtio-net through the NAT, and serves a real
-#     listener reachable from the host over the in-process bridge.
+#     listener reached from the host over the in-process bridge (round-trip).
 # The device-level fast checks (cc46_devbus_parity, both cores) are regression
 # coverage that each core's MMIO transport reaches the shared devbus — necessary
 # but NOT the parity witness (no kernel boot).
