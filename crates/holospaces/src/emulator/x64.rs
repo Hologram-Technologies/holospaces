@@ -131,6 +131,10 @@ struct Sys {
     /// `true` once the machine has halted (a `hlt` with interrupts masked, the
     /// guest power-off) — the run loop then returns [`Halt::Halted`].
     halted: bool,
+    /// SplitMix64 state for the hardware RNG (`RDRAND`/`RDSEED`). Seeded from a
+    /// constant; each draw also mixes in the TSC so the stream is non-constant
+    /// across the boot (the kernel only requires a varying value + `CF=1`).
+    rng: u64,
 }
 
 impl Sys {
@@ -161,6 +165,7 @@ impl Sys {
             tsc: 0,
             timer_div: 0,
             halted: false,
+            rng: 0x9e37_79b9_7f4a_7c15,
         }
     }
 }
@@ -2571,10 +2576,14 @@ impl Cpu {
                         self.shld_shrd(rm, reg, size, cnt, op2 == 0xad);
                     }
                     0xc7 => {
-                        // Group 9: CMPXCHG8B/16B r/m.
+                        // Group 9. Memory form (/1) = CMPXCHG8B/16B; the
+                        // register forms /6, /7 (mod==3) are RDRAND/RDSEED —
+                        // the core's hardware RNG (advertised via CPUID).
                         let (ext, rm) = self.modrm(rex);
-                        if ext & 7 == 1 {
-                            self.cmpxchg16b(rm, rex & 8 != 0);
+                        match (ext & 7, rm) {
+                            (6, Rm::Reg(g)) | (7, Rm::Reg(g)) => self.rdrand(g, size),
+                            (1, _) => self.cmpxchg16b(rm, rex & 8 != 0),
+                            _ => {}
                         }
                     }
                     0xc8..=0xcf => {
@@ -3476,6 +3485,31 @@ impl Cpu {
         }
     }
 
+    /// `RDRAND`/`RDSEED` (`0F C7 /6`, `/7`): write a fresh non-constant value to
+    /// the destination register (size per the operand) and report success
+    /// (`CF=1`, other arithmetic flags cleared). A deterministic SplitMix64
+    /// stream, perturbed by the TSC, suffices for a boot witness — it only has
+    /// to vary so the kernel's crng accepts hardware entropy instead of
+    /// spinning on jitterentropy.
+    fn rdrand(&mut self, reg: usize, size: u8) {
+        let s = self.sys_mut();
+        s.rng = s.rng.wrapping_add(0x9e37_79b9_7f4a_7c15 ^ s.tsc);
+        let mut z = s.rng;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        // 16-bit RDRAND zero-extends like an 8/16-bit GPR write; 32/64-bit
+        // follow the usual write semantics (store_rm masks per `size`).
+        self.store_rm(Rm::Reg(reg), size, z);
+        self.set(flag::CF, true);
+        self.set(flag::OF, false);
+        self.set(flag::SF, false);
+        self.set(flag::ZF, false);
+        self.set(flag::PF, false);
+        // AF (bit 4) — not in the `flag` module; clear it directly.
+        self.rflags &= !(1u64 << 4);
+    }
+
     /// `XADD`: exchange-and-add — the destination and source swap, then their sum
     /// is stored to the destination, setting the arithmetic flags.
     fn xadd(&mut self, rex: u8, size: u8) {
@@ -3497,9 +3531,14 @@ impl Cpu {
             1 => {
                 // Family/model in EAX; EDX features: FPU,TSC,MSR,PAE,CX8,APIC,
                 // SEP,MTRR,PGE,CMOV,PAT,PSE36,CLFSH,MMX,FXSR,SSE,SSE2.
-                (0x0000_0600, 0, 0x0000_0001, 0x078b_fbff)
+                // ECX bit 30 = RDRAND — the core's hardware RNG (the kernel's
+                // crng/jitterentropy path needs it to avoid spinning on the
+                // deterministic TSC entropy source).
+                (0x0000_0600, 0, 1 << 30, 0x078b_fbff)
             }
-            7 => (0, 0, 0, 0),
+            // Leaf 7 sub-leaf 0: EBX bit 18 = RDSEED (the seeding RNG the
+            // kernel pairs with RDRAND).
+            7 => (0, 1 << 18, 0, 0),
             0x8000_0000 => (0x8000_0008, 0x6874_7541, 0x444d_4163, 0x6974_6e65),
             0x8000_0001 => {
                 // EDX: SYSCALL (bit 11), NX (bit 20), Long Mode (bit 29), …
