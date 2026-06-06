@@ -856,7 +856,7 @@ impl Cpu {
         let a_bit = size & 0b10 != 0;
         let fp_opcode = matches!(
             (a_bit, opcode),
-            (false, 0b11010 | 0b11011 | 0b11100 | 0b11101) | (true, 0b01111 | 0b11010 | 0b11011)
+            (false, 0b11010..=0b11101) | (true, 0b01111 | 0b11010 | 0b11011)
         );
         if fp_opcode {
             let ftype = if size & 1 == 1 { 0b01u32 } else { 0b00u32 };
@@ -889,12 +889,22 @@ impl Cpu {
                     (true, 0b11011, false) => fp_to_int(f, Round::Zero, true, is64),     // FCVTZS
                     (true, 0b11011, true) => fp_to_int(f, Round::Zero, false, is64),     // FCVTZU
                     // SCVTF / UCVTF: integer → float (same lane width).
-                    (false, 0b11101, false) => {
-                        fp_bits(ftype, if is64 { xbits as i64 as f64 } else { xbits as i32 as f64 }) as u64
-                    }
-                    (false, 0b11101, true) => {
-                        fp_bits(ftype, if is64 { xbits as f64 } else { (xbits as u32) as f64 }) as u64
-                    }
+                    (false, 0b11101, false) => fp_bits(
+                        ftype,
+                        if is64 {
+                            xbits as i64 as f64
+                        } else {
+                            xbits as i32 as f64
+                        },
+                    ) as u64,
+                    (false, 0b11101, true) => fp_bits(
+                        ftype,
+                        if is64 {
+                            xbits as f64
+                        } else {
+                            (xbits as u32) as f64
+                        },
+                    ) as u64,
                     // FABS / FNEG.
                     (true, 0b01111, false) => fp_bits(ftype, f.abs()) as u64,
                     (true, 0b01111, true) => fp_bits(ftype, -f) as u64,
@@ -3664,7 +3674,7 @@ impl Cpu {
     /// Boot a real arm64 Linux over the **shared `emulator::devbus`** with the
     /// full devcontainer device complement — the `virtio-blk` κ-disk root **and**
     /// the shared `virtio-9p` workspace (`CC-15`) **and** the `virtio-net` device
-    /// + the userspace NAT (`CC-16`), each advertised in the devicetree so a real
+    /// plus the userspace NAT (`CC-16`), each advertised in the devicetree so a real
     /// kernel probes and drives it. This is the AArch64 analogue of the RISC-V
     /// machine's [`MachineSpec::boot_workspace_net`](crate::machine::MachineSpec):
     /// the same one devbus, only the MMIO transport (GIC vs PLIC) differs (Law
@@ -4390,9 +4400,6 @@ impl Cpu {
 
     /// Take an "unknown instruction" exception (`EC` 0x00) to EL1.
     fn take_undef(&mut self, ret: u64, _inst: u32) {
-        #[cfg(feature = "std")]
-        if self.sys().el == 0 {
-        }
         let from_el0 = self.sys().el == 0;
         let spsr = self.pack_pstate();
         let group = if from_el0 {
