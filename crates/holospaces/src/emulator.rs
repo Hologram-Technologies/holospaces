@@ -629,6 +629,65 @@ struct KappaBacking {
     /// One entry per sector: the sector's content κ, or `None` for a sparse
     /// (never-written, all-zero) sector.
     index: Vec<Option<KappaLabel71>>,
+    /// A **bounded**, κ-keyed read-through cache of decoded sectors. Every
+    /// `read_sector` would otherwise hit the (possibly OPFS-backed) store; this
+    /// caches by content κ so dedup'd sectors share one entry, and is capped at
+    /// [`READ_CACHE_SECTORS`] with FIFO eviction (a single oldest entry per
+    /// insert — never cleared wholesale), so it cannot balloon: peak cache RAM is
+    /// `READ_CACHE_SECTORS * 512` bytes regardless of disk size (Law L3: the store
+    /// is the memory, this is just a cache). Interior-mutable so the hot read path
+    /// stays `&self`.
+    read_cache: core::cell::RefCell<SectorCache>,
+}
+
+/// Fixed capacity of the κ-disk read-through cache, in 512-byte sectors. Bounds
+/// peak cache residency to `READ_CACHE_SECTORS * DISK_SECTOR` (here 2 MiB)
+/// independent of the disk's declared size.
+const READ_CACHE_SECTORS: usize = 4096;
+
+/// A bounded, κ-keyed FIFO cache of decoded disk sectors. Capacity is fixed at
+/// [`READ_CACHE_SECTORS`]; on overflow the **single** oldest entry is evicted
+/// (never a wholesale clear), so a hot working set stays resident while total
+/// residency is bounded.
+struct SectorCache {
+    map: BTreeMap<KappaLabel71, [u8; DISK_SECTOR]>,
+    /// Insertion order of the keys currently in `map`, oldest at the front.
+    order: alloc::collections::VecDeque<KappaLabel71>,
+}
+
+impl SectorCache {
+    fn new() -> Self {
+        SectorCache {
+            map: BTreeMap::new(),
+            order: alloc::collections::VecDeque::new(),
+        }
+    }
+
+    /// The cached sector for `k`, if present.
+    fn get(&self, k: &KappaLabel71) -> Option<&[u8; DISK_SECTOR]> {
+        self.map.get(k)
+    }
+
+    /// Insert `sector` for `k`, evicting the single oldest entry if at capacity.
+    fn insert(&mut self, k: KappaLabel71, sector: [u8; DISK_SECTOR]) {
+        use alloc::collections::btree_map::Entry;
+        match self.map.entry(k) {
+            Entry::Occupied(mut e) => {
+                // Refresh in place; the FIFO order is unchanged for an existing key.
+                e.insert(sector);
+            }
+            Entry::Vacant(e) => {
+                e.insert(sector);
+                self.order.push_back(k);
+            }
+        }
+        // Evict the single oldest entry while over capacity (FIFO, never a clear).
+        while self.order.len() > READ_CACHE_SECTORS {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+    }
 }
 
 impl KappaBacking {
@@ -652,7 +711,11 @@ impl KappaBacking {
             sector[..end - start].copy_from_slice(&image[start..end]);
             index.push(Self::store_sector(store.as_ref(), &sector));
         }
-        KappaBacking { store, index }
+        KappaBacking {
+            store,
+            index,
+            read_cache: core::cell::RefCell::new(SectorCache::new()),
+        }
     }
 
     /// Load a κ-disk over a caller-supplied store by **streaming** sectors from a
@@ -672,7 +735,11 @@ impl KappaBacking {
             read(i, &mut sector);
             index.push(Self::store_sector(store.as_ref(), &sector));
         }
-        KappaBacking { store, index }
+        KappaBacking {
+            store,
+            index,
+            read_cache: core::cell::RefCell::new(SectorCache::new()),
+        }
     }
 
     /// Content-address a sector through the store (sparse all-zero → `None`).
@@ -689,18 +756,25 @@ impl KappaBacking {
         self.index.len() * DISK_SECTOR
     }
 
-    /// Read sector `i` (sparse → zeros) as a 512-byte block.
+    /// Read sector `i` (sparse → zeros) as a 512-byte block, through the bounded
+    /// κ-keyed read cache so a repeated or dedup'd sector resolves without a store
+    /// round-trip (Law L3: the store is the memory, this is the RAM cache).
     fn read_sector(&self, i: usize) -> [u8; DISK_SECTOR] {
-        let mut out = [0u8; DISK_SECTOR];
-        if let Some(k) = &self.index[i] {
-            let bytes = self
-                .store
-                .get(k)
-                .ok()
-                .flatten()
-                .expect("κ-disk: a sector's content resolves for its κ");
-            out.copy_from_slice(bytes.as_ref());
+        let Some(k) = &self.index[i] else {
+            return [0u8; DISK_SECTOR]; // sparse all-zero sector
+        };
+        if let Some(hit) = self.read_cache.borrow().get(k) {
+            return *hit;
         }
+        let bytes = self
+            .store
+            .get(k)
+            .ok()
+            .flatten()
+            .expect("κ-disk: a sector's content resolves for its κ");
+        let mut out = [0u8; DISK_SECTOR];
+        out.copy_from_slice(bytes.as_ref());
+        self.read_cache.borrow_mut().insert(*k, out);
         out
     }
 
@@ -728,7 +802,14 @@ impl KappaBacking {
             let so = pos % DISK_SECTOR;
             let n = (DISK_SECTOR - so).min(data.len() - done);
             sector[so..so + n].copy_from_slice(&data[done..done + n]);
-            self.index[si] = Self::store_sector(self.store.as_ref(), &sector);
+            let k = Self::store_sector(self.store.as_ref(), &sector);
+            // Populate the read cache with the just-written content so an
+            // immediate re-read is served without a store round-trip. Keys are
+            // content κ, so there is never a stale entry to invalidate.
+            if let Some(k) = &k {
+                self.read_cache.borrow_mut().insert(*k, sector);
+            }
+            self.index[si] = k;
             done += n;
         }
     }
@@ -5359,6 +5440,47 @@ mod tests {
             disk.to_image()[2 * DISK_SECTOR..3 * DISK_SECTOR],
             image[0..DISK_SECTOR]
         );
+    }
+
+    /// The bounded read-through cache must not corrupt reads: with far more
+    /// distinct sectors than the cache capacity, every sector still reads back its
+    /// own content (cold misses re-fetch from the store), and re-reading a hot
+    /// sector returns the same bytes. The cache is a transparent accelerator, never
+    /// a source of truth (Law L3), and is bounded so it cannot balloon.
+    #[test]
+    fn read_cache_is_bounded_and_never_corrupts_reads() {
+        // One more than the cache capacity of distinct, non-zero sectors.
+        let n = READ_CACHE_SECTORS + 16;
+        let mut image = vec![0u8; n * DISK_SECTOR];
+        for s in 0..n {
+            // A unique pattern per sector so a wrong cache hit would be detected.
+            for (i, b) in image[s * DISK_SECTOR..(s + 1) * DISK_SECTOR]
+                .iter_mut()
+                .enumerate()
+            {
+                *b = ((s.wrapping_mul(31).wrapping_add(i)) % 251 + 1) as u8;
+            }
+        }
+        let disk = KappaBacking::from_image(&image);
+        // First pass: every sector reads back its own content despite eviction.
+        for s in 0..n {
+            let mut got = [0u8; DISK_SECTOR];
+            disk.read_into(s * DISK_SECTOR, &mut got);
+            assert_eq!(
+                &got[..],
+                &image[s * DISK_SECTOR..(s + 1) * DISK_SECTOR],
+                "sector {s} reads back its own content"
+            );
+        }
+        // The cache is bounded to its capacity, not the disk size.
+        assert!(
+            disk.read_cache.borrow().map.len() <= READ_CACHE_SECTORS,
+            "the read cache never exceeds its fixed capacity"
+        );
+        // A hot re-read (now a cache hit) still returns the correct bytes.
+        let mut got = [0u8; DISK_SECTOR];
+        disk.read_into((n - 1) * DISK_SECTOR, &mut got);
+        assert_eq!(&got[..], &image[(n - 1) * DISK_SECTOR..n * DISK_SECTOR]);
     }
 
     fn run_to_exit(image: &[u8]) -> u64 {

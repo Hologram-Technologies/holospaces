@@ -36,7 +36,8 @@ use alloc::{boxed::Box, vec, vec::Vec};
 /// RAM is a cache of the canonical store (Law L3), not a second medium (Law L4) —
 /// it is transient and bounded; the κ-store remains the source of truth. Capped
 /// so a large disk cannot make the cache grow without limit; on overflow the
-/// cache is cleared (a cold working set simply re-fills from the store).
+/// **single** oldest entry is evicted (FIFO), so a hot working set stays resident
+/// instead of being dropped wholesale, while total residency stays bounded.
 const CACHE_CAPACITY: usize = 4096;
 
 use spin::Mutex;
@@ -62,8 +63,53 @@ pub struct KappaDisk<'a> {
     /// κ-label (so content-identical sectors — the dedup case — share one entry).
     /// RAM caching the canonical store (Law L3); a hit returns the same bytes a
     /// `store.get` would, so the device's observable behaviour is unchanged.
-    cache: Mutex<BTreeMap<Kappa, Bytes>>,
+    /// Bounded with FIFO single-entry eviction ([`BoundedCache`]).
+    cache: Mutex<BoundedCache>,
     uuid: [u8; 16],
+}
+
+/// A bounded, κ-keyed FIFO cache of decoded sector contents. Capacity is fixed at
+/// [`CACHE_CAPACITY`]; on overflow the single oldest entry is evicted (never a
+/// wholesale clear), so a hot working set is preserved while residency is bounded.
+struct BoundedCache {
+    map: BTreeMap<Kappa, Bytes>,
+    /// Insertion order of the keys currently in `map`, oldest at the front.
+    order: alloc::collections::VecDeque<Kappa>,
+}
+
+impl BoundedCache {
+    fn new() -> Self {
+        BoundedCache {
+            map: BTreeMap::new(),
+            order: alloc::collections::VecDeque::new(),
+        }
+    }
+
+    /// The cached bytes for `kappa`, if present.
+    fn get(&self, kappa: &Kappa) -> Option<&Bytes> {
+        self.map.get(kappa)
+    }
+
+    /// Insert `bytes` for `kappa`, evicting the single oldest entry at capacity.
+    fn insert(&mut self, kappa: Kappa, bytes: Bytes) {
+        use alloc::collections::btree_map::Entry;
+        match self.map.entry(kappa) {
+            Entry::Occupied(mut e) => {
+                // Refresh in place; the FIFO order is unchanged for an existing key.
+                e.insert(bytes);
+            }
+            Entry::Vacant(e) => {
+                e.insert(bytes);
+                self.order.push_back(kappa);
+            }
+        }
+        // Evict the single oldest entry while over capacity (FIFO, never a clear).
+        while self.order.len() > CACHE_CAPACITY {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+    }
 }
 
 impl<'a> KappaDisk<'a> {
@@ -82,7 +128,7 @@ impl<'a> KappaDisk<'a> {
             sector_size,
             sector_count,
             index: Mutex::new(index),
-            cache: Mutex::new(BTreeMap::new()),
+            cache: Mutex::new(BoundedCache::new()),
             uuid,
         }
     }
@@ -190,7 +236,7 @@ impl<'a> KappaDisk<'a> {
             index[lba as usize + i] = kappa;
             // Write-through: a just-written sector is immediately readable from the
             // cache without re-hitting the store.
-            cache_insert(&mut cache, kappa, Bytes::from(slot.to_vec()));
+            cache.insert(kappa, Bytes::from(slot.to_vec()));
         }
         Ok(())
     }
@@ -254,17 +300,6 @@ fn geometry_uuid(sector_size: u32, sector_count: u64) -> [u8; 16] {
     uuid
 }
 
-/// Insert a decoded sector into the read-through cache, keeping it bounded
-/// ([`CACHE_CAPACITY`]). The cache is a transient accelerator over the canonical
-/// store (Law L3), so dropping entries on overflow is always safe — a missed
-/// content re-fetches from the store.
-fn cache_insert(cache: &mut BTreeMap<Kappa, Bytes>, kappa: Kappa, bytes: Bytes) {
-    if cache.len() >= CACHE_CAPACITY && !cache.contains_key(&kappa) {
-        cache.clear();
-    }
-    cache.insert(kappa, bytes);
-}
-
 #[async_trait::async_trait]
 impl BlockDevice for KappaDisk<'_> {
     fn sector_size(&self) -> u32 {
@@ -306,7 +341,7 @@ impl BlockDevice for KappaDisk<'_> {
                 return Err(DeviceError::HardwareFault(3));
             }
             slot.copy_from_slice(bytes.as_ref());
-            cache_insert(&mut cache, kappa, bytes);
+            cache.insert(kappa, bytes);
         }
         Ok(())
     }
@@ -333,6 +368,38 @@ impl BlockDevice for KappaDisk<'_> {
 mod tests {
     use super::*;
     use hologram_store_mem::MemKappaStore;
+
+    /// The read cache is bounded and evicts a *single* oldest entry on overflow
+    /// (FIFO) rather than clearing wholesale. After inserting one past capacity,
+    /// the cache holds exactly `CACHE_CAPACITY` entries (not 1, which a clear would
+    /// give), the second-oldest survives, and only the very oldest is gone.
+    #[test]
+    fn read_cache_evicts_one_at_a_time_not_wholesale() {
+        let mut cache = BoundedCache::new();
+        let k = |i: u64| -> Kappa {
+            let mut b = [0u8; 512];
+            b[..8].copy_from_slice(&i.to_le_bytes());
+            // A distinct content κ per i.
+            crate::realizations::address(&b)
+        };
+        for i in 0..CACHE_CAPACITY as u64 {
+            cache.insert(k(i), Bytes::from(vec![i as u8; 4]));
+        }
+        assert_eq!(cache.map.len(), CACHE_CAPACITY, "full to capacity");
+        // One more triggers a single eviction of the oldest (k(0)).
+        cache.insert(k(CACHE_CAPACITY as u64), Bytes::from(vec![0xFF; 4]));
+        assert_eq!(
+            cache.map.len(),
+            CACHE_CAPACITY,
+            "still exactly capacity — a single eviction, not a wholesale clear"
+        );
+        assert!(cache.get(&k(0)).is_none(), "the oldest entry was evicted");
+        assert!(cache.get(&k(1)).is_some(), "the second-oldest survives");
+        assert!(
+            cache.get(&k(CACHE_CAPACITY as u64)).is_some(),
+            "the newest entry is present"
+        );
+    }
 
     #[test]
     fn sectors_round_trip_and_sparse_reads_are_zero() {
