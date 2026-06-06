@@ -265,13 +265,18 @@ impl Cpu {
         for _ in 0..max_steps {
             // Pump the network periodically so host-side data and connection
             // events reach the guest without it having to transmit first (the
-            // `virtio-net` receive path; `CC-16` parity, `CC-46`). Gated on the
-            // architected counter, which `sys_tick` advances every step.
-            if self.sys.is_some()
-                && self.sys().virtionet.is_some()
-                && self.sys().counter & 0x3ff == 0
-            {
-                self.virtio_net_pump();
+            // `virtio-net` receive path; `CC-16` parity, `CC-46`). Gated on how
+            // far the architected counter has advanced since the last pump rather
+            // than on `counter & mask == 0`: `WFI` fast-forwards the counter to
+            // the next timer deadline (an idle `sleep` loop), so a bare-mask gate
+            // is almost never hit on the exact step the guest idles — which would
+            // stall host→guest delivery over the in-process bridge (`CC-33`).
+            if self.sys.is_some() && self.sys().virtionet.is_some() {
+                let counter = self.sys().counter;
+                if counter.wrapping_sub(self.sys().last_net_pump) >= NET_PUMP_INTERVAL {
+                    self.sys_mut().last_net_pump = counter;
+                    self.virtio_net_pump();
+                }
             }
             if let Err(h) = self.step() {
                 return h;
@@ -3321,6 +3326,15 @@ const GICC_END: u64 = 0x0802_0000;
 const UART_BASE: u64 = 0x0900_0000;
 const UART_END: u64 = 0x0900_1000;
 const RAM_BASE: u64 = 0x4000_0000;
+/// Architected-counter ticks between network pumps in the run loop. A delta (not
+/// a `counter & mask == 0` gate) keeps the period reliable across the large
+/// counter jumps `WFI` makes when fast-forwarding to a timer deadline.
+const NET_PUMP_INTERVAL: u64 = 0x400;
+/// Max architected-counter ticks a single `WFI` may skip while the in-process
+/// bridge is live (see [`Cpu::wfi`]). Small enough that an idle guest cannot
+/// race its socket timeouts ahead of host bridge writes, large enough to still
+/// skip the busy-spin many-fold.
+const WFI_BRIDGE_MAX_SKIP: u64 = 16;
 /// The kernel Image loads `text_offset` (0x80000) above the base of RAM, with the
 /// devicetree placed safely above it (the kernel maps it by the physical address
 /// in `x0`).
@@ -3530,6 +3544,12 @@ struct Sys {
     fault: Option<(u64, bool, bool)>,
     cntfrq: u64,
     counter: u64,
+    /// The architected-counter value at the last network pump. The run loop
+    /// pumps once the counter has advanced past [`NET_PUMP_INTERVAL`] since this
+    /// mark, which stays reliable even when `WFI` fast-forwards the counter to a
+    /// timer deadline (a bare `counter & mask == 0` gate is almost never hit on
+    /// the exact step the guest idles, stalling host→guest bridge delivery).
+    last_net_pump: u64,
     cntp_ctl: u64,
     cntp_cval: u64,
     cntv_ctl: u64,
@@ -3579,6 +3599,7 @@ impl Sys {
             fault: None,
             cntfrq: 62_500_000,
             counter: 0,
+            last_net_pump: 0,
             cntp_ctl: 0,
             cntp_cval: 0,
             cntv_ctl: 0,
@@ -4671,10 +4692,22 @@ impl Cpu {
     /// `WFI` — wait for interrupt. If none is pending, fast-forward the architected
     /// counter to the next enabled timer deadline so the tick fires on the next
     /// step (rather than spinning the idle loop against the step budget).
+    ///
+    /// Bounded while the **in-process bridge** is live: the host writes toward a
+    /// guest listener (`CC-33`) at the run loop's wall-clock cadence, but the
+    /// guest measures its own socket timeouts in architected-counter time. If
+    /// `WFI` skipped straight to a far timer deadline whenever the guest idled
+    /// in `read()`, guest time would race far ahead of the host's writes — the
+    /// guest's receive timeout (e.g. busybox `httpd`'s 60s) would elapse and it
+    /// would close the connection *before* the host's bytes were pumped in. So
+    /// when a loopback bridge is enabled, cap the skip to [`WFI_BRIDGE_MAX_SKIP`]
+    /// ticks, keeping guest time coupled to the host I/O cadence (still skipping
+    /// the busy-spin, just not past in-flight bridge delivery).
     fn wfi(&mut self) {
         if self.sys().gic.irq_pending() {
             return;
         }
+        let bridge_live = self.sys().loopback.is_some();
         let sys = self.sys_mut();
         let mut deadline = u64::MAX;
         if sys.cntp_ctl & 1 != 0 && sys.cntp_ctl & 2 == 0 {
@@ -4684,7 +4717,11 @@ impl Cpu {
             deadline = deadline.min(sys.cntv_cval.wrapping_add(sys.cntvoff));
         }
         if deadline != u64::MAX && deadline > sys.counter {
-            sys.counter = deadline - 1; // the next sys_tick increments past it
+            let mut target = deadline - 1; // the next sys_tick increments past it
+            if bridge_live {
+                target = target.min(sys.counter.wrapping_add(WFI_BRIDGE_MAX_SKIP));
+            }
+            sys.counter = target;
         }
     }
 
