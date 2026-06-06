@@ -117,6 +117,22 @@ bytes* and never perceives or alters it — it holds only sockets (no `KappaStor
 no identity, no base-frame), a pipe, not an observer. _Witness:_
 `the_egress_forwards_opaque_content_without_perceiving_it` (`CC-39`).
 
+*SEC-8 — Resource bounds.* A malicious or buggy counterparty — a peer forging a
+canonical κ/config, a guest issuing a malformed/oversized device request, a
+remote flooding connections — cannot crash a peer or balloon its memory. Every
+allocation driven by untrusted input is *bounded by the actual payload or a fixed
+quota, never a declared count*, and the substrate is the memory (the `KappaStore`
+backs the κ-disk; RAM holds only bounded caches; rootfs assembly is streamed,
+never dense). _Enforced by:_ peer-supplied `Vec::with_capacity` bounded by the
+remaining payload (`realizations.rs`, `config.rs`); the `virtio-9p` workspace
+rejecting a count/body mismatch and quota-bounding `offset+count`; the NAT's
+connection table bounded + idle-reaped with capped buffers behind a shrinking
+window; the κ-disk read cache bounded (single-entry eviction); ext4 assembly
+streamed into the `KappaStore`. _Witnesses:_ `forged_huge_ref_count_…`,
+`twrite_with_mismatched_count_…`, `twrite_at_huge_offset_…`,
+`the_connection_table_is_bounded`, `from_guest_backpressure_…`,
+`read_cache_is_bounded_…`, `streamed_layers_overlay_is_identical_to_all_at_once`.
+
 === The legacy-internet boundary (named, not wished away)
 
 The UOR-native properties hold _inside_ the holospaces network. An egress peer's
@@ -143,17 +159,18 @@ its clients.
 |===
 | Adversary | Defeated by | Residual
 
-| Malicious peer / node (forge, tamper) | SEC-1 (re-derivation), SEC-7 (egress content-blind) | may withhold/delay (availability)
+| Malicious peer / node (forge, tamper) | SEC-1 (re-derivation), SEC-7 (egress content-blind), SEC-8 (forged-count allocations bounded) | may withhold/delay (availability)
 | Compromised cold-start gateway / CDN | SEC-1 (every byte re-derived on load) | availability only
 | Passive observer / routing peer | SEC-5 (κ-as-capability; frame at Prism) | network metadata; legacy destinations on the egress outside leg
-| Malicious guest / holospace | SEC-2 (capabilities only attenuate) | resource use bounded by quota
+| Malicious guest / holospace | SEC-2 (capabilities only attenuate), SEC-8 (9p quota + bounded device buffers) | resource use bounded by the workspace quota
+| Resource exhaustion / DoS (oversized or forged input, connection flood) | SEC-8 (allocations bounded by payload/quota, NAT backpressure + bounded reaped table, streamed assembly) | throughput may degrade; never crash/OOM
 | Sybil / eclipse | SEC-1 holds regardless | availability/routing (substrate DHT)
 | Key thief | — | self-sovereign = self-responsible (key custody)
 |===
 
 === Enforcement layering (what is proven where)
 
-* *holospaces-enforced + witnessed* (`CC-40`/`CC-39`): SEC-1..SEC-7.
+* *holospaces-enforced + witnessed* (`CC-40`/`CC-39`): SEC-1..SEC-8.
 * *Substrate-inherited* (hologram conformance): the dense-matrix _structural_
   dedup, the _decreasing per-node resource floor_, and DHT eclipse/Sybil
   resistance. holospaces witnesses their observable consequences, not the
@@ -187,4 +204,5 @@ fails the gate.
 | SEC-5 | Confidentiality (κ-as-capability) | `sec_confidentiality_content_is_reachable_only_by_its_kappa` | `CC-40`
 | SEC-6 | Reference resolution (verified vs κ) | `sec_reference_resolution_verifies_against_the_kappa_on_its_axis` | `CC-40`
 | SEC-7 | Egress boundary (content-blind) | `the_egress_forwards_opaque_content_without_perceiving_it` | `CC-39`
+| SEC-8 | Resource bounds (DoS resistance) | `forged_huge_ref_count_…`, `twrite_with_mismatched_count_…`, `twrite_at_huge_offset_…`, `the_connection_table_is_bounded`, `from_guest_backpressure_…`, `read_cache_is_bounded_…`, `streamed_layers_overlay_is_identical_to_all_at_once` | Rust quality gate (lib tests)
 |===
