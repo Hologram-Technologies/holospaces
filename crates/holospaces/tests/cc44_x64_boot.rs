@@ -44,7 +44,7 @@ fn an_amd64_linux_kernel_boots_to_userspace() {
     let mut cpu = Cpu::boot_linux(
         1024 * 1024 * 1024,
         &kernel,
-        "console=ttyS0 earlyprintk=ttyS0",
+        "earlyprintk=serial,ttyS0 console=ttyS0",
     );
     let halt = cpu.run(40_000_000_000);
     let console = String::from_utf8_lossy(cpu.console());
