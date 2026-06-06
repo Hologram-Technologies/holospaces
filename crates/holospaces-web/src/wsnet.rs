@@ -44,6 +44,13 @@ const OP_RDATA: u8 = 0x12;
 const OP_CLOSED: u8 = 0x13;
 const OP_FAILED: u8 = 0x14;
 
+/// The per-connection cap on buffered host→guest bytes ([`ConnState::inbound`]).
+/// Host-side data is buffered between emulator run-chunks; without a bound a fast
+/// server could make this grow without limit. At the cap, further inbound bytes
+/// are dropped (the NAT's own TCP backpressure — the shrunken advertised window —
+/// keeps the host side from racing too far ahead), so the buffer stays bounded.
+const INBOUND_CAP: usize = 1 << 20; // 1 MiB
+
 /// Per-connection state the NAT polls.
 struct ConnState {
     status: EgressStatus,
@@ -126,7 +133,12 @@ impl WsEgress {
                 }
                 OP_RDATA => {
                     if let Some(c) = s.conns.get_mut(&id) {
-                        c.inbound.extend(&buf[5..]);
+                        // Bounded: only buffer what fits under the cap; excess is
+                        // dropped (the NAT's advertised-window backpressure keeps
+                        // the host from racing far past what the guest drains).
+                        let room = INBOUND_CAP.saturating_sub(c.inbound.len());
+                        let take = room.min(buf.len().saturating_sub(5));
+                        c.inbound.extend(&buf[5..5 + take]);
                     }
                 }
                 OP_CLOSED | OP_FAILED => {
