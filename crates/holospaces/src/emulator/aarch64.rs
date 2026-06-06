@@ -3324,13 +3324,24 @@ impl Gic {
     fn set_level(&mut self, id: u32, on: bool) {
         Self::set_bit(&mut self.pending, id, on);
     }
-    /// The highest-priority pending+enabled+inactive INTID, or `None`.
+    /// The highest-priority pending+enabled+inactive INTID, or `None`. Iterates
+    /// only the 16 deliverable-mask words (`pending & enabled & !active`), using
+    /// `trailing_zeros` to jump straight to the lowest set bit in each — instead of
+    /// scanning all 1020 INTIDs one at a time on every interrupt check (the hot
+    /// path: `irq_pending` runs per-instruction).
     fn best(&self) -> Option<u32> {
-        (0..1020u32).find(|&id| {
-            Self::get_bit(&self.pending, id)
-                && Self::get_bit(&self.enabled, id)
-                && !Self::get_bit(&self.active, id)
-        })
+        for w in 0..16 {
+            let deliverable = self.pending[w] & self.enabled[w] & !self.active[w];
+            if deliverable != 0 {
+                let id = (w as u32) * 64 + deliverable.trailing_zeros();
+                // The top words may include bits past the 1020-INTID range; reject
+                // those so a stray high bit cannot report a non-existent INTID.
+                if id < 1020 {
+                    return Some(id);
+                }
+            }
+        }
+        None
     }
     /// Whether the CPU IRQ line is asserted.
     fn irq_pending(&self) -> bool {
@@ -5216,5 +5227,47 @@ mod tests {
         );
         // The all-ones reserved logical immediate is rejected.
         assert!(decode_bit_masks(1, 63, 0, 64, true).is_none());
+    }
+
+    /// The word-scanning `Gic::best()` selects the same lowest deliverable INTID
+    /// (pending & enabled & !active) the per-INTID scan did, and returns `None`
+    /// when nothing is deliverable — only faster (it skips empty words and jumps
+    /// to the lowest set bit). Spot-checks across word boundaries and the masks.
+    #[test]
+    fn gic_best_picks_the_lowest_deliverable_intid() {
+        let mut gic = Gic::new();
+        assert_eq!(gic.best(), None, "nothing pending → None");
+
+        // Pending but not enabled → not deliverable.
+        gic.raise(42);
+        assert_eq!(gic.best(), None);
+        // Enable it → now deliverable.
+        Gic::set_bit(&mut gic.enabled, 42, true);
+        assert_eq!(gic.best(), Some(42));
+
+        // A lower enabled+pending INTID in an earlier word wins.
+        gic.raise(5);
+        Gic::set_bit(&mut gic.enabled, 5, true);
+        assert_eq!(gic.best(), Some(5), "the lowest deliverable INTID wins");
+
+        // Marking the lowest active skips it to the next deliverable one.
+        Gic::set_bit(&mut gic.active, 5, true);
+        assert_eq!(gic.best(), Some(42), "an active INTID is skipped");
+
+        // A high INTID near the top of the valid range is found (word-boundary).
+        let mut g2 = Gic::new();
+        g2.raise(1000);
+        Gic::set_bit(&mut g2.enabled, 1000, true);
+        assert_eq!(g2.best(), Some(1000));
+
+        // A bit at/above 1020 (the reserved range) is never reported.
+        let mut g3 = Gic::new();
+        g3.raise(1021);
+        Gic::set_bit(&mut g3.enabled, 1021, true);
+        assert_eq!(
+            g3.best(),
+            None,
+            "INTIDs ≥ 1020 are reserved, not deliverable"
+        );
     }
 }
