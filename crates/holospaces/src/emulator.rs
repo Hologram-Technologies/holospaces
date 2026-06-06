@@ -279,6 +279,58 @@ struct Hart {
 }
 
 /// A single-hart RV64GC RISC-V machine over a flat little-endian RAM, with an
+/// The RISC-V control-and-status register file (Zicsr) — a **flat array** over
+/// the 12-bit CSR address space, so the per-instruction reads (the interrupt
+/// check reads `mip`/`mie` every step) are O(1) array indexing with no map hashing
+/// or tree walk. A `BTreeSet` records which CSRs have been written so the snapshot
+/// serializes exactly the same set, in the same sorted order, as the former
+/// `BTreeMap` did — the snapshot κ is unchanged (Law L1; `CC-9`). An unwritten CSR
+/// reads as 0, identical to the map's `get(..).unwrap_or(0)`.
+struct CsrFile {
+    /// One slot per 12-bit CSR address; unwritten slots are 0.
+    vals: alloc::boxed::Box<[u64; 4096]>,
+    /// The addresses that have been written (for deterministic snapshot order).
+    written: alloc::collections::BTreeSet<u32>,
+}
+
+impl CsrFile {
+    fn new() -> Self {
+        CsrFile {
+            vals: alloc::boxed::Box::new([0u64; 4096]),
+            written: alloc::collections::BTreeSet::new(),
+        }
+    }
+    /// The value of CSR `csr` (0 if never written) — the O(1) hot-path read.
+    fn get(&self, csr: u32) -> u64 {
+        self.vals.get(csr as usize).copied().unwrap_or(0)
+    }
+    /// Write CSR `csr`, recording it for the snapshot.
+    fn insert(&mut self, csr: u32, value: u64) {
+        if (csr as usize) < self.vals.len() {
+            self.vals[csr as usize] = value;
+            self.written.insert(csr);
+        }
+    }
+    /// The number of written CSRs (the snapshot's entry count).
+    fn len(&self) -> usize {
+        self.written.len()
+    }
+    /// Clear the file (snapshot restore starts from empty).
+    fn clear(&mut self) {
+        for &csr in &self.written {
+            self.vals[csr as usize] = 0;
+        }
+        self.written.clear();
+    }
+    /// The written `(csr, value)` pairs in ascending CSR order — the canonical
+    /// snapshot iteration (matching the former `BTreeMap` key order).
+    fn iter(&self) -> impl Iterator<Item = (u32, u64)> + '_ {
+        self.written
+            .iter()
+            .map(move |&csr| (csr, self.vals[csr as usize]))
+    }
+}
+
 /// `ecall` console (the `write` syscall appends to [`Emulator::console`]).
 ///
 /// RAM is mapped at the machine's `base` address; a flat guest image is loaded
@@ -295,10 +347,11 @@ pub struct Emulator {
     /// unread byte). The terminal-input channel of a workspace projection (CC-11).
     console_in: Vec<u8>,
     in_cursor: usize,
-    /// Control and status registers (Zicsr) — a flat backing store; the WARL and
-    /// read-only semantics (`mstatus.UXL`/`SXL`, `misa`, the debug triggers, …)
-    /// are enforced at the `csr_read`/`csr_write` boundary.
-    csrs: BTreeMap<u32, u64>,
+    /// Control and status registers (Zicsr) — a flat backing store
+    /// ([`CsrFile`]); the WARL and read-only semantics (`mstatus.UXL`/`SXL`,
+    /// `misa`, the debug triggers, …) are enforced at the `csr_read`/`csr_write`
+    /// boundary.
+    csrs: CsrFile,
     /// The LR/SC reservation address (A extension, single hart).
     reservation: Option<u64>,
     /// The current privilege level (M/S/U) — starts in machine mode.
@@ -1917,7 +1970,7 @@ impl Emulator {
     /// Create a machine with `ram_bytes` of RAM mapped at `base`, the reset PC.
     #[must_use]
     pub fn new(base: u64, ram_bytes: usize) -> Self {
-        let mut csrs = BTreeMap::new();
+        let mut csrs = CsrFile::new();
         // `misa` reports the ISA: RV64 (MXL=2) with the I, M, A, C extensions a
         // kernel checks for. mhartid defaults to 0 (single hart).
         // RV64 (MXL=2) with A, C, D, F, I, M.
@@ -2190,7 +2243,7 @@ impl Emulator {
     }
 
     fn raw_csr(&self, csr: u32) -> u64 {
-        self.csrs.get(&csr).copied().unwrap_or(0)
+        self.csrs.get(csr)
     }
 
     fn csr_write(&mut self, csr: u32, value: u64) {
@@ -2541,7 +2594,7 @@ impl Emulator {
         // The CSR file (Zicsr), in canonical (sorted) order — deterministic, so
         // the snapshot κ is reproducible (BTreeMap iterates in key order).
         out.extend_from_slice(&(self.csrs.len() as u32).to_le_bytes());
-        for (csr, value) in &self.csrs {
+        for (csr, value) in self.csrs.iter() {
             out.extend_from_slice(&csr.to_le_bytes());
             out.extend_from_slice(&value.to_le_bytes());
         }
