@@ -135,12 +135,6 @@ struct Sys {
     /// constant; each draw also mixes in the TSC so the stream is non-constant
     /// across the boot (the kernel only requires a varying value + `CF=1`).
     rng: u64,
-    /// Monotonically-increasing TSC jitter added to `RDTSC`/`RDTSCP` reads (see
-    /// [`Cpu::read_tsc`]) so the jitterentropy collector sees a varying delta.
-    tsc_jitter: u64,
-    /// The last value [`Cpu::read_tsc`] returned — used to manufacture the
-    /// occasional backward step jent_entropy_init's calibration loop requires.
-    tsc_last_read: u64,
 }
 
 impl Sys {
@@ -172,8 +166,6 @@ impl Sys {
             timer_div: 0,
             halted: false,
             rng: 0x9e37_79b9_7f4a_7c15,
-            tsc_jitter: 0,
-            tsc_last_read: 0,
         }
     }
 }
@@ -920,9 +912,9 @@ impl Cpu {
             // Advance the platform timers (PIT + APIC timer + TSC) and latch a
             // tick when one expires, then deliver any pending interrupt through
             // the IDT — the interrupt path a real Linux boot needs (`#12`). The
-            // periodic IRQ sources only advance while the CPU is interruptible
-            // (`RFLAGS.IF`), so a tick cannot accrue inside its own handler.
-            self.sys_tick(self.rflags & RFLAGS_IF != 0);
+            // periodic timers advance unconditionally (like the riscv64/aarch64
+            // cores); a latched tick is delivered only when `RFLAGS.IF` is set.
+            self.sys_tick();
             if self.sys.as_ref().is_some_and(|s| s.halted) {
                 return Halt::Halted;
             }
@@ -2930,21 +2922,15 @@ impl Cpu {
     /// when one expires. The kernel calibrates against these and runs its
     /// periodic tick on them.
     ///
-    /// `interruptible` is the CPU's current interrupt-acceptance state
-    /// (`RFLAGS.IF` set and not mid-instruction). The periodic *IRQ* sources
-    /// (PIT channel-0, the APIC-timer LVT) only count down toward the next
-    /// interrupt while the CPU is interruptible: a periodic tick must not be
-    /// able to accrue *while the kernel is non-interruptibly servicing the
-    /// previous one*, or the handler's own runtime (`tick_periodic` → scheduler
-    /// / timekeeping / RCU / hrtimers — far longer than one tick period in
-    /// emulator-steps once `hrtimer`/`RCU` catch-up kicks in) re-queues IRQ 0
-    /// before `iret`, and the handler returns straight into itself forever (the
-    /// "timer storm" that wedged the boot at the idle handoff). Gating on
-    /// interruptibility makes the next tick be measured from when the CPU
-    /// becomes interruptible again, so the handler always returns to the
-    /// foreground first. The TSC and the channel-2 calibration one-shot still
-    /// advance unconditionally (the kernel polls channel 2 with IRQs *off*).
-    fn sys_tick(&mut self, interruptible: bool) {
+    /// The periodic IRQ sources (PIT channel-0, the APIC-timer LVT) count down
+    /// every `TIMER_DIV` steps *unconditionally* — the same model the riscv64
+    /// (`mtime`) and aarch64 (`counter`) cores use, where the timer advances
+    /// regardless of the interrupt-acceptance state and only *delivery* of the
+    /// latched interrupt is gated on `RFLAGS.IF`. The tick period
+    /// (`reload × TIMER_DIV` steps) is far longer than the handler, so a tick
+    /// cannot re-queue inside its own handler. The TSC and the channel-2
+    /// calibration one-shot advance every step.
+    fn sys_tick(&mut self) {
         let Some(sys) = self.sys.as_mut() else {
             return;
         };
@@ -2985,13 +2971,6 @@ impl Cpu {
         if sys.timer_div % TIMER_DIV != 0 {
             return;
         }
-        // Do not count the periodic IRQ sources down while the CPU is
-        // non-interruptible (inside an IRQ/exception handler): a tick must not
-        // accrue during its own handler (see the doc comment) — that is the
-        // timer storm. The TSC/channel-2 above already advanced.
-        if !interruptible {
-            return;
-        }
         // The 8254 PIT channel-0 down-counter.
         if sys.pit.enabled && sys.pit.reload != 0 {
             if sys.pit.counter == 0 {
@@ -3029,28 +3008,80 @@ impl Cpu {
         }
     }
 
-    /// Fast-forward the timers until a deliverable interrupt is latched — called
-    /// from `HLT` with interrupts enabled so the idle CPU resumes on the next
-    /// tick rather than re-executing `HLT` for millions of steps.
+    /// Advance the timers to the next armed deadline and latch its interrupt —
+    /// called from `HLT` with interrupts enabled. The wake time is computed from
+    /// the guest's *own* programmed timer counters (PIT channel-0, APIC-timer),
+    /// so it scales to any guest/HZ with no fixed iteration cap — the same O(1)
+    /// deadline-jump the riscv64 (`mtime = mtimecmp - 1`) and aarch64
+    /// (`counter = deadline - 1`) WFI paths use. No loop, no arbitrary bound.
     fn idle_until_interrupt(&mut self) {
-        // Reached only from `HLT` with interrupts enabled, so the CPU is
-        // interruptible — the periodic timers may advance toward the next tick.
-        for _ in 0..5_000_000u64 {
-            self.sys_tick(true);
-            if self.has_pending_interrupt() {
-                return;
+        let Some(sys) = self.sys.as_mut() else {
+            return;
+        };
+        // Decrements remaining until each armed periodic source fires (each source
+        // ticks once per `TIMER_DIV` emulator-steps in `sys_tick`).
+        let pit = (sys.pit.enabled && sys.pit.reload != 0).then(|| {
+            u64::from(if sys.pit.counter == 0 {
+                u32::from(sys.pit.reload)
+            } else {
+                sys.pit.counter
+            })
+        });
+        let apic = (sys.lapic.enabled()
+            && sys.lapic.initial_count != 0
+            && sys.lapic.lvt_timer & (1 << 16) == 0)
+            .then(|| {
+                u64::from(if sys.lapic.current_count == 0 {
+                    sys.lapic.initial_count
+                } else {
+                    sys.lapic.current_count
+                })
+            });
+        // No armed timer → nothing to fast-forward to; leave the CPU halted (the
+        // run loop keeps pumping devices/network and an external IRQ still wakes
+        // it), exactly as hardware idles until an interrupt.
+        let Some(ticks) = [pit, apic].into_iter().flatten().min() else {
+            return;
+        };
+        // Jump time forward by `ticks` decrements = `ticks * TIMER_DIV` steps,
+        // advancing the TSC at its locked ratio (64 per step), then fire the
+        // source(s) that reached the deadline and advance the rest — no iteration.
+        let steps = ticks.saturating_mul(TIMER_DIV);
+        sys.tsc = sys.tsc.wrapping_add(steps.saturating_mul(64));
+        sys.timer_div = sys.timer_div.wrapping_add(steps);
+        if sys.pit.ch2_gate && !sys.pit.ch2_out && sys.pit.ch2_counter > 0 {
+            if u64::from(sys.pit.ch2_counter) <= steps {
+                sys.pit.ch2_counter = 0;
+                sys.pit.ch2_out = true;
+            } else {
+                sys.pit.ch2_counter -= steps as u32;
             }
         }
-    }
-
-    /// Whether an interrupt is pending and deliverable (`RFLAGS.IF` set).
-    fn has_pending_interrupt(&self) -> bool {
-        if self.rflags & RFLAGS_IF == 0 {
-            return false;
+        if let Some(pt) = pit {
+            if pt == ticks {
+                sys.pic.raise(0);
+                if sys.pit.ch0_periodic {
+                    sys.pit.counter = u32::from(sys.pit.reload);
+                } else {
+                    sys.pit.counter = 0;
+                    sys.pit.enabled = false;
+                }
+            } else {
+                sys.pit.counter = (pt - ticks) as u32;
+            }
         }
-        self.sys
-            .as_ref()
-            .is_some_and(|s| s.lapic.pending_vector.is_some() || s.pic.pending().is_some())
+        if let Some(at) = apic {
+            if at == ticks {
+                sys.lapic.current_count = if sys.lapic.lvt_timer & (1 << 17) != 0 {
+                    sys.lapic.initial_count
+                } else {
+                    0
+                };
+                sys.lapic.pending_vector = Some((sys.lapic.lvt_timer & 0xff) as u8);
+            } else {
+                sys.lapic.current_count = (at - ticks) as u32;
+            }
+        }
     }
 
     /// Deliver a pending external interrupt through the IDT if `RFLAGS.IF` is set
@@ -3545,46 +3576,10 @@ impl Cpu {
     }
 
     /// The architected timestamp counter as `RDTSC`/`RDTSCP` observe it: the
-    /// monotonic platform `tsc` plus pseudo-random jitter on the low bits, and —
-    /// crucially — an *occasional small backward blip*.
-    ///
-    /// The kernel's jitterentropy power-up self-test (`jent_entropy_init`)
-    /// requires both timing entropy *and* at least one observed
-    /// "time went backwards" event before it will exit its calibration loop:
-    /// `for (i = 0; i < LOOPCOUNT || time_backwards == 0; i++)`. A perfectly
-    /// monotonic deterministic TSC drives `time_backwards` to stay zero, so the
-    /// loop never terminates — the boot wedged in `keccakf_round` right after
-    /// the 8250 console line, deep in `jent_entropy_init → jent_condition_data`.
-    /// Real CPUs see occasional apparent backward steps (cross-core TSC skew,
-    /// measurement noise); modelling that — one negative delta every few
-    /// hundred reads — lets the self-test complete. The base advances at the
-    /// fixed calibrated rate (TSC:PIT lockstep) and stays monotonic on average;
-    /// the kernel does not use the TSC as a clocksource here (it is marked
-    /// unstable — clocksource is `jiffies`), so the blips are harmless.
-    fn read_tsc(&mut self) -> u64 {
-        let s = self.sys_mut();
-        s.rng = s
-            .rng
-            .wrapping_mul(0x5851_f42d_4c95_7f2d)
-            .wrapping_add(0x1405_7b7e_f767_814f);
-        // Forward jitter (0..=255) on every read: varying per-read deltas, the
-        // timing entropy the collector measures.
-        s.tsc_jitter = s.tsc_jitter.wrapping_add((s.rng >> 56) & 0xff);
-        let base = s.tsc.wrapping_add(s.tsc_jitter);
-        // ~1 read in 256: return a value strictly below the *previous* read so
-        // the next measured delta is negative — the "time went backwards" event
-        // jent_entropy_init waits for, regardless of how far the base advanced
-        // between reads. (Computed off the last returned value, not the base,
-        // so the dip is guaranteed.) The base recovers on the following read.
-        let out = if (s.rng >> 48) & 0xff == 0 {
-            s.tsc_last_read
-                .wrapping_sub(((s.rng >> 32) & 0xff).wrapping_add(1))
-        } else {
-            // Keep monotonic w.r.t. the last read between blips.
-            base.max(s.tsc_last_read.wrapping_add(1))
-        };
-        s.tsc_last_read = out;
-        out
+    /// monotonic platform `tsc`, advancing at the fixed calibrated rate
+    /// (the TSC:PIT lockstep in `sys_tick`). Monotonic and jitter-free.
+    fn read_tsc(&self) -> u64 {
+        self.sys().tsc
     }
 
     /// `XADD`: exchange-and-add — the destination and source swap, then their sum
