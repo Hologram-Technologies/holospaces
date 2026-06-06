@@ -226,7 +226,43 @@ pub fn stream_ext4_image_bootable(
     disk_bytes: u64,
     emit: impl FnMut(u64, &[u8]),
 ) -> Result<ext4::ImageGeometry, AssemblyError> {
-    let mut tree = overlay_layers(layers)?;
+    let tree = overlay_layers(layers)?;
+    stream_tree_image(tree, init, disk_bytes, emit)
+}
+
+/// Like [`stream_ext4_image_bootable`], but the layers are **streamed one at a
+/// time** via `next_layer` (the [`overlay_layers_streamed`] contract) rather than
+/// borrowed all at once — so a peer can move each layer blob out of the store,
+/// overlay it, and drop it before fetching the next, never holding the whole layer
+/// stack nor the dense image. Byte-identical output to
+/// [`stream_ext4_image_bootable`] over the same stack (Law L1).
+///
+/// # Errors
+///
+/// [`AssemblyError`] if a layer does not decompress/overlay or the tree does not
+/// serialize.
+pub fn stream_ext4_image_bootable_streamed_layers<F>(
+    next_layer: F,
+    init: &[u8],
+    disk_bytes: u64,
+    emit: impl FnMut(u64, &[u8]),
+) -> Result<ext4::ImageGeometry, AssemblyError>
+where
+    F: FnMut() -> Result<Option<(String, Vec<u8>)>, AssemblyError>,
+{
+    let tree = overlay_layers_streamed(next_layer)?;
+    stream_tree_image(tree, init, disk_bytes, emit)
+}
+
+/// Inject `/init`, size the filesystem, and stream the overlaid `tree`'s sparse
+/// non-zero blocks to `emit` — the shared tail of the raw-stream bootable
+/// assemblers, byte-identical by construction (Law L1).
+fn stream_tree_image(
+    mut tree: Tree,
+    init: &[u8],
+    disk_bytes: u64,
+    emit: impl FnMut(u64, &[u8]),
+) -> Result<ext4::ImageGeometry, AssemblyError> {
     let id = tree.contents.keys().copied().max().map_or(0, |m| m + 1);
     tree.contents.insert(id, init.to_vec());
     insert_file_at(&mut tree.root, "init", 0o755, id);
@@ -265,9 +301,51 @@ pub fn stream_ext4_bootable_into_disk<'a>(
     init: &[u8],
     disk_bytes: u64,
 ) -> Result<crate::disk::KappaDisk<'a>, AssemblyError> {
+    let tree = overlay_layers(layers)?;
+    stream_tree_into_disk(store, sector_size, tree, init, disk_bytes)
+}
+
+/// Like [`stream_ext4_bootable_into_disk`], but the layers are **streamed one at a
+/// time** via `next_layer` (the same contract as [`overlay_layers_streamed`])
+/// rather than borrowed all at once. A peer ingesting an image into a κ-store can
+/// move each layer blob out of the store, overlay it, and drop it before fetching
+/// the next — so neither the whole layer stack nor the dense ext4 image is ever
+/// resident; peak working memory is one layer plus the assembler's content working
+/// set ("the KappaStore IS the memory, RAM is a cache", Laws L3/L4). The resulting
+/// κ-disk is byte-identical to [`stream_ext4_bootable_into_disk`] over the same
+/// stack (Law L1).
+///
+/// # Errors
+///
+/// [`AssemblyError`] if a layer does not decompress/overlay, the tree does not
+/// serialize, or the κ-disk rejects a streamed block.
+pub fn stream_ext4_bootable_into_disk_streamed_layers<'a, F>(
+    store: &'a dyn hologram_substrate_core::KappaStore,
+    sector_size: u32,
+    next_layer: F,
+    init: &[u8],
+    disk_bytes: u64,
+) -> Result<crate::disk::KappaDisk<'a>, AssemblyError>
+where
+    F: FnMut() -> Result<Option<(String, Vec<u8>)>, AssemblyError>,
+{
+    let tree = overlay_layers_streamed(next_layer)?;
+    stream_tree_into_disk(store, sector_size, tree, init, disk_bytes)
+}
+
+/// Inject `/init`, size the filesystem, serialize the overlaid `tree` into its
+/// sparse non-zero blocks, and stream those straight into a sized κ-disk over
+/// `store` — never materializing the dense image. Shared by the streaming
+/// bootable assemblers so they are byte-identical by construction (Law L1).
+fn stream_tree_into_disk<'a>(
+    store: &'a dyn hologram_substrate_core::KappaStore,
+    sector_size: u32,
+    mut tree: Tree,
+    init: &[u8],
+    disk_bytes: u64,
+) -> Result<crate::disk::KappaDisk<'a>, AssemblyError> {
     use crate::disk::KappaDisk;
 
-    let mut tree = overlay_layers(layers)?;
     let id = tree.contents.keys().copied().max().map_or(0, |m| m + 1);
     tree.contents.insert(id, init.to_vec());
     insert_file_at(&mut tree.root, "init", 0o755, id);
@@ -423,6 +501,36 @@ pub fn overlay_layers(layers: &[Layer]) -> Result<Tree, AssemblyError> {
     let mut builder = TreeBuilder::new();
     for layer in layers {
         let tar = decompress(layer)?;
+        builder.apply_layer(&tar)?;
+    }
+    Ok(builder.finish())
+}
+
+/// Overlay layers **streamed one at a time**, lowest first — the memory-bounded
+/// twin of [`overlay_layers`]. `next` is pulled repeatedly; each call returns the
+/// next layer's `(media_type, blob)` and `None` when the stack is exhausted.
+///
+/// Unlike [`overlay_layers`], which borrows every layer blob for the whole pass
+/// (the caller must hold them all at once), this consumes each layer in order and
+/// **drops its blob before the next is fetched** — so a peer can move each layer
+/// out of the store, overlay it, and free it, keeping peak working memory to a
+/// single layer plus the growing tree rather than every layer at once ("the
+/// KappaStore IS the memory, RAM is a cache", Laws L3/L4). The resulting tree is
+/// identical to [`overlay_layers`] over the same stack, so all downstream κ are
+/// unchanged (Law L1).
+pub fn overlay_layers_streamed<F>(mut next: F) -> Result<Tree, AssemblyError>
+where
+    F: FnMut() -> Result<Option<(String, Vec<u8>)>, AssemblyError>,
+{
+    let mut builder = TreeBuilder::new();
+    while let Some((media_type, blob)) = next()? {
+        let tar = decompress(&Layer {
+            media_type: &media_type,
+            blob: &blob,
+        })?;
+        // Drop the (possibly large) compressed blob before applying — only the
+        // decompressed tar and the tree are live across `apply_layer`.
+        drop(blob);
         builder.apply_layer(&tar)?;
     }
     Ok(builder.finish())
@@ -1085,6 +1193,58 @@ mod tests {
         };
         assert!(!children.contains_key("a"), "whiteout should remove a");
         assert!(children.contains_key("b"), "b should remain");
+    }
+
+    /// The streamed-layers overlay must produce the same tree — and therefore the
+    /// same image bytes — as the all-at-once overlay (Law L1: one canonical
+    /// serialization). This is the differential that lets a memory-bounded peer
+    /// pull layers one at a time without changing any downstream κ.
+    #[test]
+    fn streamed_layers_overlay_is_identical_to_all_at_once() {
+        let lower = make_tar(&[(b"a", b'0', b"", b"1"), (b"b", b'0', b"", b"2")]);
+        let upper = make_tar(&[(b".wh.a", b'0', b"", b""), (b"b", b'0', b"", b"two")]);
+        let stack: [(&str, &[u8]); 2] = [("tar", &lower), ("tar", &upper)];
+
+        let dense = assemble_ext4_bootable(
+            &stack
+                .iter()
+                .map(|(mt, b)| Layer {
+                    media_type: mt,
+                    blob: b,
+                })
+                .collect::<Vec<_>>(),
+            b"#!/bin/sh\n",
+            16 * 1024 * 1024,
+        )
+        .unwrap();
+
+        // Stream the same stack one layer at a time into a raw image (blocks placed
+        // over a zero buffer), then compare byte-for-byte.
+        let mut idx = 0usize;
+        let next = || -> Result<Option<(String, Vec<u8>)>, AssemblyError> {
+            if idx >= stack.len() {
+                return Ok(None);
+            }
+            let (mt, b) = stack[idx];
+            idx += 1;
+            Ok(Some((mt.to_string(), b.to_vec())))
+        };
+        let mut streamed = alloc::vec![0u8; dense.len()];
+        let geom = stream_ext4_image_bootable_streamed_layers(
+            next,
+            b"#!/bin/sh\n",
+            16 * 1024 * 1024,
+            |block_index, bytes| {
+                let off = (block_index * ext4::BLOCK_SIZE_BYTES as u64) as usize;
+                streamed[off..off + bytes.len()].copy_from_slice(bytes);
+            },
+        )
+        .unwrap();
+        assert_eq!(geom.image_len() as usize, dense.len(), "same image size");
+        assert_eq!(
+            streamed, dense,
+            "streamed-layers image equals the dense image"
+        );
     }
 
     /// A test tar entry: (name, typeflag, linkname, data).
