@@ -38,7 +38,7 @@ net = ["std", "dep:ureq", "dep:sha2"]
 # `cc44-trace` (off by default, dev-only) streams the x86-64 guest serial console
 # live to stderr and samples `rip`/TSC periodically — boot-progress visibility
 # for the CC-44 long-mode bring-up. Never enabled in CI or the default build.
-cc44-trace = []
+cc44-trace = ["std"]
 
 [dependencies]
 # The hologram substrate, consumed by reference (ADR-003, ADR-006). holospaces

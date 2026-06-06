@@ -1537,6 +1537,7 @@ impl Cpu {
         }
     }
 
+    #[cfg(feature = "std")]
     #[doc(hidden)]
     pub fn vv_dbg(&self, vaddr: u64) {
         let pml4 = self.cr3 & 0x000f_ffff_ffff_f000;
