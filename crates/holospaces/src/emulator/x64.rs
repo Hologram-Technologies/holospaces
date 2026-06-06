@@ -79,6 +79,11 @@ struct Uart {
     fcr: u8,
     /// The divisor latch (the configured baud rate; written when `DLAB` is set).
     divisor: u16,
+    /// Transmit-holding-register-empty interrupt pending (16550 THRE). Set on a
+    /// THR-empty transition (a `THR` write, or enabling `ETBEI` while empty),
+    /// CLEARED when the IIR is read — a one-shot per transition, not a level held
+    /// while `ETBEI` is set. (A level THRE re-fires the serial ISR forever.)
+    thre_pending: bool,
 }
 
 /// The shared platform the core drives: the console and the substrate devices —
@@ -169,6 +174,7 @@ impl Sys {
                 scratch: 0,
                 fcr: 0,
                 divisor: 1,
+                thre_pending: false,
             },
             virtio: None,
             virtio9p: None,
@@ -1415,6 +1421,7 @@ impl Cpu {
                 // IRQ4. Without this an interrupt-driven userspace tty write blocks
                 // forever waiting to transmit (the idle<->init boot livelock).
                 if sys.uart.ier & 0x02 != 0 {
+                    sys.uart.thre_pending = true;
                     sys.pic.raise(4);
                 }
             }
@@ -1423,9 +1430,13 @@ impl Cpu {
             }
             0x3f9 => {
                 sys.uart.ier = val;
-                // Enabling THRE ints (bit 1): TX is already empty -> raise now.
-                // Enabling RX ints (bit 0) with a byte waiting -> raise. COM1=IRQ4.
+                // Enabling ETBEI (bit 1) with an empty THR (always — we emit at
+                // once) asserts the one-shot THRE interrupt; enabling ERBFI (bit 0)
+                // with a byte waiting asserts RX. COM1 = IRQ4.
                 let dr = sys.uart.in_cursor < sys.uart.input.len();
+                if val & 0x02 != 0 {
+                    sys.uart.thre_pending = true;
+                }
                 if val & 0x02 != 0 || (val & 0x01 != 0 && dr) {
                     sys.pic.raise(4);
                 }
@@ -1563,7 +1574,11 @@ impl Cpu {
                     let dr = sys.uart.in_cursor < sys.uart.input.len();
                     let id = if sys.uart.ier & 0x01 != 0 && dr {
                         0x04
-                    } else if sys.uart.ier & 0x02 != 0 {
+                    } else if sys.uart.ier & 0x02 != 0 && sys.uart.thre_pending {
+                        // Reading the IIR clears the THRE interrupt (16550): it is a
+                        // one-shot per THR-empty transition, NOT a level held while
+                        // ETBEI is set — otherwise the serial ISR re-fires forever.
+                        sys.uart.thre_pending = false;
                         0x02
                     } else {
                         0x01
