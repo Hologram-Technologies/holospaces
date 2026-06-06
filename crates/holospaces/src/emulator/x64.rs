@@ -345,6 +345,20 @@ const VIRTIO_BLK_IRQ: u8 = 11;
 const VIRTIO_9P_IRQ: u8 = 10;
 const VIRTIO_NET_IRQ: u8 = 12;
 
+/// A direct-mapped software TLB entry: caches a virtual-page → physical-frame
+/// translation so a hot loop does not re-walk the 4-level page table on every
+/// access. `gen` is matched against [`Cpu::tlb_gen`], bumped (flushing the whole
+/// TLB) on a `CR0`/`CR3`/`CR4` write and `INVLPG` — the architected flush points.
+#[derive(Clone, Copy)]
+struct TlbEntry {
+    tag: u64,
+    frame: u64,
+    gen: u64,
+}
+
+/// Direct-mapped TLB sets, indexed by the virtual page number.
+const TLB_SETS: usize = 1024;
+
 /// The x86-64 long-mode integer core.
 pub struct Cpu {
     /// The 16 general-purpose registers (`rax`,`rcx`,`rdx`,`rbx`,`rsp`,`rbp`,
@@ -391,6 +405,9 @@ pub struct Cpu {
     /// vectors `#PF` (the kernel's early `do_early_exception` → `early_make_pgtable`
     /// lazily maps boot data through `early_top_pgt` exactly as on real hardware).
     fault: Option<PageFault>,
+    /// A direct-mapped software TLB over [`Cpu::translate_acc`] (see [`TlbEntry`]).
+    tlb: Vec<TlbEntry>,
+    tlb_gen: u64,
     sys: Option<Box<Sys>>,
 }
 
@@ -477,6 +494,15 @@ impl Cpu {
             rex_present: false,
             ram: vec![0u8; ram_bytes],
             fault: None,
+            tlb: vec![
+                TlbEntry {
+                    tag: 0,
+                    frame: 0,
+                    gen: 0
+                };
+                TLB_SETS
+            ],
+            tlb_gen: 1,
             sys: Some(Box::new(Sys::new())),
         }
     }
@@ -568,8 +594,32 @@ impl Cpu {
         if self.fault.is_some() {
             return 0; // a fault is already pending; do not double-latch
         }
+        // Fast path: the software TLB caches present translations so a hot loop
+        // does not re-walk the 4-level page table on every access (the dominant
+        // interpreter cost). It holds only successful (present) walks; a miss or a
+        // not-present page falls through to the full walk below.
+        let paging = self.paging();
+        if paging {
+            let page = vaddr & !0xfff;
+            let set = (page >> 12) as usize & (TLB_SETS - 1);
+            let e = self.tlb[set];
+            if e.gen == self.tlb_gen && e.tag == page {
+                return e.frame | (vaddr & 0xfff);
+            }
+        }
         match self.walk(vaddr) {
-            Ok(pa) => pa,
+            Ok(pa) => {
+                if paging {
+                    let page = vaddr & !0xfff;
+                    let set = (page >> 12) as usize & (TLB_SETS - 1);
+                    self.tlb[set] = TlbEntry {
+                        tag: page,
+                        frame: pa & !0xfff,
+                        gen: self.tlb_gen,
+                    };
+                }
+                pa
+            }
             Err(mut error) => {
                 if write {
                     error |= PF_ERR_WRITE;
@@ -581,6 +631,12 @@ impl Cpu {
                 0
             }
         }
+    }
+
+    /// Flush the whole software TLB (bump the generation) — the architected flush
+    /// on a `CR0`/`CR3`/`CR4` write and `INVLPG`.
+    fn flush_tlb(&mut self) {
+        self.tlb_gen = self.tlb_gen.wrapping_add(1);
     }
 
     /// Read control register `idx` (0/2/3/4; others read 0).
@@ -612,6 +668,11 @@ impl Cpu {
             3 => self.cr3 = val,
             4 => self.cr4 = val,
             _ => {}
+        }
+        // CR0 (PG/WP), CR3 (page-table root), CR4 (PAE/PGE/LA57) change the active
+        // mappings — flush the software TLB.
+        if matches!(idx, 0 | 3 | 4) {
+            self.flush_tlb();
         }
     }
 
@@ -3543,6 +3604,10 @@ impl Cpu {
                 let (base, limit) = self.sys().idtr;
                 self.wr(addr, 2, u64::from(limit));
                 self.wr(addr + 2, 8, base);
+            }
+            7 => {
+                // INVLPG — flush the software TLB (whole-TLB; correct if coarser).
+                self.flush_tlb();
             }
             _ => {}
         }
