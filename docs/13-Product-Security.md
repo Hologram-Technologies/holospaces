@@ -158,6 +158,30 @@ structure (it forwards bytes it cannot interpret). *Witness:*
 including bytes resembling frame opcodes or κ-content) is delivered byte-identical
 through the node.
 
+### SEC-8 — Resource bounds: untrusted input cannot exhaust a peer
+
+A malicious or buggy counterparty — a peer that forges a canonical κ/config, a
+guest that issues a malformed or oversized device request, a remote that floods
+connections — must not crash a holospaces peer or balloon its memory. Every
+allocation driven by untrusted input is **bounded by the actual payload or a
+fixed quota, never by a declared count**, and the substrate is the memory (the
+`KappaStore` backs the κ-disk; RAM holds only bounded caches; rootfs assembly is
+streamed, never materialized dense). *Enforced by:* peer-supplied
+`Vec::with_capacity` reservations bounded by the remaining payload
+(`realizations.rs`, `config.rs`); the `virtio-9p` workspace rejecting a
+count/body mismatch and bounding `offset+count` (checked arithmetic) against a
+per-workspace quota; the NAT's connection table bounded + idle-reaped with
+per-connection buffers capped behind a shrinking advertised window; the κ-disk
+read-through cache bounded (single-entry eviction); and ext4 assembly streamed
+into the `KappaStore` (no dense full-image buffer). *Witnesses:*
+`forged_huge_ref_count_errors_without_ballooning`,
+`forged_huge_directive_count_errors_without_ballooning`,
+`twrite_with_mismatched_count_errors_not_panics`,
+`twrite_at_huge_offset_is_quota_rejected`, `the_connection_table_is_bounded`,
+`from_guest_backpressure_shrinks_the_advertised_window`,
+`read_cache_is_bounded_and_never_corrupts_reads`,
+`streamed_layers_overlay_is_identical_to_all_at_once`.
+
 ## 13.6 The legacy-internet boundary (named, not wished away)
 
 The UOR-native properties hold **inside** the holospaces network. An egress
@@ -187,10 +211,11 @@ the far end observes what any legacy server observes of its own clients.
 
 | Adversary | Defeated by | Residual |
 |---|---|---|
-| Malicious peer / node (forge, tamper) | SEC-1 (re-derivation), SEC-7 (egress content-blind) | may withhold/delay (availability) |
+| Malicious peer / node (forge, tamper) | SEC-1 (re-derivation), SEC-7 (egress content-blind), SEC-8 (forged-count allocations bounded) | may withhold/delay (availability) |
 | Compromised cold-start gateway / CDN | SEC-1 (every byte re-derived on load) | availability only |
 | Passive observer / routing peer | SEC-5 (κ-as-capability; frame at Prism) | network metadata (timing/volume); legacy-internet destinations on the egress outside leg (§13.6) |
-| Malicious guest / holospace | SEC-2 (capabilities only attenuate) | resource use bounded by quota |
+| Malicious guest / holospace | SEC-2 (capabilities only attenuate), SEC-8 (9p quota + bounded device buffers) | resource use bounded by the workspace quota |
+| Resource exhaustion / DoS (oversized or forged input, connection flood) | SEC-8 (allocations bounded by payload/quota, NAT backpressure + bounded reaped table, streamed assembly) | throughput may degrade; the peer never crashes or OOMs |
 | Sybil / eclipse | SEC-1 holds regardless | availability/routing (substrate DHT, §13.9) |
 | Key thief | — | self-sovereign = self-responsible (key custody) |
 
@@ -202,7 +227,7 @@ each property so nothing is over-claimed:
 - **holospaces-enforced + witnessed here** (`CC-40`/`CC-39`): SEC-1 integrity,
   SEC-2 authority, SEC-3 dedup (idempotent + network-wide identity), SEC-4
   identity, SEC-5 κ-as-capability, SEC-6 reference resolution, SEC-7 egress
-  content-blindness.
+  content-blindness, SEC-8 resource bounds (DoS resistance).
 - **Substrate-inherited** (hologram conformance): the dense-matrix **structural**
   dedup (cost by unique structure, not bits), the **decreasing per-node resource
   floor**, and DHT eclipse/Sybil resistance. holospaces witnesses their
@@ -238,3 +263,4 @@ than a bolted-on check. A change that weakened any property would fail the gate.
 | SEC-5 | Confidentiality (κ-as-capability) | `sec_confidentiality_content_is_reachable_only_by_its_kappa` | `CC-40` |
 | SEC-6 | Reference resolution (verified vs κ) | `sec_reference_resolution_verifies_against_the_kappa_on_its_axis` | `CC-40` |
 | SEC-7 | Egress boundary (content-blind) | `the_egress_forwards_opaque_content_without_perceiving_it` | `CC-39` |
+| SEC-8 | Resource bounds (DoS resistance) | `forged_huge_ref_count_errors_without_ballooning`, `forged_huge_directive_count_errors_without_ballooning`, `twrite_with_mismatched_count_errors_not_panics`, `twrite_at_huge_offset_is_quota_rejected`, `the_connection_table_is_bounded`, `from_guest_backpressure_shrinks_the_advertised_window`, `read_cache_is_bounded_and_never_corrupts_reads`, `streamed_layers_overlay_is_identical_to_all_at_once` | Rust quality gate (lib tests) |
