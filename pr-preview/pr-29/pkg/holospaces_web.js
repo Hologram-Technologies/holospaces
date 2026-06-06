@@ -53,7 +53,8 @@ export class Aarch64Workspace {
      * Boot a provisioned arm64 image, **streaming** its κ-disk from OPFS (no full
      * image in RAM): `rootfs_handle` is the provisioned rootfs (read
      * sector-by-sector into the OPFS-backed store on `disk_handle`). Drive with
-     * [`run`](Aarch64Workspace::run), rendering [`terminal_delta`] between chunks.
+     * [`run`](Aarch64Workspace::run), rendering
+     * [`terminal_delta`](Aarch64Workspace::terminal_delta) between chunks.
      * @param {Uint8Array} kernel
      * @param {FileSystemSyncAccessHandle} rootfs_handle
      * @param {FileSystemSyncAccessHandle} disk_handle
@@ -231,6 +232,12 @@ if (Symbol.dispose) Aarch64Workspace.prototype[Symbol.dispose] = Aarch64Workspac
  * substrate runtime over the interpreter `ContainerEngine`.
  */
 export class Console {
+    static __wrap(ptr) {
+        const obj = Object.create(Console.prototype);
+        obj.__wbg_ptr = ptr;
+        ConsoleFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
     __destroy_into_raw() {
         const ptr = this.__wbg_ptr;
         this.__wbg_ptr = 0;
@@ -269,6 +276,62 @@ export class Console {
             return getStringFromWasm0(ptr2, len2);
         } finally {
             wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+        }
+    }
+    /**
+     * **Announce** to the peer that this node holds `kappa`, over the content
+     * network (`CC-38` `announce`). This queues a `KIND_ANNOUNCE` frame for the
+     * transport; the next [`cn_pump`](Self::cn_pump) carries it across the real
+     * WebRTC data channel to the peer. A deployed tab calls `cn_announce(κ)` then
+     * `cn_pump(link)` to advertise content it holds — the same `BareNetSync`
+     * `announce` a bare-metal peer drives, only the carrier differs (`CC-49`).
+     *
+     * The substrate's `announce` emits the frame without awaiting a reply, so the
+     * future settles immediately (the frame is then in the outbound queue); the
+     * transport pump moves it. No fabrication, no central operator.
+     * @param {string} kappa
+     */
+    cn_announce(kappa) {
+        const ptr0 = passStringToWasm0(kappa, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.console_cn_announce(this.__wbg_ptr, ptr0, len0);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+    /**
+     * **Discover** which κs the peer holds, over the content network (`CC-38`
+     * `discover`). This broadcasts a `KIND_DISCOVER_REQ` frame (queued for the
+     * transport) and returns a snapshot — as a JSON array of κ-strings — of the κs
+     * learned from peers' `KIND_DISCOVER_RES` replies so far. Because discovery is
+     * a round-trip, a deployed tab calls `cn_discover()` to send the request,
+     * `cn_pump(link)` (both peers) to carry the request and the reply across the
+     * real WebRTC data channel, then `cn_discover()` again to read the now-known
+     * holders. Re-issuing is idempotent: each call re-broadcasts and re-snapshots,
+     * so the witness loops it until a holder appears (or a deadline, fail-loud).
+     *
+     * This is the SAME `BareNetSync` `discover` a bare-metal peer drives; the
+     * WebRTC data channel only changes the carrier (`CC-49`). κs returned are
+     * hints (which peer to fetch from); the bytes themselves are still verified on
+     * receipt when fetched (Law L5) — discovery fabricates nothing.
+     * @returns {string}
+     */
+    cn_discover() {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const ret = wasm.console_cn_discover(this.__wbg_ptr);
+            var ptr1 = ret[0];
+            var len1 = ret[1];
+            if (ret[3]) {
+                ptr1 = 0; len1 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred2_0 = ptr1;
+            deferred2_1 = len1;
+            return getStringFromWasm0(ptr1, len1);
+        } finally {
+            wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
         }
     }
     /**
@@ -326,6 +389,40 @@ export class Console {
             wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
         }
         return v1;
+    }
+    /**
+     * **The product pump (CC-49).** Carry this peer's content-network frames
+     * across a real WebRTC data channel ([`WebRtcLink`]) to another browser peer:
+     * drain every frame this peer wants to transmit onto the channel
+     * ([`WebRtcLink::send`]) and deliver every frame the channel received from the
+     * peer into this peer ([`WebRtcLink::recv`] → [`cn_inbound`]). This is the
+     * browser surface's transport pump for the uor-native content network — the
+     * counterpart to a real NIC's RX/TX on bare metal — and it lives **in the
+     * product**, not the witness: a deployed tab calls `cn_fetch_start`, then
+     * `cn_pump(link)` + `cn_fetch_poll` as the channel signals readiness, and so
+     * fetches a κ from a peer over WebRTC entirely through this API.
+     *
+     * The pump moves only opaque frames; it never inspects content or addressing.
+     * Verify-on-receipt (SPINE-4 / Law L5) happens inside the content peer, so a
+     * forged response carried over the channel is rejected on re-derivation and a
+     * κ no peer holds resolves to nothing — the channel changes the carrier, not
+     * the law. While the channel is not yet open ([`WebRtcLink::is_open`]) there
+     * are no frames to move and this is a no-op.
+     *
+     * Returns the number of frames moved (outbound + inbound) — diagnostic only;
+     * the caller re-polls regardless until the fetch settles.
+     *
+     * [`cn_inbound`]: Self::cn_inbound
+     * @param {WebRtcLink} link
+     * @returns {number}
+     */
+    cn_pump(link) {
+        _assertClass(link, WebRtcLink);
+        const ret = wasm.console_cn_pump(this.__wbg_ptr, link.__wbg_ptr);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return ret[0] >>> 0;
     }
     /**
      * Publish bytes into this peer's content store so it can serve them to other
@@ -392,17 +489,18 @@ export class Console {
     /**
      * Witness the **uor-native content network in the browser** — the "browser
      * as a router" model (ADR-006; the substrate is the network). Two in-process
-     * peers are linked by a [`PacketLink`](netbare::PacketLink) pair (an
-     * in-process stand-in for a WebRTC data channel) and each wrapped in
-     * hologram's [`BareNetSync`] — the substrate's own `KappaSync` over the
+     * peers are linked by a [`PacketLink`](holospaces::content_net::PacketLink)
+     * pair (an in-process stand-in for a WebRTC data channel) and each wrapped in
+     * hologram's `BareNetSync` — the substrate's own `KappaSync` over the
      * `NetworkInterface` HAL. Peer B fetches content it does **not** hold from
      * peer A over the substrate frame protocol (`fetch`/`announce`/`discover`),
      * and the bytes are **verified by re-derivation on receipt** (SPINE-4)
      * before they are accepted — exactly as a bare-metal or std peer does it, no
      * central operator. Returns a JSON summary (the fetched content matched, an
      * unheld κ resolves to nothing — no forging). This exercises the real wasm
-     * peer's content-network path; the only browser-specific part still to bind
-     * is the WebRTC transport *pump* that carries a link's frames between tabs.
+     * peer's content-network path against an in-process link; the live
+     * browser-to-browser transport over a real WebRTC data channel is the product
+     * [`cn_pump`](Self::cn_pump) (`CC-49`), witnessed across two tabs.
      * @returns {string}
      */
     content_network_selftest() {
@@ -432,6 +530,23 @@ export class Console {
         this.__wbg_ptr = ret;
         ConsoleFinalization.register(this, this.__wbg_ptr, this);
         return this;
+    }
+    /**
+     * Open a **forging** browser peer — a malicious responder that answers every
+     * content-network fetch with `forged` bytes (which do not re-derive to the
+     * requested κ). It drives the SAME content-network seam (`cn_inbound` /
+     * `cn_outbound`) over the same transport, so a real WebRTC peer fetching from
+     * it receives a well-formed but forged response and **rejects it on receipt**
+     * (SPINE-4 / Law L5). This is the adversary the `CC-49` witness uses to prove
+     * a forging responder is refused — a genuine attacker, not a mock.
+     * @param {Uint8Array} forged
+     * @returns {Console}
+     */
+    static new_forging(forged) {
+        const ptr0 = passArray8ToWasm0(forged, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.console_new_forging(ptr0, len0);
+        return Console.__wrap(ret);
     }
     /**
      * Provision a holospace from a `.holo` compute artifact (the *holo-file*
@@ -506,7 +621,7 @@ export class Console {
      * L5) before it crosses into the peer here as `config_json`; when the
      * repository declares none, the page passes the **usable default** config
      * (`buildpack-deps` — `curl`/`git` over apt; the Dev Container spec's
-     * default, `CC-20`/[`import`]) so *any* repository runs. The `(repo,
+     * default, `CC-20`/`import`) so *any* repository runs. The `(repo,
      * reference, config, arch)` tuple is the [`Source::Devcontainer`], hence the
      * holospace's content-addressed identity (Law L1): the same repository at
      * the same reference under the same ISA is the **same** holospace
@@ -808,6 +923,36 @@ export class DevcontainerImage {
         return v1;
     }
     /**
+     * Assemble the **bootable** rootfs of [`Self::assemble_bootable`] **straight
+     * into an OPFS file**, sparse and streaming — the `CC-50` provisioning path
+     * that never materializes a dense in-RAM image. The content is identical to
+     * [`assemble_bootable`](Self::assemble_bootable) (the same overlay + injected
+     * [`DEVCONTAINER_INIT`](holospaces::machine::DEVCONTAINER_INIT) + `disk_bytes`
+     * sizing), but instead of returning a `Vec` sized to the whole disk it writes
+     * only the **non-zero 4 KiB blocks** to `rootfs_handle` at their byte offsets
+     * via the shared streaming serializer
+     * ([`stream_ext4_image_bootable`](holospaces::assembly::stream_ext4_image_bootable)) —
+     * the very primitive [`DevcontainerProvision::assemble_into_opfs`] uses. The
+     * file's free space stays sparse (zero on read); peak wasm heap tracks the
+     * image's *content*, not its declared size ("the KappaStore IS the memory, RAM
+     * is a cache", Laws L3/L4).
+     *
+     * Returns the total image length in bytes. The page then boots the file with
+     * [`boot_devcontainer_routed_opfs_streamed`](Workspace::boot_devcontainer_routed_opfs_streamed),
+     * which pages the disk sector-by-sector — so the streamed-into-OPFS image is
+     * what actually boots (not a dense image that merely shares its bytes).
+     * @param {FileSystemSyncAccessHandle} rootfs_handle
+     * @param {number} disk_bytes
+     * @returns {number}
+     */
+    assembleBootableIntoOpfs(rootfs_handle, disk_bytes) {
+        const ret = wasm.devcontainerimage_assembleBootableIntoOpfs(this.__wbg_ptr, rootfs_handle, disk_bytes);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return ret[0];
+    }
+    /**
      * Assemble the layers into a **bootable, interactive, writable** root
      * filesystem on a `disk_bytes`-sized disk: the same overlay as
      * [`Self::assemble`], plus the persistent devcontainer
@@ -850,7 +995,7 @@ if (Symbol.dispose) DevcontainerImage.prototype[Symbol.dispose] = DevcontainerIm
  * [`next_accept`](DevcontainerProvision::next_accept) /
  * [`next_bearer`](DevcontainerProvision::next_bearer), fetch through the router
  * extension's CORS-free `fetch`, and feed the response back with
- * [`deliver`](DevcontainerProvision::deliver); then [`assemble`] yields the
+ * [`deliver`](DevcontainerProvision::deliver); then `assemble` yields the
  * bootable rootfs. The pull is the *same* [`ImagePull`] the native importer uses
  * and re-derives every blob (Law L5) — only the transport differs.
  */
@@ -886,6 +1031,32 @@ export class DevcontainerProvision {
         var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
         wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
         return v1;
+    }
+    /**
+     * Assemble the bootable rootfs **straight into an OPFS file**, sparse and
+     * streaming — the `CC-50` provisioning path that never materializes a dense
+     * in-RAM image. Equivalent in content to [`assemble`](Self::assemble), but
+     * instead of returning a `Vec` sized to the whole (possibly multi-GiB) disk,
+     * it writes only the **non-zero 4 KiB blocks** to `rootfs_handle` at their
+     * byte offsets; the OPFS file's free space stays sparse (zero on read). Peak
+     * wasm heap tracks the image's *content*, not its declared size ("the
+     * KappaStore IS the memory, RAM is a cache", Laws L3/L4).
+     *
+     * Returns the total image length in bytes (a whole number of sectors). The
+     * page then boots from the file with
+     * [`boot_devcontainer_routed_opfs_streamed`](Workspace::boot_devcontainer_routed_opfs_streamed),
+     * which pages the disk sector-by-sector — so neither provisioning nor boot
+     * ever holds the whole image in RAM.
+     * @param {FileSystemSyncAccessHandle} rootfs_handle
+     * @param {number} disk_bytes
+     * @returns {number}
+     */
+    assembleIntoOpfs(rootfs_handle, disk_bytes) {
+        const ret = wasm.devcontainerprovision_assembleIntoOpfs(this.__wbg_ptr, rootfs_handle, disk_bytes);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return ret[0];
     }
     /**
      * Feed the router's response to the current fetch.
@@ -975,6 +1146,151 @@ export class DevcontainerProvision {
 if (Symbol.dispose) DevcontainerProvision.prototype[Symbol.dispose] = DevcontainerProvision.prototype.free;
 
 /**
+ * One end of a peer-to-peer content-network transport over a real WebRTC data
+ * channel — the browser surface's wire. It carries a [`Console`](crate::Console)'s
+ * content-network frames to and from another browser peer (no server between);
+ * the product pump [`Console::cn_pump`](crate::Console::cn_pump) couples it to
+ * the `BareNetSync`-driven `NetworkInterface`, so a deployed tab fetches over it.
+ */
+export class WebRtcLink {
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        WebRtcLinkFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_webrtclink_free(ptr, 0);
+    }
+    /**
+     * (Offerer) Accept the peer's answer SDP, completing the negotiation.
+     * @param {string} answer_sdp
+     * @returns {Promise<void>}
+     */
+    accept_answer(answer_sdp) {
+        const ptr0 = passStringToWasm0(answer_sdp, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.webrtclink_accept_answer(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    /**
+     * (Answerer) Accept the peer's offer SDP, set it remote, create the answer
+     * and set it local; returns the answer SDP to hand back to the peer.
+     * @param {string} offer_sdp
+     * @returns {Promise<string>}
+     */
+    accept_offer(offer_sdp) {
+        const ptr0 = passStringToWasm0(offer_sdp, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.webrtclink_accept_offer(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    /**
+     * Add a remote ICE candidate (the JSON the peer produced via
+     * [`take_ice`](Self::take_ice)) to this connection.
+     * @param {string} candidate_json
+     * @returns {Promise<void>}
+     */
+    add_ice(candidate_json) {
+        const ptr0 = passStringToWasm0(candidate_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.webrtclink_add_ice(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    /**
+     * Close the connection and its data channel.
+     */
+    close() {
+        wasm.webrtclink_close(this.__wbg_ptr);
+    }
+    /**
+     * (Offerer) Create the SDP offer and set it as the local description; returns
+     * the offer SDP to hand to the peer out of band (paste / existing peer).
+     * @returns {Promise<string>}
+     */
+    create_offer() {
+        const ret = wasm.webrtclink_create_offer(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * Whether the data channel is open and ready to carry frames.
+     * @returns {boolean}
+     */
+    is_open() {
+        const ret = wasm.webrtclink_is_open(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
+     * Open one end of a peer-to-peer link.
+     *
+     * `initiator` is the offerer: it creates the data channel and the SDP offer
+     * ([`create_offer`](Self::create_offer)). The other end is the answerer: it
+     * receives the channel via `ondatachannel` after
+     * [`accept_offer`](Self::accept_offer). Either end can then fetch from the
+     * other — the content network is symmetric, no client/server roles.
+     *
+     * With no `iceServers` configured the connection uses only **host
+     * candidates** (loopback / LAN) — sufficient for two peers reachable to each
+     * other directly, and entirely serverless. A deployment may add STUN/TURN for
+     * NAT traversal without changing this transport or the protocol it carries.
+     * @param {boolean} initiator
+     */
+    constructor(initiator) {
+        const ret = wasm.webrtclink_new(initiator);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        this.__wbg_ptr = ret[0];
+        WebRtcLinkFinalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+    /**
+     * Take the next content-network frame received from the peer over the data
+     * channel, or `undefined` if none is queued. The pump feeds each into a
+     * [`Console`](crate::Console)'s `cn_inbound`.
+     * @returns {Uint8Array | undefined}
+     */
+    recv() {
+        const ret = wasm.webrtclink_recv(this.__wbg_ptr);
+        let v1;
+        if (ret[0] !== 0) {
+            v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+            wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        }
+        return v1;
+    }
+    /**
+     * Send a content-network frame to the peer over the data channel. The pump
+     * drains a [`Console`](crate::Console)'s `cn_outbound` and sends each frame
+     * here. Returns an error if the channel is not yet open (the pump should wait
+     * for [`is_open`](Self::is_open)).
+     * @param {Uint8Array} frame
+     */
+    send(frame) {
+        const ptr0 = passArray8ToWasm0(frame, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.webrtclink_send(this.__wbg_ptr, ptr0, len0);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+    /**
+     * Drain the local ICE candidates gathered so far, as JSON strings to hand to
+     * the peer out of band. Call repeatedly while negotiating (candidates arrive
+     * over a few event-loop turns).
+     * @returns {any[]}
+     */
+    take_ice() {
+        const ret = wasm.webrtclink_take_ice(this.__wbg_ptr);
+        var v1 = getArrayJsValueFromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+        return v1;
+    }
+}
+if (Symbol.dispose) WebRtcLink.prototype[Symbol.dispose] = WebRtcLink.prototype.free;
+
+/**
  * A **workspace** over a running holospace, in the browser tab — the
  * Codespaces/Gitpod experience (ADR-009; `CC-9` + `CC-11`). The operator
  * launches a holospace whose code is the system emulator; it **boots a real
@@ -1030,7 +1346,7 @@ export class Workspace {
     }
     /**
      * Boot a **devcontainer** workspace: the Boot Orchestrator
-     * ([`MachineSpec`](holospaces::machine::MachineSpec)) generates the device
+     * ([`MachineSpec`]) generates the device
      * tree and boots `kernel` on a machine whose `virtio-blk` disk is the
      * assembled `rootfs` (from [`DevcontainerImage::assemble`]). The guest
      * kernel mounts the rootfs over `/dev/vda` and runs the devcontainer's real
@@ -1753,11 +2069,74 @@ function __wbg_get_imports() {
             getDataViewMemory0().setInt32(arg0 + 4 * 1, len1, true);
             getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr1, true);
         },
+        __wbg___wbindgen_is_function_754e9f305ff6029e: function(arg0) {
+            const ret = typeof(arg0) === 'function';
+            return ret;
+        },
+        __wbg___wbindgen_is_undefined_67b456be8673d3d7: function(arg0) {
+            const ret = arg0 === undefined;
+            return ret;
+        },
+        __wbg___wbindgen_number_get_9bb1761122181af2: function(arg0, arg1) {
+            const obj = arg1;
+            const ret = typeof(obj) === 'number' ? obj : undefined;
+            getDataViewMemory0().setFloat64(arg0 + 8 * 1, isLikeNone(ret) ? 0 : ret, true);
+            getDataViewMemory0().setInt32(arg0 + 4 * 0, !isLikeNone(ret), true);
+        },
+        __wbg___wbindgen_string_get_72bdf95d3ae505b1: function(arg0, arg1) {
+            const obj = arg1;
+            const ret = typeof(obj) === 'string' ? obj : undefined;
+            var ptr1 = isLikeNone(ret) ? 0 : passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            var len1 = WASM_VECTOR_LEN;
+            getDataViewMemory0().setInt32(arg0 + 4 * 1, len1, true);
+            getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr1, true);
+        },
         __wbg___wbindgen_throw_1506f2235d1bdba0: function(arg0, arg1) {
             throw new Error(getStringFromWasm0(arg0, arg1));
         },
         __wbg__wbg_cb_unref_61db23ac97f16c31: function(arg0) {
             arg0._wbg_cb_unref();
+        },
+        __wbg_addIceCandidate_610fa246adfe72e7: function(arg0, arg1) {
+            const ret = arg0.addIceCandidate(arg1);
+            return ret;
+        },
+        __wbg_call_9c758de292015997: function() { return handleError(function (arg0, arg1, arg2) {
+            const ret = arg0.call(arg1, arg2);
+            return ret;
+        }, arguments); },
+        __wbg_candidate_aec42b49d948326f: function(arg0, arg1) {
+            const ret = arg1.candidate;
+            const ptr1 = passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len1 = WASM_VECTOR_LEN;
+            getDataViewMemory0().setInt32(arg0 + 4 * 1, len1, true);
+            getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr1, true);
+        },
+        __wbg_candidate_fa2286979f14d982: function(arg0) {
+            const ret = arg0.candidate;
+            return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+        },
+        __wbg_channel_201dd300ab9cbf8c: function(arg0) {
+            const ret = arg0.channel;
+            return ret;
+        },
+        __wbg_close_46a302f048f55362: function(arg0) {
+            arg0.close();
+        },
+        __wbg_close_49c1a4313997f616: function(arg0) {
+            arg0.close();
+        },
+        __wbg_createAnswer_dc4ac39a2ad51630: function(arg0) {
+            const ret = arg0.createAnswer();
+            return ret;
+        },
+        __wbg_createDataChannel_91bd40e53ea00623: function(arg0, arg1, arg2, arg3) {
+            const ret = arg0.createDataChannel(getStringFromWasm0(arg1, arg2), arg3);
+            return ret;
+        },
+        __wbg_createOffer_308df5ff89c1d329: function(arg0) {
+            const ret = arg0.createOffer();
+            return ret;
         },
         __wbg_data_bd354b70c783c66e: function(arg0) {
             const ret = arg0.data;
@@ -1767,6 +2146,20 @@ function __wbg_get_imports() {
             const ret = arg0.getSize();
             return ret;
         }, arguments); },
+        __wbg_get_de6a0f7d4d18a304: function() { return handleError(function (arg0, arg1) {
+            const ret = Reflect.get(arg0, arg1);
+            return ret;
+        }, arguments); },
+        __wbg_instanceof_ArrayBuffer_8f49811467741499: function(arg0) {
+            let result;
+            try {
+                result = arg0 instanceof ArrayBuffer;
+            } catch (_) {
+                result = false;
+            }
+            const ret = result;
+            return ret;
+        },
         __wbg_length_4a591ecaa01354d9: function(arg0) {
             const ret = arg0.length;
             return ret;
@@ -1779,6 +2172,10 @@ function __wbg_get_imports() {
             const ret = new Object();
             return ret;
         },
+        __wbg_new_d1ee2ad725d13a92: function() { return handleError(function (arg0) {
+            const ret = new RTCIceCandidate(arg0);
+            return ret;
+        }, arguments); },
         __wbg_new_d7e476b433a26bea: function() { return handleError(function (arg0, arg1) {
             const ret = new WebSocket(getStringFromWasm0(arg0, arg1));
             return ret;
@@ -1787,15 +2184,78 @@ function __wbg_get_imports() {
             const ret = new Uint8Array(getArrayU8FromWasm0(arg0, arg1));
             return ret;
         },
+        __wbg_new_typed_bf31d18f92484486: function(arg0, arg1) {
+            try {
+                var state0 = {a: arg0, b: arg1};
+                var cb0 = (arg0, arg1) => {
+                    const a = state0.a;
+                    state0.a = 0;
+                    try {
+                        return wasm_bindgen__convert__closures_____invoke__h15e070fd36541a18(a, state0.b, arg0, arg1);
+                    } finally {
+                        state0.a = a;
+                    }
+                };
+                const ret = new Promise(cb0);
+                return ret;
+            } finally {
+                state0.a = 0;
+            }
+        },
+        __wbg_new_with_configuration_c5455bb5a1ffffaf: function() { return handleError(function (arg0) {
+            const ret = new RTCPeerConnection(arg0);
+            return ret;
+        }, arguments); },
+        __wbg_parse_03863847d06c4e89: function() { return handleError(function (arg0, arg1) {
+            const ret = JSON.parse(getStringFromWasm0(arg0, arg1));
+            return ret;
+        }, arguments); },
         __wbg_prototypesetcall_3249fc62a0fafa30: function(arg0, arg1, arg2) {
             Uint8Array.prototype.set.call(getArrayU8FromWasm0(arg0, arg1), arg2);
+        },
+        __wbg_queueMicrotask_35c611f4a14830b2: function(arg0) {
+            queueMicrotask(arg0);
+        },
+        __wbg_queueMicrotask_404ed0a58e0b63cc: function(arg0) {
+            const ret = arg0.queueMicrotask;
+            return ret;
         },
         __wbg_read_34a0958bcc273c55: function() { return handleError(function (arg0, arg1, arg2, arg3) {
             const ret = arg0.read(getArrayU8FromWasm0(arg1, arg2), arg3);
             return ret;
         }, arguments); },
+        __wbg_resolve_25a7e548d5881dca: function(arg0) {
+            const ret = Promise.resolve(arg0);
+            return ret;
+        },
+        __wbg_sdpMLineIndex_b339eae663ebd246: function(arg0) {
+            const ret = arg0.sdpMLineIndex;
+            return isLikeNone(ret) ? 0xFFFFFF : ret;
+        },
+        __wbg_sdpMid_cd81b900484c47ee: function(arg0, arg1) {
+            const ret = arg1.sdpMid;
+            var ptr1 = isLikeNone(ret) ? 0 : passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            var len1 = WASM_VECTOR_LEN;
+            getDataViewMemory0().setInt32(arg0 + 4 * 1, len1, true);
+            getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr1, true);
+        },
+        __wbg_send_251327178fa2f848: function() { return handleError(function (arg0, arg1, arg2) {
+            arg0.send(getArrayU8FromWasm0(arg1, arg2));
+        }, arguments); },
         __wbg_send_4a773f523104d75e: function() { return handleError(function (arg0, arg1, arg2) {
             arg0.send(getArrayU8FromWasm0(arg1, arg2));
+        }, arguments); },
+        __wbg_setLocalDescription_f1d8d5fcd90cb6d8: function(arg0, arg1) {
+            const ret = arg0.setLocalDescription(arg1);
+            return ret;
+        },
+        __wbg_setRemoteDescription_bb75c6d991a6f3e3: function(arg0, arg1) {
+            const ret = arg0.setRemoteDescription(arg1);
+            return ret;
+        },
+        __wbg_set_6e30c9374c26414c: function() { return handleError(function (arg0, arg1, arg2) {
+            const ret = Reflect.set(arg0, arg1, arg2);
+            return ret;
         }, arguments); },
         __wbg_set_at_5b6d1bf4f66bd626: function(arg0, arg1) {
             arg0.at = arg1;
@@ -1803,30 +2263,114 @@ function __wbg_get_imports() {
         __wbg_set_binaryType_41994c453b95bdd2: function(arg0, arg1) {
             arg0.binaryType = __wbindgen_enum_BinaryType[arg1];
         },
+        __wbg_set_binaryType_42788161dca49131: function(arg0, arg1) {
+            arg0.binaryType = __wbindgen_enum_RtcDataChannelType[arg1];
+        },
+        __wbg_set_candidate_29e350f13594b788: function(arg0, arg1, arg2) {
+            arg0.candidate = getStringFromWasm0(arg1, arg2);
+        },
         __wbg_set_onclose_13787fb31ae8aefd: function(arg0, arg1) {
             arg0.onclose = arg1;
+        },
+        __wbg_set_ondatachannel_a587d1ab2beb980c: function(arg0, arg1) {
+            arg0.ondatachannel = arg1;
+        },
+        __wbg_set_onicecandidate_93c856dfffcdf353: function(arg0, arg1) {
+            arg0.onicecandidate = arg1;
+        },
+        __wbg_set_onmessage_037145d00ca09471: function(arg0, arg1) {
+            arg0.onmessage = arg1;
         },
         __wbg_set_onmessage_9c6b4cb14e244b7f: function(arg0, arg1) {
             arg0.onmessage = arg1;
         },
+        __wbg_set_onopen_86348bf9ecce6b54: function(arg0, arg1) {
+            arg0.onopen = arg1;
+        },
         __wbg_set_onopen_db452f4233e99d7d: function(arg0, arg1) {
             arg0.onopen = arg1;
         },
+        __wbg_set_ordered_71f6573f0cd09889: function(arg0, arg1) {
+            arg0.ordered = arg1 !== 0;
+        },
+        __wbg_set_sdp_e84e01261ff10019: function(arg0, arg1, arg2) {
+            arg0.sdp = getStringFromWasm0(arg1, arg2);
+        },
+        __wbg_set_sdp_m_line_index_fb131dda6ec31caf: function(arg0, arg1) {
+            arg0.sdpMLineIndex = arg1 === 0xFFFFFF ? undefined : arg1;
+        },
+        __wbg_set_sdp_mid_4dfe66538ecfac76: function(arg0, arg1, arg2) {
+            arg0.sdpMid = arg1 === 0 ? undefined : getStringFromWasm0(arg1, arg2);
+        },
+        __wbg_set_type_ea82b7fc95b450a7: function(arg0, arg1) {
+            arg0.type = __wbindgen_enum_RtcSdpType[arg1];
+        },
+        __wbg_static_accessor_GLOBAL_9d53f2689e622ca1: function() {
+            const ret = typeof global === 'undefined' ? null : global;
+            return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+        },
+        __wbg_static_accessor_GLOBAL_THIS_a1a35cec07001a8a: function() {
+            const ret = typeof globalThis === 'undefined' ? null : globalThis;
+            return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+        },
+        __wbg_static_accessor_SELF_4c59f6c7ea29a144: function() {
+            const ret = typeof self === 'undefined' ? null : self;
+            return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+        },
+        __wbg_static_accessor_WINDOW_e70ae9f2eb052253: function() {
+            const ret = typeof window === 'undefined' ? null : window;
+            return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+        },
+        __wbg_stringify_8286df6dcc591521: function() { return handleError(function (arg0) {
+            const ret = JSON.stringify(arg0);
+            return ret;
+        }, arguments); },
+        __wbg_then_18f476d590e58992: function(arg0, arg1, arg2) {
+            const ret = arg0.then(arg1, arg2);
+            return ret;
+        },
+        __wbg_then_ac7b025999b52837: function(arg0, arg1) {
+            const ret = arg0.then(arg1);
+            return ret;
+        },
+        __wbg_truncate_6b32a1fa508f5f05: function() { return handleError(function (arg0, arg1) {
+            arg0.truncate(arg1);
+        }, arguments); },
         __wbg_write_948386f6a5cf303f: function() { return handleError(function (arg0, arg1, arg2, arg3) {
             const ret = arg0.write(getArrayU8FromWasm0(arg1, arg2), arg3);
             return ret;
         }, arguments); },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 8, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h71bffd0d1851400e);
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 12, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h4aecbb93981a4764);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 8, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h71bffd0d1851400e_1);
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 6, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__he3db6f405dd0e0d2);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 12, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h4aecbb93981a4764_2);
+            return ret;
+        },
+        __wbindgen_cast_0000000000000004: function(arg0, arg1) {
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCDataChannelEvent")], shim_idx: 12, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h4aecbb93981a4764_3);
+            return ret;
+        },
+        __wbindgen_cast_0000000000000005: function(arg0, arg1) {
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCPeerConnectionIceEvent")], shim_idx: 12, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h4aecbb93981a4764_4);
+            return ret;
+        },
+        __wbindgen_cast_0000000000000006: function(arg0) {
+            // Cast intrinsic for `F64 -> Externref`.
+            const ret = arg0;
+            return ret;
+        },
+        __wbindgen_cast_0000000000000007: function(arg0, arg1) {
             // Cast intrinsic for `Ref(String) -> Externref`.
             const ret = getStringFromWasm0(arg0, arg1);
             return ret;
@@ -1847,16 +2391,41 @@ function __wbg_get_imports() {
     };
 }
 
-function wasm_bindgen__convert__closures_____invoke__h71bffd0d1851400e(arg0, arg1, arg2) {
-    wasm.wasm_bindgen__convert__closures_____invoke__h71bffd0d1851400e(arg0, arg1, arg2);
+function wasm_bindgen__convert__closures_____invoke__h4aecbb93981a4764(arg0, arg1, arg2) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h4aecbb93981a4764(arg0, arg1, arg2);
 }
 
-function wasm_bindgen__convert__closures_____invoke__h71bffd0d1851400e_1(arg0, arg1, arg2) {
-    wasm.wasm_bindgen__convert__closures_____invoke__h71bffd0d1851400e_1(arg0, arg1, arg2);
+function wasm_bindgen__convert__closures_____invoke__h4aecbb93981a4764_2(arg0, arg1, arg2) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h4aecbb93981a4764_2(arg0, arg1, arg2);
+}
+
+function wasm_bindgen__convert__closures_____invoke__h4aecbb93981a4764_3(arg0, arg1, arg2) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h4aecbb93981a4764_3(arg0, arg1, arg2);
+}
+
+function wasm_bindgen__convert__closures_____invoke__h4aecbb93981a4764_4(arg0, arg1, arg2) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h4aecbb93981a4764_4(arg0, arg1, arg2);
+}
+
+function wasm_bindgen__convert__closures_____invoke__he3db6f405dd0e0d2(arg0, arg1, arg2) {
+    const ret = wasm.wasm_bindgen__convert__closures_____invoke__he3db6f405dd0e0d2(arg0, arg1, arg2);
+    if (ret[1]) {
+        throw takeFromExternrefTable0(ret[0]);
+    }
+}
+
+function wasm_bindgen__convert__closures_____invoke__h15e070fd36541a18(arg0, arg1, arg2, arg3) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h15e070fd36541a18(arg0, arg1, arg2, arg3);
 }
 
 
 const __wbindgen_enum_BinaryType = ["blob", "arraybuffer"];
+
+
+const __wbindgen_enum_RtcDataChannelType = ["arraybuffer", "blob"];
+
+
+const __wbindgen_enum_RtcSdpType = ["offer", "pranswer", "answer", "rollback"];
 const Aarch64WorkspaceFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_aarch64workspace_free(ptr, 1));
@@ -1869,6 +2438,9 @@ const DevcontainerImageFinalization = (typeof FinalizationRegistry === 'undefine
 const DevcontainerProvisionFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_devcontainerprovision_free(ptr, 1));
+const WebRtcLinkFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_webrtclink_free(ptr, 1));
 const WorkspaceFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_workspace_free(ptr, 1));
@@ -1877,6 +2449,12 @@ function addToExternrefTable0(obj) {
     const idx = wasm.__externref_table_alloc();
     wasm.__wbindgen_externrefs.set(idx, obj);
     return idx;
+}
+
+function _assertClass(instance, klass) {
+    if (!(instance instanceof klass)) {
+        throw new Error(`expected instance of ${klass.name}`);
+    }
 }
 
 const CLOSURE_DTORS = (typeof FinalizationRegistry === 'undefined')
@@ -1991,6 +2569,10 @@ function handleError(f, args) {
         const idx = addToExternrefTable0(e);
         wasm.__wbindgen_exn_store(idx);
     }
+}
+
+function isLikeNone(x) {
+    return x === undefined || x === null;
 }
 
 function makeMutClosure(arg0, arg1, f) {
