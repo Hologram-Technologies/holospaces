@@ -1427,7 +1427,9 @@ impl Cpu {
             0x080 => l.tpr = val,
             0x0b0 => l.pending_vector = None, // EOI
             0x0f0 => l.svr = val,
-            0x320 => l.lvt_timer = val,
+            0x320 => {
+                l.lvt_timer = val;
+            }
             0x380 => {
                 l.initial_count = val;
                 l.current_count = val;
@@ -2861,10 +2863,32 @@ impl Cpu {
         // thousands of instructions of headroom between ticks. The guest still sees
         // a coherent HZ; only the host step:wall ratio changes.
         sys.timer_div = sys.timer_div.wrapping_add(1);
+        // The TSC and the PIT channel-2 calibration one-shot advance on *every*
+        // step (un-stretched), at the locked TSC:PIT ratio (TSC += 64 per PIT
+        // tick). Calibration (`pit_hpet_ptimer_calibrate_cpu`, `quick_pit_calibrate`)
+        // busy-polls `IN 0x61` bit 5 (channel-2 OUT2) for at most ~1000 iterations
+        // before giving up; if channel 2 were stretched by `TIMER_DIV` it could not
+        // expire inside that budget and the kernel would loop refining the TSC
+        // forever (#12 — the boot wedged in `tsc_refine_calibration_work`). The
+        // measured frequency stays self-consistent because TSC and channel 2 move
+        // together regardless of the host step:wall ratio.
+        sys.tsc = sys.tsc.wrapping_add(64);
+        // PIT channel 2 — the TSC-calibration one-shot. While gated, count down
+        // to zero, then latch OUT2 (the calibration loop's wait condition).
+        if sys.pit.ch2_gate && !sys.pit.ch2_out && sys.pit.ch2_counter > 0 {
+            sys.pit.ch2_counter = sys.pit.ch2_counter.saturating_sub(1);
+            if sys.pit.ch2_counter == 0 {
+                sys.pit.ch2_out = true;
+            }
+        }
+        // The periodic *IRQ* sources (PIT channel-0 IRQ0, APIC-timer LVT) are paced
+        // slower — once every `TIMER_DIV` steps — so the kernel's HZ tick handler
+        // (`tick_periodic` → scheduler / timekeeping / RCU / hrtimers, several
+        // thousand instructions) does not drown the boot in back-to-back interrupts
+        // (the "timer storm"). The guest still sees a coherent HZ.
         if sys.timer_div % TIMER_DIV != 0 {
             return;
         }
-        sys.tsc = sys.tsc.wrapping_add(64);
         // The 8254 PIT channel-0 down-counter.
         if sys.pit.enabled && sys.pit.reload != 0 {
             if sys.pit.counter == 0 {
@@ -2880,14 +2904,6 @@ impl Cpu {
                     // deadline (the next `OUT 0x40` re-arms `enabled`/`counter`).
                     sys.pit.enabled = false;
                 }
-            }
-        }
-        // PIT channel 2 — the TSC-calibration one-shot. While gated, count down
-        // to zero, then latch OUT2 (the calibration loop's wait condition).
-        if sys.pit.ch2_gate && !sys.pit.ch2_out && sys.pit.ch2_counter > 0 {
-            sys.pit.ch2_counter = sys.pit.ch2_counter.saturating_sub(1);
-            if sys.pit.ch2_counter == 0 {
-                sys.pit.ch2_out = true;
             }
         }
         // The local-APIC timer.
@@ -2976,6 +2992,21 @@ impl Cpu {
         let hi = self.rd_virt(desc + 8, 8);
         let off = (lo & 0xffff) | ((lo >> 32) & 0xffff_0000) | ((hi & 0xffff_ffff) << 32);
         let ist = (lo >> 32) & 0x7;
+        // dev-only (`cc44-trace`): log CPU-exception vectors (< 32) as they vector
+        // through the IDT — the fault type + faulting RIP + CR2 + target handler.
+        // External IRQs (≥ 32) are omitted: they fire thousands of times per boot.
+        #[cfg(feature = "cc44-trace")]
+        if vector < 32 {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "\n[cc44-trace] VECTOR={vector} err={error:#x} from rip={:#x} cr2={:#x} -> handler={off:#x} ist={ist} rsp={:#x} if={}",
+                self.rip,
+                self.cr2,
+                self.r[RSP],
+                self.rflags & RFLAGS_IF != 0,
+            );
+        }
         let old_cs = self.seg[SegId::Cs as usize].selector;
         let old_ss = self.seg[SegId::Ss as usize].selector;
         let old_rsp = self.r[RSP];
