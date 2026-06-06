@@ -3,10 +3,10 @@
 /**
  * **The browser peer's AArch64 holospace** — a real arm64 devcontainer booted on
  * the [AArch64 core](holospaces::emulator::aarch64) (`CC-36`), its κ-disk paged
- * from OPFS (the same substrate as the RISC-V [`Workspace`]). Complete for boot +
- * terminal; the AArch64 core's net/9p parity (router egress, the 9p workspace) is
- * the continued build, so this surface exposes only what the core does today —
- * nothing it cannot fulfil.
+ * from OPFS (the same substrate as the RISC-V [`Workspace`]). The AArch64 core
+ * reaches the **shared** `emulator::devbus` for the 9p workspace, the network
+ * (router egress), and the in-process guest bridge (`CC-46`) — the same device
+ * surface the RISC-V [`Workspace`] exposes, here over the GIC transport.
  */
 export class Aarch64Workspace {
     static __wrap(ptr) {
@@ -24,6 +24,30 @@ export class Aarch64Workspace {
     free() {
         const ptr = this.__destroy_into_raw();
         wasm.__wbg_aarch64workspace_free(ptr, 0);
+    }
+    /**
+     * Boot like [`boot_devcontainer_opfs_streamed`](Aarch64Workspace::boot_devcontainer_opfs_streamed),
+     * additionally attaching the **shared workspace filesystem** (`virtio-9p`,
+     * `CC-15`/`CC-46`), a **router-backed network** (`virtio-net` + the userspace
+     * NAT, carried over the egress protocol — `CC-16`/`CC-46`), and the
+     * **in-process guest bridge** (`CC-33`/`CC-46`). The editor shares files with
+     * the OS ([`workspace_file`](Aarch64Workspace::workspace_file)/[`workspace_write`](Aarch64Workspace::workspace_write)),
+     * the page carries the guest's egress to the router, and the workbench can
+     * [`dial_guest`](Aarch64Workspace::dial_guest) a server inside the
+     * devcontainer — the full shared-devbus surface the RISC-V workspace exposes.
+     * @param {Uint8Array} kernel
+     * @param {FileSystemSyncAccessHandle} rootfs_handle
+     * @param {FileSystemSyncAccessHandle} disk_handle
+     * @returns {Aarch64Workspace}
+     */
+    static boot_devcontainer_opfs_full(kernel, rootfs_handle, disk_handle) {
+        const ptr0 = passArray8ToWasm0(kernel, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.aarch64workspace_boot_devcontainer_opfs_full(ptr0, len0, rootfs_handle, disk_handle);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return Aarch64Workspace.__wrap(ret[0]);
     }
     /**
      * Boot a provisioned arm64 image, **streaming** its κ-disk from OPFS (no full
@@ -46,6 +70,41 @@ export class Aarch64Workspace {
         return Aarch64Workspace.__wrap(ret[0]);
     }
     /**
+     * Dial an in-process connection to a server inside the devcontainer over the
+     * loopback bridge (`CC-33`/`CC-46`). `None` if not a `*_full` boot.
+     * @param {number} guest_port
+     * @returns {number | undefined}
+     */
+    dial_guest(guest_port) {
+        const ret = wasm.aarch64workspace_dial_guest(this.__wbg_ptr, guest_port);
+        return ret === Number.MAX_SAFE_INTEGER ? undefined : ret;
+    }
+    /**
+     * Deliver an egress frame the router returned into the guest's network. A
+     * no-op when this is not a `*_full` boot.
+     * @param {Uint8Array} frame
+     */
+    egress_inbound(frame) {
+        const ptr0 = passArray8ToWasm0(frame, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.aarch64workspace_egress_inbound(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * Drain the next egress frame the guest produced, for the page to carry to
+     * the router (`CC-46` net parity). `undefined` when none is queued (or this
+     * is not a `*_full` boot).
+     * @returns {Uint8Array | undefined}
+     */
+    egress_outbound() {
+        const ret = wasm.aarch64workspace_egress_outbound(this.__wbg_ptr);
+        let v1;
+        if (ret[0] !== 0) {
+            v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+            wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        }
+        return v1;
+    }
+    /**
      * Feed keystrokes to the guest's serial console.
      * @param {Uint8Array} bytes
      */
@@ -53,6 +112,43 @@ export class Aarch64Workspace {
         const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
         const len0 = WASM_VECTOR_LEN;
         wasm.aarch64workspace_feed_input(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * Close the host side of a loopback connection (`CC-33`).
+     * @param {number} id
+     */
+    guest_close(id) {
+        wasm.aarch64workspace_guest_close(this.__wbg_ptr, id);
+    }
+    /**
+     * Whether a loopback connection is still usable (`CC-33`).
+     * @param {number} id
+     * @returns {boolean}
+     */
+    guest_is_open(id) {
+        const ret = wasm.aarch64workspace_guest_is_open(this.__wbg_ptr, id);
+        return ret !== 0;
+    }
+    /**
+     * Drain the guest server's reply bytes on a loopback connection (`CC-33`).
+     * @param {number} id
+     * @returns {Uint8Array}
+     */
+    guest_recv(id) {
+        const ret = wasm.aarch64workspace_guest_recv(this.__wbg_ptr, id);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
+     * Write bytes toward the guest server on a loopback connection (`CC-33`).
+     * @param {number} id
+     * @param {Uint8Array} data
+     */
+    guest_send(id, data) {
+        const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.aarch64workspace_guest_send(this.__wbg_ptr, id, ptr0, len0);
     }
     /**
      * Whether the machine has powered off.
@@ -97,6 +193,36 @@ export class Aarch64Workspace {
         var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
         wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
         return v1;
+    }
+    /**
+     * Read a file from the shared workspace — how the editor observes the OS's
+     * edits over `virtio-9p` (`CC-15`/`CC-46`). `undefined` if absent / no 9p.
+     * @param {string} name
+     * @returns {Uint8Array | undefined}
+     */
+    workspace_file(name) {
+        const ptr0 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.aarch64workspace_workspace_file(this.__wbg_ptr, ptr0, len0);
+        let v2;
+        if (ret[0] !== 0) {
+            v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+            wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        }
+        return v2;
+    }
+    /**
+     * Write a file into the shared workspace — the editor saving content the OS
+     * reads over `virtio-9p` (one content, Law L1; `CC-15`/`CC-46`).
+     * @param {string} name
+     * @param {Uint8Array} data
+     */
+    workspace_write(name, data) {
+        const ptr0 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+        const len1 = WASM_VECTOR_LEN;
+        wasm.aarch64workspace_workspace_write(this.__wbg_ptr, ptr0, len0, ptr1, len1);
     }
 }
 if (Symbol.dispose) Aarch64Workspace.prototype[Symbol.dispose] = Aarch64Workspace.prototype.free;
