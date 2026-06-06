@@ -1,0 +1,58 @@
+Intel SDM — the x86-64 architectural authority for the holospaces x86-64 core.
+
+The Intel® 64 and IA-32 Architectures Software Developer's Manual (SDM) is the
+published, authoritative specification of the x86-64 processor architecture. It is
+the *API the holospaces x86-64 core is built against*: the core's instruction
+semantics (CC-43) conform to Volume 2, and its privileged behavior — long-mode
+paging, the local APIC and APIC timer, exception/interrupt delivery and the IDT,
+the 8259-via-LINT0 "virtual wire" mode, and `RDTSC`/`IA32_TSC` — conforms to
+Volume 3. This is the spec, distinct from and prior to the differential oracle
+(`qemu-system-x86_64`): the oracle shows *a* correct trace, the SDM defines *the*
+required behavior, so the emulator is implemented to the document, not reverse-
+engineered from a reference run.
+
+Imported, content-addressed, verified on import (PROVENANCE.md). Intel's PDF is
+copyrighted and NOT redistributed in-tree — like the Structurizr import, `fetch.sh`
+downloads it from Intel's versioned CDN and verifies it against the committed
+sha256 pin (`intel-sdm.sha256`). A drift in the upstream document changes the
+sha256 and fails the check.
+
+Pins
+  Authority : Intel® 64 and IA-32 Architectures Software Developer's Manual
+  Landing   : https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
+  Vol 3A    : System Programming Guide, Part 1 (Intel doc 253668)
+              https://cdrdv2-public.intel.com/812386/253668-sdm-vol-3a.pdf
+              sha256 60942ad6a4bc4b820afec0ab0d9d0d19c17f5d84906d663685809f47be6b309e
+              Chapters used as the authority for the x86-64 system core:
+                - Paging (4-level long-mode translation; CR0/CR3/CR4, PCID)
+                - Advanced Programmable Interrupt Controller (APIC):
+                  local APIC registers, the APIC timer (one-shot/periodic/
+                  TSC-deadline), the LVT, local-interrupt acceptance, EOI,
+                  and the IRR/ISR priority model
+                - 8259A interaction and the "virtual wire" mode (LINT0/LINT1)
+                - Interrupt & exception handling, the 64-bit IDT, the TSS/IST
+                - Time-Stamp Counter (`RDTSC`, `IA32_TSC`)
+  Vol 2     : Instruction Set Reference, A–Z (Intel doc 325383) — the authority
+              for CC-43 instruction semantics. Fetch the current revision from the
+              landing page above; pin alongside Vol 3A when added.
+  Vol 1     : Basic Architecture (Intel doc 253665) — the register/operand model.
+
+Used by
+  CC-43  x86-64 core (instruction conformance) ........ SDM Vol 2 (+ Vol 1)
+  CC-44  amd64 Linux boots to userspace ............... SDM Vol 3A (system) + Vol 2
+  CC-45  x86-64 devcontainer .......................... SDM Vol 3A (system)
+External validator / witness (required: a spec is never validated by self-reference)
+  The SDM is the *specification*; its **external validator** is
+  **`qemu-system-x86_64`** — an independent reference implementation of the same
+  architecture. The witnesses run the emulator against it, never against the
+  emulator's own output:
+    - CC-44 (`tests/cc44_x64_boot.rs`): a real Linux boots to userspace on the
+      core **byte-identically to `qemu-system-x86_64`** on the same kernel
+      (`vv/artifacts/cc44/linux/expected-userspace.txt`, re-derived live from qemu
+      whenever it is present, so the oracle is never stale). The boot exercises the
+      SDM behaviors above (paging, the APIC timer + interrupt delivery, the IDT,
+      instruction semantics) end to end.
+    - CC-43 (the core): instruction semantics witnessed against the SDM Vol 2 /
+      the reference machine.
+  qemu is invoked when present (as the other cores' oracles are — e.g. CC-14/15/16
+  use `qemu-system-riscv64`); the verified version here is qemu 8.2.2.
