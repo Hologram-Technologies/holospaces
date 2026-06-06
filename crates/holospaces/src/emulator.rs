@@ -977,7 +977,16 @@ mod ninep {
     const DT_REG: u8 = 8;
     // errno values the backend returns.
     const ENOENT: u32 = 2;
+    const EINVAL: u32 = 22;
+    const EFBIG: u32 = 27;
+    const ENOSPC: u32 = 28;
     const EOPNOTSUPP: u32 = 95;
+
+    /// Per-workspace byte quota for the 9p backend. A guest `Twrite` may not grow
+    /// the workspace beyond this; a single write whose `offset + count` exceeds it
+    /// is rejected (`EFBIG`/`ENOSPC`) rather than letting a guest-controlled
+    /// offset balloon host RAM by resizing an inode's backing `Vec`.
+    const WORKSPACE_QUOTA_BYTES: usize = 1usize << 30; // 1 GiB
 
     /// A backend inode: a directory (name → child inode) or a file (bytes).
     struct Inode {
@@ -1007,6 +1016,15 @@ mod ninep {
                 },
             );
             Fs9p { inodes, next: 2 }
+        }
+
+        /// Total bytes backing all file inodes — the live workspace footprint a
+        /// guest `Twrite` is bounded against ([`WORKSPACE_QUOTA_BYTES`]).
+        fn total_bytes(&self) -> usize {
+            self.inodes
+                .values()
+                .map(|n| n.data.len())
+                .fold(0usize, |a, b| a.saturating_add(b))
         }
 
         /// Seed a regular file `name` in the root with `data` — content
@@ -1467,11 +1485,33 @@ mod ninep {
                 let Some(&id) = fids.get(&fid) else {
                     return rlerror(tag, ENOENT);
                 };
+                // The reader returns the actual body slice (empty on a truncated
+                // message). A declared `count` that disagrees with the body length
+                // is a malformed frame: reject it instead of panicking in
+                // `copy_from_slice`, which would crash the guest's tab.
+                if data.len() != count {
+                    return rlerror(tag, EINVAL);
+                }
+                // `offset` is guest-controlled; a sparse write at a huge offset
+                // would resize the inode's backing Vec and balloon host RAM. Bound
+                // the resulting size with checked arithmetic (no wasm32 overflow)
+                // against the per-workspace quota, accounting for the growth this
+                // write would add beyond the inode's current length.
+                let Some(end) = offset.checked_add(count) else {
+                    return rlerror(tag, EFBIG);
+                };
+                let cur_len = fs.inodes.get(&id).map(|n| n.data.len()).unwrap_or(0);
+                let growth = end.saturating_sub(cur_len);
+                if end > WORKSPACE_QUOTA_BYTES
+                    || fs.total_bytes().saturating_add(growth) > WORKSPACE_QUOTA_BYTES
+                {
+                    return rlerror(tag, ENOSPC);
+                }
                 if let Some(n) = fs.inodes.get_mut(&id) {
-                    if n.data.len() < offset + count {
-                        n.data.resize(offset + count, 0);
+                    if n.data.len() < end {
+                        n.data.resize(end, 0);
                     }
-                    n.data[offset..offset + count].copy_from_slice(data);
+                    n.data[offset..end].copy_from_slice(data);
                 }
                 let mut w = W::new();
                 w.u32(count as u32);
@@ -1720,6 +1760,61 @@ mod ninep {
             assert_eq!(rtype(&reply), TRENAMEAT + 1);
             assert!(fs.read_file("old.txt").is_none());
             assert_eq!(fs.read_file("new.txt"), Some(&b"data"[..]));
+        }
+
+        // A guest can frame a Twrite whose declared count disagrees with the
+        // body it actually supplies. The handler must not panic in
+        // copy_from_slice (which would crash the guest's tab) — it must reply
+        // with an Rlerror.
+        #[test]
+        fn twrite_with_mismatched_count_errors_not_panics() {
+            let mut fs = Fs9p::new();
+            fs.seed_file("f", b"");
+            let mut fids = BTreeMap::new();
+            attach_and_walk(&mut fs, &mut fids, "f");
+            let mut b = W::new();
+            b.u32(2); // fid
+            b.u64(0); // offset
+            b.u32(64); // count says 64...
+            b.0.extend_from_slice(b"short"); // ...but only 5 bytes of body
+            let reply = handle(&mut fs, &mut fids, &msg(TWRITE, 0, &b.0));
+            assert_eq!(
+                rtype(&reply),
+                RLERROR,
+                "a count/body mismatch is rejected, not a panic"
+            );
+            assert_eq!(
+                fs.read_file("f"),
+                Some(&b""[..]),
+                "no partial write applied"
+            );
+        }
+
+        // A guest-controlled offset must not balloon host RAM: a sparse write
+        // far beyond the per-workspace quota is rejected rather than resizing
+        // the inode's backing Vec to gigabytes.
+        #[test]
+        fn twrite_at_huge_offset_is_quota_rejected() {
+            let mut fs = Fs9p::new();
+            fs.seed_file("f", b"");
+            let mut fids = BTreeMap::new();
+            attach_and_walk(&mut fs, &mut fids, "f");
+            let mut b = W::new();
+            b.u32(2); // fid
+            b.u64((WORKSPACE_QUOTA_BYTES as u64) + 1); // offset past the quota
+            b.u32(1); // count
+            b.0.push(0xAA); // one byte of body
+            let reply = handle(&mut fs, &mut fids, &msg(TWRITE, 0, &b.0));
+            assert_eq!(
+                rtype(&reply),
+                RLERROR,
+                "an oversized sparse write is rejected, not allocated"
+            );
+            assert_eq!(
+                fs.read_file("f"),
+                Some(&b""[..]),
+                "the inode was not resized to the quota"
+            );
         }
 
         #[test]
