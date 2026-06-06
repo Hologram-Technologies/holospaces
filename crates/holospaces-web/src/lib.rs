@@ -251,31 +251,40 @@ impl DevcontainerProvision {
         disk_bytes: f64,
     ) -> Result<f64, JsValue> {
         let image = self.pull.ingest(&self.store).map_err(js_err)?;
-        let mut owned: Vec<(String, Vec<u8>)> = Vec::new();
-        for (k, mt) in image.layers().iter().zip(image.layer_media_types()) {
-            let bytes = self
-                .store
-                .get(k)
-                .map_err(js_err)?
-                .ok_or_else(|| JsValue::from_str("an ingested layer is missing from the store"))?
-                .as_ref()
-                .to_vec();
-            owned.push((mt.clone(), bytes));
-        }
-        let layers: Vec<Layer> = owned
-            .iter()
-            .map(|(mt, b)| Layer {
-                media_type: mt,
-                blob: b,
-            })
-            .collect();
+        // Pull each layer blob out of the store one at a time, overlay it, and let
+        // it drop before fetching the next — neither the whole layer stack nor the
+        // dense ext4 image is ever resident (Laws L3/L4).
+        let layer_kappas: Vec<Kappa> = image.layers().to_vec();
+        let media_types: Vec<String> = image.layer_media_types().to_vec();
+        let mut layer_idx = 0usize;
+        let mut layer_err: Option<JsValue> = None;
+        let next_layer = || -> Result<Option<(String, Vec<u8>)>, holospaces::assembly::AssemblyError> {
+            if layer_idx >= layer_kappas.len() {
+                return Ok(None);
+            }
+            let i = layer_idx;
+            layer_idx += 1;
+            match self.store.get(&layer_kappas[i]) {
+                Ok(Some(bytes)) => Ok(Some((media_types[i].clone(), bytes.as_ref().to_vec()))),
+                Ok(None) => {
+                    layer_err = Some(JsValue::from_str(
+                        "an ingested layer is missing from the store",
+                    ));
+                    Ok(None)
+                }
+                Err(e) => {
+                    layer_err = Some(js_err(e));
+                    Ok(None)
+                }
+            }
+        };
 
         // Stream the ext4 image block-by-block into the OPFS file. Only non-zero
         // blocks are written (the free space stays sparse), so the wasm heap holds
         // the assembler's content working set, never the whole image.
         let mut io_err: Option<JsValue> = None;
-        let geom = holospaces::assembly::stream_ext4_image_bootable(
-            &layers,
+        let geom = holospaces::assembly::stream_ext4_image_bootable_streamed_layers(
+            next_layer,
             holospaces::machine::REAL_IMAGE_INIT,
             disk_bytes as u64,
             |block_index, bytes| {
@@ -290,6 +299,9 @@ impl DevcontainerProvision {
             },
         )
         .map_err(js_err)?;
+        if let Some(e) = layer_err {
+            return Err(e);
+        }
         if let Some(e) = io_err {
             return Err(e);
         }
@@ -418,18 +430,22 @@ impl DevcontainerImage {
         rootfs_handle: web_sys::FileSystemSyncAccessHandle,
         disk_bytes: f64,
     ) -> Result<f64, JsValue> {
-        let layers: Vec<Layer> = self
-            .layers
-            .iter()
-            .map(|(mt, b)| Layer {
-                media_type: mt,
-                blob: b,
-            })
-            .collect();
+        // Overlay the layers one at a time (each decompressed tar drops before the
+        // next), and stream the ext4 image block-by-block into the OPFS file —
+        // never materializing the dense disk-sized image (Laws L3/L4).
+        let mut layer_idx = 0usize;
+        let next_layer = || -> Result<Option<(String, Vec<u8>)>, holospaces::assembly::AssemblyError> {
+            if layer_idx >= self.layers.len() {
+                return Ok(None);
+            }
+            let (mt, b) = &self.layers[layer_idx];
+            layer_idx += 1;
+            Ok(Some((mt.clone(), b.clone())))
+        };
 
         let mut io_err: Option<JsValue> = None;
-        let geom = holospaces::assembly::stream_ext4_image_bootable(
-            &layers,
+        let geom = holospaces::assembly::stream_ext4_image_bootable_streamed_layers(
+            next_layer,
             holospaces::machine::DEVCONTAINER_INIT,
             disk_bytes as u64,
             |block_index, bytes| {
