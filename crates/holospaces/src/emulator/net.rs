@@ -61,6 +61,31 @@ const RECV_WINDOW: u16 = 0xFAF0;
 /// The maximum segment the NAT emits toward the guest.
 const MSS: usize = 1460;
 
+/// The maximum number of concurrent NAT connections (guest-initiated + forwarded
+/// inbound). A guest or a flood of inbound connections cannot make the connection
+/// table grow without bound: a new connection beyond this is refused (the guest's
+/// SYN is dropped → standard TCP backpressure; an inbound accept is closed). The
+/// idle reaper keeps long-dead entries from holding slots.
+const MAX_CONNS: usize = 256;
+
+/// The per-connection cap on buffered guest→host bytes ([`Conn::from_guest`]).
+/// When the buffer is at this cap the NAT stops accepting new guest payload (it
+/// does not advance `rcv_nxt`, so the guest retransmits) and shrinks the
+/// advertised window, applying real TCP backpressure instead of buffering without
+/// limit.
+const FROM_GUEST_CAP: usize = 256 * 1024;
+
+/// The per-connection cap on buffered host→guest bytes ([`Conn::to_guest`]).
+/// When at this cap the NAT stops draining the egress (host-side backpressure),
+/// so a fast server cannot make the NAT buffer grow without bound.
+const TO_GUEST_CAP: usize = 256 * 1024;
+
+/// Idle polls before a connection is reaped. The NAT is pumped each device poll;
+/// a connection with no activity for this many polls (a dead peer, a lost FIN, a
+/// `TIME-WAIT` that has lingered) is closed and its slot freed, bounding the
+/// table's residency over time.
+const IDLE_REAP_POLLS: u32 = 60_000;
+
 /// The status of an egress connection — what the NAT polls to drive the
 /// guest-facing TCP state machine (open the connection, relay, tear down).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -182,6 +207,10 @@ struct Conn {
     guest_fin: bool,
     /// Whether the NAT has sent its own FIN.
     fin_sent: bool,
+    /// Polls since the last activity on this connection (reset whenever bytes flow
+    /// or state advances). Reaped once it exceeds [`IDLE_REAP_POLLS`] so a dead
+    /// peer / lingering `TIME-WAIT` cannot hold a table slot forever.
+    idle: u32,
 }
 
 /// The userspace network — terminates the guest's link layer and bridges its TCP
@@ -295,11 +324,18 @@ impl Nat {
                 let out: Vec<u8> = self.conns[i].from_guest.drain(..).collect();
                 if !out.is_empty() {
                     egress.send(self.conns[i].eid, &out);
+                    self.conns[i].idle = 0;
                 }
-                // host → guest
-                let data = egress.recv(self.conns[i].eid);
-                if !data.is_empty() {
-                    self.conns[i].to_guest.extend(data);
+                // host → guest, with backpressure: stop pulling from the egress
+                // once the to-guest buffer is full, so a fast server cannot make
+                // the NAT buffer grow without bound (the bytes stay in the host
+                // transport until the guest has drained what we hold).
+                if self.conns[i].to_guest.len() < TO_GUEST_CAP {
+                    let data = egress.recv(self.conns[i].eid);
+                    if !data.is_empty() {
+                        self.conns[i].to_guest.extend(data);
+                        self.conns[i].idle = 0;
+                    }
                 }
                 self.segment_to_guest(i, &mut frames);
                 // 3. Close: once the host side is closed and everything is drained
@@ -313,9 +349,12 @@ impl Nat {
                     c.fin_sent = true;
                 }
             }
-            // 4. Reap a fully-closed connection.
+            // 4. Reap a fully-closed connection, or one idle past the threshold
+            //    (a dead peer / lingering TIME-WAIT) — bounding the table over time.
+            self.conns[i].idle = self.conns[i].idle.saturating_add(1);
             let c = &self.conns[i];
-            if c.guest_fin && (c.fin_sent && c.snd_una == c.snd_nxt) {
+            let closed = c.guest_fin && c.fin_sent && c.snd_una == c.snd_nxt;
+            if closed || c.idle >= IDLE_REAP_POLLS {
                 egress.close(c.eid);
                 self.conns.remove(i);
                 continue;
@@ -356,7 +395,14 @@ impl Nat {
                 from_guest: VecDeque::new(),
                 guest_fin: false,
                 fin_sent: false,
+                idle: 0,
             };
+            // Bounded connection table: refuse the inbound connection if the table
+            // is full (close it rather than letting a flood balloon the table).
+            if self.conns.len() >= MAX_CONNS {
+                ingress.close(iid);
+                continue;
+            }
             // Send the SYN to the guest's listener (the NAT is the active opener).
             let opts = [2u8, 4, (MSS >> 8) as u8, MSS as u8];
             let frame = tcp_to_guest(&c, F_SYN, &opts, &[], self.guest_mac);
@@ -378,11 +424,17 @@ impl Nat {
                 let out: Vec<u8> = self.conns[i].from_guest.drain(..).collect();
                 if !out.is_empty() {
                     ingress.send(iid, &out);
+                    self.conns[i].idle = 0;
                 }
-                // host → guest (the external client's request)
-                let data = ingress.recv(iid);
-                if !data.is_empty() {
-                    self.conns[i].to_guest.extend(data);
+                // host → guest (the external client's request), with the same
+                // to-guest backpressure as the egress path: stop pulling once the
+                // buffer is full so a flooding client cannot balloon the NAT.
+                if self.conns[i].to_guest.len() < TO_GUEST_CAP {
+                    let data = ingress.recv(iid);
+                    if !data.is_empty() {
+                        self.conns[i].to_guest.extend(data);
+                        self.conns[i].idle = 0;
+                    }
                 }
                 self.segment_to_guest(i, &mut frames);
                 let drained = self.conns[i].to_guest.is_empty()
@@ -399,9 +451,12 @@ impl Nat {
             // closed the socket) and we have relayed everything, close the
             // outside client — promptly, without waiting for the guest to
             // acknowledge our FIN (a one-shot server may already be gone). The
-            // response was drained to the ingress in the relay step above.
+            // response was drained to the ingress in the relay step above. Also
+            // reap a connection idle past the threshold (a dead client / lost FIN).
+            self.conns[i].idle = self.conns[i].idle.saturating_add(1);
             let c = &self.conns[i];
-            if c.guest_fin && c.fin_sent && c.to_guest.is_empty() {
+            let closed = c.guest_fin && c.fin_sent && c.to_guest.is_empty();
+            if closed || c.idle >= IDLE_REAP_POLLS {
                 ingress.close(iid);
                 self.conns.remove(i);
                 continue;
@@ -600,6 +655,12 @@ impl Nat {
 
         // A new connection: SYN with no prior state.
         if flags & F_SYN != 0 && idx.is_none() {
+            // Bounded connection table: drop the SYN if the table is full. The
+            // guest will retransmit (standard TCP backpressure); the idle reaper
+            // frees dead slots, so a connection flood cannot balloon the table.
+            if self.conns.len() >= MAX_CONNS {
+                return;
+            }
             let eid = egress.connect(dst, dport);
             let iss = self.next_iss();
             self.conns.push(Conn {
@@ -620,6 +681,7 @@ impl Nat {
                 from_guest: VecDeque::new(),
                 guest_fin: false,
                 fin_sent: false,
+                idle: 0,
             });
             return; // the SYN-ACK is emitted by poll() once the egress is Open
         }
@@ -672,15 +734,23 @@ impl Nat {
         // Accept in-order payload and buffer it for the host transport (drained
         // in poll/poll_ingress — handle_tcp stays transport-agnostic).
         if !payload.is_empty() && self.conns[idx].established {
-            if seq == self.conns[idx].rcv_nxt {
+            // Backpressure: only accept the segment if the guest→host buffer has
+            // room. If it is full we drop the segment (do not advance rcv_nxt) so
+            // the guest retransmits once the host side has drained, and the
+            // shrunken advertised window (below) tells it to back off — bounding
+            // the buffer instead of letting it grow without limit.
+            let has_room = self.conns[idx].from_guest.len() < FROM_GUEST_CAP;
+            if seq == self.conns[idx].rcv_nxt && has_room {
                 let p = payload.to_vec();
                 self.conns[idx].from_guest.extend(p);
                 self.conns[idx].rcv_nxt =
                     self.conns[idx].rcv_nxt.wrapping_add(payload.len() as u32);
+                self.conns[idx].idle = 0;
             }
-            // ACK the current receive point (re-ACK on a retransmit).
+            // ACK the current receive point (re-ACK on a retransmit), advertising
+            // the connection's *current* free window so the guest sees backpressure.
             let c = &mut self.conns[idx];
-            reply = Some(tcp_to_guest(c, F_ACK, &[], &[], self.guest_mac));
+            reply = Some(tcp_ack_windowed(c, self.guest_mac));
         }
 
         // The guest's FIN (half-close): acknowledge it, mark it, and start our own
@@ -726,6 +796,30 @@ fn tcp_to_guest(c: &Conn, flags: u8, opts: &[u8], payload: &[u8], guest_mac: [u8
         RECV_WINDOW,
         opts,
         payload,
+    );
+    let ip = build_ipv4(c.r_ip, c.g_ip, IP_PROTO_TCP, &tcp);
+    eth(guest_mac, GW_MAC, ET_IPV4, &ip)
+}
+
+/// A bare `ACK` toward the guest that advertises the connection's **current free
+/// receive window** — the room left in [`Conn::from_guest`] before [`FROM_GUEST_CAP`]
+/// (clamped to the unscaled 16-bit window). As the host side falls behind and the
+/// buffer fills, the advertised window shrinks toward zero, so the guest applies
+/// real TCP backpressure instead of the NAT buffering without limit.
+fn tcp_ack_windowed(c: &Conn, guest_mac: [u8; 6]) -> Vec<u8> {
+    let free = FROM_GUEST_CAP.saturating_sub(c.from_guest.len());
+    let window = free.min(RECV_WINDOW as usize) as u16;
+    let tcp = build_tcp(
+        c.r_ip,
+        c.g_ip,
+        c.r_port,
+        c.g_port,
+        c.snd_nxt,
+        c.rcv_nxt,
+        F_ACK,
+        window,
+        &[],
+        &[],
     );
     let ip = build_ipv4(c.r_ip, c.g_ip, IP_PROTO_TCP, &tcp);
     eth(guest_mac, GW_MAC, ET_IPV4, &ip)
@@ -1800,5 +1894,118 @@ mod tests {
         let _ = ingress.poll_accept();
         host.close(id2);
         assert_eq!(ingress.status(id2), EgressStatus::Closed);
+    }
+
+    /// An egress that just counts `connect` calls — to prove the bounded
+    /// connection table refuses new connections past the cap.
+    struct CountingEgress {
+        connects: usize,
+    }
+    impl Egress for CountingEgress {
+        fn connect(&mut self, _ip: [u8; 4], _port: u16) -> u32 {
+            self.connects += 1;
+            self.connects as u32
+        }
+        fn status(&mut self, _id: u32) -> EgressStatus {
+            EgressStatus::Connecting
+        }
+        fn recv(&mut self, _id: u32) -> Vec<u8> {
+            Vec::new()
+        }
+        fn send(&mut self, _id: u32, _data: &[u8]) {}
+        fn close(&mut self, _id: u32) {}
+    }
+
+    /// The connection table is bounded: a guest that opens MAX_CONNS connections
+    /// and then one more does not get a new egress connection for the overflow
+    /// SYN — the table cannot balloon (remote/guest DoS). The dropped SYN is
+    /// standard TCP backpressure (the guest retransmits).
+    #[test]
+    fn the_connection_table_is_bounded() {
+        let mut nat = Nat::new();
+        let mut eg = CountingEgress { connects: 0 };
+        // Open exactly MAX_CONNS connections, each a distinct source port.
+        for i in 0..MAX_CONNS {
+            let sport = 40000u16.wrapping_add(i as u16);
+            nat.on_guest_frame(
+                &guest_tcp(sport, [10, 0, 2, 9], 8080, 1000, 0, F_SYN, b""),
+                &mut eg,
+            );
+        }
+        assert_eq!(eg.connects, MAX_CONNS, "the table filled to its cap");
+        assert_eq!(nat.conns.len(), MAX_CONNS);
+        // One more SYN (a new 4-tuple) is refused — no new egress connection.
+        nat.on_guest_frame(
+            &guest_tcp(60000, [10, 0, 2, 9], 8080, 1000, 0, F_SYN, b""),
+            &mut eg,
+        );
+        assert_eq!(
+            eg.connects, MAX_CONNS,
+            "the overflow SYN did not open a new egress connection"
+        );
+        assert_eq!(
+            nat.conns.len(),
+            MAX_CONNS,
+            "the table did not grow past the cap"
+        );
+    }
+
+    /// The NAT advertises a shrinking receive window as the guest→host buffer
+    /// fills, so the guest applies real backpressure instead of the NAT buffering
+    /// without bound. With a full buffer the advertised window is zero.
+    #[test]
+    fn from_guest_backpressure_shrinks_the_advertised_window() {
+        let mut nat = Nat::new();
+        let mut eg = MockEgress::new(b"");
+        // Establish a connection.
+        nat.on_guest_frame(
+            &guest_tcp(40000, [10, 0, 2, 9], 8080, 1000, 0, F_SYN, b""),
+            &mut eg,
+        );
+        nat.poll(&mut eg);
+        let synack = nat.take_rx().unwrap();
+        let our_isn = u32::from_be_bytes([
+            synack[14 + 20 + 4],
+            synack[14 + 20 + 5],
+            synack[14 + 20 + 6],
+            synack[14 + 20 + 7],
+        ]);
+        nat.on_guest_frame(
+            &guest_tcp(
+                40000,
+                [10, 0, 2, 9],
+                8080,
+                1001,
+                our_isn.wrapping_add(1),
+                F_ACK,
+                b"",
+            ),
+            &mut eg,
+        );
+        // Simulate a backed-up host side: stuff from_guest right up to the cap so
+        // the *next* accepted payload advertises a (near-)zero window.
+        nat.conns[0]
+            .from_guest
+            .extend(core::iter::repeat_n(0u8, FROM_GUEST_CAP));
+        // A payload segment now elicits a window-bearing ACK with window 0.
+        nat.on_guest_frame(
+            &guest_tcp(
+                40000,
+                [10, 0, 2, 9],
+                8080,
+                1001,
+                our_isn.wrapping_add(1),
+                F_ACK,
+                b"x",
+            ),
+            &mut eg,
+        );
+        let ack = nat.take_rx().expect("a windowed ACK");
+        let t = &ack[14 + 20..];
+        let window = u16::from_be_bytes([t[14], t[15]]);
+        assert_eq!(
+            window, 0,
+            "a full guest→host buffer advertises a zero window"
+        );
     }
 }
