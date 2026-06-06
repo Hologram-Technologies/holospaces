@@ -76,6 +76,11 @@ struct Uart {
 /// *same* [`VirtioBlk`](super::VirtioBlk) / [`Virtio9p`](super::Virtio9p) /
 /// [`VirtioNet`](super::VirtioNet) the RISC-V and AArch64 machines boot, serviced
 /// by the one shared `devbus` (Law L4: devices are shared, not per-ISA).
+/// dev-only (`cc44-trace`): set while the CPU is executing inside `__text_poke`,
+/// so the CR3-switch / aliased-write trace fires only for the poke sequence.
+#[cfg(feature = "cc44-trace")]
+static TP_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 struct Sys {
     uart: Uart,
     /// The `virtio-blk` κ-disk rootfs (`CC-7`), when a disk is attached. The
@@ -542,11 +547,12 @@ impl Cpu {
             return Err(np);
         }
         #[cfg(feature = "cc44-trace")]
-        if (0x5faa_0000_0000..0x5fab_0000_0000).contains(&vaddr) {
+        if TP_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) && vaddr < 0x0001_0000_0000_0000 {
             use std::io::Write as _;
             let _ = writeln!(
                 std::io::stderr(),
-                "[cc44-trace] WALK va={vaddr:#x} pml4={pml4:#x} e4={e4:#x} e3={e3:#x} e2={e2:#x} e1={e1:#x}",
+                "[cc44-trace] WALK va={vaddr:#x} cr3={:#x} pml4={pml4:#x} i4={:#x} i3={:#x} i2={:#x} i1={:#x} e4={e4:#x} e3={e3:#x} e2={e2:#x} e1={e1:#x}",
+                self.cr3, idx(3), idx(2), idx(1), idx(0),
             );
         }
         Ok((e1 & 0x000f_ffff_ffff_f000) | (vaddr & 0xfff))
@@ -590,6 +596,16 @@ impl Cpu {
 
     /// Write control register `idx`.
     fn set_cr(&mut self, idx: usize, val: u64) {
+        #[cfg(feature = "cc44-trace")]
+        if idx == 3 && self.cr3 != val && TP_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "[cc44-trace] CR3-SWITCH {:#x} -> {val:#x} rip={:#x}",
+                self.cr3,
+                self.rip,
+            );
+        }
         match idx {
             0 => self.cr0 = val,
             2 => self.cr2 = val,
@@ -677,6 +693,15 @@ impl Cpu {
             let p = self.translate_acc(addr.wrapping_add(i), false, user) as usize;
             v |= u64::from(*self.ram.get(p).unwrap_or(&0)) << (8 * i);
         }
+        #[cfg(feature = "cc44-trace")]
+        if addr == 0xffff_ffff_827b_b1e8 && TP_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "[cc44-trace] RD vmemmap_base va={addr:#x} -> pa={pa:#x} val={v:#x} rip={:#x}",
+                self.rip,
+            );
+        }
         v
     }
 
@@ -692,11 +717,14 @@ impl Cpu {
             return;
         }
         #[cfg(feature = "cc44-trace")]
-        if (0x385b6e0..=0x385b700).contains(&pa) {
+        if TP_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+            && (0xffff_ffff_82a0_3e38..=0xffff_ffff_82a0_3e48).contains(&addr)
+        {
             use std::io::Write as _;
             let _ = writeln!(
                 std::io::stderr(),
-                "[cc44-trace] PTE-SET pa={pa:#x} (va={addr:#x}) size={size} val={val:#x} rip={:#x}",
+                "[cc44-trace] POKE-WR va={addr:#x} -> pa={pa:#x} size={size} val={val:#x} cr3={:#x} rip={:#x}",
+                self.cr3,
                 self.rip,
             );
             let _ = std::io::stderr().flush();
@@ -825,6 +853,31 @@ impl Cpu {
             self.take_pending_interrupt();
             #[cfg(feature = "cc44-trace")]
             let prev_rip = self.rip;
+            #[cfg(feature = "cc44-trace")]
+            if (0xffff_ffff_8103_6970..0xffff_ffff_8103_6e00).contains(&self.rip) {
+                TP_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            #[cfg(feature = "cc44-trace")]
+            if matches!(
+                self.rip,
+                0xffff_ffff_8103_69fe
+                    | 0xffff_ffff_8103_6a04
+                    | 0xffff_ffff_8103_6a53
+                    | 0xffff_ffff_8103_6a65
+                    | 0xffff_ffff_8103_6a7d
+                    | 0xffff_ffff_8103_6a82
+                    | 0xffff_ffff_8103_6a92
+            ) {
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[cc44-trace] BR rip={:#x} rax={:#x} rcx={:#x} rsp={:#x}",
+                    self.rip,
+                    self.r[RAX],
+                    self.r[RCX],
+                    self.r[RSP],
+                );
+            }
             match self.step() {
                 Ok(()) => {}
                 Err(h) => return h,
@@ -1971,9 +2024,12 @@ impl Cpu {
                 self.store_rm(Rm::Reg(reg), size, a);
             }
             0x8f => {
-                // POP r/m64.
-                let (_e, rm) = self.modrm(rex);
+                // POP r/m64. Per the SDM, when rSP is the base of the
+                // destination's effective address, the address is computed
+                // *after* rSP is incremented by the pop — so pop first, then
+                // decode the ModRM address (e.g. `pop 0x20(%rsp)`).
                 let v = self.pop();
+                let (_e, rm) = self.modrm(rex);
                 self.store_rm(rm, 8, v);
             }
             0x98 => {
@@ -1996,8 +2052,13 @@ impl Cpu {
                 self.push(self.rflags);
             }
             0x9d => {
-                // POPFQ.
-                self.rflags = (self.pop() & 0x0024_4dd5) | 0x2;
+                // POPFQ — restore the settable flags (CF/PF/AF/ZF/SF/TF/IF/DF/
+                // OF/NT/AC/ID). The mask must include IF (bit 9, 0x200): the
+                // kernel's `local_irq_restore` is `push; popfq`, so dropping IF
+                // here would leave interrupts disabled across every
+                // `local_irq_save/restore` region (the `irqs disabled` WARNs).
+                // Same settable mask as IRETQ below.
+                self.rflags = (self.pop() & 0x0024_4fd5) | 0x2;
             }
             0xa4 => self.string_op(StringOp::Movs, 1, rep),
             0xa5 => self.string_op(StringOp::Movs, size, rep),
@@ -2373,7 +2434,21 @@ impl Cpu {
                                 self.cr3,
                             );
                         }
-                        return Err(Halt::Undefined(start)); // UD2
+                        // UD2 (`0F 0B`). On real x86-64 this raises `#UD`, which
+                        // the kernel's `exc_invalid_op` → `handle_bug` decodes
+                        // against `__bug_table`: a `WARN` prints and *resumes*
+                        // (the handler advances past the `ud2`), a `BUG` panics.
+                        // So vector `#UD` through the IDT (rip at the faulting
+                        // `ud2`, a fault) rather than halting — the boot path hits
+                        // `WARN`s (e.g. an initcall returning with IRQs off) that
+                        // must be survivable. Only halt if no IDT is installed yet
+                        // (the earliest boot, before the kernel's traps exist).
+                        if self.sys.as_ref().is_some_and(|s| s.idtr.1 != 0) {
+                            self.rip = start;
+                            self.raise_exception(6, 0, false);
+                            return Ok(());
+                        }
+                        return Err(Halt::Undefined(start)); // UD2, no handler yet
                     }
                     0x40..=0x4f => {
                         // CMOVcc r, r/m.
