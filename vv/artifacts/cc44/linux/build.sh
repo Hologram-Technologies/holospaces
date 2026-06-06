@@ -44,6 +44,14 @@ sed -i "s#/tmp/linuxboot/initramfs/init#$work/root/init#" initramfs.list
       --enable  VIRTIO_NET --enable NET_9P --enable NET_9P_VIRTIO --enable 9P_FS \
       --enable  EXT4_FS --enable IP_PNP --enable IP_PNP_DHCP \
       --enable  SERIAL_8250 --enable SERIAL_8250_CONSOLE
+  # The holospaces x86-64 core implements *4-level* paging (no LA57/5-level
+  # walk; CPUID.7.0:ECX[16] LA57 is not advertised, CR4.LA57 stays off). A
+  # 4-level kernel is a completely standard x86-64 Linux — disabling 5-level
+  # makes the kernel and the emulator AGREE on the paging mode, so the
+  # vmemmap/page-table arithmetic (vmalloc_to_page, __text_poke's alias) is
+  # computed for 4 levels and matches the MMU. KASLR stays ON (it is correct
+  # under 4-level paging too).
+  ./scripts/config --disable X86_5LEVEL
   echo 0 > .version
   export KBUILD_BUILD_TIMESTAMP="Fri 31 May 2026 00:00:00 UTC" \
          KBUILD_BUILD_USER=holospaces KBUILD_BUILD_HOST=cc44
