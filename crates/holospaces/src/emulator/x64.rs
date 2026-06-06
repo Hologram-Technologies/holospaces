@@ -11,6 +11,16 @@
 //! identical console output and final state (Law L1/L5), so a κ snapshot is
 //! reproducible across peers.
 //!
+//! **Architectural authority.** This core is built to the published x86-64
+//! specification — the *Intel® 64 and IA-32 Architectures Software Developer's
+//! Manual* (instruction semantics from Vol 2; long-mode paging, the local APIC +
+//! APIC timer, the IDT and interrupt/exception delivery, the 8259-via-LINT0
+//! virtual-wire mode, and `IA32_TSC` from Vol 3A). The SDM is imported and pinned
+//! under `vv/artifacts/intel-sdm/` and, per the V&V governance, paired with an
+//! external validator: `qemu-system-x86_64` (an independent SDM implementation) is
+//! the differential oracle `CC-44` witnesses the boot against — behaviour is
+//! defined by the spec and checked against the reference, never self-referentially.
+//!
 //! This module is the **long-mode integer core + platform** it boots on: the
 //! 64-bit register file and `RFLAGS`, a flat 64-bit address space over guest RAM,
 //! the legacy `16550` serial console (port `0x3f8`, the boot console), and the
@@ -140,6 +150,10 @@ struct Sys {
     /// config mechanism #1; the config-data port then returns all-ones (an empty
     /// bus — this machine's devices are virtio-mmio, not PCI).
     pci_addr: u32,
+    /// Modelled L1 data-cache tags (one line number per set; direct-mapped). A miss
+    /// charges [`DCACHE_MISS_CYCLES`] to the TSC, giving address-dependent access
+    /// timing — the jitter `jitterentropy` needs on an otherwise deterministic core.
+    dcache: Vec<u64>,
 }
 
 impl Sys {
@@ -172,6 +186,7 @@ impl Sys {
             rng: 0x9e37_79b9_7f4a_7c15,
             tdiv: 0,
             pci_addr: 0,
+            dcache: vec![u64::MAX; DCACHE_LINES],
         }
     }
 }
@@ -414,6 +429,18 @@ const TICK_DIV: u64 = 16;
 /// are paced by `TICK_DIV`, so this factor sets `cpu_khz` independently of the
 /// delay-cost granularity above.
 const TSC_PER_STEP: u64 = 128;
+
+/// Lines in the modelled L1 data cache (direct-mapped, 64-byte lines → 32 KiB).
+/// Smaller than the working sets entropy daemons deliberately stride across (the
+/// kernel's `jitterentropy` buffer is 64 KiB), so their walks miss and the access
+/// latency varies with the address pattern.
+const DCACHE_LINES: usize = 512;
+/// Extra TSC cycles charged on a data-cache miss — the microarchitectural timing
+/// variance a real CPU exhibits, and that `jitterentropy` harvests as its noise
+/// source. Without it the (otherwise perfectly deterministic) emulator gives a
+/// constant per-access latency: jitterentropy's health test sees no jitter and the
+/// crypto DRBG it seeds never initialises (the boot wedges before userspace).
+const DCACHE_MISS_CYCLES: u64 = 32;
 
 /// A direct-mapped software TLB entry: caches a virtual-page → physical-frame
 /// translation so a hot loop does not re-walk the 4-level page table on every
@@ -740,6 +767,20 @@ impl Cpu {
         }
     }
 
+    /// Account a RAM access in the modelled L1 data cache: a miss installs the line
+    /// (evicting its set) and adds [`DCACHE_MISS_CYCLES`] to the TSC, so the access
+    /// latency varies with the address pattern — real microarchitectural jitter.
+    fn dcache_touch(&mut self, pa: u64) {
+        let line = pa >> 6;
+        let idx = (line as usize) & (DCACHE_LINES - 1);
+        if let Some(sys) = self.sys.as_mut() {
+            if sys.dcache[idx] != line {
+                sys.dcache[idx] = line;
+                sys.tsc = sys.tsc.wrapping_add(DCACHE_MISS_CYCLES);
+            }
+        }
+    }
+
     /// Read control register `idx` (0/2/3/4; others read 0).
     fn cr(&self, idx: usize) -> u64 {
         match idx {
@@ -867,6 +908,7 @@ impl Cpu {
         if (LAPIC_BASE..LAPIC_END).contains(&pa) {
             return u64::from(self.lapic_read((pa - LAPIC_BASE) as u32));
         }
+        self.dcache_touch(pa);
         let mut v = 0u64;
         for i in 0..u64::from(size) {
             let p = self.translate_acc(addr.wrapping_add(i), false, user) as usize;
@@ -895,6 +937,7 @@ impl Cpu {
             self.lapic_write((pa - LAPIC_BASE) as u32, val as u32);
             return;
         }
+        self.dcache_touch(pa);
         #[cfg(feature = "cc44-trace")]
         if TP_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
             && (0xffff_ffff_82a0_3e38..=0xffff_ffff_82a0_3e48).contains(&addr)
