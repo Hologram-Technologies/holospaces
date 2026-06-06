@@ -135,6 +135,9 @@ struct Sys {
     /// constant; each draw also mixes in the TSC so the stream is non-constant
     /// across the boot (the kernel only requires a varying value + `CF=1`).
     rng: u64,
+    /// Monotonically-increasing TSC jitter added to `RDTSC`/`RDTSCP` reads (see
+    /// [`Cpu::read_tsc`]) so the jitterentropy collector sees a varying delta.
+    tsc_jitter: u64,
 }
 
 impl Sys {
@@ -166,6 +169,7 @@ impl Sys {
             timer_div: 0,
             halted: false,
             rng: 0x9e37_79b9_7f4a_7c15,
+            tsc_jitter: 0,
         }
     }
 }
@@ -458,7 +462,7 @@ enum SegId {
 /// between ticks so it makes forward progress instead of drowning in the timer IRQ
 /// handler. The TSC and PIT advance together, so the guest's calibrated time base
 /// stays self-consistent.
-const TIMER_DIV: u64 = 256;
+const TIMER_DIV: u64 = 4096;
 
 /// `RFLAGS.IF` — the interrupt-enable flag (`STI`/`CLI`).
 const RFLAGS_IF: u64 = 1 << 9;
@@ -911,8 +915,10 @@ impl Cpu {
             }
             // Advance the platform timers (PIT + APIC timer + TSC) and latch a
             // tick when one expires, then deliver any pending interrupt through
-            // the IDT — the interrupt path a real Linux boot needs (`#12`).
-            self.sys_tick();
+            // the IDT — the interrupt path a real Linux boot needs (`#12`). The
+            // periodic IRQ sources only advance while the CPU is interruptible
+            // (`RFLAGS.IF`), so a tick cannot accrue inside its own handler.
+            self.sys_tick(self.rflags & RFLAGS_IF != 0);
             if self.sys.as_ref().is_some_and(|s| s.halted) {
                 return Halt::Halted;
             }
@@ -2469,7 +2475,7 @@ impl Cpu {
                     }
                     0xa2 => self.cpuid(),
                     0x31 => {
-                        let tsc = self.sys().tsc;
+                        let tsc = self.read_tsc();
                         self.r[RAX] = tsc & 0xffff_ffff;
                         self.r[RDX] = tsc >> 32;
                     }
@@ -2919,7 +2925,22 @@ impl Cpu {
     /// step; latch a timer interrupt (PIT IRQ 0 or the APIC-timer LVT vector)
     /// when one expires. The kernel calibrates against these and runs its
     /// periodic tick on them.
-    fn sys_tick(&mut self) {
+    ///
+    /// `interruptible` is the CPU's current interrupt-acceptance state
+    /// (`RFLAGS.IF` set and not mid-instruction). The periodic *IRQ* sources
+    /// (PIT channel-0, the APIC-timer LVT) only count down toward the next
+    /// interrupt while the CPU is interruptible: a periodic tick must not be
+    /// able to accrue *while the kernel is non-interruptibly servicing the
+    /// previous one*, or the handler's own runtime (`tick_periodic` → scheduler
+    /// / timekeeping / RCU / hrtimers — far longer than one tick period in
+    /// emulator-steps once `hrtimer`/`RCU` catch-up kicks in) re-queues IRQ 0
+    /// before `iret`, and the handler returns straight into itself forever (the
+    /// "timer storm" that wedged the boot at the idle handoff). Gating on
+    /// interruptibility makes the next tick be measured from when the CPU
+    /// becomes interruptible again, so the handler always returns to the
+    /// foreground first. The TSC and the channel-2 calibration one-shot still
+    /// advance unconditionally (the kernel polls channel 2 with IRQs *off*).
+    fn sys_tick(&mut self, interruptible: bool) {
         let Some(sys) = self.sys.as_mut() else {
             return;
         };
@@ -2958,6 +2979,13 @@ impl Cpu {
         // thousand instructions) does not drown the boot in back-to-back interrupts
         // (the "timer storm"). The guest still sees a coherent HZ.
         if sys.timer_div % TIMER_DIV != 0 {
+            return;
+        }
+        // Do not count the periodic IRQ sources down while the CPU is
+        // non-interruptible (inside an IRQ/exception handler): a tick must not
+        // accrue during its own handler (see the doc comment) — that is the
+        // timer storm. The TSC/channel-2 above already advanced.
+        if !interruptible {
             return;
         }
         // The 8254 PIT channel-0 down-counter.
@@ -3001,8 +3029,10 @@ impl Cpu {
     /// from `HLT` with interrupts enabled so the idle CPU resumes on the next
     /// tick rather than re-executing `HLT` for millions of steps.
     fn idle_until_interrupt(&mut self) {
+        // Reached only from `HLT` with interrupts enabled, so the CPU is
+        // interruptible — the periodic timers may advance toward the next tick.
         for _ in 0..5_000_000u64 {
-            self.sys_tick();
+            self.sys_tick(true);
             if self.has_pending_interrupt() {
                 return;
             }
@@ -3510,6 +3540,29 @@ impl Cpu {
         self.rflags &= !(1u64 << 4);
     }
 
+    /// The architected timestamp counter as `RDTSC`/`RDTSCP` observe it: the
+    /// monotonic platform `tsc` plus a small, monotonically-increasing
+    /// pseudo-random jitter on the low bits. The base advances at the fixed
+    /// calibrated rate (TSC:PIT lockstep); the jitter (a SplitMix step, masked
+    /// to a few bits and only ever added) leaves the rate and monotonicity
+    /// intact but makes the *delta* between two successive reads vary — the
+    /// timing entropy the kernel's jitterentropy collector
+    /// (`jent_read_entropy` → `jent_hash_time`) needs. Without it the collector
+    /// measures a constant delta on the deterministic TSC, never accrues
+    /// entropy, and spins forever the moment the DRBG seeds from it (the boot
+    /// wedged in `keccakf_round` right after the 8250 console line).
+    fn read_tsc(&mut self) -> u64 {
+        let s = self.sys_mut();
+        s.rng = s
+            .rng
+            .wrapping_mul(0x5851_f42d_4c95_7f2d)
+            .wrapping_add(0x1405_7b7e_f767_814f);
+        // 0..=255 — far below a calibration interval (~millions of cycles) but
+        // ample variation at jent's nanosecond measurement granularity.
+        s.tsc_jitter = s.tsc_jitter.wrapping_add((s.rng >> 56) & 0xff);
+        s.tsc.wrapping_add(s.tsc_jitter)
+    }
+
     /// `XADD`: exchange-and-add — the destination and source swap, then their sum
     /// is stored to the destination, setting the arithmetic flags.
     fn xadd(&mut self, rex: u8, size: u8) {
@@ -3609,7 +3662,7 @@ impl Cpu {
                 0xf8 => self.swapgs(),
                 0xf9 => {
                     // RDTSCP — like RDTSC plus the CPU id in ECX.
-                    let tsc = self.sys().tsc;
+                    let tsc = self.read_tsc();
                     self.r[RAX] = tsc & 0xffff_ffff;
                     self.r[RDX] = tsc >> 32;
                     self.r[RCX] = 0;
