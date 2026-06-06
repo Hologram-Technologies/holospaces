@@ -172,7 +172,13 @@ pub(crate) fn extract_refs(iri: &str, bytes: &[u8]) -> Result<References, Realiz
     }
     let mut cur = nul + 1;
     let n = read_u32(bytes, &mut cur)? as usize;
-    let mut refs = Vec::with_capacity(n);
+    // `n` is peer-supplied. Each element is exactly `KAPPA71` bytes, so the
+    // declared count can never exceed the remaining bytes divided by the
+    // per-element size. Bound the eager reservation against the buffer so a
+    // forged header (huge `n`) cannot trigger a multi-gigabyte allocation
+    // before the per-element loop errors on the truncated input.
+    let max_possible = bytes.len().saturating_sub(cur) / KAPPA71;
+    let mut refs = Vec::with_capacity(n.min(max_possible));
     for _ in 0..n {
         let end = cur
             .checked_add(KAPPA71)
@@ -688,5 +694,25 @@ mod tests {
         // The userland source round-trips through the canonical form.
         let back = Holospace::from_canonical(&userland.canonicalize()).unwrap();
         assert_eq!(back.source(), &Source::Userland { entry: code });
+    }
+
+    /// A peer can forge a realization whose ref-count header declares a huge `n`
+    /// while supplying almost no body. The inverse projection must reject the
+    /// truncated input (`Truncated`) rather than eagerly reserving `n * KAPPA71`
+    /// bytes — a remote OOM / DoS vector. The bounded `with_capacity` ensures the
+    /// allocation tracks the actual buffer, never the attacker's claim.
+    #[test]
+    fn forged_huge_ref_count_errors_without_ballooning() {
+        let iri = "holospace.example/op";
+        // Header: IRI, NUL, then n = u32::MAX, then no ref bytes at all.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(iri.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        let err = extract_refs(iri, &bytes).unwrap_err();
+        assert!(
+            matches!(err, RealizationError::Truncated),
+            "a forged count must error on the truncated body, got {err:?}"
+        );
     }
 }

@@ -213,7 +213,13 @@ impl Configuration {
         let mut cur = 0usize;
         let seq = take_u64(&payload, &mut cur)?;
         let count = take_u32(&payload, &mut cur)? as usize;
-        let mut directives = Vec::with_capacity(count);
+        // `count` is peer-supplied. The smallest directive encoding is a single
+        // tag byte, so the declared count can never exceed the remaining payload
+        // bytes. Bound the eager reservation against the buffer so a forged
+        // header (huge `count`) cannot trigger a multi-gigabyte allocation
+        // before `decode_directive` errors on the truncated input.
+        let max_possible = payload.len().saturating_sub(cur);
+        let mut directives = Vec::with_capacity(count.min(max_possible));
         for _ in 0..count {
             directives.push(decode_directive(&payload, &mut cur)?);
         }
@@ -514,5 +520,30 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err, ConfigError::UnauthorizedOperator);
+    }
+
+    /// A peer can forge a configuration whose directive-count header declares a
+    /// huge `count` while supplying an empty directive body. `from_canonical`
+    /// must reject the truncated payload (`Truncated`) rather than eagerly
+    /// reserving `count` directive slots — a remote OOM / DoS vector. The bounded
+    /// `with_capacity` ensures the allocation tracks the actual payload, never the
+    /// attacker's claim.
+    #[test]
+    fn forged_huge_directive_count_errors_without_ballooning() {
+        // Build a canonical configuration whose payload claims u32::MAX
+        // directives but supplies none.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&7u64.to_le_bytes()); // seq
+        payload.extend_from_slice(&u32::MAX.to_le_bytes()); // count, no body
+        let bytes = encode(
+            Configuration::IRI,
+            &[address(b"operator-key"), address(b"instance-kappa")],
+            &payload,
+        );
+        let err = Configuration::from_canonical(&bytes).unwrap_err();
+        assert!(
+            matches!(err, RealizationError::Truncated),
+            "a forged count must error on the truncated body, got {err:?}"
+        );
     }
 }
