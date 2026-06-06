@@ -43,4 +43,4 @@ cc46.sha256
 
 Reproduce: ./build.sh  (extends CC-37's recipe: rebuilds the v6.6 kernel +
 busybox and mirrors them here; only /init differs). The qemu-system-aarch64
-differential is run by vv/targets/cc46-devbus-arch-parity.sh when qemu is present.
+differential is run by vv/suites/cc46-devbus-arch-parity.sh when qemu is present.
