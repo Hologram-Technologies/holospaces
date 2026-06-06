@@ -51,6 +51,7 @@ sed -i "s#/tmp/linuxboot/initramfs/init#$work/root/init#" initramfs.list
   # vmemmap/page-table arithmetic (vmalloc_to_page, __text_poke's alias) is
   # computed for 4 levels and matches the MMU. KASLR stays ON (it is correct
   # under 4-level paging too).
+  ./scripts/config --disable FTRACE --disable FUNCTION_TRACER
   ./scripts/config --disable X86_5LEVEL
   echo 0 > .version
   export KBUILD_BUILD_TIMESTAMP="Fri 31 May 2026 00:00:00 UTC" \
