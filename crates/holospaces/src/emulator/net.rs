@@ -452,11 +452,20 @@ impl Nat {
             // outside client — promptly, without waiting for the guest to
             // acknowledge our FIN (a one-shot server may already be gone). The
             // response was drained to the ingress in the relay step above. Also
-            // reap a connection idle past the threshold (a dead client / lost FIN).
+            // reap a connection idle past the threshold (a dead client / lost FIN)
+            // — but only once the *ingress (host) side has closed*: while the host
+            // transport is still Open the connection is live by definition (the
+            // in-process bridge's workbench, or a forwarded-port client, is
+            // holding it open and may send at any time — e.g. a guest server
+            // `accept()`ing and blocking in `read()` is not a dead peer). Idle
+            // is measured in poll cycles, and the run loop pumps far faster than
+            // wall-clock, so without this an idle-but-open bridge connection
+            // (`CC-33`) would be reaped out from under the host before it writes.
             self.conns[i].idle = self.conns[i].idle.saturating_add(1);
+            let host_open = ingress.status(iid) == EgressStatus::Open;
             let c = &self.conns[i];
             let closed = c.guest_fin && c.fin_sent && c.to_guest.is_empty();
-            if closed || c.idle >= IDLE_REAP_POLLS {
+            if closed || (!host_open && c.idle >= IDLE_REAP_POLLS) {
                 ingress.close(iid);
                 self.conns.remove(i);
                 continue;
