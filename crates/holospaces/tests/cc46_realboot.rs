@@ -70,10 +70,9 @@ fn the_aarch64_core_serves_9p_net_and_bridge_to_a_real_arm64_boot() {
         if let Ok((mut sock, _)) = listener.accept() {
             let mut buf = [0u8; 512];
             let _ = sock.read(&mut buf); // the guest's HTTP request line
-            // busybox wget reads the body; serve the marker as the response body.
-            let _ = sock.write_all(
-                b"HTTP/1.0 200 OK\r\nContent-Length: 22\r\n\r\nHELLO-FROM-HOST-SERVER",
-            );
+                                         // busybox wget reads the body; serve the marker as the response body.
+            let _ = sock
+                .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 22\r\n\r\nHELLO-FROM-HOST-SERVER");
             let _ = sock.flush();
         }
     });
