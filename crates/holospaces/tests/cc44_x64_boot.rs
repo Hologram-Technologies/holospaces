@@ -44,7 +44,13 @@ fn an_amd64_linux_kernel_boots_to_userspace() {
     let mut cpu = Cpu::boot_linux(
         1024 * 1024 * 1024,
         &kernel,
-        "earlyprintk=serial,ttyS0 console=ttyS0",
+        // `random.trust_cpu=on`: credit the entropy from the core's RDRAND (the
+        // hardware RNG the x86-64 core implements) so the crng is fully seeded at
+        // boot. Without it the kernel won't credit RDRAND, `wait_for_random_bytes`
+        // blocks for interrupt/jitter entropy that a deterministic core can't
+        // supply quickly, and PID 1 never starts. The correct posture for a
+        // platform that genuinely provides a hardware RNG.
+        "earlyprintk=serial,ttyS0 console=ttyS0 random.trust_cpu=on",
     );
     let halt = cpu.run(40_000_000_000);
     let console = String::from_utf8_lossy(cpu.console());
