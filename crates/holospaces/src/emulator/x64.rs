@@ -731,6 +731,10 @@ impl Cpu {
     pub fn feed_console(&mut self, bytes: &[u8]) {
         if let Some(sys) = self.sys.as_mut() {
             sys.uart.input.extend_from_slice(bytes);
+            // Raise the receive interrupt if the driver runs input interrupt-driven.
+            if sys.uart.ier & 0x01 != 0 {
+                sys.pic.raise(4);
+            }
         }
     }
 
@@ -1261,11 +1265,27 @@ impl Cpu {
                     let _ = o.write_all(&[val]);
                     let _ = o.flush();
                 }
+                // The TX holding register is empty again immediately (we emit at
+                // once); if the driver runs the console interrupt-driven (THRE
+                // enabled, IER bit 1), signal it can send the next byte. COM1 =
+                // IRQ4. Without this an interrupt-driven userspace tty write blocks
+                // forever waiting to transmit (the idle<->init boot livelock).
+                if sys.uart.ier & 0x02 != 0 {
+                    sys.pic.raise(4);
+                }
             }
             0x3f9 if dlab => {
                 sys.uart.divisor = (sys.uart.divisor & 0x00ff) | (u16::from(val) << 8);
             }
-            0x3f9 => sys.uart.ier = val,
+            0x3f9 => {
+                sys.uart.ier = val;
+                // Enabling THRE ints (bit 1): TX is already empty -> raise now.
+                // Enabling RX ints (bit 0) with a byte waiting -> raise. COM1=IRQ4.
+                let dr = sys.uart.in_cursor < sys.uart.input.len();
+                if val & 0x02 != 0 || (val & 0x01 != 0 && dr) {
+                    sys.pic.raise(4);
+                }
+            }
             0x3fa => sys.uart.fcr = val, // FCR (write side of IIR/FCR)
             0x3fb => sys.uart.lcr = val,
             0x3fc => sys.uart.mcr = val,
@@ -1391,8 +1411,20 @@ impl Cpu {
                 0x3f9 if dlab => return (sys.uart.divisor >> 8) as u8, // DLM
                 0x3f9 => return sys.uart.ier,
                 0x3fa => {
-                    // IIR: no interrupt pending (bit0=1); FIFO bits reflect FCR.
-                    return 0x01 | (sys.uart.fcr & 0xc0);
+                    // IIR: report the pending UART interrupt by priority — RX-data
+                    // (id 0x04) when receive ints are enabled and a byte waits,
+                    // else transmit-holding-empty (id 0x02) while THRE ints are
+                    // enabled (the TX register is always empty — we emit at once),
+                    // else none (bit0 = 1). FIFO bits reflect FCR.
+                    let dr = sys.uart.in_cursor < sys.uart.input.len();
+                    let id = if sys.uart.ier & 0x01 != 0 && dr {
+                        0x04
+                    } else if sys.uart.ier & 0x02 != 0 {
+                        0x02
+                    } else {
+                        0x01
+                    };
+                    return id | (sys.uart.fcr & 0xc0);
                 }
                 0x3fb => return sys.uart.lcr,
                 0x3fc => return sys.uart.mcr,
