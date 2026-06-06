@@ -138,6 +138,9 @@ struct Sys {
     /// Monotonically-increasing TSC jitter added to `RDTSC`/`RDTSCP` reads (see
     /// [`Cpu::read_tsc`]) so the jitterentropy collector sees a varying delta.
     tsc_jitter: u64,
+    /// The last value [`Cpu::read_tsc`] returned — used to manufacture the
+    /// occasional backward step jent_entropy_init's calibration loop requires.
+    tsc_last_read: u64,
 }
 
 impl Sys {
@@ -170,6 +173,7 @@ impl Sys {
             halted: false,
             rng: 0x9e37_79b9_7f4a_7c15,
             tsc_jitter: 0,
+            tsc_last_read: 0,
         }
     }
 }
@@ -3541,26 +3545,46 @@ impl Cpu {
     }
 
     /// The architected timestamp counter as `RDTSC`/`RDTSCP` observe it: the
-    /// monotonic platform `tsc` plus a small, monotonically-increasing
-    /// pseudo-random jitter on the low bits. The base advances at the fixed
-    /// calibrated rate (TSC:PIT lockstep); the jitter (a SplitMix step, masked
-    /// to a few bits and only ever added) leaves the rate and monotonicity
-    /// intact but makes the *delta* between two successive reads vary — the
-    /// timing entropy the kernel's jitterentropy collector
-    /// (`jent_read_entropy` → `jent_hash_time`) needs. Without it the collector
-    /// measures a constant delta on the deterministic TSC, never accrues
-    /// entropy, and spins forever the moment the DRBG seeds from it (the boot
-    /// wedged in `keccakf_round` right after the 8250 console line).
+    /// monotonic platform `tsc` plus pseudo-random jitter on the low bits, and —
+    /// crucially — an *occasional small backward blip*.
+    ///
+    /// The kernel's jitterentropy power-up self-test (`jent_entropy_init`)
+    /// requires both timing entropy *and* at least one observed
+    /// "time went backwards" event before it will exit its calibration loop:
+    /// `for (i = 0; i < LOOPCOUNT || time_backwards == 0; i++)`. A perfectly
+    /// monotonic deterministic TSC drives `time_backwards` to stay zero, so the
+    /// loop never terminates — the boot wedged in `keccakf_round` right after
+    /// the 8250 console line, deep in `jent_entropy_init → jent_condition_data`.
+    /// Real CPUs see occasional apparent backward steps (cross-core TSC skew,
+    /// measurement noise); modelling that — one negative delta every few
+    /// hundred reads — lets the self-test complete. The base advances at the
+    /// fixed calibrated rate (TSC:PIT lockstep) and stays monotonic on average;
+    /// the kernel does not use the TSC as a clocksource here (it is marked
+    /// unstable — clocksource is `jiffies`), so the blips are harmless.
     fn read_tsc(&mut self) -> u64 {
         let s = self.sys_mut();
         s.rng = s
             .rng
             .wrapping_mul(0x5851_f42d_4c95_7f2d)
             .wrapping_add(0x1405_7b7e_f767_814f);
-        // 0..=255 — far below a calibration interval (~millions of cycles) but
-        // ample variation at jent's nanosecond measurement granularity.
+        // Forward jitter (0..=255) on every read: varying per-read deltas, the
+        // timing entropy the collector measures.
         s.tsc_jitter = s.tsc_jitter.wrapping_add((s.rng >> 56) & 0xff);
-        s.tsc.wrapping_add(s.tsc_jitter)
+        let base = s.tsc.wrapping_add(s.tsc_jitter);
+        // ~1 read in 256: return a value strictly below the *previous* read so
+        // the next measured delta is negative — the "time went backwards" event
+        // jent_entropy_init waits for, regardless of how far the base advanced
+        // between reads. (Computed off the last returned value, not the base,
+        // so the dip is guaranteed.) The base recovers on the following read.
+        let out = if (s.rng >> 48) & 0xff == 0 {
+            s.tsc_last_read
+                .wrapping_sub(((s.rng >> 32) & 0xff).wrapping_add(1))
+        } else {
+            // Keep monotonic w.r.t. the last read between blips.
+            base.max(s.tsc_last_read.wrapping_add(1))
+        };
+        s.tsc_last_read = out;
+        out
     }
 
     /// `XADD`: exchange-and-add — the destination and source swap, then their sum
