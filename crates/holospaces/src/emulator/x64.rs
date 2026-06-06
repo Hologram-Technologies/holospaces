@@ -136,6 +136,10 @@ struct Sys {
     /// Free-running step counter pacing the PIT/APIC down-counters once per
     /// [`TICK_DIV`] steps (see [`Cpu::sys_tick`]).
     tdiv: u64,
+    /// PCI CONFIG_ADDRESS latch (port 0xcf8). Readable so the kernel detects PCI
+    /// config mechanism #1; the config-data port then returns all-ones (an empty
+    /// bus — this machine's devices are virtio-mmio, not PCI).
+    pci_addr: u32,
 }
 
 impl Sys {
@@ -167,6 +171,7 @@ impl Sys {
             halted: false,
             rng: 0x9e37_79b9_7f4a_7c15,
             tdiv: 0,
+            pci_addr: 0,
         }
     }
 }
@@ -1514,13 +1519,40 @@ impl Cpu {
         0
     }
 
+    /// The 32-bit PCI configuration register addressed by `pci_addr` (mechanism
+    /// #1). Only bus 0 / device 0 / function 0 exists — a minimal Intel i440FX-style
+    /// host bridge, so the kernel's type-1 sanity check finds a host bridge and uses
+    /// mechanism #1; every other function reads all-ones (absent). The machine's
+    /// real devices are virtio-mmio, not PCI.
+    fn pci_config_dword(pci_addr: u32) -> u32 {
+        let bus = (pci_addr >> 16) & 0xff;
+        let dev = (pci_addr >> 11) & 0x1f;
+        let func = (pci_addr >> 8) & 0x7;
+        if bus != 0 || dev != 0 || func != 0 {
+            return 0xffff_ffff; // no device
+        }
+        match pci_addr & 0xfc {
+            0x00 => 0x7190_8086, // vendor 0x8086 (Intel), device 0x7190 (i440FX)
+            0x08 => 0x0600_0000, // class 0x06 host bridge, subclass 0x00, rev 0
+            _ => 0,
+        }
+    }
+
     /// A word/dword (`size` 2/4) port read. The PCI config-data port
     /// (`0xcfc`..`0xcff`) returns all-ones — no PCI host bridge is present, so the
     /// kernel's PCI scan finds no devices (it uses `virtio-mmio`, not PCI).
     /// Other ports compose from byte reads.
     fn port_in_wide(&mut self, port: u16, size: u8) -> u64 {
+        if port == 0xcf8 {
+            return u64::from(self.sys().pci_addr); // CONFIG_ADDRESS read-back
+        }
         if (0xcfc..=0xcff).contains(&port) {
-            return Self::mask(size); // no device
+            // Config-data read (mechanism #1): the latched address selects the
+            // device/register; the port offset within 0xcfc..0xcff selects the byte
+            // within the register dword.
+            let dword = Self::pci_config_dword(self.sys().pci_addr);
+            let shift = 8 * u32::from(port - 0xcfc);
+            return u64::from(dword >> shift) & Self::mask(size);
         }
         let mut v = 0u64;
         for i in 0..u64::from(size) {
@@ -1533,8 +1565,16 @@ impl Cpu {
     /// data are accepted and discarded (no PCI bridge); other ports compose into
     /// byte writes.
     fn port_out_wide(&mut self, port: u16, size: u8, val: u64) {
-        if port == 0xcf8 || (0xcfc..=0xcff).contains(&port) {
-            return; // PCI config — no host bridge
+        if port == 0xcf8 {
+            // CONFIG_ADDRESS — latch it so the kernel's mechanism-#1 detection
+            // (write 0x80000000, read it back) succeeds; the config-data scan then
+            // returns all-ones (no devices) and completes, instead of falling back
+            // to the unhandled mechanism #2 (which wedged the boot).
+            self.sys_mut().pci_addr = val as u32;
+            return;
+        }
+        if (0xcfc..=0xcff).contains(&port) {
+            return; // PCI config data — no host bridge / no devices
         }
         for i in 0..u64::from(size) {
             self.port_out(port.wrapping_add(i as u16), (val >> (8 * i)) as u8);
