@@ -1,0 +1,2 @@
+HOLOSPACES-LINUX-USERSPACE-OK
+Linux version 6.6.0 (holospaces@cc44) (gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, GNU ld (GNU Binutils for Ubuntu) 2.42) #1 SMP PREEMPT_DYNAMIC Fri 31 May 2026 00:00:00 UTC
