@@ -397,22 +397,39 @@ const VIRTIO_9P_IRQ: u8 = 10;
 const VIRTIO_NET_IRQ: u8 = 12;
 
 /// Emulator-steps per PIT/APIC down-counter decrement — one shared rate for every
-/// platform timer. Large enough that the tick period (`reload × TICK_DIV` steps)
-/// far exceeds the tick handler (no "timer storm"), small enough that
-/// `quick_pit_calibrate`'s channel-2 poll still expires inside its budget. The TSC
-/// advances every step (fine `sched_clock` resolution); only the down-counters are
-/// paced. One coherent rate keeps the kernel's calibration and its tick in step.
-const TICK_DIV: u64 = 256;
+/// platform timer. With the PIT at its architectural 1.193182 MHz, this fixes the
+/// guest-time granularity at `TICK_DIV × 1.193182` steps per microsecond, which is
+/// what bounds the cost of a busy-wait delay (`udelay`/`delay_tsc` and absent-device
+/// poll timeouts spin in emulator steps proportional to it). Kept small so those
+/// delays — and a long device-probe timeout — do not burn billions of steps, while
+/// still large enough that the tick period (`reload × TICK_DIV` steps) far exceeds
+/// the tick handler (no "timer storm"). One coherent rate keeps the kernel's
+/// calibration and its tick in step. (See [`TSC_PER_STEP`] for `cpu_khz`.)
+const TICK_DIV: u64 = 16;
+
+/// TSC ticks advanced per emulator step. With [`TICK_DIV`] this sets the frequency
+/// the kernel calibrates: `cpu_khz = TSC_PER_STEP × TICK_DIV × 1.193182 MHz`
+/// (≈ 2.44 GHz here — a realistic CPU, so `udelay`'s cycle budget is sane). The TSC
+/// advances every step for fine `sched_clock` resolution; only the down-counters
+/// are paced by `TICK_DIV`, so this factor sets `cpu_khz` independently of the
+/// delay-cost granularity above.
+const TSC_PER_STEP: u64 = 128;
 
 /// A direct-mapped software TLB entry: caches a virtual-page → physical-frame
 /// translation so a hot loop does not re-walk the 4-level page table on every
-/// access. `gen` is matched against [`Cpu::tlb_gen`], bumped (flushing the whole
-/// TLB) on a `CR0`/`CR3`/`CR4` write and `INVLPG` — the architected flush points.
+/// access. An entry is live when its `gen` matches [`Cpu::tlb_gen`] (the global
+/// flush counter, bumped on a `CR0`/`CR4` write), its `pgen` matches
+/// [`Cpu::pcid_gen`]`[pcid]` (the per-PCID flush counter, bumped on a flushing
+/// `CR3` load / `INVLPG`), and its `pcid` matches the active PCID — so a `CR3`
+/// switch between address spaces (the kernel's ASID scheme, and `text_poke`'s
+/// poking-mm ping-pong) keeps every PCID's translations instead of cold-flushing.
 #[derive(Clone, Copy)]
 struct TlbEntry {
     tag: u64,
     frame: u64,
+    pcid: u16,
     gen: u64,
+    pgen: u64,
 }
 
 /// Direct-mapped TLB sets, indexed by the virtual page number.
@@ -467,6 +484,12 @@ pub struct Cpu {
     /// A direct-mapped software TLB over [`Cpu::translate_acc`] (see [`TlbEntry`]).
     tlb: Vec<TlbEntry>,
     tlb_gen: u64,
+    /// Per-PCID TLB generations (`CR4.PCIDE`). A `CR3` load without the no-flush
+    /// hint bumps only the loaded PCID's generation, so the other address spaces'
+    /// cached translations survive — the kernel reuses a handful of ASIDs and
+    /// `text_poke` ping-pongs between the kernel mm and a temporary poking-mm.
+    /// Indexed by the 12-bit PCID.
+    pcid_gen: Vec<u64>,
     sys: Option<Box<Sys>>,
 }
 
@@ -508,6 +531,8 @@ enum SegId {
 
 /// `RFLAGS.IF` — the interrupt-enable flag (`STI`/`CLI`).
 const RFLAGS_IF: u64 = 1 << 9;
+/// `CR4.PCIDE` — process-context identifiers enable.
+const CR4_PCIDE: u64 = 1 << 17;
 /// `RFLAGS.DF` — the direction flag (string-op increment/decrement).
 const RFLAGS_DF: u64 = 1 << 10;
 
@@ -549,11 +574,14 @@ impl Cpu {
                 TlbEntry {
                     tag: 0,
                     frame: 0,
-                    gen: 0
+                    pcid: 0,
+                    gen: 0,
+                    pgen: 0,
                 };
                 TLB_SETS
             ],
             tlb_gen: 1,
+            pcid_gen: vec![1; 4096],
             sys: Some(Box::new(Sys::new())),
         }
     }
@@ -650,11 +678,16 @@ impl Cpu {
         // interpreter cost). It holds only successful (present) walks; a miss or a
         // not-present page falls through to the full walk below.
         let paging = self.paging();
+        let pcid = self.active_pcid();
         if paging {
             let page = vaddr & !0xfff;
             let set = (page >> 12) as usize & (TLB_SETS - 1);
             let e = self.tlb[set];
-            if e.gen == self.tlb_gen && e.tag == page {
+            if e.gen == self.tlb_gen
+                && e.pcid as usize == pcid
+                && e.pgen == self.pcid_gen[pcid]
+                && e.tag == page
+            {
                 return e.frame | (vaddr & 0xfff);
             }
         }
@@ -666,7 +699,9 @@ impl Cpu {
                     self.tlb[set] = TlbEntry {
                         tag: page,
                         frame: pa & !0xfff,
+                        pcid: pcid as u16,
                         gen: self.tlb_gen,
+                        pgen: self.pcid_gen[pcid],
                     };
                 }
                 pa
@@ -684,10 +719,25 @@ impl Cpu {
         }
     }
 
-    /// Flush the whole software TLB (bump the generation) — the architected flush
-    /// on a `CR0`/`CR3`/`CR4` write and `INVLPG`.
+    /// Flush the whole software TLB (bump the global generation) — the architected
+    /// flush on a `CR0`/`CR4` write (a change of paging regime).
     fn flush_tlb(&mut self) {
         self.tlb_gen = self.tlb_gen.wrapping_add(1);
+    }
+
+    /// Flush the software TLB entries for a single PCID — a `CR3` load without the
+    /// no-flush hint, or `INVLPG` for the active address space.
+    fn flush_pcid(&mut self, pcid: usize) {
+        self.pcid_gen[pcid] = self.pcid_gen[pcid].wrapping_add(1);
+    }
+
+    /// The active PCID: `CR3[11:0]` when `CR4.PCIDE` is enabled, else 0.
+    fn active_pcid(&self) -> usize {
+        if self.cr4 & CR4_PCIDE != 0 {
+            (self.cr3 & 0xfff) as usize
+        } else {
+            0
+        }
     }
 
     /// Read control register `idx` (0/2/3/4; others read 0).
@@ -716,14 +766,27 @@ impl Cpu {
         match idx {
             0 => self.cr0 = val,
             2 => self.cr2 = val,
-            3 => self.cr3 = val,
+            // Bit 63 of a CR3 load is the transient no-flush hint, not retained.
+            3 => self.cr3 = val & !(1u64 << 63),
             4 => self.cr4 = val,
             _ => {}
         }
-        // CR0 (PG/WP), CR3 (page-table root), CR4 (PAE/PGE/LA57) change the active
-        // mappings — flush the software TLB.
-        if matches!(idx, 0 | 3 | 4) {
-            self.flush_tlb();
+        match idx {
+            // CR0 (PG/WP) and CR4 (PAE/PGE/PCIDE/LA57) change the paging regime.
+            0 | 4 => self.flush_tlb(),
+            // CR3: with PCID a no-flush load (bit 63) keeps every PCID's entries;
+            // otherwise it flushes only the PCID being loaded. Without PCIDE a CR3
+            // load flushes the whole TLB, as on real hardware.
+            3 => {
+                if self.cr4 & CR4_PCIDE != 0 {
+                    if val & (1u64 << 63) == 0 {
+                        self.flush_pcid((val & 0xfff) as usize);
+                    }
+                } else {
+                    self.flush_tlb();
+                }
+            }
+            _ => {}
         }
     }
 
@@ -3069,7 +3132,7 @@ impl Cpu {
             return;
         };
         // The TSC advances every step (fine `sched_clock` resolution).
-        sys.tsc = sys.tsc.wrapping_add(64);
+        sys.tsc = sys.tsc.wrapping_add(TSC_PER_STEP);
         // The PIT/APIC down-counters advance at ONE shared rate — once per
         // `TICK_DIV` steps. A single rate keeps the calibration reference (PIT
         // channel 2) and the tick sources (PIT channel 0, the APIC-timer) in
@@ -3168,7 +3231,7 @@ impl Cpu {
         // phase by the step count; the down-counters advance by `ticks`. Then fire
         // the source(s) that reached the deadline and advance the rest.
         let steps = ticks.saturating_mul(TICK_DIV);
-        sys.tsc = sys.tsc.wrapping_add(steps.saturating_mul(64));
+        sys.tsc = sys.tsc.wrapping_add(steps.saturating_mul(TSC_PER_STEP));
         sys.tdiv = sys.tdiv.wrapping_add(steps);
         if sys.pit.ch2_gate && !sys.pit.ch2_out && sys.pit.ch2_counter > 0 {
             if u64::from(sys.pit.ch2_counter) <= ticks {
@@ -3726,8 +3789,10 @@ impl Cpu {
                 // SEP,MTRR,PGE,CMOV,PAT,PSE36,CLFSH,MMX,FXSR,SSE,SSE2.
                 // ECX bit 30 = RDRAND — the core's hardware RNG (the kernel's
                 // crng/jitterentropy path needs it to avoid spinning on the
-                // deterministic TSC entropy source).
-                (0x0000_0600, 0, 1 << 30, 0x078b_fbff)
+                // deterministic TSC entropy source). ECX bit 17 = PCID, so the
+                // kernel tags address spaces and `CR3` switches (its ASID reuse and
+                // text_poke's poking-mm) need not flush the (software) TLB.
+                (0x0000_0600, 0, (1 << 30) | (1 << 17), 0x078b_fbff)
             }
             // Leaf 7 sub-leaf 0: EBX bit 18 = RDSEED (the seeding RNG the
             // kernel pairs with RDRAND).
@@ -3839,8 +3904,10 @@ impl Cpu {
                 self.wr(addr + 2, 8, base);
             }
             7 => {
-                // INVLPG — flush the software TLB (whole-TLB; correct if coarser).
-                self.flush_tlb();
+                // INVLPG — invalidate the active address space's mapping for the
+                // page (coarsened to the whole active PCID; a correct over-flush).
+                let pcid = self.active_pcid();
+                self.flush_pcid(pcid);
             }
             _ => {}
         }
