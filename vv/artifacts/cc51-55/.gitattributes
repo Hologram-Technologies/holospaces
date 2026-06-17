@@ -1,0 +1,2 @@
+# pin exact bytes: the SHASUMS.txt manifest must re-derive byte-identically on every checkout (Law L5)
+* -text
