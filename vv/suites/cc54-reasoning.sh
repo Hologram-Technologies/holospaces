@@ -14,7 +14,7 @@
 # Upstreams to: holospaces  vv/suites/cc-reasoning.sh holospaces vv/: export HOLO_SYSTEM=<pinned HOLOGRAM>/holo-os/system(catalog rows CC-reasoning, CC-shacl; arc42 ch.10).
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SYSTEM="${HOLO_SYSTEM:-$(cd "$HERE/../artifacts/cc51-55/holo-system" 2>/dev/null && pwd)}" holospaces vv/: export HOLO_SYSTEM=<pinned HOLOGRAM>/holo-os/system# holospaces vv/: export HOLO_SYSTEM=<pinned HOLOGRAM>/holo-os/system
+SYSTEM="${HOLO_SYSTEM:-$(cd "$HERE/../artifacts/cc51-55/holo-system" 2>/dev/null && pwd)}"   # defaults to the vendored artifact; set HOLO_SYSTEM to override
 command -v node >/dev/null 2>&1 || { echo "CC-reasoning: SKIP — node not available in this environment" >&2; exit 127; }
 echo "CC-reasoning — RDFS entailment + SHACL-core with L5 proofs (W3C RDF Semantics §9.2.1 · SHACL Core · Law L5)"
 WITNESS="$SYSTEM/tools/holo-reason-witness.mjs"

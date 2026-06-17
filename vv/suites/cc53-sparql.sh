@@ -17,7 +17,7 @@
 # Upstreams to: holospaces  vv/suites/cc-sparql.sh holospaces vv/: export HOLO_SYSTEM=<pinned HOLOGRAM>/holo-os/system(catalog row CC-sparql, arc42 ch.10).
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SYSTEM="${HOLO_SYSTEM:-$(cd "$HERE/../artifacts/cc51-55/holo-system" 2>/dev/null && pwd)}" holospaces vv/: export HOLO_SYSTEM=<pinned HOLOGRAM>/holo-os/system# holospaces vv/: export HOLO_SYSTEM=<pinned HOLOGRAM>/holo-os/system
+SYSTEM="${HOLO_SYSTEM:-$(cd "$HERE/../artifacts/cc51-55/holo-system" 2>/dev/null && pwd)}"   # defaults to the vendored artifact; set HOLO_SYSTEM to override
 command -v node >/dev/null 2>&1 || { echo "CC-sparql: SKIP — node not available in this environment" >&2; exit 127; }
 echo "CC-sparql — JSON-LD→RDF + SPARQL BGP over the L5-verified graph (W3C RDF 1.1 N-Quads · SPARQL 1.1 BGP · RDF/JS · Law L5)"
 WITNESS="$SYSTEM/tools/holo-sparql-witness.mjs"

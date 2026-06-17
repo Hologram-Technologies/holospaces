@@ -17,7 +17,7 @@
 # Upstreams to: holospaces  vv/suites/cc-agentic.sh holospaces vv/: export HOLO_SYSTEM=<pinned HOLOGRAM>/holo-os/system(catalog rows CC-owl, CC-did, CC-vc, arc42 ch.10).
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SYSTEM="${HOLO_SYSTEM:-$(cd "$HERE/../artifacts/cc51-55/holo-system" 2>/dev/null && pwd)}" holospaces vv/: export HOLO_SYSTEM=<pinned HOLOGRAM>/holo-os/system# holospaces vv/: export HOLO_SYSTEM=<pinned HOLOGRAM>/holo-os/system
+SYSTEM="${HOLO_SYSTEM:-$(cd "$HERE/../artifacts/cc51-55/holo-system" 2>/dev/null && pwd)}"   # defaults to the vendored artifact; set HOLO_SYSTEM to override
 command -v node >/dev/null 2>&1 || { echo "CC-owl/did/vc: SKIP — node not available in this environment" >&2; exit 127; }
 echo "CC-owl/CC-did/CC-vc — OWL 2 RL entailment + did:holo DID Documents + Verifiable Credentials (Law L5 trust face)"
 WITNESS="$SYSTEM/tools/holo-agentic-witness.mjs"
