@@ -1,0 +1,22 @@
+cc51-55 — vendored witness closure (the HOLOGRAM Semantic-Web → Agentic-Web substrate)
+
+WHAT: a self-contained snapshot of the HOLOGRAM holo-os/system files the cc51..cc55 suites run, so the rows
+witness reproducibly with NO external HOLOGRAM checkout and NO npm. The suites default HOLO_SYSTEM to
+$HERE/../artifacts/cc51-55/holo-system; set HOLO_SYSTEM to override with a live HOLOGRAM tree.
+
+CONTENTS (holo-system/, mirroring holo-os/system layout):
+  tools/holo-{render-contract,linkeddata,sparql,reason,agentic}-witness.mjs   the 5 witnesses
+  os/sbin/holo-*.mjs                                                          their module closure
+  os/usr/lib/holo/holo-{object,uor,ipfs,blake3}.{mjs,js}                      the isomorphic substrate
+  os/usr/lib/holo/vendor/n3/                                                  the κ-sealed N3.js bundle (SEAL.json)
+  node_modules/{n3 + runtime deps}                                           so `import "n3"` resolves (n3 v2.0.3)
+
+PIN (content-addressed — the holospaces way, Law L5):
+  manifest κ (sha256 of SHASUMS.txt) = 260c1b674713ed40882035dc7339b56b29b894e2aac613ef400a435be3213b12
+  N3.js engine κ                     = did:holo:sha256:0fa509e7298caa3f5d02c6561fa61f4fb0edaeeeae1b4c19e9dc690a468fe91e   (n3 v2.0.3, github.com/rdfjs/N3.js)
+  source HOLOGRAM tree origin        = github.com/humuhumu33/os-holo (holo-os/system)
+  every file's sha256 is in SHASUMS.txt; re-derive to verify (a tampered byte flips its κ — Law L5).
+
+REGENERATE: copy the listed files from a HOLOGRAM holo-os/system checkout into holo-system/ (same layout),
+copy node_modules/{n3,buffer,readable-stream,safe-buffer,string_decoder,events,process,abort-controller,
+event-target-shim,base64-js,ieee754}, then: find holo-system -type f -print0 | sort -z | xargs -0 sha256sum > SHASUMS.txt
