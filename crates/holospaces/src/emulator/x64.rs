@@ -32,7 +32,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -529,6 +529,18 @@ pub struct Cpu {
     /// Indexed by the 12-bit PCID.
     pcid_gen: Vec<u64>,
     sys: Option<Box<Sys>>,
+    /// Physical page numbers (`pa >> 12`) for which the CC-48 JIT driver
+    /// ([`Cpu::run_jit`]) holds a cached translated block. The interpreter write
+    /// path ([`Cpu::wr`]) consults this set on every committed store so it can
+    /// detect **self-modifying code** — the kernel boot patches its own `.text`
+    /// via the alternatives/`text_poke` machinery, so a cached block whose source
+    /// bytes were overwritten must be re-translated. Empty unless `run_jit` is
+    /// driving, so the interpreter-only path pays only an `is_empty()` check.
+    jit_code_pages: BTreeSet<u64>,
+    /// Set by [`Cpu::wr`] when a committed store lands on a page in
+    /// [`Cpu::jit_code_pages`]; the JIT driver checks and clears it to flush the
+    /// invalidated block(s) before continuing.
+    jit_dirty: bool,
 }
 
 /// A page fault latched by the MMU during an instruction's memory access (`#12`):
@@ -622,6 +634,8 @@ impl Cpu {
             tlb_gen: 1,
             pcid_gen: vec![1; 4096],
             sys: Some(Box::new(Sys::new())),
+            jit_code_pages: BTreeSet::new(),
+            jit_dirty: false,
         }
     }
 
@@ -927,6 +941,165 @@ impl Cpu {
         self.insns
     }
 
+    // ── CC-48 JIT driver support ───────────────────────────────────────────────
+    // Small `pub(crate)`/`#[cfg(std)]` shims the JIT execution driver
+    // ([`super::x64_jit_exec::X64JitExec`] / [`Cpu::run_jit`]) uses to reach the
+    // core's private bookkeeping without widening the interpreter's public API. The
+    // driver lives in a sibling module, so it cannot touch these private fields
+    // directly. Gated by `std` since `run_jit` is std-only.
+
+    /// A tiny placeholder core (zero RAM) the JIT executor parks in its Wasm store
+    /// when no block is running; the driver swaps the real core in around each
+    /// block call. Never executes — only ever swapped out of.
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub(crate) fn jit_placeholder() -> Cpu {
+        Cpu::new(0)
+    }
+
+    /// The set of physical page numbers (`pa >> 12`) with a cached translated block
+    /// (the SMC invalidation oracle the driver consults on a dirty flush).
+    #[cfg(feature = "std")]
+    pub(crate) fn jit_code_pages_ref(&self) -> &BTreeSet<u64> {
+        &self.jit_code_pages
+    }
+
+    /// Mark `page` as carrying a cached translated block so the interpreter write
+    /// path detects a self-modifying store onto it.
+    #[cfg(feature = "std")]
+    pub(crate) fn jit_mark_code_page(&mut self, page: u64) {
+        self.jit_code_pages.insert(page);
+    }
+
+    /// Take and clear the self-modifying-code dirty flag (a committed store landed
+    /// on a cached code page since the last check).
+    #[cfg(feature = "std")]
+    pub(crate) fn jit_take_dirty(&mut self) -> bool {
+        core::mem::take(&mut self.jit_dirty)
+    }
+
+    /// Set a general-purpose register (the driver copies the block's register file
+    /// back into the architectural state).
+    #[cfg(feature = "std")]
+    pub(crate) fn set_reg(&mut self, i: usize, v: u64) {
+        self.r[i & 15] = v;
+    }
+
+    /// Set `RFLAGS` (the driver copies the block's flags back).
+    #[cfg(feature = "std")]
+    pub(crate) fn set_rflags(&mut self, v: u64) {
+        self.rflags = v;
+    }
+
+    /// Set `rip` to the block's resolved next address.
+    #[cfg(feature = "std")]
+    pub(crate) fn jit_set_rip(&mut self, v: u64) {
+        self.rip = v;
+    }
+
+    /// Advance the retired-instruction counter by `n` (a block retires `n` at once).
+    #[cfg(feature = "std")]
+    pub(crate) fn jit_add_insns(&mut self, n: u64) {
+        self.insns = self.insns.wrapping_add(n);
+    }
+
+    /// The driver's network pump — the same periodic `virtio-net` pump `run`
+    /// performs (`i & 0x3ff == 0`), so host-side data reaches the guest.
+    #[cfg(feature = "std")]
+    pub(crate) fn jit_pump_net(&mut self, i: u64) {
+        if i & 0x3ff == 0 && self.sys.as_ref().is_some_and(|s| s.virtionet.is_some()) {
+            self.virtio_net_pump();
+        }
+    }
+
+    /// Advance the platform timers (the driver's per-iteration `sys_tick`).
+    #[cfg(feature = "std")]
+    pub(crate) fn jit_sys_tick(&mut self) {
+        self.sys_tick();
+    }
+
+    /// Whether the guest has halted (`hlt` with interrupts masked) — the driver's
+    /// per-iteration halted check, identical to `run`'s.
+    #[cfg(feature = "std")]
+    pub(crate) fn jit_halted(&self) -> bool {
+        self.sys.as_ref().is_some_and(|s| s.halted)
+    }
+
+    /// Deliver a pending interrupt through the IDT (the driver's per-iteration
+    /// interrupt pump).
+    #[cfg(feature = "std")]
+    pub(crate) fn jit_take_pending_interrupt(&mut self) {
+        self.take_pending_interrupt();
+    }
+
+    /// A *side-effect-free* check of whether [`Cpu::take_pending_interrupt`] would
+    /// deliver an interrupt now (the same gate: `RFLAGS.IF` set, an IDT installed,
+    /// and a deliverable LAPIC vector or pending PIC IRQ). The JIT driver uses it to
+    /// decide whether it must first flush the live registers out of the Wasm
+    /// register file (interrupt delivery pushes a frame using `rsp`/`rflags`), so it
+    /// can keep registers in Wasm across a hot all-JIT stretch otherwise.
+    #[cfg(feature = "std")]
+    pub(crate) fn jit_interrupt_pending(&self) -> bool {
+        if self.rflags & RFLAGS_IF == 0 {
+            return false;
+        }
+        let Some(sys) = self.sys.as_ref() else {
+            return false;
+        };
+        if sys.idtr.1 == 0 {
+            return false;
+        }
+        sys.lapic.deliverable().is_some() || sys.pic.pending().is_some()
+    }
+
+    /// Clear any latched page fault before re-interpreting an instruction the JIT
+    /// aborted on (the interpreter re-derives and vectors the real `#PF`).
+    #[cfg(feature = "std")]
+    pub(crate) fn jit_clear_fault(&mut self) {
+        self.fault = None;
+    }
+
+    /// Translate the current `rip` to a physical address for block lookup. Returns
+    /// `None` if the fetch translation faults (the code page is not present); the
+    /// fault is left latched for the caller to clear. Uses `translate_acc` exactly
+    /// as `step`'s fetch does (same TLB fill, same `CPL`).
+    #[cfg(feature = "std")]
+    pub(crate) fn jit_fetch_phys(&mut self, rip: u64) -> Option<u64> {
+        let user = self.cpl == 3;
+        let pa = self.translate_acc(rip, false, user);
+        if self.fault.is_some() {
+            None
+        } else {
+            Some(pa)
+        }
+    }
+
+    /// Fetch up to 64 contiguous code bytes starting at physical `phys`, clamped to
+    /// the end of its 4 KiB page (a translated block never crosses a page, so the
+    /// translator must only see bytes whose physical address is contiguous). Read
+    /// straight from physical RAM (`rd_phys`) — the bytes the decoder consumes.
+    #[cfg(feature = "std")]
+    pub(crate) fn jit_fetch_code(&self, phys: u64) -> Vec<u8> {
+        let page_end = (phys & !0xfff) + 0x1000;
+        let n = core::cmp::min(64u64, page_end - phys) as usize;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n as u64 {
+            out.push(self.rd_phys(phys + i, 1) as u8);
+        }
+        out
+    }
+
+    /// Interpret exactly one instruction (the JIT fallback), mirroring `run`'s loop
+    /// tail: `step()` runs the instruction (the post-`step` `#PF` vector is inside
+    /// `step`), and a successful step bumps the retired counter. Returns `Err(halt)`
+    /// if the instruction halted/faulted the core, exactly as `run` would.
+    #[cfg(feature = "std")]
+    pub(crate) fn jit_interpret_one(&mut self) -> Result<(), Halt> {
+        self.step()?;
+        self.insns = self.insns.wrapping_add(1);
+        Ok(())
+    }
+
     // ── Memory ───────────────────────────────────────────────────────────────
     fn rd(&mut self, addr: u64, size: u8) -> u64 {
         let user = self.cpl == 3;
@@ -985,6 +1158,93 @@ impl Cpu {
             if let Some(b) = self.ram.get_mut(p) {
                 *b = (val >> (8 * i)) as u8;
             }
+        }
+        // Self-modifying-code detection for the CC-48 JIT driver: if this store
+        // landed on a physical page that has a cached translated block, the block
+        // is now stale (the kernel's alternatives/`text_poke` patches its own
+        // `.text`). Drop the page from the cached set and flag the driver to flush
+        // its block cache. Guarded by `is_empty()` so the interpreter-only path
+        // pays nothing beyond one cheap check. A store can straddle two pages, so
+        // check the first and last byte's frame.
+        if !self.jit_code_pages.is_empty() {
+            let lo = pa >> 12;
+            let hi = pa.wrapping_add(u64::from(size).saturating_sub(1)) >> 12;
+            for page in [lo, hi] {
+                if self.jit_code_pages.remove(&page) {
+                    self.jit_dirty = true;
+                }
+            }
+        }
+    }
+
+    /// The **CC-48 JIT memory primitive** — the *only* path a translated block
+    /// uses to touch guest memory (via the emitted module's `env.load`/`env.store`
+    /// imports). It mirrors [`Cpu::rd`]/[`Cpu::wr`]'s translation exactly (paging,
+    /// `CPL`, the per-byte `translate_acc` walk, `dcache_touch` timing) but is
+    /// **abortive**: any access the interpreter would handle specially makes the
+    /// JIT bail out so the interpreter re-runs the instruction from the block
+    /// entry. Specifically it returns `None` (without performing the access) when:
+    ///
+    ///   * the translation latches a `#PF` (`self.fault` becomes `Some`) — left
+    ///     set so the caller clears it and re-interprets, taking the real fault;
+    ///   * the physical address falls in an MMIO window (the `virtio` block at
+    ///     [`VIRTIO_BLK_BASE`], the local APIC at [`LAPIC_BASE`]) — MMIO has side
+    ///     effects that must run through the interpreter's `mmio_*`/`lapic_*`.
+    ///
+    /// Otherwise it performs the plain RAM access for `size` bytes (a read returns
+    /// the zero-extended value; a write stores `val` and returns `Some(0)`), after
+    /// charging the data cache exactly as the interpreter does. Because a JIT block
+    /// only commits idempotent RAM writes before any aborting access, re-running the
+    /// faulting/MMIO instruction from the block entry on the interpreter is correct.
+    #[cfg(feature = "std")]
+    pub(crate) fn jit_mem(&mut self, addr: u64, size: u8, write: bool, val: u64) -> Option<u64> {
+        let user = self.cpl == 3;
+        // Translate the first byte exactly as rd/wr do — this latches a #PF on a
+        // not-present page and resolves the MMIO classification.
+        let pa = self.translate_acc(addr, write, user);
+        if self.fault.is_some() {
+            // A page fault was latched; do NOT access. Leave the fault set so the
+            // driver clears it and lets the interpreter take the real #PF.
+            return None;
+        }
+        if (VIRTIO_BLK_BASE..VIRTIO_NET_END).contains(&pa) || (LAPIC_BASE..LAPIC_END).contains(&pa)
+        {
+            // An MMIO access — bail out so the interpreter performs the device op
+            // with its side effects.
+            return None;
+        }
+        self.dcache_touch(pa);
+        if write {
+            for i in 0..u64::from(size) {
+                let p = self.translate_acc(addr.wrapping_add(i), true, user);
+                if self.fault.is_some() {
+                    return None;
+                }
+                if let Some(b) = self.ram.get_mut(p as usize) {
+                    *b = (val >> (8 * i)) as u8;
+                }
+            }
+            // Mirror wr's SMC bookkeeping for a write a JIT block performs.
+            if !self.jit_code_pages.is_empty() {
+                let lo = pa >> 12;
+                let hi = pa.wrapping_add(u64::from(size).saturating_sub(1)) >> 12;
+                for page in [lo, hi] {
+                    if self.jit_code_pages.remove(&page) {
+                        self.jit_dirty = true;
+                    }
+                }
+            }
+            Some(0)
+        } else {
+            let mut v = 0u64;
+            for i in 0..u64::from(size) {
+                let p = self.translate_acc(addr.wrapping_add(i), false, user);
+                if self.fault.is_some() {
+                    return None;
+                }
+                v |= u64::from(*self.ram.get(p as usize).unwrap_or(&0)) << (8 * i);
+            }
+            Some(v)
         }
     }
 
