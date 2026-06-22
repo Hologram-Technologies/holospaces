@@ -13,13 +13,17 @@
 //! N interpreter dispatches.
 //!
 //! The translator is deliberately small and conservative — it is the *core*, not
-//! the whole DBT. It decodes a **linear** run of register-direct integer
-//! instructions (the common hot-loop shape) and stops at the first thing it does
-//! not handle (control flow, a memory operand, a 16-bit operand, an unsupported
-//! opcode, or the end of the slice), leaving the interpreter to take over there.
-//! Every instruction it does emit is validated **bit-for-bit** against the
-//! interpreter — the qemu-validated authority ([`super::x64::Cpu`], CC-44) — by
-//! the differential test (`tests/cc48_jit.rs`).
+//! the whole DBT. It decodes a **linear** run of integer instructions (the common
+//! hot-loop shape) — ALU/MOV (register and memory operands), INC/DEC, PUSH/POP
+//! (register and r/m, via the stack-memory path), LEA, TEST, MOVZX/MOVSX/MOVSXD,
+//! the SHL/SHR/SAR shifts, SETcc, NEG/NOT, and IMUL (2-/3-operand) plus the
+//! single-operand MUL/IMUL writing RDX:RAX — and stops at the first thing it does
+//! not handle (a non-branch control transfer, a 16-bit (`0x66`) or 8-bit operand,
+//! DIV/IDIV or the rotates, any other unsupported opcode, or the end of the
+//! slice), leaving the interpreter to take over there. Relative `JMP`/`Jcc` are
+//! included as block terminators. Every instruction it does emit is validated
+//! **bit-for-bit** against the interpreter — the qemu-validated authority
+//! ([`super::x64::Cpu`], CC-44) — by the differential test (`tests/cc48_jit.rs`).
 //!
 //! ## Emitted module shape
 //!
@@ -187,13 +191,19 @@ mod op {
     pub const I64_LT_U: u8 = 0x54;
     pub const I64_ADD: u8 = 0x7c;
     pub const I64_SUB: u8 = 0x7d;
+    pub const I64_MUL: u8 = 0x7e;
     pub const I64_AND: u8 = 0x83;
     pub const I64_OR: u8 = 0x84;
     pub const I64_XOR: u8 = 0x85;
     pub const I64_SHL: u8 = 0x86;
+    pub const I64_SHR_S: u8 = 0x87;
     pub const I64_SHR_U: u8 = 0x88;
     pub const I64_POPCNT: u8 = 0x7b;
+    pub const I32_WRAP_I64: u8 = 0xa7;
     pub const I64_EXTEND_I32_U: u8 = 0xad;
+    pub const I64_EXTEND8_S: u8 = 0xc2;
+    pub const I64_EXTEND16_S: u8 = 0xc3;
+    pub const I64_EXTEND32_S: u8 = 0xc4;
 }
 
 // ── Function body builder ─────────────────────────────────────────────────────
@@ -354,12 +364,15 @@ impl Body {
 // ── Register file accessors (operand width semantics) ─────────────────────────
 
 /// The mask for an operand size in bytes (matching `Cpu::mask`): 8 → all bits,
-/// 4 → low 32. Only 4 and 8 are produced (16/8-bit operands stop the block).
+/// 4 → low 32, 2 → low 16, 1 → low 8. The 1/2-byte masks are only used by the
+/// narrow *source* read of `MOVZX`/`MOVSX`/`MOVSXD` and the narrow *destination*
+/// write of `SETcc` (general 8/16-bit ALU is still deferred — the block stops).
 fn size_mask(size: u8) -> i64 {
-    if size >= 8 {
-        -1 // u64::MAX as i64
-    } else {
-        0xffff_ffff
+    match size {
+        1 => 0xff,
+        2 => 0xffff,
+        4 => 0xffff_ffff,
+        _ => -1, // 8: u64::MAX as i64
     }
 }
 
@@ -889,6 +902,148 @@ fn write_rm(body: &mut Body, rm: &RmLoc, size: u8, addr_local: Option<u32>, val_
     }
 }
 
+// ── Narrow (8/16-bit) source reads for MOVZX/MOVSX/MOVSXD ──────────────────────
+
+/// Read an 8/16-bit r/m *source* into a fresh i64 local (zero-extended), returning
+/// its index. Mirrors the interpreter's `load_rm(rm, size)` for `size` 1/2: a
+/// register source is masked to `size`, EXCEPT the legacy AH/CH/DH/BH high-byte
+/// encoding (`size==1`, no `REX`, register field `4..=7` → `bits[15:8]` of the low
+/// register); a memory source is fetched via `env.load(EA, size)`. Used only by
+/// MOVZX/MOVSX/MOVSXD, whose narrow read is explicitly allowed in this increment.
+fn read_rm_narrow(
+    body: &mut Body,
+    rm: &RmLoc,
+    size: u8,
+    addr_local: Option<u32>,
+    rex_present: bool,
+) -> u32 {
+    let v = body.local();
+    match rm {
+        RmLoc::Reg(reg) => {
+            if size == 1 && !rex_present && (4..8).contains(reg) {
+                // AH/CH/DH/BH — bits[15:8] of RAX/RCX/RDX/RBX.
+                body.load_reg(reg - 4);
+                body.i64_const(8);
+                body.binop(op::I64_SHR_U);
+                body.i64_const(0xff);
+                body.binop(op::I64_AND);
+            } else {
+                body.load_reg(*reg);
+                body.i64_const(size_mask(size));
+                body.binop(op::I64_AND);
+            }
+        }
+        RmLoc::Mem(_) => {
+            body.emit_load(addr_local.expect("memory operand needs an EA"), size);
+            body.i64_const(size_mask(size));
+            body.binop(op::I64_AND);
+        }
+    }
+    body.local_set(v);
+    v
+}
+
+/// Write a *narrow* (here always 1-byte) value into an r/m destination, honouring
+/// the legacy AH/CH/DH/BH high-byte encoding and the partial-register merge (a
+/// 1-byte write preserves the surrounding bits, unlike a 4-byte write). Mirrors
+/// the interpreter's `store_rm(rm, 1, v)`. Used only by SETcc. `val_local` holds
+/// the 0/1 byte value.
+fn write_rm_byte(
+    body: &mut Body,
+    rm: &RmLoc,
+    addr_local: Option<u32>,
+    rex_present: bool,
+    val_local: u32,
+) {
+    match rm {
+        RmLoc::Reg(reg) => {
+            if !rex_present && (4..8).contains(reg) {
+                // AH/CH/DH/BH: r[reg-4] = (r[reg-4] & !0xff00) | ((v & 0xff) << 8)
+                let lr = reg - 4;
+                body.store_reg(lr, |b| {
+                    b.load_reg(lr);
+                    b.i64_const(!0xff00i64);
+                    b.binop(op::I64_AND);
+                    b.local_get(val_local);
+                    b.i64_const(0xff);
+                    b.binop(op::I64_AND);
+                    b.i64_const(8);
+                    b.binop(op::I64_SHL);
+                    b.binop(op::I64_OR);
+                });
+            } else {
+                // Low byte merge: r[reg] = (r[reg] & !0xff) | (v & 0xff).
+                let reg = *reg;
+                body.store_reg(reg, |b| {
+                    b.load_reg(reg);
+                    b.i64_const(!0xffi64);
+                    b.binop(op::I64_AND);
+                    b.local_get(val_local);
+                    b.i64_const(0xff);
+                    b.binop(op::I64_AND);
+                    b.binop(op::I64_OR);
+                });
+            }
+        }
+        RmLoc::Mem(_) => {
+            let addr = addr_local.expect("memory operand needs an EA");
+            body.emit_store(addr, 1, |b| {
+                b.local_get(val_local);
+                b.i64_const(0xff);
+                b.binop(op::I64_AND);
+            });
+        }
+    }
+}
+
+// ── Stack ops (PUSH/POP) ───────────────────────────────────────────────────────
+
+/// Decrement RSP by 8 (the 64-bit stack slot) and return its new value in a fresh
+/// local (the address the pushed value goes to). Mirrors the interpreter's
+/// `push`: `r[RSP] -= 8; wr(r[RSP], 8, val)`.
+const RSP: u32 = 4;
+
+/// Emit `r[RSP] -= 8` and leave the new RSP in a fresh local (the store address).
+fn emit_dec_rsp(body: &mut Body) -> u32 {
+    let sp = body.local();
+    body.load_reg(RSP);
+    body.i64_const(8);
+    body.binop(op::I64_SUB);
+    body.local_set(sp);
+    // commit the new RSP
+    body.store_reg(RSP, |b| b.local_get(sp));
+    sp
+}
+
+/// `PUSH val` where the 64-bit value is produced by `f`. Decrements RSP by 8 and
+/// stores 8 bytes at the new RSP via `env.store`. No flags.
+fn emit_push(body: &mut Body, f: impl FnOnce(&mut Body)) {
+    let v = body.local();
+    f(body);
+    body.local_set(v);
+    let sp = emit_dec_rsp(body);
+    body.emit_store(sp, 8, |b| b.local_get(v));
+}
+
+/// `POP` into a fresh local: load 8 bytes from RSP, then `r[RSP] += 8`. Returns
+/// the popped value's local. No flags. (Per the interpreter's `pop`, the read uses
+/// the pre-increment RSP.)
+fn emit_pop(body: &mut Body) -> u32 {
+    let sp = body.local();
+    body.load_reg(RSP);
+    body.local_set(sp);
+    let v = body.local();
+    body.emit_load(sp, 8);
+    body.local_set(v);
+    // r[RSP] += 8
+    body.store_reg(RSP, |b| {
+        b.local_get(sp);
+        b.i64_const(8);
+        b.binop(op::I64_ADD);
+    });
+    v
+}
+
 /// Emit one ALU op `dst (op)= src_b`. `dst` is the destination operand (a
 /// register or a memory location, skipped for CMP); `a_local` holds the
 /// destination's current value, `b_local` the source. `dst_addr` is the
@@ -959,6 +1114,546 @@ fn emit_alu(
     if op != AluOp::Cmp {
         write_rm(body, dst, size, dst_addr, r);
     }
+}
+
+// ── TEST (logical AND, flags only) ─────────────────────────────────────────────
+
+/// `TEST` `a & b` — set the logical flags (CF=0,OF=0,ZF/SF/PF from result),
+/// writing nothing. `a_local`/`b_local` hold the masked operands.
+fn emit_test(body: &mut Body, a_local: u32, b_local: u32, size: u8) {
+    let r = body.local();
+    body.local_get(a_local);
+    body.local_get(b_local);
+    body.binop(op::I64_AND);
+    if size < 8 {
+        body.i64_const(size_mask(size));
+        body.binop(op::I64_AND);
+    }
+    body.local_set(r);
+    emit_flags_logic(body, r, size);
+}
+
+// ── LEA (effective address into a register, no memory access) ───────────────────
+
+/// `LEA reg, m` — write the effective address (already in `addr_local`) into the
+/// destination register, masked/zero-extended to the operand size. No flags, no
+/// memory access (mirrors the interpreter's `store_rm(Reg, size, addr & mask)`).
+fn emit_lea(body: &mut Body, dst: u32, addr_local: u32, size: u8) {
+    write_reg(body, dst, size, addr_local);
+}
+
+// ── MOVZX / MOVSX / MOVSXD (extend a narrow source into a wide register) ────────
+
+/// `MOVZX`/`MOVSX` `dst, src`. `src_size` is 1 or 2 (the narrow source); for
+/// MOVSXD it is 4. `signed` selects sign- vs zero-extension. The narrow source has
+/// already been read (zero-extended) into `src_local`; this extends it to the
+/// operand `size` and writes the destination register. No flags.
+fn emit_movx(body: &mut Body, dst: u32, src_local: u32, src_size: u8, signed: bool, size: u8) {
+    let v = body.local();
+    if signed {
+        body.local_get(src_local);
+        body.binop(match src_size {
+            1 => op::I64_EXTEND8_S,
+            2 => op::I64_EXTEND16_S,
+            _ => op::I64_EXTEND32_S,
+        });
+    } else {
+        // zero-extend: the source local is already `& mask(src_size)`.
+        body.local_get(src_local);
+    }
+    body.local_set(v);
+    // write_reg masks to `size` (a 32-bit destination clears the upper 32 bits).
+    write_reg(body, dst, size, v);
+}
+
+// ── Shifts SHL/SHR/SAR ─────────────────────────────────────────────────────────
+
+/// The supported shift kinds (group-2 digit): SHL(4/6), SHR(5), SAR(7).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShiftOp {
+    Shl,
+    Shr,
+    Sar,
+}
+
+impl ShiftOp {
+    fn from_digit(d: u8) -> Option<ShiftOp> {
+        Some(match d {
+            4 | 6 => ShiftOp::Shl, // SHL / SAL
+            5 => ShiftOp::Shr,     // SHR
+            7 => ShiftOp::Sar,     // SAR
+            _ => return None,      // ROL/ROR/RCL/RCR (0..=3) deferred — stop
+        })
+    }
+}
+
+/// `SHL/SHR/SAR rm, cnt`. `cnt_local` holds the *raw* count (imm8 zero-extended,
+/// or `CL` for the `0xD3` form); it is masked to 0x3f (size 8) / 0x1f (size 4)
+/// here, matching the interpreter. A zero (masked) count leaves the result AND all
+/// flags unchanged. CF = last bit shifted out; ZF/SF/PF from the result; OF is
+/// left unchanged (the interpreter's `shift_rotate` never writes OF).
+fn emit_shift(
+    body: &mut Body,
+    sop: ShiftOp,
+    rm: &RmLoc,
+    rm_addr: Option<u32>,
+    cnt_local: u32,
+    size: u8,
+) {
+    let bits = i64::from(size) * 8;
+    let cnt_mask: i64 = if size == 8 { 63 } else { 31 };
+
+    // cnt = raw & cnt_mask
+    let cnt = body.local();
+    body.local_get(cnt_local);
+    body.i64_const(cnt_mask);
+    body.binop(op::I64_AND);
+    body.local_set(cnt);
+
+    // The source value (masked to size).
+    let a = read_rm(body, rm, size, rm_addr);
+
+    // result and CF, computed unconditionally for cnt != 0; the cnt==0 case selects
+    // back the original operand / original flags so nothing changes.
+    let res = body.local();
+    let cf = body.local();
+    match sop {
+        ShiftOp::Shl => {
+            // res = (a << cnt) & mask
+            body.local_get(a);
+            body.local_get(cnt);
+            body.binop(op::I64_SHL);
+            if size < 8 {
+                body.i64_const(size_mask(size));
+                body.binop(op::I64_AND);
+            }
+            body.local_set(res);
+            // cf = (a >> (bits - cnt)) & 1
+            body.local_get(a);
+            body.i64_const(bits);
+            body.local_get(cnt);
+            body.binop(op::I64_SUB);
+            body.binop(op::I64_SHR_U);
+            body.i64_const(1);
+            body.binop(op::I64_AND);
+            body.local_set(cf);
+        }
+        ShiftOp::Shr => {
+            // res = a >> cnt   (a already masked → logical)
+            body.local_get(a);
+            body.local_get(cnt);
+            body.binop(op::I64_SHR_U);
+            body.local_set(res);
+            // cf = (a >> (cnt - 1)) & 1
+            body.local_get(a);
+            body.local_get(cnt);
+            body.i64_const(1);
+            body.binop(op::I64_SUB);
+            body.binop(op::I64_SHR_U);
+            body.i64_const(1);
+            body.binop(op::I64_AND);
+            body.local_set(cf);
+        }
+        ShiftOp::Sar => {
+            // sign-extend a to 64 bits, arithmetic-shift, re-mask.
+            // sa = (a << (64-bits)) >>s (64-bits)
+            body.local_get(a);
+            if bits < 64 {
+                body.i64_const(64 - bits);
+                body.binop(op::I64_SHL);
+                body.i64_const(64 - bits);
+                body.binop(op::I64_SHR_S);
+            }
+            body.local_get(cnt);
+            body.binop(op::I64_SHR_S);
+            if size < 8 {
+                body.i64_const(size_mask(size));
+                body.binop(op::I64_AND);
+            }
+            body.local_set(res);
+            // cf = (a >> (cnt - 1)) & 1
+            body.local_get(a);
+            body.local_get(cnt);
+            body.i64_const(1);
+            body.binop(op::I64_SUB);
+            body.binop(op::I64_SHR_U);
+            body.i64_const(1);
+            body.binop(op::I64_AND);
+            body.local_set(cf);
+        }
+    }
+
+    // Build the new flags (CF + ZF/SF/PF from res), then SELECT between old and new
+    // flags on (cnt != 0) so a zero count leaves rflags unchanged.
+    let oldflags = body.local();
+    body.load_rflags();
+    body.local_set(oldflags);
+    let newflags = body.local();
+    // start from oldflags with CF/ZF/SF/PF cleared (OF preserved — interp leaves it).
+    body.local_get(oldflags);
+    body.i64_const(!((CF | ZF | SF | PF) as i64));
+    body.binop(op::I64_AND);
+    // | CF (CF is bit 0 — no shift needed)
+    body.local_get(cf);
+    body.binop(op::I64_OR);
+    // | ZF
+    push_zf(body, res);
+    shift_into(body, ZF);
+    body.binop(op::I64_OR);
+    // | SF
+    push_sf(body, res, size);
+    shift_into(body, SF);
+    body.binop(op::I64_OR);
+    // | PF
+    push_pf(body, res);
+    shift_into(body, PF);
+    body.binop(op::I64_OR);
+    body.local_set(newflags);
+
+    // rflags = (cnt != 0) ? newflags : oldflags
+    body.store_rflags(|b| {
+        b.local_get(newflags);
+        b.local_get(oldflags);
+        // predicate: cnt != 0  (i32)
+        b.local_get(cnt);
+        b.binop(op::I64_EQZ); // i32 1 if cnt==0
+        b.binop(op::I32_EQZ); // i32 1 if cnt!=0
+        b.byte(op::SELECT);
+    });
+
+    // Write the destination = (cnt != 0) ? res : original. A zero count leaves the
+    // operand entirely unchanged in the interpreter (no store), so for a *register*
+    // destination the not-shifted value must be the FULL 64-bit register (a 32-bit
+    // store would wrongly clear the upper half); we therefore build the final value
+    // already zero-extended/merged and do a single full 64-bit register write.
+    match rm {
+        RmLoc::Reg(reg) => {
+            let out = body.local();
+            // shifted = res zero-extended to the operand size (size 4 clears upper).
+            body.local_get(res);
+            if size < 8 {
+                body.i64_const(size_mask(size));
+                body.binop(op::I64_AND);
+            }
+            // original = the FULL register value (unchanged when cnt == 0).
+            body.load_reg(*reg);
+            body.local_get(cnt);
+            body.binop(op::I64_EQZ);
+            body.binop(op::I32_EQZ); // cnt != 0
+            body.byte(op::SELECT);
+            body.local_set(out);
+            // full 64-bit store (the value already carries the right extension).
+            body.store_reg(*reg, |b| b.local_get(out));
+        }
+        RmLoc::Mem(_) => {
+            // For memory, re-storing the original `size` bytes when cnt == 0 is a
+            // no-op (identical bytes), so a plain size-`size` store of the selected
+            // value is correct.
+            let out = body.local();
+            body.local_get(res);
+            body.local_get(a);
+            body.local_get(cnt);
+            body.binop(op::I64_EQZ);
+            body.binop(op::I32_EQZ); // cnt != 0
+            body.byte(op::SELECT);
+            body.local_set(out);
+            write_rm(body, rm, size, rm_addr, out);
+        }
+    }
+}
+
+// ── SETcc (write 0/1 byte by condition) ────────────────────────────────────────
+
+/// `SETcc rm` — write the byte `cond(cc)` (0/1) to the r/m destination (no flags).
+fn emit_setcc(body: &mut Body, cc: u8, rm: &RmLoc, rm_addr: Option<u32>, rex_present: bool) {
+    let v = body.local();
+    emit_cond_base(body, cc >> 1); // i64 0/1
+    if cc & 1 == 1 {
+        // invert: 1 - base  ==  (base == 0)
+        body.binop(op::I64_EQZ);
+        body.binop(op::I64_EXTEND_I32_U);
+    }
+    body.local_set(v);
+    write_rm_byte(body, rm, rm_addr, rex_present, v);
+}
+
+// ── NEG / NOT (group3 /3, /2) ──────────────────────────────────────────────────
+
+/// `NOT rm` — bitwise complement, no flags.
+fn emit_not(body: &mut Body, rm: &RmLoc, rm_addr: Option<u32>, size: u8) {
+    let a = read_rm(body, rm, size, rm_addr);
+    let r = body.local();
+    body.local_get(a);
+    body.i64_const(-1);
+    body.binop(op::I64_XOR);
+    if size < 8 {
+        body.i64_const(size_mask(size));
+        body.binop(op::I64_AND);
+    }
+    body.local_set(r);
+    write_rm(body, rm, size, rm_addr, r);
+}
+
+/// `NEG rm` — `0 - a`; flags as `flags_arith(0, a, r, size, sub=true)`, then
+/// CF = (a != 0) (the interpreter overrides the borrow CF with `a != 0`).
+fn emit_neg(body: &mut Body, rm: &RmLoc, rm_addr: Option<u32>, size: u8) {
+    let a = read_rm(body, rm, size, rm_addr);
+    let zero = body.local();
+    body.i64_const(0);
+    body.local_set(zero);
+    let r = body.local();
+    body.i64_const(0);
+    body.local_get(a);
+    body.binop(op::I64_SUB);
+    if size < 8 {
+        body.i64_const(size_mask(size));
+        body.binop(op::I64_AND);
+    }
+    body.local_set(r);
+    // flags_arith(0, a, r, sub) sets CF = (0 < a) which equals (a != 0); the
+    // interpreter then explicitly sets CF = (a != 0) — identical — so the standard
+    // arithmetic flags already match.
+    emit_flags_arith(body, zero, a, r, size, true);
+    write_rm(body, rm, size, rm_addr, r);
+}
+
+// ── IMUL (2/3-operand) — truncated product into a register, no flags ───────────
+
+/// 2-operand `IMUL reg, rm` (0x0F 0xAF) — `reg = (reg * rm)` truncated to the
+/// operand size, written to the register. The interpreter sets NO flags for this
+/// form, so neither do we.
+fn emit_imul2(body: &mut Body, dst: u32, rm: &RmLoc, rm_addr: Option<u32>, size: u8) {
+    let a = read_rm(body, &RmLoc::Reg(dst), size, None);
+    let b = read_rm(body, rm, size, rm_addr);
+    let r = body.local();
+    body.local_get(a);
+    body.local_get(b);
+    body.binop(op::I64_MUL);
+    body.local_set(r);
+    write_reg(body, dst, size, r);
+}
+
+/// 3-operand `IMUL reg, rm, imm` (0x69 imm32 / 0x6B imm8) — `reg = sext(rm) * imm`
+/// truncated to the operand size. The immediate is already sign-extended to i64 by
+/// the decoder. The interpreter sets NO flags for this form. The `rm` source is
+/// sign-extended to the operand width before the multiply.
+fn emit_imul3(body: &mut Body, dst: u32, rm: &RmLoc, rm_addr: Option<u32>, imm: i64, size: u8) {
+    let a_raw = read_rm(body, rm, size, rm_addr);
+    let r = body.local();
+    // sign-extend the (masked) rm value to the operand width, then * imm.
+    body.local_get(a_raw);
+    if size == 4 {
+        body.binop(op::I64_EXTEND32_S);
+    }
+    body.i64_const(imm);
+    body.binop(op::I64_MUL);
+    body.local_set(r);
+    write_reg(body, dst, size, r);
+}
+
+// ── MUL / IMUL single-operand (group3 /4,/5) — write RDX:RAX, set CF/OF ─────────
+
+/// Index of RAX / RDX in the register file.
+const RAX: u32 = 0;
+const RDX: u32 = 2;
+
+/// Single-operand `MUL`/`IMUL` (0xF7 /4,/5): `RDX:RAX = RAX * rm`. `signed`
+/// selects IMUL. Sets CF=OF=(high half nonzero), mirroring `store_mul_result`;
+/// the other arithmetic flags (ZF/SF/PF) are left as the interpreter leaves them
+/// (it does not touch them here). Only operand sizes 4/8 reach this path.
+fn emit_muldiv_mul(body: &mut Body, rm: &RmLoc, rm_addr: Option<u32>, signed: bool, size: u8) {
+    // a = RAX & mask ; b = rm & mask
+    let a = read_rm(body, &RmLoc::Reg(RAX), size, None);
+    let b = read_rm(body, rm, size, rm_addr);
+
+    if size == 8 {
+        // 64x64 → 128. Wasm has no i128, so compute the 128-bit product by halves.
+        emit_mul64_128(body, a, b, signed);
+    } else {
+        // 32x32 → 64 fits in one i64. Sign-extend operands for IMUL.
+        let prod = body.local();
+        body.local_get(a);
+        if signed {
+            body.binop(op::I64_EXTEND32_S);
+        }
+        body.local_get(b);
+        if signed {
+            body.binop(op::I64_EXTEND32_S);
+        }
+        body.binop(op::I64_MUL);
+        body.local_set(prod);
+        // RAX = prod & 0xffffffff (zero-extends upper, per store_rm size 4)
+        let lo = body.local();
+        body.local_get(prod);
+        body.i64_const(size_mask(4));
+        body.binop(op::I64_AND);
+        body.local_set(lo);
+        write_reg(body, RAX, 4, lo);
+        // hi = (prod >> 32) & 0xffffffff
+        let hi = body.local();
+        body.local_get(prod);
+        body.i64_const(32);
+        body.binop(op::I64_SHR_U);
+        body.i64_const(size_mask(4));
+        body.binop(op::I64_AND);
+        body.local_set(hi);
+        write_reg(body, RDX, 4, hi);
+        // CF=OF = hi != 0   (hi is the size-masked high half)
+        emit_mul_overflow_flags(body, hi);
+    }
+}
+
+/// Set CF=OF = (`hi_local` != 0); ZF/SF/PF preserved (matching `store_mul_result`).
+fn emit_mul_overflow_flags(body: &mut Body, hi_local: u32) {
+    body.store_rflags(|b| {
+        b.load_rflags();
+        b.i64_const(!((CF | OF) as i64));
+        b.binop(op::I64_AND);
+        // ov = hi != 0  (i64 0/1)
+        let ov = b.local();
+        b.local_get(hi_local);
+        b.binop(op::I64_EQZ);
+        b.binop(op::I32_EQZ);
+        b.binop(op::I64_EXTEND_I32_U);
+        b.local_set(ov);
+        b.local_get(ov);
+        // CF bit 0
+        b.binop(op::I64_OR);
+        b.local_get(ov);
+        shift_into(b, OF);
+        b.binop(op::I64_OR);
+    });
+}
+
+/// Emit a full 64×64→128 multiply of `a_local`*`b_local`, storing the low 64 bits
+/// into RAX and the high 64 bits into RDX, then setting CF=OF=(high != 0).
+/// `signed` selects IMUL (signed) vs MUL (unsigned). The 128-bit product is built
+/// from 32-bit lane partial products (Wasm lacks `i64.mul_wide`).
+fn emit_mul64_128(body: &mut Body, a_local: u32, b_local: u32, signed: bool) {
+    // Compute the UNSIGNED 128-bit product first via 32-bit lanes, then correct
+    // the high half for signedness (two's-complement: subtract b if a<0, a if b<0).
+    let mask32: i64 = 0xffff_ffff;
+
+    let a0 = body.local(); // a low 32
+    let a1 = body.local(); // a high 32
+    let b0 = body.local();
+    let b1 = body.local();
+    body.local_get(a_local);
+    body.i64_const(mask32);
+    body.binop(op::I64_AND);
+    body.local_set(a0);
+    body.local_get(a_local);
+    body.i64_const(32);
+    body.binop(op::I64_SHR_U);
+    body.local_set(a1);
+    body.local_get(b_local);
+    body.i64_const(mask32);
+    body.binop(op::I64_AND);
+    body.local_set(b0);
+    body.local_get(b_local);
+    body.i64_const(32);
+    body.binop(op::I64_SHR_U);
+    body.local_set(b1);
+
+    // ll = a0*b0 ; lh = a1*b0 ; hl = a0*b1 ; hh = a1*b1
+    let ll = body.local();
+    body.local_get(a0);
+    body.local_get(b0);
+    body.binop(op::I64_MUL);
+    body.local_set(ll);
+    let lh = body.local();
+    body.local_get(a1);
+    body.local_get(b0);
+    body.binop(op::I64_MUL);
+    body.local_set(lh);
+    let hl = body.local();
+    body.local_get(a0);
+    body.local_get(b1);
+    body.binop(op::I64_MUL);
+    body.local_set(hl);
+    let hh = body.local();
+    body.local_get(a1);
+    body.local_get(b1);
+    body.binop(op::I64_MUL);
+    body.local_set(hh);
+
+    // mid = (ll >> 32) + (lh & mask32) + (hl & mask32)
+    let mid = body.local();
+    body.local_get(ll);
+    body.i64_const(32);
+    body.binop(op::I64_SHR_U);
+    body.local_get(lh);
+    body.i64_const(mask32);
+    body.binop(op::I64_AND);
+    body.binop(op::I64_ADD);
+    body.local_get(hl);
+    body.i64_const(mask32);
+    body.binop(op::I64_AND);
+    body.binop(op::I64_ADD);
+    body.local_set(mid);
+
+    // lo = (ll & mask32) | (mid << 32)
+    let lo = body.local();
+    body.local_get(ll);
+    body.i64_const(mask32);
+    body.binop(op::I64_AND);
+    body.local_get(mid);
+    body.i64_const(32);
+    body.binop(op::I64_SHL);
+    body.binop(op::I64_OR);
+    body.local_set(lo);
+
+    // hi = hh + (lh >> 32) + (hl >> 32) + (mid >> 32)
+    let hi = body.local();
+    body.local_get(hh);
+    body.local_get(lh);
+    body.i64_const(32);
+    body.binop(op::I64_SHR_U);
+    body.binop(op::I64_ADD);
+    body.local_get(hl);
+    body.i64_const(32);
+    body.binop(op::I64_SHR_U);
+    body.binop(op::I64_ADD);
+    body.local_get(mid);
+    body.i64_const(32);
+    body.binop(op::I64_SHR_U);
+    body.binop(op::I64_ADD);
+    body.local_set(hi);
+
+    if signed {
+        // Signed correction: hi -= (a<0 ? b : 0) + (b<0 ? a : 0).
+        // a<0 ? b : 0
+        body.local_get(hi);
+        body.local_get(b_local);
+        body.i64_const(0);
+        // predicate a < 0  → (a >> 63) & 1 as i32
+        body.local_get(a_local);
+        body.i64_const(63);
+        body.binop(op::I64_SHR_U);
+        body.binop(op::I32_WRAP_I64);
+        body.byte(op::SELECT); // a<0 ? b : 0
+        body.binop(op::I64_SUB);
+        // - (b<0 ? a : 0)
+        body.local_get(a_local);
+        body.i64_const(0);
+        body.local_get(b_local);
+        body.i64_const(63);
+        body.binop(op::I64_SHR_U);
+        body.binop(op::I32_WRAP_I64);
+        body.byte(op::SELECT); // b<0 ? a : 0
+        body.binop(op::I64_SUB);
+        body.local_set(hi);
+    }
+
+    // RAX = lo ; RDX = hi (full 64-bit writes).
+    write_reg(body, RAX, 8, lo);
+    write_reg(body, RDX, 8, hi);
+
+    // CF=OF = (hi != 0). This matches the interpreter's `store_mul_result`, which
+    // sets the overflow from `(prod >> bits) != 0` over the *unsigned* 128-bit
+    // two's-complement product (so a negative IMUL result, whose high half is all
+    // ones, also sets the flags) — `hi` here is exactly that top 64-bit half.
+    emit_mul_overflow_flags(body, hi);
 }
 
 /// Translate a linear run of supported instructions starting at the block entry.
@@ -1088,7 +1783,6 @@ fn decode_one(dec: &mut Decoder, body: &mut Body, next_rip_local: u32) -> Decode
     // To avoid emitting partial code on Stop, decode the full operand set into a
     // small staging description, then emit. ModRm decode can fail (memory form
     // or truncation) — handle before any emission.
-    let _ = rex_present;
 
     match op {
         // ── ALU reg forms: r/m,r (0x01..) and r,r/m (0x03..) ──
@@ -1194,18 +1888,28 @@ fn decode_one(dec: &mut Decoder, body: &mut Body, next_rip_local: u32) -> Decode
             emit_mov_rm_imm(body, &d.rm, addr, imm, size);
             DecodeResult::Ok
         }
-        // ── inc/dec via 0xFF /0 (inc) and /1 (dec) ──
+        // ── inc/dec via 0xFF /0 (inc) and /1 (dec); PUSH r/m via /6 ──
         0xff => {
             let Some(d) = decode_modrm(dec, rex) else {
                 return DecodeResult::Stop;
             };
             let digit = d.reg & 7;
-            if digit != 0 && digit != 1 {
-                return DecodeResult::Stop; // call/jmp/push — control flow
+            match digit {
+                0 | 1 => {
+                    let addr = maybe_ea(body, &d.rm, dec.pos);
+                    emit_inc_dec(body, &d.rm, addr, digit == 1, size);
+                    DecodeResult::Ok
+                }
+                6 => {
+                    // PUSH r/m64 — always an 8-byte operand (operand-size
+                    // independent), pushed after the EA is computed.
+                    let addr = maybe_ea(body, &d.rm, dec.pos);
+                    let v = read_rm(body, &d.rm, 8, addr);
+                    emit_push(body, |b| b.local_get(v));
+                    DecodeResult::Ok
+                }
+                _ => DecodeResult::Stop, // call/jmp (2/3/4/5) — control flow
             }
-            let addr = maybe_ea(body, &d.rm, dec.pos);
-            emit_inc_dec(body, &d.rm, addr, digit == 1, size);
-            DecodeResult::Ok
         }
         // ── relative branch terminators (these END the block, included) ──
         // JMP rel8 (0xEB): next_rip = instruction_end + sext(rel8).
@@ -1236,22 +1940,261 @@ fn decode_one(dec: &mut Decoder, body: &mut Body, next_rip_local: u32) -> Decode
             emit_jcc(body, next_rip_local, op - 0x70, taken, fallthru);
             DecodeResult::Terminator
         }
-        // 0x0F two-byte: only Jcc rel32 (0x80..0x8F) is a supported terminator;
-        // every other 0x0F opcode stops the block (interpreter handles it).
+        // ── PUSH r64 (0x50+r) / POP r64 (0x58+r) ──
+        0x50..=0x57 => {
+            let reg = u32::from(op - 0x50) | (u32::from(rex & 1) << 3);
+            // PUSH always uses the full 64-bit register value.
+            let v = body.local();
+            push_masked_reg(body, reg, 8);
+            body.local_set(v);
+            emit_push(body, |b| b.local_get(v));
+            DecodeResult::Ok
+        }
+        0x58..=0x5f => {
+            let reg = u32::from(op - 0x58) | (u32::from(rex & 1) << 3);
+            let v = emit_pop(body);
+            write_reg(body, reg, 8, v);
+            DecodeResult::Ok
+        }
+        // ── POP r/m64 (0x8F /0) — pop FIRST, then decode the destination EA ──
+        0x8f => {
+            // Per the SDM the EA is computed after RSP is incremented by the pop;
+            // matching the interpreter, we pop before decoding the ModRM.
+            let v = emit_pop(body);
+            let Some(d) = decode_modrm(dec, rex) else {
+                return DecodeResult::Stop;
+            };
+            if d.reg & 7 != 0 {
+                return DecodeResult::Stop; // only /0 is POP r/m
+            }
+            let addr = maybe_ea(body, &d.rm, dec.pos);
+            write_rm(body, &d.rm, 8, addr, v);
+            DecodeResult::Ok
+        }
+        // ── LEA (0x8D) — effective address into reg, no memory access, no flags ──
+        0x8d => {
+            let Some(d) = decode_modrm(dec, rex) else {
+                return DecodeResult::Stop;
+            };
+            // A register r/m form of LEA is illegal (#UD); stop the block.
+            let RmLoc::Mem(ref ea) = d.rm else {
+                return DecodeResult::Stop;
+            };
+            let addr = emit_ea(body, ea, dec.pos);
+            emit_lea(body, d.reg, addr, size);
+            DecodeResult::Ok
+        }
+        // ── TEST r/m, r (0x85) ──
+        0x85 => {
+            let Some(d) = decode_modrm(dec, rex) else {
+                return DecodeResult::Stop;
+            };
+            let addr = maybe_ea(body, &d.rm, dec.pos);
+            let a = read_rm(body, &d.rm, size, addr);
+            let b = body.local();
+            push_masked_reg(body, d.reg, size);
+            body.local_set(b);
+            emit_test(body, a, b, size);
+            DecodeResult::Ok
+        }
+        // ── TEST eAX, imm (0xA9) ──
+        0xa9 => {
+            let imm: u64 = {
+                let Some(v) = dec.u32_le() else {
+                    return DecodeResult::Stop;
+                };
+                if size == 8 {
+                    (v as i32 as i64) as u64
+                } else {
+                    u64::from(v)
+                }
+            };
+            let a = read_rm(body, &RmLoc::Reg(RAX), size, None);
+            let b = body.local();
+            body.i64_const(imm as i64);
+            if size < 8 {
+                body.i64_const(size_mask(size));
+                body.binop(op::I64_AND);
+            }
+            body.local_set(b);
+            emit_test(body, a, b, size);
+            DecodeResult::Ok
+        }
+        // ── MOVSXD r64, r/m32 (0x63) ──
+        0x63 => {
+            let Some(d) = decode_modrm(dec, rex) else {
+                return DecodeResult::Stop;
+            };
+            let addr = maybe_ea(body, &d.rm, dec.pos);
+            let src = read_rm_narrow(body, &d.rm, 4, addr, rex_present);
+            emit_movx(body, d.reg, src, 4, true, size);
+            DecodeResult::Ok
+        }
+        // ── IMUL r, r/m, imm32 (0x69) / imm8 (0x6B) ──
+        0x69 | 0x6b => {
+            let Some(d) = decode_modrm(dec, rex) else {
+                return DecodeResult::Stop;
+            };
+            let imm: i64 = if op == 0x6b {
+                let Some(b) = dec.u8() else {
+                    return DecodeResult::Stop;
+                };
+                b as i8 as i64
+            } else {
+                let Some(v) = dec.u32_le() else {
+                    return DecodeResult::Stop;
+                };
+                v as i32 as i64
+            };
+            let addr = maybe_ea(body, &d.rm, dec.pos);
+            emit_imul3(body, d.reg, &d.rm, addr, imm, size);
+            DecodeResult::Ok
+        }
+        // ── shifts SHL/SHR/SAR: 0xC1 imm8, 0xD1 by 1, 0xD3 by CL ──
+        0xc1 | 0xd1 | 0xd3 => {
+            let Some(d) = decode_modrm(dec, rex) else {
+                return DecodeResult::Stop;
+            };
+            let Some(sop) = ShiftOp::from_digit((d.reg & 7) as u8) else {
+                return DecodeResult::Stop; // ROL/ROR/RCL/RCR deferred
+            };
+            // Fetch the count source BEFORE resolving a RIP-relative EA so the EA's
+            // instruction-end matches the interpreter (the imm8 of 0xC1 follows the
+            // ModRM/SIB/disp; 0xD1/0xD3 have no trailing immediate).
+            let cnt = body.local();
+            match op {
+                0xc1 => {
+                    let Some(imm) = dec.u8() else {
+                        return DecodeResult::Stop;
+                    };
+                    body.i64_const(i64::from(imm));
+                    body.local_set(cnt);
+                }
+                0xd1 => {
+                    body.i64_const(1);
+                    body.local_set(cnt);
+                }
+                _ => {
+                    // 0xD3: count = CL = r[RCX] & 0xff.
+                    body.load_reg(1); // RCX
+                    body.i64_const(0xff);
+                    body.binop(op::I64_AND);
+                    body.local_set(cnt);
+                }
+            }
+            let addr = maybe_ea(body, &d.rm, dec.pos);
+            emit_shift(body, sop, &d.rm, addr, cnt, size);
+            DecodeResult::Ok
+        }
+        // ── group3 (0xF7): TEST/NOT/NEG/MUL/IMUL (DIV/IDIV deferred) ──
+        0xf7 => {
+            let Some(d) = decode_modrm(dec, rex) else {
+                return DecodeResult::Stop;
+            };
+            let digit = d.reg & 7;
+            match digit {
+                0 | 1 => {
+                    // TEST r/m, imm32-sext. Immediate fetched before EA resolve.
+                    let imm: u64 = {
+                        let Some(v) = dec.u32_le() else {
+                            return DecodeResult::Stop;
+                        };
+                        if size == 8 {
+                            (v as i32 as i64) as u64
+                        } else {
+                            u64::from(v)
+                        }
+                    };
+                    let addr = maybe_ea(body, &d.rm, dec.pos);
+                    let a = read_rm(body, &d.rm, size, addr);
+                    let b = body.local();
+                    body.i64_const(imm as i64);
+                    if size < 8 {
+                        body.i64_const(size_mask(size));
+                        body.binop(op::I64_AND);
+                    }
+                    body.local_set(b);
+                    emit_test(body, a, b, size);
+                    DecodeResult::Ok
+                }
+                2 => {
+                    let addr = maybe_ea(body, &d.rm, dec.pos);
+                    emit_not(body, &d.rm, addr, size);
+                    DecodeResult::Ok
+                }
+                3 => {
+                    let addr = maybe_ea(body, &d.rm, dec.pos);
+                    emit_neg(body, &d.rm, addr, size);
+                    DecodeResult::Ok
+                }
+                4 | 5 => {
+                    // MUL (/4) / IMUL (/5): RDX:RAX = RAX * r/m.
+                    let addr = maybe_ea(body, &d.rm, dec.pos);
+                    emit_muldiv_mul(body, &d.rm, addr, digit == 5, size);
+                    DecodeResult::Ok
+                }
+                // DIV (/6) / IDIV (/7) can raise #DE; the JIT has no exception
+                // path, so they stop the block (the interpreter handles them).
+                _ => DecodeResult::Stop,
+            }
+        }
+        // 0x0F two-byte: Jcc rel32 (0x80..0x8F) terminator, plus SETcc, MOVZX/
+        // MOVSX, and 2-operand IMUL; every other 0x0F opcode stops the block.
         0x0f => {
             let Some(op2) = dec.u8() else {
                 return DecodeResult::Stop;
             };
-            if (0x80..=0x8f).contains(&op2) {
-                let Some(rel) = dec.u32_le() else {
-                    return DecodeResult::Stop;
-                };
-                let fallthru = dec.pos as u64;
-                let taken = fallthru.wrapping_add(rel as i32 as i64 as u64);
-                emit_jcc(body, next_rip_local, op2 - 0x80, taken, fallthru);
-                DecodeResult::Terminator
-            } else {
-                DecodeResult::Stop
+            match op2 {
+                0x80..=0x8f => {
+                    let Some(rel) = dec.u32_le() else {
+                        return DecodeResult::Stop;
+                    };
+                    let fallthru = dec.pos as u64;
+                    let taken = fallthru.wrapping_add(rel as i32 as i64 as u64);
+                    emit_jcc(body, next_rip_local, op2 - 0x80, taken, fallthru);
+                    DecodeResult::Terminator
+                }
+                // SETcc r/m8 (0x90..0x9F) — write a 0/1 byte by condition.
+                0x90..=0x9f => {
+                    let Some(d) = decode_modrm(dec, rex) else {
+                        return DecodeResult::Stop;
+                    };
+                    let addr = maybe_ea(body, &d.rm, dec.pos);
+                    emit_setcc(body, op2 - 0x90, &d.rm, addr, rex_present);
+                    DecodeResult::Ok
+                }
+                // MOVZX r, r/m8 (0xB6) / r/m16 (0xB7).
+                0xb6 | 0xb7 => {
+                    let ssz: u8 = if op2 == 0xb6 { 1 } else { 2 };
+                    let Some(d) = decode_modrm(dec, rex) else {
+                        return DecodeResult::Stop;
+                    };
+                    let addr = maybe_ea(body, &d.rm, dec.pos);
+                    let src = read_rm_narrow(body, &d.rm, ssz, addr, rex_present);
+                    emit_movx(body, d.reg, src, ssz, false, size);
+                    DecodeResult::Ok
+                }
+                // MOVSX r, r/m8 (0xBE) / r/m16 (0xBF).
+                0xbe | 0xbf => {
+                    let ssz: u8 = if op2 == 0xbe { 1 } else { 2 };
+                    let Some(d) = decode_modrm(dec, rex) else {
+                        return DecodeResult::Stop;
+                    };
+                    let addr = maybe_ea(body, &d.rm, dec.pos);
+                    let src = read_rm_narrow(body, &d.rm, ssz, addr, rex_present);
+                    emit_movx(body, d.reg, src, ssz, true, size);
+                    DecodeResult::Ok
+                }
+                // 2-operand IMUL r, r/m (0xAF).
+                0xaf => {
+                    let Some(d) = decode_modrm(dec, rex) else {
+                        return DecodeResult::Stop;
+                    };
+                    let addr = maybe_ea(body, &d.rm, dec.pos);
+                    emit_imul2(body, d.reg, &d.rm, addr, size);
+                    DecodeResult::Ok
+                }
+                _ => DecodeResult::Stop,
             }
         }
         _ => DecodeResult::Stop,

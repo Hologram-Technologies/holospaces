@@ -460,6 +460,230 @@ fn instr_incdec_m(w: bool, mem: Mem, dec: bool) -> Vec<u8> {
     instr_rm(w, 0xFF, if dec { 1 } else { 0 }, mem)
 }
 
+// ── New-opcode assembly helpers (push/pop, lea, test, movzx/sx, shift, setcc, …) ─
+
+/// `PUSH r64` (0x50+r). REX only needed for r8..r15 (the B bit).
+fn instr_push_r(reg: u8) -> Vec<u8> {
+    let mut v = Vec::new();
+    if reg >= 8 {
+        v.push(0x41); // REX.B
+    }
+    v.push(0x50 + (reg & 7));
+    v
+}
+
+/// `POP r64` (0x58+r).
+fn instr_pop_r(reg: u8) -> Vec<u8> {
+    let mut v = Vec::new();
+    if reg >= 8 {
+        v.push(0x41); // REX.B
+    }
+    v.push(0x58 + (reg & 7));
+    v
+}
+
+/// `PUSH r/m64` (0xFF /6).
+fn instr_push_m(mem: Mem) -> Vec<u8> {
+    // operand size is always 64-bit for PUSH; REX.W is irrelevant, but the
+    // memory operand may need REX.X/REX.B — encode with w=false.
+    instr_rm(false, 0xFF, 6, mem)
+}
+
+/// `POP r/m64` (0x8F /0).
+fn instr_pop_m(mem: Mem) -> Vec<u8> {
+    instr_rm(false, 0x8F, 0, mem)
+}
+
+/// `LEA reg, mem` (0x8D).
+fn instr_lea(w: bool, reg: u8, mem: Mem) -> Vec<u8> {
+    instr_rm(w, 0x8D, reg, mem)
+}
+
+/// `TEST r/m, r` (0x85) register-direct.
+fn instr_test_rr(w: bool, reg: u8, rm: u8) -> Vec<u8> {
+    instr_rr(w, 0x85, reg, rm)
+}
+
+/// `TEST r/m, r` (0x85) with a memory r/m.
+fn instr_test_rm(w: bool, reg: u8, mem: Mem) -> Vec<u8> {
+    instr_rm(w, 0x85, reg, mem)
+}
+
+/// `TEST eAX/rAX, imm32` (0xA9). REX.W selects 64-bit (imm32 sign-extended).
+fn instr_test_ax_imm(w: bool, imm32: i32) -> Vec<u8> {
+    let mut v = Vec::new();
+    if w {
+        v.push(0x48);
+    }
+    v.push(0xA9);
+    v.extend_from_slice(&imm32.to_le_bytes());
+    v
+}
+
+/// `TEST r/m, imm32` (0xF7 /0). Register-direct.
+fn instr_test_imm_rr(w: bool, rm: u8, imm32: i32) -> Vec<u8> {
+    let mut v = vec![rex(w, 0, rm), 0xF7, modrm_rr(0, rm)];
+    v.extend_from_slice(&imm32.to_le_bytes());
+    v
+}
+
+/// `TEST r/m, imm32` (0xF7 /0). Memory r/m.
+fn instr_test_imm_m(w: bool, mem: Mem, imm32: i32) -> Vec<u8> {
+    let mut v = instr_rm(w, 0xF7, 0, mem);
+    v.extend_from_slice(&imm32.to_le_bytes());
+    v
+}
+
+/// `NOT r/m` (0xF7 /2) register-direct, and `NEG r/m` (0xF7 /3).
+fn instr_f7_unary(w: bool, digit: u8, rm: u8) -> Vec<u8> {
+    vec![rex(w, digit, rm), 0xF7, modrm_rr(digit, rm)]
+}
+
+/// `NOT`/`NEG` r/m memory (0xF7 /2 or /3).
+fn instr_f7_unary_m(w: bool, digit: u8, mem: Mem) -> Vec<u8> {
+    instr_rm(w, 0xF7, digit, mem)
+}
+
+/// Single-operand `MUL`/`IMUL` (0xF7 /4 or /5) register-direct.
+fn instr_f7_muldiv(w: bool, digit: u8, rm: u8) -> Vec<u8> {
+    vec![rex(w, digit, rm), 0xF7, modrm_rr(digit, rm)]
+}
+
+/// Single-operand `MUL`/`IMUL` (0xF7 /4 or /5) with a memory r/m.
+fn instr_f7_muldiv_m(w: bool, digit: u8, mem: Mem) -> Vec<u8> {
+    instr_rm(w, 0xF7, digit, mem)
+}
+
+/// A 0x0F two-byte instruction `op2 reg, rm` register-direct: `[rex, 0x0F, op2, modrm]`.
+fn instr_0f_rr(w: bool, op2: u8, reg: u8, rm: u8) -> Vec<u8> {
+    vec![rex(w, reg, rm), 0x0F, op2, modrm_rr(reg, rm)]
+}
+
+/// A 0x0F two-byte instruction `op2 reg, [mem]`: `[rex, 0x0F, op2, ModRM…]`.
+fn instr_0f_rm(w: bool, op2: u8, reg: u8, mem: Mem) -> Vec<u8> {
+    let (rex_xb, modrm) = enc_mem(reg, mem);
+    let mut v = vec![rex_mem(w, reg, rex_xb), 0x0F, op2];
+    v.extend_from_slice(&modrm);
+    v
+}
+
+/// `MOVZX`/`MOVSX` reg, r/m (op2 = 0xB6/0xB7/0xBE/0xBF) register-direct source.
+fn instr_movx_rr(w: bool, op2: u8, reg: u8, rm: u8) -> Vec<u8> {
+    instr_0f_rr(w, op2, reg, rm)
+}
+
+/// `MOVZX`/`MOVSX` reg, [mem] memory source.
+fn instr_movx_rm(w: bool, op2: u8, reg: u8, mem: Mem) -> Vec<u8> {
+    instr_0f_rm(w, op2, reg, mem)
+}
+
+/// `MOVSXD r64, r/m32` (0x63) register-direct.
+fn instr_movsxd_rr(reg: u8, rm: u8) -> Vec<u8> {
+    vec![rex(true, reg, rm), 0x63, modrm_rr(reg, rm)]
+}
+
+/// `MOVSXD r64, [mem]` memory.
+fn instr_movsxd_rm(reg: u8, mem: Mem) -> Vec<u8> {
+    instr_rm(true, 0x63, reg, mem)
+}
+
+/// `IMUL reg, rm, imm32` (0x69) register-direct.
+fn instr_imul_imm32_rr(w: bool, reg: u8, rm: u8, imm32: i32) -> Vec<u8> {
+    let mut v = vec![rex(w, reg, rm), 0x69, modrm_rr(reg, rm)];
+    v.extend_from_slice(&imm32.to_le_bytes());
+    v
+}
+
+/// `IMUL reg, [mem], imm32` (0x69).
+fn instr_imul_imm32_rm(w: bool, reg: u8, mem: Mem, imm32: i32) -> Vec<u8> {
+    let mut v = instr_rm(w, 0x69, reg, mem);
+    v.extend_from_slice(&imm32.to_le_bytes());
+    v
+}
+
+/// `IMUL reg, rm, imm8` (0x6B) register-direct.
+fn instr_imul_imm8_rr(w: bool, reg: u8, rm: u8, imm8: i8) -> Vec<u8> {
+    vec![rex(w, reg, rm), 0x6B, modrm_rr(reg, rm), imm8 as u8]
+}
+
+/// `IMUL reg, [mem], imm8` (0x6B).
+fn instr_imul_imm8_rm(w: bool, reg: u8, mem: Mem, imm8: i8) -> Vec<u8> {
+    let mut v = instr_rm(w, 0x6B, reg, mem);
+    v.push(imm8 as u8);
+    v
+}
+
+/// `IMUL reg, rm` 2-operand (0x0F 0xAF) register-direct.
+fn instr_imul2_rr(w: bool, reg: u8, rm: u8) -> Vec<u8> {
+    instr_0f_rr(w, 0xAF, reg, rm)
+}
+
+/// `IMUL reg, [mem]` 2-operand (0x0F 0xAF).
+fn instr_imul2_rm(w: bool, reg: u8, mem: Mem) -> Vec<u8> {
+    instr_0f_rm(w, 0xAF, reg, mem)
+}
+
+/// Shift `SHL/SHR/SAR` r/m by imm8 (0xC1 /digit) register-direct.
+fn instr_shift_imm_rr(w: bool, digit: u8, rm: u8, imm8: u8) -> Vec<u8> {
+    vec![rex(w, digit, rm), 0xC1, modrm_rr(digit, rm), imm8]
+}
+
+/// Shift r/m by imm8 (0xC1 /digit) memory.
+fn instr_shift_imm_m(w: bool, digit: u8, mem: Mem, imm8: u8) -> Vec<u8> {
+    let mut v = instr_rm(w, 0xC1, digit, mem);
+    v.push(imm8);
+    v
+}
+
+/// Shift r/m by 1 (0xD1 /digit) register-direct.
+fn instr_shift_1_rr(w: bool, digit: u8, rm: u8) -> Vec<u8> {
+    vec![rex(w, digit, rm), 0xD1, modrm_rr(digit, rm)]
+}
+
+/// Shift r/m by 1 (0xD1 /digit) memory.
+fn instr_shift_1_m(w: bool, digit: u8, mem: Mem) -> Vec<u8> {
+    instr_rm(w, 0xD1, digit, mem)
+}
+
+/// Shift r/m by CL (0xD3 /digit) register-direct.
+fn instr_shift_cl_rr(w: bool, digit: u8, rm: u8) -> Vec<u8> {
+    vec![rex(w, digit, rm), 0xD3, modrm_rr(digit, rm)]
+}
+
+/// Shift r/m by CL (0xD3 /digit) memory.
+fn instr_shift_cl_m(w: bool, digit: u8, mem: Mem) -> Vec<u8> {
+    instr_rm(w, 0xD3, digit, mem)
+}
+
+/// `SETcc r/m8` (0x0F 0x90+cc) register-direct (low byte of the register).
+fn instr_setcc_rr(cc: u8, rm: u8) -> Vec<u8> {
+    // SETcc has no operand-size meaning; emit a REX only when needed for the B bit
+    // so the low-byte (non-AH) encoding is used for r0..r3 (matches the interp's
+    // rex_present low-byte handling).
+    let mut v = Vec::new();
+    if rm >= 8 {
+        v.push(0x41); // REX.B
+    }
+    v.push(0x0F);
+    v.push(0x90 + cc);
+    v.push(modrm_rr(0, rm));
+    v
+}
+
+/// `SETcc [mem]` (0x0F 0x90+cc) — store a byte.
+fn instr_setcc_m(cc: u8, mem: Mem) -> Vec<u8> {
+    let (rex_xb, modrm) = enc_mem(0, mem);
+    let mut v = Vec::new();
+    let rb = rex_mem(false, 0, rex_xb);
+    if rb != 0x40 {
+        v.push(rb);
+    }
+    v.push(0x0F);
+    v.push(0x90 + cc);
+    v.extend_from_slice(&modrm);
+    v
+}
+
 // ── Hand-written edge-case blocks ─────────────────────────────────────────────
 
 #[test]
@@ -986,6 +1210,475 @@ fn handwritten_mem_edges() {
     check_mem("mixed reg+mem block", &block, &init, &ram);
 }
 
+// ── New-opcode edge cases (push/pop, lea, test, movzx/sx, shift, setcc, neg/not,
+//    imul, mul) ─────────────────────────────────────────────────────────────────
+
+/// A register state with several registers pointing into the data region AND a
+/// valid in-RAM stack pointer (rsp = `STACK_TOP`) for the PUSH/POP round-trips.
+const STACK_TOP: u64 = 0x2000;
+
+fn newop_init() -> [u64; 16] {
+    let mut init = mem_init();
+    init[4] = STACK_TOP; // rsp → a valid in-RAM stack
+    init
+}
+
+#[test]
+fn handwritten_newop_edges() {
+    let ram = seeded_ram();
+    let init = newop_init();
+
+    // ── PUSH r64 / POP r64 round-trips (touch the stack memory) ──
+    for &r in &[0u8, 1, 3, 8, 10, 15] {
+        check_mem(&format!("push r{r}"), &instr_push_r(r), &init, &ram);
+        check_mem(&format!("pop r{r}"), &instr_pop_r(r), &init, &ram);
+    }
+    // push then pop into a different register (a real round-trip through memory).
+    {
+        let mut blk = Vec::new();
+        blk.extend(instr_push_r(3)); // push rbx
+        blk.extend(instr_pop_r(0)); // pop rax  → rax == old rbx, rsp restored
+        check_mem("push rbx; pop rax", &blk, &init, &ram);
+    }
+    // push two, pop two (LIFO order), exercising consecutive stack slots.
+    {
+        let mut blk = Vec::new();
+        blk.extend(instr_push_r(0));
+        blk.extend(instr_push_r(1));
+        blk.extend(instr_pop_r(2)); // rdx = old rcx
+        blk.extend(instr_pop_r(5)); // rbp = old rax
+        check_mem("push/push/pop/pop", &blk, &init, &ram);
+    }
+
+    // ── PUSH r/m (0xFF /6) and POP r/m (0x8F /0) ──
+    check_mem(
+        "push qword [rbx]",
+        &instr_push_m(Mem::Base { base: 3, disp: 0 }),
+        &init,
+        &ram,
+    );
+    check_mem(
+        "pop qword [rbx+0x10]",
+        &instr_pop_m(Mem::Base {
+            base: 3,
+            disp: 0x10,
+        }),
+        &init,
+        &ram,
+    );
+    // push reg then pop into memory.
+    {
+        let mut blk = Vec::new();
+        blk.extend(instr_push_r(8)); // push r8
+        blk.extend(instr_pop_m(Mem::Base {
+            base: 3,
+            disp: 0x18,
+        })); // pop [rbx+0x18]
+        check_mem("push r8; pop [rbx+0x18]", &blk, &init, &ram);
+    }
+
+    // ── LEA: register dest, every addressing mode incl. SIB + RIP-relative ──
+    check_mem(
+        "lea r0,[rbx+0x10]",
+        &instr_lea(
+            true,
+            0,
+            Mem::Base {
+                base: 3,
+                disp: 0x10,
+            },
+        ),
+        &init,
+        &ram,
+    );
+    check_mem(
+        "lea r0,[rbx+r9*4+8]",
+        &instr_lea(
+            true,
+            0,
+            Mem::Sib {
+                base: 3,
+                index: 9,
+                scale: 2,
+                disp: 8,
+            },
+        ),
+        &init,
+        &ram,
+    );
+    check_mem(
+        "lea32 r0,[rbx+0x10] (zext)",
+        &instr_lea(
+            false,
+            0,
+            Mem::Base {
+                base: 3,
+                disp: 0x10,
+            },
+        ),
+        &init,
+        &ram,
+    );
+    check_mem(
+        "lea r5,[r9*8 + DATA] (no base)",
+        &instr_lea(
+            true,
+            5,
+            Mem::NoBase {
+                index: 9,
+                scale: 3,
+                disp: DATA as i32,
+            },
+        ),
+        &init,
+        &ram,
+    );
+    {
+        let len = instr_lea(true, 0, Mem::Rip { disp: 0 }).len() as i64;
+        let disp = (DATA as i64) - (BLOCK_BASE as i64 + len);
+        check_mem(
+            "lea r0,[rip+disp]",
+            &instr_lea(true, 0, Mem::Rip { disp: disp as i32 }),
+            &init,
+            &ram,
+        );
+    }
+
+    // ── TEST: r/m,r (0x85); rAX,imm (0xA9); r/m,imm (0xF7 /0) ──
+    for &(reg, rm) in &[(0u8, 1u8), (2, 3), (8, 10)] {
+        check_mem(
+            &format!("test64 r{reg},r{rm}"),
+            &instr_test_rr(true, reg, rm),
+            &init,
+            &ram,
+        );
+        check_mem(
+            &format!("test32 r{reg},r{rm}"),
+            &instr_test_rr(false, reg, rm),
+            &init,
+            &ram,
+        );
+    }
+    check_mem(
+        "test [rbx+8],rcx",
+        &instr_test_rm(true, 1, Mem::Base { base: 3, disp: 8 }),
+        &init,
+        &ram,
+    );
+    check_mem("test rax,imm 64", &instr_test_ax_imm(true, -1), &init, &ram);
+    check_mem(
+        "test eax,imm 32",
+        &instr_test_ax_imm(false, 0x7fff_ffff),
+        &init,
+        &ram,
+    );
+    check_mem(
+        "test r3,imm (F7/0)",
+        &instr_test_imm_rr(true, 3, 0x0f0f),
+        &init,
+        &ram,
+    );
+    check_mem(
+        "test [rbx+0x10],imm (F7/0)",
+        &instr_test_imm_m(
+            true,
+            Mem::Base {
+                base: 3,
+                disp: 0x10,
+            },
+            -1,
+        ),
+        &init,
+        &ram,
+    );
+
+    // ── MOVZX / MOVSX, register source AND memory source, byte + word ──
+    // Put discriminating values into a register so the narrow read is exercised.
+    let mut mvinit = init;
+    mvinit[1] = 0xffff_ffff_ffff_ff80; // low byte 0x80 (neg), low word 0xff80
+    mvinit[2] = 0x0000_0000_0000_007f; // low byte 0x7f (pos)
+    for &(name, op2, ssz) in &[
+        ("movzx8", 0xB6u8, 1u8),
+        ("movzx16", 0xB7, 2),
+        ("movsx8", 0xBE, 1),
+        ("movsx16", 0xBF, 2),
+    ] {
+        let _ = ssz;
+        check_mem(
+            &format!("{name} r0,r1 (64)"),
+            &instr_movx_rr(true, op2, 0, 1),
+            &mvinit,
+            &ram,
+        );
+        check_mem(
+            &format!("{name} r0,r2 (32 dest, zext upper)"),
+            &instr_movx_rr(false, op2, 0, 2),
+            &mvinit,
+            &ram,
+        );
+        check_mem(
+            &format!("{name} r0,[rbx] (mem src)"),
+            &instr_movx_rm(true, op2, 0, Mem::Base { base: 3, disp: 0 }),
+            &mvinit,
+            &ram,
+        );
+    }
+    // MOVSXD 32→64, register and memory.
+    check_mem("movsxd r0,r1 (neg)", &instr_movsxd_rr(0, 1), &mvinit, &ram);
+    check_mem(
+        "movsxd r0,[rbx+8]",
+        &instr_movsxd_rm(0, Mem::Base { base: 3, disp: 8 }),
+        &mvinit,
+        &ram,
+    );
+
+    // ── shifts SHL(4)/SHR(5)/SAR(7): imm8 (incl. 0), by 1, by CL (incl. CL=0) ──
+    // Seed rax with a sign-bit-set value so SAR vs SHR differ; rcx (CL) varies.
+    for &digit in &[4u8, 5, 7] {
+        for &imm in &[0u8, 1, 3, 31, 63] {
+            check_mem(
+                &format!("shift64 d{digit} r0 by imm {imm}"),
+                &instr_shift_imm_rr(true, digit, 0, imm),
+                &init,
+                &ram,
+            );
+            check_mem(
+                &format!("shift32 d{digit} r0 by imm {imm}"),
+                &instr_shift_imm_rr(false, digit, 0, imm),
+                &init,
+                &ram,
+            );
+        }
+        // shift by 1 (0xD1).
+        check_mem(
+            &format!("shift64 d{digit} r3 by 1"),
+            &instr_shift_1_rr(true, digit, 3),
+            &init,
+            &ram,
+        );
+        check_mem(
+            &format!("shift d{digit} [rbx+8] by 1 (mem)"),
+            &instr_shift_1_m(true, digit, Mem::Base { base: 3, disp: 8 }),
+            &init,
+            &ram,
+        );
+        // shift by CL (0xD3) — try CL set to several values via rcx.
+        for &cl in &[0u64, 1, 5, 32, 63, 0x100 /* masks to 0 */] {
+            let mut ci = init;
+            ci[1] = cl; // rcx low byte = CL
+            check_mem(
+                &format!("shift64 d{digit} r0 by CL={cl}"),
+                &instr_shift_cl_rr(true, digit, 0),
+                &ci,
+                &ram,
+            );
+            check_mem(
+                &format!("shift32 d{digit} r0 by CL={cl}"),
+                &instr_shift_cl_rr(false, digit, 0),
+                &ci,
+                &ram,
+            );
+        }
+        // shift imm8 to a memory operand.
+        check_mem(
+            &format!("shift d{digit} [rbx] by imm 3 (mem)"),
+            &instr_shift_imm_m(true, digit, Mem::Base { base: 3, disp: 0 }, 3),
+            &init,
+            &ram,
+        );
+        check_mem(
+            &format!("shift d{digit} [rbx] by CL (mem)"),
+            &instr_shift_cl_m(true, digit, Mem::Base { base: 3, disp: 0 }),
+            &init,
+            &ram,
+        );
+    }
+
+    // ── SETcc, several conditions, register low-byte + memory ──
+    // Run a flag-setting op first, then SETcc, to exercise real conditions.
+    for cc in 0u8..16 {
+        let mut blk = instr_rr(true, 0x29, 1, 0); // sub rax, rcx → set flags
+        blk.extend(instr_setcc_rr(cc, 8)); // setcc r8b
+        check_mem(&format!("setcc cc={cc} r8b"), &blk, &init, &ram);
+
+        let mut blk = instr_rr(true, 0x01, 8, 13); // add r8, r13 (INT_MAX+small) → OF/SF
+        blk.extend(instr_setcc_rr(cc, 0)); // setcc al
+        check_mem(&format!("setcc cc={cc} al (after add)"), &blk, &init, &ram);
+
+        let mut blk = instr_rr(true, 0x21, 1, 0); // and rax, rcx
+        blk.extend(instr_setcc_m(
+            cc,
+            Mem::Base {
+                base: 3,
+                disp: 0x28,
+            },
+        )); // setcc [rbx+0x28]
+        check_mem(&format!("setcc cc={cc} [mem]"), &blk, &init, &ram);
+    }
+
+    // ── NEG / NOT, register + memory, edge values (0, INT_MIN) ──
+    {
+        let mut ni = init;
+        ni[0] = 0; // NEG 0 → r=0, CF=0, ZF=1
+        ni[1] = 0x8000_0000_0000_0000; // INT_MIN → NEG = INT_MIN, OF=1
+        ni[2] = 0x8000_0000; // 32-bit INT_MIN
+        check_mem("neg r0 (0)", &instr_f7_unary(true, 3, 0), &ni, &ram);
+        check_mem(
+            "neg r1 (INT_MIN 64)",
+            &instr_f7_unary(true, 3, 1),
+            &ni,
+            &ram,
+        );
+        check_mem(
+            "neg32 r2 (INT_MIN 32)",
+            &instr_f7_unary(false, 3, 2),
+            &ni,
+            &ram,
+        );
+        check_mem("not r3", &instr_f7_unary(true, 2, 3), &ni, &ram);
+        check_mem("not32 r4", &instr_f7_unary(false, 2, 4), &ni, &ram);
+        check_mem(
+            "neg qword [rbx]",
+            &instr_f7_unary_m(true, 3, Mem::Base { base: 3, disp: 0 }),
+            &ni,
+            &ram,
+        );
+        check_mem(
+            "not dword [rbx+8]",
+            &instr_f7_unary_m(false, 2, Mem::Base { base: 3, disp: 8 }),
+            &ni,
+            &ram,
+        );
+    }
+
+    // ── IMUL 2-operand (0xAF) and 3-operand (0x69/0x6B), reg + mem ──
+    check_mem("imul2 r0,r1 (64)", &instr_imul2_rr(true, 0, 1), &init, &ram);
+    check_mem(
+        "imul2 r0,r1 (32)",
+        &instr_imul2_rr(false, 0, 1),
+        &init,
+        &ram,
+    );
+    check_mem(
+        "imul2 r0,[rbx]",
+        &instr_imul2_rm(true, 0, Mem::Base { base: 3, disp: 0 }),
+        &init,
+        &ram,
+    );
+    check_mem(
+        "imul3 r0,r1,imm32",
+        &instr_imul_imm32_rr(true, 0, 1, 0x1234),
+        &init,
+        &ram,
+    );
+    check_mem(
+        "imul3 r0,r1,imm8 (neg)",
+        &instr_imul_imm8_rr(true, 0, 1, -5),
+        &init,
+        &ram,
+    );
+    check_mem(
+        "imul3 r0,[rbx],imm32 (32)",
+        &instr_imul_imm32_rm(false, 0, Mem::Base { base: 3, disp: 0 }, -1),
+        &init,
+        &ram,
+    );
+    check_mem(
+        "imul3 r0,[rbx+8],imm8",
+        &instr_imul_imm8_rm(true, 0, Mem::Base { base: 3, disp: 8 }, 7),
+        &init,
+        &ram,
+    );
+
+    // ── single-operand MUL / IMUL (0xF7 /4,/5): RDX:RAX, overflow set + clear ──
+    {
+        // overflow CLEAR: small * small fits in the low half.
+        let mut si = init;
+        si[0] = 3; // rax
+        si[3] = 5; // rbx — the multiplier r/m
+        check_mem(
+            "mul r3 (no overflow)",
+            &instr_f7_muldiv(true, 4, 3),
+            &si,
+            &ram,
+        );
+        check_mem(
+            "imul r3 (no overflow)",
+            &instr_f7_muldiv(true, 5, 3),
+            &si,
+            &ram,
+        );
+
+        // overflow SET: large unsigned product spills into RDX.
+        let mut oi = init;
+        oi[0] = 0xffff_ffff_ffff_ffff; // rax
+        oi[3] = 2; // rbx
+        check_mem("mul r3 (overflow)", &instr_f7_muldiv(true, 4, 3), &oi, &ram);
+        check_mem(
+            "imul r3 (neg→overflow)",
+            &instr_f7_muldiv(true, 5, 3),
+            &oi,
+            &ram,
+        );
+
+        // 32-bit MUL / IMUL.
+        let mut wi = init;
+        wi[0] = 0x1_0000; // rax (32-bit op uses low 32)
+        wi[3] = 0x1_0000; // → product 0x1_0000_0000 spills to EDX
+        check_mem(
+            "mul32 r3 (overflow)",
+            &instr_f7_muldiv(false, 4, 3),
+            &wi,
+            &ram,
+        );
+        check_mem("imul32 r3", &instr_f7_muldiv(false, 5, 3), &wi, &ram);
+
+        // negative IMUL 64-bit (exercises the signed 128-bit correction).
+        let mut neg = init;
+        neg[0] = (-3i64) as u64;
+        neg[3] = 7;
+        check_mem("imul r3 (-3*7)", &instr_f7_muldiv(true, 5, 3), &neg, &ram);
+        neg[0] = (-3i64) as u64;
+        neg[3] = (-7i64) as u64;
+        check_mem("imul r3 (-3*-7)", &instr_f7_muldiv(true, 5, 3), &neg, &ram);
+
+        // MUL / IMUL with a memory r/m.
+        check_mem(
+            "mul qword [rbx]",
+            &instr_f7_muldiv_m(true, 4, Mem::Base { base: 3, disp: 0 }),
+            &init,
+            &ram,
+        );
+        check_mem(
+            "imul qword [rbx+8]",
+            &instr_f7_muldiv_m(true, 5, Mem::Base { base: 3, disp: 8 }),
+            &init,
+            &ram,
+        );
+    }
+
+    // ── a longer linear block mixing the new opcodes (block-length win) ──
+    {
+        let mut blk = Vec::new();
+        blk.extend(instr_lea(
+            true,
+            0,
+            Mem::Base {
+                base: 3,
+                disp: 0x10,
+            },
+        )); // lea rax,[rbx+0x10]
+        blk.extend(instr_movx_rr(true, 0xB6, 1, 0)); // movzx rcx, al
+        blk.extend(instr_shift_imm_rr(true, 4, 1, 3)); // shl rcx, 3
+        blk.extend(instr_imul2_rr(true, 1, 3)); // imul rcx, rbx
+        blk.extend(instr_test_rr(true, 1, 1)); // test rcx, rcx
+        blk.extend(instr_f7_unary(true, 3, 2)); // neg rdx
+        blk.extend(instr_push_r(1)); // push rcx
+        blk.extend(instr_pop_r(5)); // pop rbp
+        check_mem("linear new-opcode block", &blk, &init, &ram);
+    }
+}
+
 // ── Branch terminators ────────────────────────────────────────────────────────
 
 #[test]
@@ -1142,7 +1835,7 @@ impl Rng {
 fn random_insn(rng: &mut Rng, out: &mut Vec<u8>) {
     let alu_ops_rm = [0x01u8, 0x09, 0x21, 0x29, 0x31, 0x39];
     let alu_ops_r = [0x03u8, 0x0B, 0x23, 0x2B, 0x33, 0x3B];
-    let kind = rng.next() % 8;
+    let kind = rng.next() % 18;
     let w = rng.next() & 1 == 0;
     let a = (rng.next() % 16) as u8;
     let b = (rng.next() % 16) as u8;
@@ -1160,7 +1853,36 @@ fn random_insn(rng: &mut Rng, out: &mut Vec<u8>) {
         4 => out.extend(instr_mov_imm(w, a, rng.next())),
         5 => out.extend(instr_movc7(w, a, rng.next() as i32)),
         6 => out.extend(instr_incdec(w, a, rng.next() & 1 == 0)),
-        _ => out.extend(instr_rr(w, 0x89, a, b)), // mov
+        7 => out.extend(instr_rr(w, 0x89, a, b)), // mov
+        // ── new opcodes (register-direct forms) ──
+        8 => out.extend(instr_test_rr(w, a, b)),
+        9 => out.extend(instr_test_imm_rr(w, a, rng.next() as i32)),
+        10 => out.extend(instr_f7_unary(w, *rng.pick(&[2u8, 3]), a)), // NOT/NEG
+        11 => out.extend(instr_imul2_rr(w, a, b)),
+        12 => out.extend(instr_imul_imm32_rr(w, a, b, rng.next() as i32)),
+        13 => out.extend(instr_imul_imm8_rr(w, a, b, rng.next() as i8)),
+        14 => {
+            // shift SHL/SHR/SAR; mix imm8 / by-1 / by-CL forms.
+            let digit = *rng.pick(&[4u8, 5, 7]);
+            match rng.next() % 3 {
+                0 => out.extend(instr_shift_imm_rr(w, digit, a, (rng.next() % 70) as u8)),
+                1 => out.extend(instr_shift_1_rr(w, digit, a)),
+                _ => out.extend(instr_shift_cl_rr(w, digit, a)),
+            }
+        }
+        15 => {
+            // MOVZX/MOVSX/MOVSXD into a register from a register source.
+            match rng.next() % 5 {
+                0 => out.extend(instr_movx_rr(w, 0xB6, a, b)),
+                1 => out.extend(instr_movx_rr(w, 0xB7, a, b)),
+                2 => out.extend(instr_movx_rr(w, 0xBE, a, b)),
+                3 => out.extend(instr_movx_rr(w, 0xBF, a, b)),
+                _ => out.extend(instr_movsxd_rr(a, b)),
+            }
+        }
+        16 => out.extend(instr_setcc_rr((rng.next() % 16) as u8, a)),
+        // single-operand MUL/IMUL (writes RDX:RAX).
+        _ => out.extend(instr_f7_muldiv(w, *rng.pick(&[4u8, 5]), a)),
     }
 }
 
@@ -1210,11 +1932,16 @@ fn randomized_fuzz() {
 ///
 /// All register operands (reg field and register r/m) are drawn from r0..=r10,
 /// so the reserved registers stay constant for the whole block.
+/// The general-purpose register operands the memory fuzzer may write: r0..=r10
+/// except r4 (RSP), which is reserved as a valid in-RAM stack pointer so the
+/// PUSH/POP forms touch real stack memory.
+const MEM_FUZZ_REGS: [u8; 10] = [0, 1, 2, 3, 5, 6, 7, 8, 9, 10];
+
 fn random_mem_insn(rng: &mut Rng, out: &mut Vec<u8>) {
     let alu_ops_rm = [0x01u8, 0x09, 0x21, 0x29, 0x31, 0x39];
     let alu_ops_r = [0x03u8, 0x0B, 0x23, 0x2B, 0x33, 0x3B];
     let w = rng.next() & 1 == 0;
-    let reg = (rng.next() % 11) as u8; // r0..=r10 only
+    let reg = *rng.pick(&MEM_FUZZ_REGS); // r0..=r10 except RSP
 
     // A random data-region memory operand.
     let mk_mem = |rng: &mut Rng| -> Mem {
@@ -1243,7 +1970,7 @@ fn random_mem_insn(rng: &mut Rng, out: &mut Vec<u8>) {
     };
     let mem = mk_mem(rng);
 
-    match rng.next() % 8 {
+    match rng.next() % 18 {
         0 => out.extend(instr_rm(w, *rng.pick(&alu_ops_rm), reg, mem)), // op [mem], reg
         1 => out.extend(instr_rm(w, *rng.pick(&alu_ops_r), reg, mem)),  // op reg, [mem]
         2 => {
@@ -1257,7 +1984,41 @@ fn random_mem_insn(rng: &mut Rng, out: &mut Vec<u8>) {
         4 => out.extend(instr_rm(w, 0x89, reg, mem)), // mov [mem], reg
         5 => out.extend(instr_rm(w, 0x8B, reg, mem)), // mov reg, [mem]
         6 => out.extend(instr_movc7_m(w, mem, rng.next() as i32)),
-        _ => out.extend(instr_incdec_m(w, mem, rng.next() & 1 == 0)),
+        7 => out.extend(instr_incdec_m(w, mem, rng.next() & 1 == 0)),
+        // ── new opcodes with memory operands ──
+        8 => out.extend(instr_test_rm(w, reg, mem)), // TEST [mem], reg
+        9 => out.extend(instr_test_imm_m(w, mem, rng.next() as i32)), // TEST [mem], imm
+        10 => out.extend(instr_f7_unary_m(w, *rng.pick(&[2u8, 3]), mem)), // NOT/NEG [mem]
+        11 => out.extend(instr_f7_muldiv_m(w, *rng.pick(&[4u8, 5]), mem)), // MUL/IMUL [mem]
+        12 => out.extend(instr_imul2_rm(w, reg, mem)), // IMUL reg, [mem]
+        13 => out.extend(instr_imul_imm8_rm(w, reg, mem, rng.next() as i8)),
+        14 => {
+            // shift [mem] by imm8 / by 1 / by CL.
+            let digit = *rng.pick(&[4u8, 5, 7]);
+            match rng.next() % 3 {
+                0 => out.extend(instr_shift_imm_m(w, digit, mem, (rng.next() % 70) as u8)),
+                1 => out.extend(instr_shift_1_m(w, digit, mem)),
+                _ => out.extend(instr_shift_cl_m(w, digit, mem)),
+            }
+        }
+        15 => {
+            // MOVZX/MOVSX/MOVSXD reg, [mem].
+            match rng.next() % 5 {
+                0 => out.extend(instr_movx_rm(w, 0xB6, reg, mem)),
+                1 => out.extend(instr_movx_rm(w, 0xB7, reg, mem)),
+                2 => out.extend(instr_movx_rm(w, 0xBE, reg, mem)),
+                3 => out.extend(instr_movx_rm(w, 0xBF, reg, mem)),
+                _ => out.extend(instr_movsxd_rm(reg, mem)),
+            }
+        }
+        16 => out.extend(instr_setcc_m((rng.next() % 16) as u8, mem)),
+        // PUSH/POP — reg and r/m forms (RSP is reserved valid; see MEM_FUZZ_REGS).
+        _ => match rng.next() % 4 {
+            0 => out.extend(instr_push_r(reg)),
+            1 => out.extend(instr_pop_r(reg)),
+            2 => out.extend(instr_push_m(mem)),
+            _ => out.extend(instr_pop_m(mem)),
+        },
     }
 }
 
@@ -1281,6 +2042,10 @@ fn randomized_fuzz_mem() {
                 _ => rng.next(),
             };
         }
+        // r4 (RSP) is reserved as a valid in-RAM stack pointer (a region disjoint
+        // from the code and the data region) so the PUSH/POP fuzz forms touch real
+        // stack memory; it is never used as a random reg operand (MEM_FUZZ_REGS).
+        init[4] = 0x3000;
         init[11] = 1; // index regs: small values so index*scale stays bounded
         init[12] = 2;
         init[13] = DATA; // pointer bases into the data region
@@ -1294,9 +2059,9 @@ fn randomized_fuzz_mem() {
             if rng.next() & 1 == 0 {
                 random_mem_insn(&mut rng, &mut code);
             } else {
-                // a register-only instruction touching only r0..=r10
-                let a = (rng.next() % 11) as u8;
-                let b = (rng.next() % 11) as u8;
+                // a register-only instruction touching only r0..=r10 except RSP
+                let a = *rng.pick(&MEM_FUZZ_REGS);
+                let b = *rng.pick(&MEM_FUZZ_REGS);
                 match rng.next() % 4 {
                     0 => code.extend(instr_rr(
                         rng.next() & 1 == 0,
@@ -1423,4 +2188,58 @@ fn speed_comparison() {
     println!("================================================\n");
 
     assert!(jit_mips > 0.0 && interp_mips > 0.0);
+}
+
+#[test]
+fn measure_block_length() {
+    // A representative linear instruction mix (the shapes Node/V8 + kernel hot
+    // paths emit), assembled back to back; we walk it translating block-by-block
+    // and report the average translated-block length BEFORE vs the kinds of stops.
+    let mut code = Vec::new();
+    // function prologue-ish + arithmetic + new opcodes, no control flow inside.
+    code.extend(instr_push_r(5)); // push rbp
+    code.extend(instr_rr(true, 0x89, 5, 4)); // mov rbp, rsp
+    code.extend(instr_rm(true, 0x8B, 0, Mem::Base { base: 3, disp: 0 })); // mov rax,[rbx]
+    code.extend(instr_movx_rr(true, 0xB6, 1, 0)); // movzx rcx, al
+    code.extend(instr_shift_imm_rr(true, 4, 1, 4)); // shl rcx, 4
+    code.extend(instr_imul2_rr(true, 1, 3)); // imul rcx, rbx
+    code.extend(instr_lea(
+        true,
+        2,
+        Mem::Base {
+            base: 1,
+            disp: 0x10,
+        },
+    )); // lea rdx,[rcx+0x10]
+    code.extend(instr_test_rr(true, 2, 2)); // test rdx, rdx
+    code.extend(instr_setcc_rr(4, 8)); // sete r8b
+    code.extend(instr_g1_imm8(true, 0, 0, 1)); // add rax, 1
+    code.extend(instr_f7_unary(true, 3, 6)); // neg rsi
+    code.extend(instr_movsxd_rr(7, 0)); // movsxd rdi, eax
+    code.extend(instr_pop_r(5)); // pop rbp
+    code.extend(instr_jmp_rel8(0x10)); // jmp (terminator)
+
+    let mut pos = 0usize;
+    let mut blocks = 0u32;
+    let mut total_insns = 0u32;
+    while pos < code.len() {
+        match translate_block(&code[pos..]) {
+            Some(tb) => {
+                blocks += 1;
+                total_insns += tb.insns;
+                pos += tb.bytes as usize;
+            }
+            None => {
+                pos += 1; // an unsupported lead byte; interpreter would step it
+            }
+        }
+    }
+    let avg = total_insns as f64 / blocks as f64;
+    println!("\n=== CC-48 translated-block length on the representative sample ===");
+    println!("blocks={blocks} total_insns={total_insns} avg_block_len={avg:.1}");
+    println!("==================================================================\n");
+    assert!(
+        avg > 2.0,
+        "new opcodes should grow blocks well past ~2 insns"
+    );
 }
