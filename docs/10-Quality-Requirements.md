@@ -134,7 +134,7 @@ composing the
 `Cargo.toml`. Adding a component without satisfying its `CC` row leaves
 holospaces incomplete by definition.
 
-**CC-45 .. CC-49 are _targets_ (behavior/test-driven)** (`CC-44` was promoted to `live` when its boot went green)**.** Each is unfinished
+**CC-45 .. CC-49 are _targets_ (behavior/test-driven).** (`CC-44` was promoted to `live` when its boot went green.) Each is unfinished
 work whose **behavioral V&V is written first** — an executable, expected-RED
 suite in `vv/targets/` (and a named `#[ignore]`d witness) that defines what
 "done" means before any implementation. This is the conceptual model driving the
