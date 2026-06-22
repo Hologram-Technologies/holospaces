@@ -702,6 +702,14 @@ impl Cpu {
     /// returns a benign physical address (`0`) so the in-flight access reads/writes
     /// harmlessly; the instruction is discarded and restarted after the handler
     /// maps the page. `write` and `user` set the error-code bits.
+    ///
+    /// Physical `0` is deliberately below every device MMIO window
+    /// (`VIRTIO_BLK_BASE` = `0xD000_0000`, the local APIC at `0xFEE0_0000`), so a
+    /// faulting access never resolves to a device — `rd`/`wr` take no MMIO side
+    /// effect on a fault, only a harmless phys-0 scratch read/write that the
+    /// instruction restart overwrites. This phys-0 scratch is load-bearing for the
+    /// early boot's demand-paging: removing it (returning early from `rd`/`wr`)
+    /// regresses the boot to a hang, so the scratch access is kept, not elided.
     fn translate_acc(&mut self, vaddr: u64, write: bool, user: bool) -> u64 {
         if self.fault.is_some() {
             return 0; // a fault is already pending; do not double-latch
@@ -3089,11 +3097,24 @@ impl Cpu {
             let memsz = rd64(ph + 40) as usize;
             let dst = paddr as usize;
             let n = filesz.min(elf.len().saturating_sub(offset));
-            if dst + memsz <= self.ram.len() {
-                self.ram[dst..dst + n].copy_from_slice(&elf[offset..offset + n]);
-                for b in &mut self.ram[dst + n..dst + memsz] {
-                    *b = 0;
-                }
+            // Fail fast on a malformed/oversized image rather than silently
+            // skipping the segment (which would leave a partially-loaded kernel
+            // that executes into undefined behavior). This is a public boot API.
+            assert!(
+                dst.checked_add(memsz)
+                    .is_some_and(|end| end <= self.ram.len()),
+                "load_elf64: PT_LOAD segment [{dst:#x}, {:#x}) does not fit in {} bytes \
+                 of guest RAM — increase ram_bytes or check the kernel image",
+                dst.saturating_add(memsz),
+                self.ram.len(),
+            );
+            assert!(
+                offset + n <= elf.len(),
+                "load_elf64: PT_LOAD file range exceeds the image"
+            );
+            self.ram[dst..dst + n].copy_from_slice(&elf[offset..offset + n]);
+            for b in &mut self.ram[dst + n..dst + memsz] {
+                *b = 0;
             }
         }
         entry
