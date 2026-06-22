@@ -45,7 +45,7 @@ fn run_interp(
     init: &[u64; 16],
     init_ram: &[u8],
     insns: u32,
-) -> ([u64; 16], u64, Vec<u8>) {
+) -> ([u64; 16], u64, u64, Vec<u8>) {
     // The interpreter exposes no public register setter, so we prepend a
     // `mov reg, imm64` (REX.W + 0xB8+r) for each of the 16 GPRs to install the
     // known initial state, then run those 16 setup instructions plus the block.
@@ -78,7 +78,7 @@ fn run_interp(
         *slot = cpu.reg(i);
     }
     let ram = cpu.vv_ram_read(0, RAM_BYTES);
-    (regs, cpu.rflags() & ARITH_FLAGS, ram)
+    (regs, cpu.rflags() & ARITH_FLAGS, cpu.rip(), ram)
 }
 
 /// Instantiate a translated block on wasmtime over a host memory seeded with the
@@ -90,7 +90,8 @@ fn run_jit(
     tb: &TranslatedBlock,
     init: &[u64; 16],
     init_ram_full: &[u8],
-) -> ([u64; 16], u64, u32, Vec<u8>) {
+    entry_rip: u64,
+) -> ([u64; 16], u64, u64, u32, Vec<u8>) {
     let engine = Engine::default();
     let module = Module::new(&engine, &tb.wasm).expect("translated module must validate");
 
@@ -143,10 +144,13 @@ fn run_jit(
         &[mem.into(), load.into(), store_fn.into()],
     )
     .expect("instantiate");
-    let run: TypedFunc<(), i32> = instance
+    // `run(entry_rip) -> (next_rip, insns)`.
+    let run: TypedFunc<i64, (i64, i64)> = instance
         .get_typed_func(&mut store, "run")
         .expect("run export");
-    let ran = run.call(&mut store, ()).expect("run call") as u32;
+    let (next_rip, ran) = run.call(&mut store, entry_rip as i64).expect("run call");
+    let next_rip = next_rip as u64;
+    let ran = ran as u32;
 
     let data = mem.data(&store);
     let mut regs = [0u64; 16];
@@ -159,7 +163,7 @@ fn run_jit(
     fb.copy_from_slice(&data[RFLAGS_OFF..RFLAGS_OFF + 8]);
     let flags = u64::from_le_bytes(fb) & ARITH_FLAGS;
     let ram = store.data().clone();
-    (regs, flags, ran, ram)
+    (regs, flags, next_rip, ran, ram)
 }
 
 /// Assert the interpreter and JIT agree, bit-for-bit, on a register-only block
@@ -206,12 +210,16 @@ fn check_mem(label: &str, code: &[u8], init: &[u64; 16], init_ram: &[u8]) {
     );
 
     let start_ram = starting_ram(code, init, init_ram);
-    let (iregs, iflags, iram) = run_interp(code, init, init_ram, tb.insns);
-    let (jregs, jflags, ran, jram) = run_jit(&tb, init, &start_ram);
+    let (iregs, iflags, irip, iram) = run_interp(code, init, init_ram, tb.insns);
+    let (jregs, jflags, jrip, ran, jram) = run_jit(&tb, init, &start_ram, BLOCK_BASE);
 
     assert_eq!(
         ran, tb.insns,
         "[{label}] run() returned the wrong insn count"
+    );
+    assert_eq!(
+        irip, jrip,
+        "[{label}] next_rip mismatch: interp={irip:#x} jit={jrip:#x}"
     );
     for i in 0..16 {
         assert_eq!(
@@ -297,6 +305,32 @@ fn instr_movc7(w: bool, rm: u8, imm32: i32) -> Vec<u8> {
 fn instr_incdec(w: bool, rm: u8, dec: bool) -> Vec<u8> {
     let digit = if dec { 1 } else { 0 };
     vec![rex(w, digit, rm), 0xFF, modrm_rr(digit, rm)]
+}
+
+// ── Relative branch assembly ──────────────────────────────────────────────────
+
+/// `JMP rel8` (0xEB).
+fn instr_jmp_rel8(rel: i8) -> Vec<u8> {
+    vec![0xEB, rel as u8]
+}
+
+/// `JMP rel32` (0xE9).
+fn instr_jmp_rel32(rel: i32) -> Vec<u8> {
+    let mut v = vec![0xE9];
+    v.extend_from_slice(&rel.to_le_bytes());
+    v
+}
+
+/// `Jcc rel8` (0x70+cc).
+fn instr_jcc_rel8(cc: u8, rel: i8) -> Vec<u8> {
+    vec![0x70 + cc, rel as u8]
+}
+
+/// `Jcc rel32` (0x0F 0x80+cc).
+fn instr_jcc_rel32(cc: u8, rel: i32) -> Vec<u8> {
+    let mut v = vec![0x0F, 0x80 + cc];
+    v.extend_from_slice(&rel.to_le_bytes());
+    v
 }
 
 // ── Memory-operand ModRM assembly ─────────────────────────────────────────────
@@ -952,6 +986,140 @@ fn handwritten_mem_edges() {
     check_mem("mixed reg+mem block", &block, &init, &ram);
 }
 
+// ── Branch terminators ────────────────────────────────────────────────────────
+
+#[test]
+fn handwritten_branch_edges() {
+    let base: [u64; 16] = [
+        5,
+        7,
+        0xffff_ffff_ffff_ffff,
+        0x8000_0000_0000_0000,
+        0x1234_5678_9abc_def0,
+        0,
+        0x7fff_ffff,
+        0x8000_0000,
+        1,
+        0xdead_beef,
+        0xffff_ffff,
+        0x100,
+        0x12,
+        0x7fff_ffff_ffff_ffff,
+        0xfedc_ba98_7654_3210,
+        0xabcd,
+    ];
+
+    // ── unconditional JMP, forward + backward, rel8 + rel32 ──
+    check("jmp rel8 +0", &instr_jmp_rel8(0), &base);
+    check("jmp rel8 fwd", &instr_jmp_rel8(40), &base);
+    check("jmp rel8 back", &instr_jmp_rel8(-20), &base);
+    check("jmp rel8 min", &instr_jmp_rel8(i8::MIN), &base);
+    check("jmp rel8 max", &instr_jmp_rel8(i8::MAX), &base);
+    check("jmp rel32 +0", &instr_jmp_rel32(0), &base);
+    check("jmp rel32 fwd", &instr_jmp_rel32(0x1234), &base);
+    check("jmp rel32 back", &instr_jmp_rel32(-0x1000), &base);
+    check(
+        "jmp rel32 big-back",
+        &instr_jmp_rel32(-(BLOCK_BASE as i32)),
+        &base,
+    );
+
+    // A JMP after some arithmetic (the arithmetic sets flags; JMP ignores them).
+    {
+        let mut blk = Vec::new();
+        blk.extend(instr_rr(true, 0x01, 0, 1)); // add rax, rcx
+        blk.extend(instr_jmp_rel8(0x10));
+        check("arith then jmp rel8", &blk, &base);
+    }
+
+    // ── conditional Jcc: every condition, several flag states, rel8 + rel32 ──
+    // Flag-producing setups (a `cmp`-like or `add` over a register pair) drive a
+    // spread of CF/ZF/SF/OF/PF; the interpreter and JIT must agree on taken/not
+    // for ALL 16 conditions regardless of which way each setup resolves them.
+    // Each entry is `op reg, reg` chosen to land a distinct flag combination.
+    let setups: &[(&str, Vec<u8>)] = &[
+        // sub rax,rax → ZF=1, CF=0, SF=0, OF=0, PF=1 (result 0)
+        ("zero", instr_rr(true, 0x29, 0, 0)),
+        // sub rax,rcx with rax=5,rcx=7 → negative, CF=1 (borrow), SF=1, OF=0
+        ("borrow-neg", instr_rr(true, 0x29, 1, 0)),
+        // add r2(-1)+r8(1) → 0, CF=1, ZF=1
+        ("carry-zero", instr_rr(true, 0x01, 8, 2)),
+        // add r13(INT_MAX)+r8(1) → OF=1, SF=1
+        ("signed-of", instr_rr(true, 0x01, 8, 13)),
+        // and rax,rcx (5 & 7 = 5) → CF=0,OF=0, SF=0, ZF=0, PF(parity of 5=101→2 ones→even? no, PF set on even)
+        ("logic", instr_rr(true, 0x21, 1, 0)),
+        // cmp r6(0x7fffffff),r7(0x80000000) 32-bit → exercises 32-bit flags
+        ("cmp32", instr_rr(false, 0x39, 7, 6)),
+    ];
+
+    for cc in 0u8..16 {
+        for (sname, setup) in setups {
+            // rel8 form
+            let mut blk = setup.clone();
+            blk.extend(instr_jcc_rel8(cc, 0x12));
+            check(&format!("jcc cc={cc} rel8 setup={sname}"), &blk, &base);
+
+            // rel8 backward
+            let mut blk = setup.clone();
+            blk.extend(instr_jcc_rel8(cc, -0x10));
+            check(&format!("jcc cc={cc} rel8-back setup={sname}"), &blk, &base);
+
+            // rel32 form
+            let mut blk = setup.clone();
+            blk.extend(instr_jcc_rel32(cc, 0x2000));
+            check(&format!("jcc cc={cc} rel32 setup={sname}"), &blk, &base);
+
+            // rel32 backward
+            let mut blk = setup.clone();
+            blk.extend(instr_jcc_rel32(cc, -0x800));
+            check(
+                &format!("jcc cc={cc} rel32-back setup={sname}"),
+                &blk,
+                &base,
+            );
+        }
+    }
+
+    // ── Jcc as the very first/only instruction (flags = reset state 0x2) ──
+    for cc in 0u8..16 {
+        check(
+            &format!("bare jcc cc={cc} rel8"),
+            &instr_jcc_rel8(cc, 8),
+            &base,
+        );
+        check(
+            &format!("bare jcc cc={cc} rel32"),
+            &instr_jcc_rel32(cc, 0x40),
+            &base,
+        );
+    }
+
+    // ── a block that ends by fall-through (no branch) still returns right RIP ──
+    {
+        let mut blk = Vec::new();
+        blk.extend(instr_mov_imm(true, 0, 42));
+        blk.extend(instr_rr(true, 0x01, 0, 1)); // add rax, rcx
+        check("fallthrough no-branch rip", &blk, &base);
+    }
+
+    // ── multi-insn arithmetic block terminated by the matching Jcc ──
+    {
+        // mov rax,10; sub rax,10 (→ZF); je +0x20
+        let mut blk = Vec::new();
+        blk.extend(instr_mov_imm(true, 0, 10));
+        blk.extend(instr_g1_imm8(true, 5, 0, 10)); // sub rax, 10 → ZF=1
+        blk.extend(instr_jcc_rel8(0x4, 0x20)); // JE (cc=4) taken
+        check("sub-to-zero then JE (taken)", &blk, &base);
+
+        // mov rax,10; sub rax,3 (→ZF=0); je +0x20 (not taken → fallthrough)
+        let mut blk = Vec::new();
+        blk.extend(instr_mov_imm(true, 0, 10));
+        blk.extend(instr_g1_imm8(true, 5, 0, 3)); // sub rax, 3 → ZF=0
+        blk.extend(instr_jcc_rel8(0x4, 0x20)); // JE not taken
+        check("sub-nonzero then JE (not taken)", &blk, &base);
+    }
+}
+
 // ── Randomized fuzzing ────────────────────────────────────────────────────────
 
 /// A tiny xorshift PRNG (deterministic, no external crate).
@@ -1017,6 +1185,16 @@ fn randomized_fuzz() {
         let mut code = Vec::new();
         for _ in 0..n {
             random_insn(&mut rng, &mut code);
+        }
+        // Half the time, terminate the block with a random relative branch so the
+        // branch terminator + condition evaluation is fuzzed against the interp.
+        if rng.next() & 1 == 0 {
+            match rng.next() % 4 {
+                0 => code.extend(instr_jmp_rel8(rng.next() as i8)),
+                1 => code.extend(instr_jmp_rel32(rng.next() as i32)),
+                2 => code.extend(instr_jcc_rel8((rng.next() % 16) as u8, rng.next() as i8)),
+                _ => code.extend(instr_jcc_rel32((rng.next() % 16) as u8, rng.next() as i32)),
+            }
         }
         check(&format!("fuzz case {case}"), &code, &init);
     }
@@ -1219,13 +1397,14 @@ fn speed_comparison() {
         &[mem.into(), load.into(), store_fn.into()],
     )
     .expect("inst");
-    let run: TypedFunc<(), i32> = instance.get_typed_func(&mut store, "run").expect("run");
+    let run: TypedFunc<i64, (i64, i64)> = instance.get_typed_func(&mut store, "run").expect("run");
 
     let jit_start = std::time::Instant::now();
     let mut total_jit_insns = 0u64;
     for _ in 0..calls {
-        let r = run.call(&mut store, ()).expect("run") as u64;
-        total_jit_insns += r;
+        // entry_rip is irrelevant for this register-only fall-through block.
+        let (_next_rip, r) = run.call(&mut store, 0i64).expect("run");
+        total_jit_insns += r as u64;
     }
     let jit_dt = jit_start.elapsed();
     let jit_mips = (total_jit_insns as f64) / jit_dt.as_secs_f64() / 1e6;
