@@ -628,7 +628,7 @@ enum PullStage {
 
 /// A **page-drivable OCI image pull** — the browser peer's pull, driven by a
 /// fetch/deliver loop instead of a blocking HTTP client, so the *same* parse +
-/// select + verify + ingest path that [`crate::import::pull_image`] proves (CC-20)
+/// select + verify + ingest path that `import::pull_image` proves (CC-20)
 /// runs in wasm with the router as the transport. The page loops:
 /// [`next_fetch`](ImagePull::next_fetch) → fetch via the router →
 /// [`deliver`](ImagePull::deliver); when [`is_done`](ImagePull::is_done), it calls
