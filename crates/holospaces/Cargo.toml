@@ -135,3 +135,7 @@ jsonschema = "0.46.5"
 # CC-9 OS-boot witness — decompress the pinned gzipped Linux kernel Image
 # (pure-Rust miniz_oxide backend; dev-only).
 flate2 = "1"
+# CC-48 — run the x86-64→Wasm translated blocks on the real Wasm engine for the
+# differential (interpreter-vs-JIT) correctness gate and the speed comparison.
+# Already in Cargo.lock via hologram-runtime-wasmtime, so no version risk.
+wasmtime = { version = "45.0", default-features = false, features = ["cranelift", "runtime"] }

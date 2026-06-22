@@ -1053,6 +1053,7 @@ dependencies = [
  "uor-prism",
  "ureq",
  "wasmparser 0.221.3",
+ "wasmtime",
  "wast",
  "wat",
 ]
