@@ -90,6 +90,17 @@ const ARITH_FLAGS: u64 = CF | PF | ZF | SF | OF;
 /// Byte offset of the `rflags` slot in the register file.
 const RFLAGS_OFF: u64 = 128;
 
+/// Byte offset of the **fault-restart RIP** slot in the register file. Before each
+/// guest-memory access the block stores the absolute guest `rip` of the
+/// instruction performing it here, so that if the host `env.load`/`env.store`
+/// import traps (a page fault / MMIO), the JIT driver can resume the interpreter at
+/// exactly that instruction — with the register/flag state the regfile already
+/// holds (every *prior* instruction's results are committed; this instruction's
+/// are not yet, since its memory access is its first or last effect). This is what
+/// makes a multi-memory-op block safely restartable after an abort. The slot is
+/// written only by blocks that touch memory; register-only blocks never trap.
+const FAULT_RIP_OFF: u64 = 136;
+
 /// A translated basic block: a complete, self-contained WebAssembly module plus
 /// the guest instruction/byte counts it covers (so the caller can advance `rip`
 /// and the retired-instruction counter past the translated region).
@@ -100,6 +111,11 @@ pub struct TranslatedBlock {
     pub insns: u32,
     /// The number of guest code bytes the block consumes.
     pub bytes: u32,
+    /// Whether the block emits any guest-memory access (an `env.load`/`env.store`
+    /// import call). A register-only block (`false`) needs no host memory primitive
+    /// at run time, so the JIT driver can execute it without lending the `Cpu` to
+    /// the host imports — a cheaper fast path.
+    pub touches_mem: bool,
 }
 
 // ── LEB128 ────────────────────────────────────────────────────────────────────
@@ -190,6 +206,13 @@ struct Body {
     /// Number of extra `i64` locals (beyond the single `entry_rip` parameter)
     /// declared.
     i64_locals: u32,
+    /// Set once the body emits a guest-memory access (a `env.load`/`env.store`
+    /// call) — surfaced as [`TranslatedBlock::touches_mem`].
+    touches_mem: bool,
+    /// The block-relative byte offset of the instruction currently being emitted —
+    /// stamped into the [`FAULT_RIP_OFF`] slot before each memory access so an abort
+    /// can be resumed at this instruction. Set by [`decode_one`] per instruction.
+    cur_insn_off: usize,
 }
 
 /// Wasm function index of the imported `env.load(addr,size)->i64`.
@@ -208,7 +231,26 @@ impl Body {
         Body {
             code: Vec::new(),
             i64_locals: 0,
+            touches_mem: false,
+            cur_insn_off: 0,
         }
+    }
+
+    /// Stamp the absolute guest `rip` of the current instruction
+    /// (`entry_rip + cur_insn_off`) into the [`FAULT_RIP_OFF`] slot. Emitted before
+    /// every guest-memory access so a trapped block resumes at the right
+    /// instruction (see [`FAULT_RIP_OFF`]).
+    fn store_fault_rip(&mut self) {
+        let off = self.cur_insn_off as u64;
+        self.i32_const(0); // address operand for the i64.store
+        self.local_get(ENTRY_RIP_LOCAL);
+        if off != 0 {
+            self.i64_const(off as i64);
+            self.binop(op::I64_ADD);
+        }
+        self.byte(op::I64_STORE);
+        leb_u32(&mut self.code, 3); // align 8
+        leb_u64(&mut self.code, FAULT_RIP_OFF);
     }
 
     /// Reserve a fresh `i64` local, returning its index. Local index 0 is the
@@ -289,6 +331,8 @@ impl Body {
     /// Emit `env.load(addr, size)` where the address is in `addr_local` and the
     /// loaded (host-zero-extended) value is left on the stack.
     fn emit_load(&mut self, addr_local: u32, size: u8) {
+        self.touches_mem = true;
+        self.store_fault_rip();
         self.local_get(addr_local);
         self.i32_const(i32::from(size));
         self.call(FN_LOAD);
@@ -298,6 +342,8 @@ impl Body {
     /// and the value is produced by `f` (pushed after the address/size operands,
     /// as the import's signature requires `(addr, size, value)`).
     fn emit_store(&mut self, addr_local: u32, size: u8, f: impl FnOnce(&mut Self)) {
+        self.touches_mem = true;
+        self.store_fault_rip();
         self.local_get(addr_local);
         self.i32_const(i32::from(size));
         f(self);
@@ -950,6 +996,9 @@ pub fn translate_block_at(code: &[u8], entry_rip: u64) -> Option<TranslatedBlock
         if dec.peek().is_none() {
             break; // end of slice
         }
+        // Record this instruction's block-relative offset so a memory access can
+        // stamp its absolute rip for fault restart (see `Body::store_fault_rip`).
+        body.cur_insn_off = start;
         match decode_one(&mut dec, &mut body, next_rip_local) {
             DecodeResult::Ok => {
                 insns += 1;
@@ -982,11 +1031,13 @@ pub fn translate_block_at(code: &[u8], entry_rip: u64) -> Option<TranslatedBlock
     body.local_get(next_rip_local);
     body.i64_const(i64::from(insns));
 
+    let touches_mem = body.touches_mem;
     let wasm = encode_module(&body);
     Some(TranslatedBlock {
         wasm,
         insns,
         bytes: dec.pos as u32,
+        touches_mem,
     })
 }
 
