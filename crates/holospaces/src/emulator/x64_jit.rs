@@ -105,6 +105,15 @@ const RFLAGS_OFF: u64 = 128;
 /// written only by blocks that touch memory; register-only blocks never trap.
 const FAULT_RIP_OFF: u64 = 136;
 
+/// Byte offset of the **retired-instruction** slot in the register file. A
+/// *region* (see [`translate_region_at`]) stamps the number of guest instructions
+/// it has fully retired *before* the instruction it is about to execute a memory
+/// access for, alongside [`FAULT_RIP_OFF`]. If that access traps, the driver reads
+/// this slot to credit the timer/interrupt bookkeeping with the instructions the
+/// region actually ran before the abort (a region can chain many blocks in one
+/// call, so unlike a single basic block the lost-on-trap count is not negligible).
+const RETIRED_OFF: u64 = 144;
+
 /// A translated basic block: a complete, self-contained WebAssembly module plus
 /// the guest instruction/byte counts it covers (so the caller can advance `rip`
 /// and the retired-instruction counter past the translated region).
@@ -119,6 +128,30 @@ pub struct TranslatedBlock {
     /// import call). A register-only block (`false`) needs no host memory primitive
     /// at run time, so the JIT driver can execute it without lending the `Cpu` to
     /// the host imports — a cheaper fast path.
+    pub touches_mem: bool,
+}
+
+/// A translated **region** (trace): one WebAssembly function covering several
+/// basic blocks reachable from a hot entry by *direct* branches, with an internal
+/// `br_table` dispatch loop so a hot guest loop runs entirely inside ONE Wasm call
+/// (no per-block driver round-trip). The exported `run` has signature
+/// `(entry_rip: i64, budget: i64) -> (exit_rip: i64, insns: i64)` — it runs guest
+/// instructions starting at `entry_rip` (region block 0) until it either leaves the
+/// region (an indirect/out-of-region transfer or an unsupported instruction) or the
+/// instruction `budget` is exhausted, returning the guest `rip` to continue at and
+/// the number of guest instructions it retired. See [`translate_region_at`].
+pub struct TranslatedRegion {
+    /// The encoded WebAssembly module (importing `env.mem`, exporting `run`).
+    pub wasm: Vec<u8>,
+    /// The number of guest code bytes the region spans from the entry (the SMC
+    /// invalidation extent — a write anywhere in `[entry, entry+bytes)` stales it).
+    pub bytes: u32,
+    /// The number of basic blocks discovered and emitted in the region.
+    pub blocks: u32,
+    /// The total number of guest instructions across all discovered blocks (a
+    /// region-size probe; the *runtime* retired count is the `run` second result).
+    pub insns: u32,
+    /// Whether any block emits a guest-memory access (see [`TranslatedBlock`]).
     pub touches_mem: bool,
 }
 
@@ -175,7 +208,14 @@ fn leb_i32(out: &mut Vec<u8>, v: i32) {
 
 // ── Wasm opcodes used by the emitter ──────────────────────────────────────────
 mod op {
+    pub const BLOCK: u8 = 0x02;
+    pub const LOOP: u8 = 0x03;
+    pub const IF: u8 = 0x04;
+    pub const ELSE: u8 = 0x05;
     pub const END: u8 = 0x0b;
+    pub const BR: u8 = 0x0c;
+    pub const BR_TABLE: u8 = 0x0e;
+    pub const RETURN: u8 = 0x0f;
     pub const CALL: u8 = 0x10;
     pub const SELECT: u8 = 0x1b;
     pub const LOCAL_GET: u8 = 0x20;
@@ -189,6 +229,7 @@ mod op {
     pub const I64_EQ: u8 = 0x51;
     pub const I64_NE: u8 = 0x52;
     pub const I64_LT_U: u8 = 0x54;
+    pub const I64_LE_S: u8 = 0x57;
     pub const I64_ADD: u8 = 0x7c;
     pub const I64_SUB: u8 = 0x7d;
     pub const I64_MUL: u8 = 0x7e;
@@ -213,9 +254,12 @@ mod op {
 /// the imported memory.
 struct Body {
     code: Vec<u8>,
-    /// Number of extra `i64` locals (beyond the single `entry_rip` parameter)
-    /// declared.
+    /// Number of extra `i64` locals (beyond the function parameters) declared.
     i64_locals: u32,
+    /// Number of `i64` parameters of the function this body belongs to: 1 for a
+    /// single block (`$entry_rip`), 2 for a region (`$entry_rip`, `$budget`).
+    /// On-demand locals are numbered after the parameters.
+    param_count: u32,
     /// Set once the body emits a guest-memory access (a `env.load`/`env.store`
     /// call) — surfaced as [`TranslatedBlock::touches_mem`].
     touches_mem: bool,
@@ -223,6 +267,12 @@ struct Body {
     /// stamped into the [`FAULT_RIP_OFF`] slot before each memory access so an abort
     /// can be resumed at this instruction. Set by [`decode_one`] per instruction.
     cur_insn_off: usize,
+    /// For a *region* body: the local holding the running count of guest
+    /// instructions retired *before* the current instruction, stamped into
+    /// [`RETIRED_OFF`] before each memory access so a trap credits the timer with
+    /// the work the region actually did. `None` for a single-block body (which
+    /// retires at most one block, so the lost-on-trap count is negligible).
+    retired_local: Option<u32>,
 }
 
 /// Wasm function index of the imported `env.load(addr,size)->i64`.
@@ -230,26 +280,41 @@ const FN_LOAD: u32 = 0;
 /// Wasm function index of the imported `env.store(addr,size,val)`.
 const FN_STORE: u32 = 1;
 
-/// Number of parameters of the exported `run` function. Index 0 is `$entry_rip`
-/// (an `i64`); all reserved temporaries are locals after it.
-const PARAM_COUNT: u32 = 1;
-/// Local index of the `$entry_rip` parameter.
+/// Local index of the `$entry_rip` parameter (parameter 0 in both the single-block
+/// and the region `run` functions).
 const ENTRY_RIP_LOCAL: u32 = 0;
+/// Local index of the `$budget` parameter (region `run` only — parameter 1).
+const BUDGET_LOCAL: u32 = 1;
 
 impl Body {
     fn new() -> Self {
         Body {
             code: Vec::new(),
             i64_locals: 0,
+            param_count: 1,
             touches_mem: false,
             cur_insn_off: 0,
+            retired_local: None,
+        }
+    }
+
+    /// A body for a *region* `run` function (`$entry_rip`, `$budget` parameters).
+    fn new_region() -> Self {
+        Body {
+            code: Vec::new(),
+            i64_locals: 0,
+            param_count: 2,
+            touches_mem: false,
+            cur_insn_off: 0,
+            retired_local: None,
         }
     }
 
     /// Stamp the absolute guest `rip` of the current instruction
     /// (`entry_rip + cur_insn_off`) into the [`FAULT_RIP_OFF`] slot. Emitted before
     /// every guest-memory access so a trapped block resumes at the right
-    /// instruction (see [`FAULT_RIP_OFF`]).
+    /// instruction (see [`FAULT_RIP_OFF`]). For a region body it also stamps the
+    /// instructions-retired-so-far into [`RETIRED_OFF`] so a trap credits the timer.
     fn store_fault_rip(&mut self) {
         let off = self.cur_insn_off as u64;
         self.i32_const(0); // address operand for the i64.store
@@ -261,12 +326,21 @@ impl Body {
         self.byte(op::I64_STORE);
         leb_u32(&mut self.code, 3); // align 8
         leb_u64(&mut self.code, FAULT_RIP_OFF);
+
+        if let Some(rl) = self.retired_local {
+            // RETIRED_OFF = instructions fully retired before this instruction.
+            self.i32_const(0);
+            self.local_get(rl);
+            self.byte(op::I64_STORE);
+            leb_u32(&mut self.code, 3);
+            leb_u64(&mut self.code, RETIRED_OFF);
+        }
     }
 
-    /// Reserve a fresh `i64` local, returning its index. Local index 0 is the
-    /// `entry_rip` parameter, so the first reserved local is index 1.
+    /// Reserve a fresh `i64` local, returning its index. Locals are numbered after
+    /// the function's parameters (`param_count`).
     fn local(&mut self) -> u32 {
-        let idx = PARAM_COUNT + self.i64_locals;
+        let idx = self.param_count + self.i64_locals;
         self.i64_locals += 1;
         idx
     }
@@ -998,31 +1072,33 @@ fn write_rm_byte(
 
 // ── Stack ops (PUSH/POP) ───────────────────────────────────────────────────────
 
-/// Decrement RSP by 8 (the 64-bit stack slot) and return its new value in a fresh
-/// local (the address the pushed value goes to). Mirrors the interpreter's
-/// `push`: `r[RSP] -= 8; wr(r[RSP], 8, val)`.
+/// Index of RSP in the register file.
 const RSP: u32 = 4;
 
-/// Emit `r[RSP] -= 8` and leave the new RSP in a fresh local (the store address).
-fn emit_dec_rsp(body: &mut Body) -> u32 {
+/// `PUSH val` where the 64-bit value is produced by `f`. Mirrors the interpreter's
+/// `push`: the pushed value goes to `RSP - 8` and `RSP` is decremented by 8.
+///
+/// **Fault-restart safety:** the memory store at `RSP - 8` is emitted *before* the
+/// `RSP -= 8` commit, so if the store traps (a stack-growth / guard-page #PF — very
+/// common in userspace), the register file still holds the *original* RSP. The JIT
+/// driver then re-interprets the PUSH from `FAULT_RIP` with an unchanged RSP, and
+/// the interpreter decrements it exactly once — no double-decrement. (Committing RSP
+/// first, as a naive translation would, double-decrements on every faulting push.)
+fn emit_push(body: &mut Body, f: impl FnOnce(&mut Body)) {
+    // value to push
+    let v = body.local();
+    f(body);
+    body.local_set(v);
+    // store address = RSP - 8 (NOT yet committed to the register file)
     let sp = body.local();
     body.load_reg(RSP);
     body.i64_const(8);
     body.binop(op::I64_SUB);
     body.local_set(sp);
-    // commit the new RSP
-    body.store_reg(RSP, |b| b.local_get(sp));
-    sp
-}
-
-/// `PUSH val` where the 64-bit value is produced by `f`. Decrements RSP by 8 and
-/// stores 8 bytes at the new RSP via `env.store`. No flags.
-fn emit_push(body: &mut Body, f: impl FnOnce(&mut Body)) {
-    let v = body.local();
-    f(body);
-    body.local_set(v);
-    let sp = emit_dec_rsp(body);
+    // store first (may trap → RSP is still the original value in the regfile)
     body.emit_store(sp, 8, |b| b.local_get(v));
+    // store succeeded — now commit RSP -= 8
+    body.store_reg(RSP, |b| b.local_get(sp));
 }
 
 /// `POP` into a fresh local: load 8 bytes from RSP, then `r[RSP] += 8`. Returns
@@ -1736,6 +1812,640 @@ pub fn translate_block_at(code: &[u8], entry_rip: u64) -> Option<TranslatedBlock
     })
 }
 
+// ── Region (trace) translation ─────────────────────────────────────────────────
+
+/// The maximum number of basic blocks a region may contain. A larger cap captures
+/// bigger traces (more throughput), but a region's blocks all run in one Wasm call
+/// with no interrupt-delivery point between them; capped conservatively here. Beyond
+/// this, the discovery treats further direct-branch targets as region exits.
+const MAX_REGION_BLOCKS: usize = 4;
+/// The maximum guest-byte span of a region from its entry (a region never crosses a
+/// guest page — the driver fetches at most a page — and is further capped here).
+const MAX_REGION_BYTES: usize = 4096;
+
+/// The control-flow classification of one scanned instruction (discovery pass).
+enum Scan {
+    /// An ordinary supported, non-control instruction of `len` bytes.
+    Linear { len: usize },
+    /// An unconditional relative `JMP` of `len` bytes whose target is at byte
+    /// offset `target` from the region entry.
+    Jmp { len: usize, target: usize },
+    /// A conditional `Jcc` (`cc` = low nibble) of `len` bytes; `target` is the taken
+    /// offset from the region entry, the fall-through is the next instruction.
+    Jcc { len: usize, cc: u8, target: usize },
+    /// An unsupported instruction / a non-direct control transfer — a region edge.
+    Stop,
+}
+
+/// Scan one instruction at byte offset `at` within the region `code` (entry-based
+/// offsets), classifying its control flow and length **without emitting** anything.
+/// This mirrors [`decode_one`]'s opcode coverage exactly so the discovered block
+/// boundaries match what the emitter (`decode_one`) will produce; a branch's
+/// `target` is resolved to a region-entry-relative byte offset (`insn_end + rel`).
+/// Returns `None` only on truncation (the instruction runs off the slice).
+fn scan_one(code: &[u8], at: usize) -> Option<Scan> {
+    let mut dec = Decoder::new(&code[at..]);
+    // Optional REX prefix; 0x66 (16-bit) is unsupported.
+    let mut rex = 0u8;
+    let b0 = dec.peek()?;
+    if (0x40..=0x4f).contains(&b0) {
+        rex = b0;
+        dec.u8();
+    } else if b0 == 0x66 {
+        return Some(Scan::Stop);
+    }
+    let op = dec.u8()?;
+
+    // A helper that, after the decoder has consumed the whole instruction, yields a
+    // `Linear` scan of the right length (region-entry-relative end minus start).
+    macro_rules! linear {
+        () => {
+            Some(Scan::Linear { len: dec.pos })
+        };
+    }
+
+    match op {
+        // ALU reg forms (r/m,r and r,r/m) — adc/sbb (digit 2/3) unsupported.
+        0x01 | 0x09 | 0x21 | 0x29 | 0x31 | 0x39 | 0x03 | 0x0b | 0x23 | 0x2b | 0x33 | 0x3b => {
+            if AluOp::from_digit(op >> 3).is_none() {
+                return Some(Scan::Stop);
+            }
+            decode_modrm(&mut dec, rex)?;
+            linear!()
+        }
+        // group1 imm32 / imm8.
+        0x81 | 0x83 => {
+            let d = decode_modrm(&mut dec, rex)?;
+            if AluOp::from_digit((d.reg & 7) as u8).is_none() {
+                return Some(Scan::Stop);
+            }
+            if op == 0x83 {
+                dec.u8()?;
+            } else {
+                dec.u32_le()?;
+            }
+            linear!()
+        }
+        // mov r/m,r ; mov r,r/m ; LEA ; TEST r/m,r.
+        0x89 | 0x8b | 0x8d | 0x85 => {
+            let d = decode_modrm(&mut dec, rex)?;
+            if op == 0x8d && matches!(d.rm, RmLoc::Reg(_)) {
+                return Some(Scan::Stop); // LEA reg,reg is #UD
+            }
+            linear!()
+        }
+        // mov r, imm (imm64 if REX.W else imm32).
+        0xb8..=0xbf => {
+            if rex & 8 != 0 {
+                dec.u64_le()?;
+            } else {
+                dec.u32_le()?;
+            }
+            linear!()
+        }
+        // mov r/m, imm32 (0xC7 /0 only).
+        0xc7 => {
+            let d = decode_modrm(&mut dec, rex)?;
+            if d.reg & 7 != 0 {
+                return Some(Scan::Stop);
+            }
+            dec.u32_le()?;
+            linear!()
+        }
+        // 0xFF /0,/1 (inc/dec), /6 (push r/m); else control flow → Stop.
+        0xff => {
+            let d = decode_modrm(&mut dec, rex)?;
+            match d.reg & 7 {
+                0 | 1 | 6 => linear!(),
+                _ => Some(Scan::Stop),
+            }
+        }
+        // JMP rel8 / rel32 (terminators).
+        0xeb => {
+            let rel = dec.u8()? as i8 as i64;
+            let target = (at + dec.pos).wrapping_add(rel as usize);
+            Some(Scan::Jmp {
+                len: dec.pos,
+                target,
+            })
+        }
+        0xe9 => {
+            let rel = dec.u32_le()? as i32 as i64;
+            let target = (at + dec.pos).wrapping_add(rel as usize);
+            Some(Scan::Jmp {
+                len: dec.pos,
+                target,
+            })
+        }
+        // Jcc rel8.
+        0x70..=0x7f => {
+            let rel = dec.u8()? as i8 as i64;
+            let target = (at + dec.pos).wrapping_add(rel as usize);
+            Some(Scan::Jcc {
+                len: dec.pos,
+                cc: op - 0x70,
+                target,
+            })
+        }
+        // PUSH/POP r64.
+        0x50..=0x5f => linear!(),
+        // POP r/m (0x8F /0). Register and non-RSP-relative memory destinations are
+        // translated; an RSP-relative `pop [rsp±…]` is left to the interpreter for
+        // fault-restart correctness (see `decode_one`).
+        0x8f => {
+            let d = decode_modrm(&mut dec, rex)?;
+            if d.reg & 7 != 0 {
+                return Some(Scan::Stop);
+            }
+            if let RmLoc::Mem(ref ea) = d.rm {
+                if ea.base == Some(RSP) || ea.index == Some(RSP) {
+                    return Some(Scan::Stop);
+                }
+            }
+            linear!()
+        }
+        // TEST eAX,imm.
+        0xa9 => {
+            dec.u32_le()?;
+            linear!()
+        }
+        // MOVSXD.
+        0x63 => {
+            decode_modrm(&mut dec, rex)?;
+            linear!()
+        }
+        // IMUL r,r/m,imm32 / imm8.
+        0x69 | 0x6b => {
+            decode_modrm(&mut dec, rex)?;
+            if op == 0x6b {
+                dec.u8()?;
+            } else {
+                dec.u32_le()?;
+            }
+            linear!()
+        }
+        // shifts.
+        0xc1 | 0xd1 | 0xd3 => {
+            let d = decode_modrm(&mut dec, rex)?;
+            if ShiftOp::from_digit((d.reg & 7) as u8).is_none() {
+                return Some(Scan::Stop);
+            }
+            if op == 0xc1 {
+                dec.u8()?;
+            }
+            linear!()
+        }
+        // group3 (0xF7): TEST/NOT/NEG/MUL/IMUL; DIV/IDIV → Stop.
+        0xf7 => {
+            let d = decode_modrm(&mut dec, rex)?;
+            match d.reg & 7 {
+                0 | 1 => {
+                    dec.u32_le()?;
+                    linear!()
+                }
+                2..=5 => linear!(),
+                _ => Some(Scan::Stop),
+            }
+        }
+        // 0x0F two-byte.
+        0x0f => {
+            let op2 = dec.u8()?;
+            match op2 {
+                // Jcc rel32 (terminator).
+                0x80..=0x8f => {
+                    let rel = dec.u32_le()? as i32 as i64;
+                    let target = (at + dec.pos).wrapping_add(rel as usize);
+                    Some(Scan::Jcc {
+                        len: dec.pos,
+                        cc: op2 - 0x80,
+                        target,
+                    })
+                }
+                // SETcc / MOVZX / MOVSX / 2-op IMUL.
+                0x90..=0x9f | 0xb6 | 0xb7 | 0xbe | 0xbf | 0xaf => {
+                    decode_modrm(&mut dec, rex)?;
+                    linear!()
+                }
+                _ => Some(Scan::Stop),
+            }
+        }
+        _ => Some(Scan::Stop),
+    }
+}
+
+/// A discovered basic block within a region: its byte offset from the region entry,
+/// the instructions it spans, and how it leaves (its successors).
+struct RegionBlock {
+    /// Byte offset of the block's first instruction from the region entry.
+    start: usize,
+    /// The number of guest instructions in the block (including any terminator).
+    insns: u32,
+    /// How the block exits.
+    exit: BlockExit,
+}
+
+/// How a discovered region block transfers control.
+enum BlockExit {
+    /// Falls through (no branch) to byte offset `next` (a discovered in-region
+    /// block — fall-through is only used when the next block was discovered).
+    Fallthrough { next: usize },
+    /// An unconditional `JMP` to byte offset `target`.
+    Jmp { target: usize },
+    /// A `Jcc cc`: taken → `target`, not-taken → `fallthru` (both byte offsets).
+    Jcc {
+        cc: u8,
+        target: usize,
+        fallthru: usize,
+    },
+    /// Leaves the region at guest `rip == entry_rip + exit_off` (an out-of-region
+    /// direct branch target, an unsupported/indirect transfer, or the end of the
+    /// scanned slice). The driver resumes there (the JIT or the interpreter).
+    Leave { exit_off: usize },
+}
+
+/// Translate a **region** (trace) starting at the hot entry `code[0]` (guest
+/// `rip == entry_rip`). Discovers the basic blocks reachable from the entry by
+/// *direct* branches that stay within the scanned slice (a single guest page, capped
+/// by [`MAX_REGION_BLOCKS`] / [`MAX_REGION_BYTES`]), assigns each an index, and emits
+/// ONE Wasm function with an internal `br_table` dispatch loop so a hot guest loop
+/// runs entirely inside one Wasm call. Returns `None` if the entry instruction is
+/// itself untranslatable (the caller interprets it).
+///
+/// The emitted `run(entry_rip, budget) -> (exit_rip, insns)` executes guest
+/// instructions from block 0 until it leaves the region or the instruction `budget`
+/// is exhausted, then returns the guest `rip` to continue at and the retired count.
+#[must_use]
+pub fn translate_region_at(code: &[u8], entry_rip: u64) -> Option<TranslatedRegion> {
+    let _ = entry_rip; // supplied at call time via the `$entry_rip` parameter.
+    let slice_len = code.len().min(MAX_REGION_BYTES);
+
+    // ── Discovery: BFS over block starts reachable by direct branches ──
+    // `index_of[off]` maps a discovered block-start offset → its region block index.
+    let mut starts: Vec<usize> = Vec::new();
+    let mut index_of: alloc::collections::BTreeMap<usize, usize> =
+        alloc::collections::BTreeMap::new();
+    let mut blocks: Vec<RegionBlock> = Vec::new();
+    let mut worklist: Vec<usize> = Vec::new();
+
+    // Register a block-start offset (if in range and not seen), returning whether it
+    // is (now) an in-region block. Out-of-range starts are region exits.
+    let want = |off: usize,
+                starts: &mut Vec<usize>,
+                index_of: &mut alloc::collections::BTreeMap<usize, usize>,
+                worklist: &mut Vec<usize>|
+     -> bool {
+        if off >= slice_len {
+            return false;
+        }
+        if index_of.contains_key(&off) {
+            return true;
+        }
+        if starts.len() >= MAX_REGION_BLOCKS {
+            return false; // cap reached — treat as a region exit
+        }
+        let idx = starts.len();
+        starts.push(off);
+        index_of.insert(off, idx);
+        worklist.push(off);
+        true
+    };
+
+    want(0, &mut starts, &mut index_of, &mut worklist);
+
+    // Process the worklist. Each entry is a block start; scan instructions until a
+    // terminator or a region edge, recording the block and enqueuing direct targets.
+    while let Some(block_start) = worklist.pop() {
+        let mut pos = block_start;
+        let mut insns: u32 = 0;
+        let exit;
+        loop {
+            // A discovered block-start that is not this block ends the current block
+            // (fall into it) — keeps blocks single-entry for the dispatch.
+            if pos != block_start && index_of.contains_key(&pos) {
+                exit = BlockExit::Fallthrough { next: pos };
+                break;
+            }
+            if pos >= slice_len {
+                exit = BlockExit::Leave { exit_off: pos };
+                break;
+            }
+            match scan_one(code, pos) {
+                None | Some(Scan::Stop) => {
+                    // The instruction at `pos` is untranslatable / a region edge: the
+                    // block ends *before* it and leaves the region at `pos`.
+                    if pos == block_start {
+                        // The block's first instruction is itself untranslatable.
+                        if block_start == 0 {
+                            return None; // entry instruction unsupported
+                        }
+                        // A branch target landed on an unsupported instruction — the
+                        // block is just a region exit to `pos` (no instructions).
+                    }
+                    exit = BlockExit::Leave { exit_off: pos };
+                    break;
+                }
+                Some(Scan::Linear { len }) => {
+                    insns += 1;
+                    pos += len;
+                }
+                Some(Scan::Jmp { len: _, target }) => {
+                    insns += 1;
+                    let in_region = want(target, &mut starts, &mut index_of, &mut worklist);
+                    exit = if in_region {
+                        BlockExit::Jmp { target }
+                    } else {
+                        BlockExit::Leave { exit_off: target }
+                    };
+                    break;
+                }
+                Some(Scan::Jcc { len, cc, target }) => {
+                    insns += 1;
+                    pos += len;
+                    let fallthru = pos;
+                    // Enqueue both successors (in-region ones become blocks).
+                    want(target, &mut starts, &mut index_of, &mut worklist);
+                    want(fallthru, &mut starts, &mut index_of, &mut worklist);
+                    exit = BlockExit::Jcc {
+                        cc,
+                        target,
+                        fallthru,
+                    };
+                    break;
+                }
+            }
+        }
+        blocks.push(RegionBlock {
+            start: block_start,
+            insns,
+            exit,
+        });
+    }
+
+    // Sort blocks by their assigned index (worklist order is LIFO).
+    blocks.sort_by_key(|b| index_of[&b.start]);
+
+    // A region with a single block and no in-region branch is just a basic block —
+    // still emitted as a (degenerate) region for a uniform driver path.
+    let region_bytes = blocks
+        .iter()
+        .map(|b| b.start + block_byte_len(code, b))
+        .max()
+        .unwrap_or(0)
+        .min(slice_len);
+
+    // ── Emission: one function with a br_table dispatch loop ──
+    let mut body = Body::new_region();
+    // Reserve the bookkeeping locals first so their indices are stable:
+    //   $cur   — current block index (i64; wrapped to i32 for br_table)
+    //   $insns — guest instructions retired so far (the `run` 2nd result)
+    // The per-instruction emitters allocate further i64 temporaries after these.
+    let cur_local = body.local();
+    let insns_local = body.local();
+    // A scratch local for `decode_one`'s `next_rip` parameter — only branch
+    // terminators write it, and the region emits those itself (never via
+    // `decode_one`), so it is never actually stored to; reserved for a valid index.
+    let scratch_next_rip = body.local();
+    body.retired_local = Some(insns_local);
+
+    // Wasm locals are zero-initialised, so `$cur = 0` (enter at block 0) and
+    // `$insns = 0` need no init code.
+
+    let n = blocks.len();
+
+    // Dispatch shape (the standard relooper br_table form), with `return` used for
+    // every region exit so no multi-value block type is needed:
+    //
+    //   loop $disp                          ;; void
+    //     block $B_{n-1} … block $B_0       ;; void each (innermost = $B_0)
+    //       (i32)$cur ; br_table 0 1 … n-1 default
+    //     end ; <body B_0>                  ;; br $disp (depth n-1) to re-dispatch,
+    //     end ; <body B_1>                  ;;   or push (rip,insns); return to exit
+    //     …
+    //     end ; <body B_{n-1}>
+    //   end loop
+    //   unreachable                         ;; control never falls out of the loop
+    //
+    // From inside body B_k the open frames outward are $B_{k+1}…$B_{n-1} then the
+    // loop, so `br $disp` is at depth `n-1-k`.
+    body.byte(op::LOOP);
+    body.byte(0x40); // void
+    for _ in 0..n {
+        body.byte(op::BLOCK);
+        body.byte(0x40);
+    }
+    body.local_get(cur_local);
+    body.binop(op::I32_WRAP_I64);
+    body.byte(op::BR_TABLE);
+    leb_u32(&mut body.code, n as u32); // table length (targets 0..n-1)
+    for k in 0..n {
+        leb_u32(&mut body.code, k as u32); // index k → block $B_k (depth k here)
+    }
+    leb_u32(&mut body.code, 0); // default (unreachable: $cur is always valid)
+
+    // Emit each block: `end` (closes $B_k), then its body.
+    let mut dec = Decoder::new(code);
+    for (k, block) in blocks.iter().enumerate() {
+        body.byte(op::END); // close block $B_k → its body follows
+        emit_region_block(
+            &mut body,
+            &mut dec,
+            block,
+            &index_of,
+            cur_local,
+            insns_local,
+            scratch_next_rip,
+            k,
+            n,
+        );
+    }
+    body.byte(op::END); // close loop $disp
+    body.byte(0x00); // `unreachable` — control never falls out of the dispatch loop
+
+    let touches_mem = body.touches_mem;
+    let total_insns: u32 = blocks.iter().map(|b| b.insns).sum();
+    let wasm = encode_module(&body);
+    Some(TranslatedRegion {
+        wasm,
+        bytes: region_bytes as u32,
+        blocks: n as u32,
+        insns: total_insns,
+        touches_mem,
+    })
+}
+
+/// The byte length the block at `b.start` spans (to its terminator end or its leave
+/// edge), used to size the region's SMC extent. Re-scans the block's instructions.
+fn block_byte_len(code: &[u8], b: &RegionBlock) -> usize {
+    let mut pos = b.start;
+    let slice_len = code.len().min(MAX_REGION_BYTES);
+    let mut count = 0u32;
+    while count < b.insns && pos < slice_len {
+        match scan_one(code, pos) {
+            Some(Scan::Linear { len })
+            | Some(Scan::Jmp { len, .. })
+            | Some(Scan::Jcc { len, .. }) => {
+                pos += len;
+                count += 1;
+            }
+            _ => break,
+        }
+    }
+    pos - b.start
+}
+
+/// Emit the body of one region block `B_k` (of `n`): its instructions (via the
+/// per-instruction emitters over the shared `dec`), counting each into `$insns`,
+/// then the dispatch tail that either continues the loop at the next in-region block
+/// index (honouring the instruction budget) or `return`s an exit rip to the driver.
+/// `dec` is sought to the block's start before emitting.
+#[allow(clippy::too_many_arguments)]
+fn emit_region_block(
+    body: &mut Body,
+    dec: &mut Decoder,
+    block: &RegionBlock,
+    index_of: &alloc::collections::BTreeMap<usize, usize>,
+    cur_local: u32,
+    insns_local: u32,
+    scratch_next_rip: u32,
+    k: usize,
+    n: usize,
+) {
+    // The `br $disp` (loop) depth from inside this block's body: the open frames
+    // outward are $B_{k+1}…$B_{n-1} then the loop.
+    let disp_depth = (n - 1 - k) as u32;
+
+    // The terminator (JMP/Jcc) is NOT emitted by `decode_one` (the region emits its
+    // own dispatch for it); every other instruction is.
+    let has_branch_terminator = matches!(block.exit, BlockExit::Jmp { .. } | BlockExit::Jcc { .. });
+    let body_insns = if has_branch_terminator {
+        block.insns - 1
+    } else {
+        block.insns
+    };
+
+    dec.pos = block.start;
+    let mut emitted: u32 = 0;
+    while emitted < body_insns {
+        body.cur_insn_off = dec.pos;
+        match decode_one(dec, body, scratch_next_rip) {
+            DecodeResult::Ok => {
+                // $insns += 1 (one more instruction retired in the region).
+                bump_insns(body, insns_local);
+                emitted += 1;
+            }
+            // A non-terminator block should never produce these (the scanner
+            // validated supportability and the terminator is handled separately);
+            // be defensive and stop emitting the body if it does.
+            DecodeResult::Terminator | DecodeResult::Stop => break,
+        }
+    }
+
+    // Dispatch tail.
+    match &block.exit {
+        BlockExit::Fallthrough { next } => {
+            let idx = index_of[next];
+            emit_region_goto(body, idx, *next, cur_local, insns_local, disp_depth);
+        }
+        BlockExit::Leave { exit_off } => emit_region_return(body, *exit_off, insns_local),
+        BlockExit::Jmp { target } => {
+            bump_insns(body, insns_local); // count the JMP
+            let idx = index_of[target];
+            emit_region_goto(body, idx, *target, cur_local, insns_local, disp_depth);
+        }
+        BlockExit::Jcc {
+            cc,
+            target,
+            fallthru,
+        } => {
+            bump_insns(body, insns_local); // count the Jcc
+            emit_cond_i32(body, *cc); // i32 0/1
+            body.byte(op::IF);
+            body.byte(0x40); // void
+                             // Inside the `if`/`else` arms there is one extra enclosing control frame,
+                             // so a `br $disp` (loop) must reach one level deeper than at body level.
+            emit_region_succ(
+                body,
+                *target,
+                index_of,
+                cur_local,
+                insns_local,
+                disp_depth + 1,
+            );
+            body.byte(op::ELSE);
+            emit_region_succ(
+                body,
+                *fallthru,
+                index_of,
+                cur_local,
+                insns_local,
+                disp_depth + 1,
+            );
+            body.byte(op::END);
+        }
+    }
+}
+
+/// `$insns += 1`.
+fn bump_insns(body: &mut Body, insns_local: u32) {
+    body.local_get(insns_local);
+    body.i64_const(1);
+    body.binop(op::I64_ADD);
+    body.local_set(insns_local);
+}
+
+/// Emit the dispatch tail for a single successor at region byte offset `off`: an
+/// in-region block continues the loop (budget permitting), an out-of-region target
+/// `return`s.
+fn emit_region_succ(
+    body: &mut Body,
+    off: usize,
+    index_of: &alloc::collections::BTreeMap<usize, usize>,
+    cur_local: u32,
+    insns_local: u32,
+    disp_depth: u32,
+) {
+    match index_of.get(&off) {
+        Some(&idx) => emit_region_goto(body, idx, off, cur_local, insns_local, disp_depth),
+        None => emit_region_return(body, off, insns_local),
+    }
+}
+
+/// Emit: if the instruction budget is exhausted, `return (entry+off, $insns)` to the
+/// driver (which resumes at the in-region block's rip); otherwise set `$cur = idx`
+/// and branch to the dispatch loop (`br $disp`). `off` is the target block's
+/// region-entry-relative byte offset (its guest rip = `entry_rip + off`).
+fn emit_region_goto(
+    body: &mut Body,
+    idx: usize,
+    off: usize,
+    cur_local: u32,
+    insns_local: u32,
+    disp_depth: u32,
+) {
+    // if ($insns >= budget) { return (entry+off, $insns) }   (budget <= insns)
+    body.local_get(BUDGET_LOCAL);
+    body.local_get(insns_local);
+    body.binop(op::I64_LE_S); // budget <= insns  → exhausted
+    body.byte(op::IF);
+    body.byte(0x40);
+    push_rip_at(body, off as u64);
+    body.local_get(insns_local);
+    body.byte(op::RETURN);
+    body.byte(op::END);
+    // not exhausted: $cur = idx ; br $disp (re-dispatch)
+    body.i64_const(idx as i64);
+    body.local_set(cur_local);
+    body.byte(op::BR);
+    leb_u32(&mut body.code, disp_depth);
+}
+
+/// Emit a region exit: `return (entry+off, $insns)` (guest `rip == entry_rip + off`).
+fn emit_region_return(body: &mut Body, off: usize, insns_local: u32) {
+    push_rip_at(body, off as u64);
+    body.local_get(insns_local);
+    body.byte(op::RETURN);
+}
+
 enum DecodeResult {
     /// A non-control instruction was decoded and emitted; continue the block.
     Ok,
@@ -1956,20 +2666,52 @@ fn decode_one(dec: &mut Decoder, body: &mut Body, next_rip_local: u32) -> Decode
             write_reg(body, reg, 8, v);
             DecodeResult::Ok
         }
-        // ── POP r/m64 (0x8F /0) — pop FIRST, then decode the destination EA ──
+        // ── POP r/m64 (0x8F /0) ──
         0x8f => {
-            // Per the SDM the EA is computed after RSP is incremented by the pop;
-            // matching the interpreter, we pop before decoding the ModRM.
-            let v = emit_pop(body);
+            // Per the SDM the EA is computed after RSP is incremented by the pop.
             let Some(d) = decode_modrm(dec, rex) else {
                 return DecodeResult::Stop;
             };
             if d.reg & 7 != 0 {
                 return DecodeResult::Stop; // only /0 is POP r/m
             }
-            let addr = maybe_ea(body, &d.rm, dec.pos);
-            write_rm(body, &d.rm, 8, addr, v);
-            DecodeResult::Ok
+            match d.rm {
+                RmLoc::Reg(_) => {
+                    // Register destination: pop (commits RSP += 8) then write the
+                    // register — no memory access after the RSP commit, so safe.
+                    let v = emit_pop(body);
+                    write_rm(body, &d.rm, 8, None, v);
+                    DecodeResult::Ok
+                }
+                RmLoc::Mem(ref ea) => {
+                    // Memory destination. The destination store can page-fault; to be
+                    // fault-restart-safe the store must precede the `RSP += 8` commit
+                    // (so a trap leaves RSP unchanged and the interpreter re-runs the
+                    // pop cleanly). That reordering is only valid when the destination
+                    // EA does NOT depend on RSP (the interpreter computes the EA from
+                    // the *post*-increment RSP); an RSP-relative `pop [rsp±…]` is left
+                    // to the interpreter (a rare form).
+                    if ea.base == Some(RSP) || ea.index == Some(RSP) {
+                        return DecodeResult::Stop;
+                    }
+                    // sp = RSP ; v = load(sp) ; store(EA, v) ; RSP = sp + 8.
+                    let sp = body.local();
+                    body.load_reg(RSP);
+                    body.local_set(sp);
+                    let v = body.local();
+                    body.emit_load(sp, 8);
+                    body.local_set(v);
+                    let addr = emit_ea(body, ea, dec.pos);
+                    body.emit_store(addr, 8, |b| b.local_get(v));
+                    // store succeeded — commit RSP += 8
+                    body.store_reg(RSP, |b| {
+                        b.local_get(sp);
+                        b.i64_const(8);
+                        b.binop(op::I64_ADD);
+                    });
+                    DecodeResult::Ok
+                }
+            }
         }
         // ── LEA (0x8D) — effective address into reg, no memory access, no flags ──
         0x8d => {
@@ -2374,18 +3116,20 @@ fn encode_module(body: &Body) -> Vec<u8> {
     out.extend_from_slice(&[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
 
     // Type section — three types:
-    //   0: (i64) -> (i64, i64)        (the exported `run`: entry_rip -> next_rip,insns)
+    //   0: the exported `run` — a single block is `(i64) -> (i64,i64)` (entry_rip
+    //      -> next_rip,insns); a region is `(i64,i64) -> (i64,i64)` (entry_rip,
+    //      budget -> exit_rip, insns). Selected by `body.param_count`.
     //   1: (i64, i32) -> i64          (env.load(addr, size) -> value)
     //   2: (i64, i32, i64) -> ()      (env.store(addr, size, value))
     {
         let mut p = Vec::new();
         leb_u32(&mut p, 3); // 3 types
-                            // type 0: (i64) -> (i64, i64)
+                            // type 0: (i64 [, i64]) -> (i64, i64)
         p.push(0x60);
-        leb_u32(&mut p, 1); // 1 param
-        p.push(0x7e); // i64 ($entry_rip)
+        leb_u32(&mut p, body.param_count); // 1 (block) or 2 (region) params
+        p.resize(p.len() + body.param_count as usize, 0x7e); // i64 ($entry_rip [, $budget])
         leb_u32(&mut p, 2); // 2 results
-        p.push(0x7e); // i64 (next_rip)
+        p.push(0x7e); // i64 (next_rip / exit_rip)
         p.push(0x7e); // i64 (insns)
                       // type 1: (i64, i32) -> i64
         p.push(0x60);

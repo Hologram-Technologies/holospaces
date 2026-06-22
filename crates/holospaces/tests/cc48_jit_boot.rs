@@ -203,9 +203,24 @@ fn jit_boots_real_amd64_linux_to_userspace() {
         INTERP_BASELINE_MIPS
     );
     println!(
-        "JIT coverage      : {jit_frac:.1}% of instructions via JIT blocks \
-         ({} JIT / {} interp; {} blocks compiled, {} block runs)",
-        exec.jit_insns, exec.interp_insns, exec.blocks_translated, exec.blocks_run
+        "JIT coverage      : {jit_frac:.1}% of instructions via JIT regions \
+         ({} JIT / {} interp)",
+        exec.jit_insns, exec.interp_insns
+    );
+    let avg_region = if exec.blocks_translated > 0 {
+        exec.region_blocks_total as f64 / exec.blocks_translated as f64
+    } else {
+        0.0
+    };
+    let insns_per_call = if exec.blocks_run > 0 {
+        exec.jit_insns as f64 / exec.blocks_run as f64
+    } else {
+        0.0
+    };
+    println!(
+        "regions           : {} compiled, {} run; avg {avg_region:.1} blocks/region; \
+         {insns_per_call:.0} guest insns/call; {} traps",
+        exec.blocks_translated, exec.blocks_run, exec.blocks_trapped
     );
     println!("=======================================================\n");
 

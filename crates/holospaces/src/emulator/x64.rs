@@ -1012,10 +1012,77 @@ impl Cpu {
         }
     }
 
-    /// Advance the platform timers (the driver's per-iteration `sys_tick`).
+    /// Advance the platform timers by exactly `n` retired guest instructions — the
+    /// region driver's batched `sys_tick`. A translated region runs many guest
+    /// instructions in one Wasm call, so the driver cannot call the per-instruction
+    /// [`Cpu::sys_tick`] once per instruction; this advances the TSC and the
+    /// PIT/APIC down-counter phase by `n` steps **with the same effect** as `n`
+    /// individual `sys_tick`s, so the periodic timer/jiffies advance by the real
+    /// retired-instruction count (the boot's calibration stays correct). The
+    /// per-`TICK_DIV` down-counter work runs `n / TICK_DIV` times (the only loop),
+    /// firing the PIT/APIC sources as they cross zero.
     #[cfg(feature = "std")]
-    pub(crate) fn jit_sys_tick(&mut self) {
-        self.sys_tick();
+    pub(crate) fn jit_sys_tick_n(&mut self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let Some(sys) = self.sys.as_mut() else {
+            return;
+        };
+        // The TSC advances every step.
+        sys.tsc = sys.tsc.wrapping_add(TSC_PER_STEP.wrapping_mul(n));
+        // Number of `TICK_DIV` boundaries crossed advancing the phase by `n`.
+        let before = sys.tdiv;
+        sys.tdiv = sys.tdiv.wrapping_add(n);
+        let decrements = (sys.tdiv / TICK_DIV).wrapping_sub(before / TICK_DIV);
+        for _ in 0..decrements {
+            self.tick_down_counters();
+        }
+    }
+
+    /// One down-counter tick of the PIT (ch2 calibration + ch0 periodic) and the
+    /// local-APIC timer — the per-`TICK_DIV` body shared by [`Cpu::sys_tick`] and
+    /// the batched [`Cpu::jit_sys_tick_n`]. Raises the PIT IRQ / latches the APIC
+    /// vector as a source crosses zero, reloading periodic sources.
+    fn tick_down_counters(&mut self) {
+        let Some(sys) = self.sys.as_mut() else {
+            return;
+        };
+        if sys.pit.ch2_gate && !sys.pit.ch2_out && sys.pit.ch2_counter > 0 {
+            sys.pit.ch2_counter = sys.pit.ch2_counter.saturating_sub(1);
+            if sys.pit.ch2_counter == 0 {
+                sys.pit.ch2_out = true;
+            }
+        }
+        if sys.pit.enabled && sys.pit.reload != 0 {
+            if sys.pit.counter == 0 {
+                sys.pit.counter = u32::from(sys.pit.reload);
+            }
+            sys.pit.counter = sys.pit.counter.saturating_sub(1);
+            if sys.pit.counter == 0 {
+                sys.pic.raise(0);
+                if sys.pit.ch0_periodic {
+                    sys.pit.counter = u32::from(sys.pit.reload);
+                } else {
+                    sys.pit.enabled = false;
+                }
+            }
+        }
+        if sys.lapic.enabled()
+            && sys.lapic.initial_count != 0
+            && sys.lapic.lvt_timer & (1 << 16) == 0
+        {
+            if sys.lapic.current_count == 0 {
+                sys.lapic.current_count = sys.lapic.initial_count;
+            }
+            sys.lapic.current_count = sys.lapic.current_count.saturating_sub(1);
+            if sys.lapic.current_count == 0 {
+                if sys.lapic.lvt_timer & (1 << 17) != 0 {
+                    sys.lapic.current_count = sys.lapic.initial_count;
+                }
+                sys.lapic.set_irr((sys.lapic.lvt_timer & 0xff) as u8);
+            }
+        }
     }
 
     /// Whether the guest has halted (`hlt` with interrupts masked) — the driver's
@@ -1030,6 +1097,58 @@ impl Cpu {
     #[cfg(feature = "std")]
     pub(crate) fn jit_take_pending_interrupt(&mut self) {
         self.take_pending_interrupt();
+    }
+
+    /// The number of guest instructions until the next armed periodic timer (PIT
+    /// channel-0, the local-APIC timer, or the PIT channel-2 calibration one-shot)
+    /// fires — the **interrupt-deadline budget** the region driver caps a region's
+    /// `run` at, so a long-running region exits exactly when a timer is due and the
+    /// driver delivers the IRQ promptly (matching the interpreter's per-instruction
+    /// delivery instead of stranding it for a whole region). `u64::MAX` when no timer
+    /// is armed. A down-counter decrements once per [`TICK_DIV`] steps, so the step
+    /// distance to a deadline is `(ticks_remaining × TICK_DIV) − phase`, where
+    /// `phase = tdiv % TICK_DIV` is how far into the current tick we already are.
+    #[cfg(feature = "std")]
+    pub(crate) fn jit_steps_to_next_timer(&self) -> u64 {
+        let Some(sys) = self.sys.as_ref() else {
+            return u64::MAX;
+        };
+        let mut min_ticks = u64::MAX;
+        // PIT channel 0 (periodic tick).
+        if sys.pit.enabled && sys.pit.reload != 0 {
+            let c = if sys.pit.counter == 0 {
+                u64::from(sys.pit.reload)
+            } else {
+                u64::from(sys.pit.counter)
+            };
+            min_ticks = min_ticks.min(c);
+        }
+        // PIT channel 2 (TSC-calibration one-shot) — gated, counting to OUT2.
+        if sys.pit.ch2_gate && !sys.pit.ch2_out && sys.pit.ch2_counter > 0 {
+            min_ticks = min_ticks.min(u64::from(sys.pit.ch2_counter));
+        }
+        // Local-APIC timer.
+        if sys.lapic.enabled()
+            && sys.lapic.initial_count != 0
+            && sys.lapic.lvt_timer & (1 << 16) == 0
+        {
+            let c = if sys.lapic.current_count == 0 {
+                u64::from(sys.lapic.initial_count)
+            } else {
+                u64::from(sys.lapic.current_count)
+            };
+            min_ticks = min_ticks.min(c);
+        }
+        if min_ticks == u64::MAX {
+            return u64::MAX;
+        }
+        let phase = sys.tdiv % TICK_DIV;
+        // Steps until the `min_ticks`-th decrement: the remaining steps of the current
+        // tick (`TICK_DIV - phase`) plus full ticks for the rest. At least 1.
+        min_ticks
+            .saturating_mul(TICK_DIV)
+            .saturating_sub(phase)
+            .max(1)
     }
 
     /// A *side-effect-free* check of whether [`Cpu::take_pending_interrupt`] would
@@ -1074,14 +1193,16 @@ impl Cpu {
         }
     }
 
-    /// Fetch up to 64 contiguous code bytes starting at physical `phys`, clamped to
-    /// the end of its 4 KiB page (a translated block never crosses a page, so the
-    /// translator must only see bytes whose physical address is contiguous). Read
-    /// straight from physical RAM (`rd_phys`) — the bytes the decoder consumes.
+    /// Fetch the contiguous code bytes from physical `phys` to the end of its 4 KiB
+    /// page (capped at `max` bytes), clamped to the page so a translated block/region
+    /// only sees bytes whose physical address is contiguous (a region never crosses a
+    /// page). Read straight from physical RAM (`rd_phys`) — the decoder's input. A
+    /// single block needs only ~64 bytes; a region discovers branch targets across
+    /// the whole page, so the driver passes a page-sized `max`.
     #[cfg(feature = "std")]
-    pub(crate) fn jit_fetch_code(&self, phys: u64) -> Vec<u8> {
+    pub(crate) fn jit_fetch_code(&self, phys: u64, max: usize) -> Vec<u8> {
         let page_end = (phys & !0xfff) + 0x1000;
-        let n = core::cmp::min(64u64, page_end - phys) as usize;
+        let n = core::cmp::min(max as u64, page_end - phys) as usize;
         let mut out = Vec::with_capacity(n);
         for i in 0..n as u64 {
             out.push(self.rd_phys(phys + i, 1) as u8);
@@ -3501,66 +3622,28 @@ impl Cpu {
     /// gated on `RFLAGS.IF`. The TSC and the channel-2 calibration one-shot
     /// advance at the same rate (one coherent time-base).
     fn sys_tick(&mut self) {
-        let Some(sys) = self.sys.as_mut() else {
-            return;
+        let at_boundary = {
+            let Some(sys) = self.sys.as_mut() else {
+                return;
+            };
+            // The TSC advances every step (fine `sched_clock` resolution).
+            sys.tsc = sys.tsc.wrapping_add(TSC_PER_STEP);
+            // The PIT/APIC down-counters advance at ONE shared rate — once per
+            // `TICK_DIV` steps. A single rate keeps the calibration reference (PIT
+            // channel 2) and the tick sources (PIT channel 0, the APIC-timer) in
+            // lockstep, so the LAPIC clockevent the kernel calibrates against the PIT
+            // fires at exactly the rate the kernel expects — jiffies advance correctly
+            // (no crawl). The period (`reload × TICK_DIV` steps) is far longer than the
+            // handler (no storm) while channel 2 still expires inside
+            // `quick_pit_calibrate`'s poll budget. One coherent time-base, like the
+            // riscv64 (`mtime`) / aarch64 (`counter`) cores.
+            sys.tdiv = sys.tdiv.wrapping_add(1);
+            sys.tdiv % TICK_DIV == 0
         };
-        // The TSC advances every step (fine `sched_clock` resolution).
-        sys.tsc = sys.tsc.wrapping_add(TSC_PER_STEP);
-        // The PIT/APIC down-counters advance at ONE shared rate — once per
-        // `TICK_DIV` steps. A single rate keeps the calibration reference (PIT
-        // channel 2) and the tick sources (PIT channel 0, the APIC-timer) in
-        // lockstep, so the LAPIC clockevent the kernel calibrates against the PIT
-        // fires at exactly the rate the kernel expects — jiffies advance correctly
-        // (no crawl). The period (`reload × TICK_DIV` steps) is far longer than the
-        // handler (no storm) while channel 2 still expires inside
-        // `quick_pit_calibrate`'s poll budget. One coherent time-base, like the
-        // riscv64 (`mtime`) / aarch64 (`counter`) cores.
-        sys.tdiv = sys.tdiv.wrapping_add(1);
-        if sys.tdiv % TICK_DIV != 0 {
-            return;
-        }
-        // PIT channel 2 — the TSC-calibration one-shot. While gated, count down
-        // to zero, then latch OUT2 (the calibration loop's wait condition).
-        if sys.pit.ch2_gate && !sys.pit.ch2_out && sys.pit.ch2_counter > 0 {
-            sys.pit.ch2_counter = sys.pit.ch2_counter.saturating_sub(1);
-            if sys.pit.ch2_counter == 0 {
-                sys.pit.ch2_out = true;
-            }
-        }
-        // The 8254 PIT channel-0 down-counter.
-        if sys.pit.enabled && sys.pit.reload != 0 {
-            if sys.pit.counter == 0 {
-                sys.pit.counter = u32::from(sys.pit.reload);
-            }
-            sys.pit.counter = sys.pit.counter.saturating_sub(1);
-            if sys.pit.counter == 0 {
-                sys.pic.raise(0);
-                if sys.pit.ch0_periodic {
-                    sys.pit.counter = u32::from(sys.pit.reload);
-                } else {
-                    // One-shot: stay expired until the kernel reprograms a new
-                    // deadline (the next `OUT 0x40` re-arms `enabled`/`counter`).
-                    sys.pit.enabled = false;
-                }
-            }
-        }
-        // The local-APIC timer.
-        if sys.lapic.enabled()
-            && sys.lapic.initial_count != 0
-            && sys.lapic.lvt_timer & (1 << 16) == 0
-        {
-            if sys.lapic.current_count == 0 {
-                sys.lapic.current_count = sys.lapic.initial_count;
-            }
-            sys.lapic.current_count = sys.lapic.current_count.saturating_sub(1);
-            if sys.lapic.current_count == 0 {
-                if sys.lapic.lvt_timer & (1 << 17) != 0 {
-                    sys.lapic.current_count = sys.lapic.initial_count; // periodic
-                }
-                // The APIC-timer vector is delivered directly through the IDT (it
-                // is a local-APIC source, not a PIC line).
-                sys.lapic.set_irr((sys.lapic.lvt_timer & 0xff) as u8);
-            }
+        if at_boundary {
+            // The per-`TICK_DIV` PIT/APIC down-counter body (shared with the region
+            // driver's batched `jit_sys_tick_n`).
+            self.tick_down_counters();
         }
     }
 
