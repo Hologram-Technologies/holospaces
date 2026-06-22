@@ -27,14 +27,31 @@
 //! (import "env" "mem"   (memory 1))                          ;; register file
 //! (import "env" "load"  (func (param i64 i32) (result i64))) ;; load(addr,size)
 //! (import "env" "store" (func (param i64 i32 i64)))          ;; store(addr,size,val)
-//! (func (export "run") (result i32) ... )  ;; returns guest instructions executed
+//! (func (export "run") (param $entry_rip i64) (result i64 i64) ... )
 //! ```
 //!
 //! The guest register file lives in that memory at byte offset 0 as 16
 //! little-endian `u64` registers (`r[0..16]`) followed by `rflags` at offset
 //! 128. The function reads/writes a register via `i64.load`/`i64.store` at
-//! `reg*8` (rflags at 128) and returns the number of guest instructions it
-//! executed (the same retired-instruction count the interpreter would report).
+//! `reg*8` (rflags at 128).
+//!
+//! ## `run` signature — `(entry_rip) -> (next_rip, insns)`
+//!
+//! The exported `run` takes the block's entry guest `rip` and returns two
+//! `i64`s: the **next guest RIP** control should continue at, and the number of
+//! guest instructions executed (the retired-instruction count the interpreter
+//! would report). Returning the next RIP — not just a count — is what lets a
+//! run-loop chain translated blocks by entry RIP. The `next_rip` is the first
+//! result, `insns` the second.
+//!
+//! A block that *ends in a relative branch* (`JMP`/`Jcc`, the only terminators
+//! this translator emits) returns the branch's resolved destination (taken
+//! target for `JMP` / a taken `Jcc`, or the fall-through end for a not-taken
+//! `Jcc`); the branch instruction itself is counted in `insns`. A block that
+//! runs into a non-branch boundary (an unsupported opcode, a `CALL`/`RET`/
+//! indirect control transfer, the end of the slice) ends *before* that boundary
+//! and returns the fall-through RIP after the last translated instruction. All
+//! other control transfers are left to the interpreter (see [`translate_block_at`]).
 //!
 //! ## Memory operands
 //!
@@ -140,12 +157,14 @@ fn leb_i32(out: &mut Vec<u8>, v: i32) {
 mod op {
     pub const END: u8 = 0x0b;
     pub const CALL: u8 = 0x10;
+    pub const SELECT: u8 = 0x1b;
     pub const LOCAL_GET: u8 = 0x20;
     pub const LOCAL_SET: u8 = 0x21;
     pub const I64_LOAD: u8 = 0x29;
     pub const I64_STORE: u8 = 0x37;
     pub const I32_CONST: u8 = 0x41;
     pub const I64_CONST: u8 = 0x42;
+    pub const I32_EQZ: u8 = 0x45;
     pub const I64_EQZ: u8 = 0x50;
     pub const I64_EQ: u8 = 0x51;
     pub const I64_NE: u8 = 0x52;
@@ -168,11 +187,9 @@ mod op {
 /// the imported memory.
 struct Body {
     code: Vec<u8>,
-    /// Number of extra `i64` locals (beyond the zero parameters) declared.
+    /// Number of extra `i64` locals (beyond the single `entry_rip` parameter)
+    /// declared.
     i64_locals: u32,
-    /// The guest `rip` at the block entry — the base against which a
-    /// RIP-relative operand's instruction-end address is resolved.
-    entry_rip: u64,
 }
 
 /// Wasm function index of the imported `env.load(addr,size)->i64`.
@@ -180,18 +197,24 @@ const FN_LOAD: u32 = 0;
 /// Wasm function index of the imported `env.store(addr,size,val)`.
 const FN_STORE: u32 = 1;
 
+/// Number of parameters of the exported `run` function. Index 0 is `$entry_rip`
+/// (an `i64`); all reserved temporaries are locals after it.
+const PARAM_COUNT: u32 = 1;
+/// Local index of the `$entry_rip` parameter.
+const ENTRY_RIP_LOCAL: u32 = 0;
+
 impl Body {
-    fn new(entry_rip: u64) -> Self {
+    fn new() -> Self {
         Body {
             code: Vec::new(),
             i64_locals: 0,
-            entry_rip,
         }
     }
 
-    /// Reserve a fresh `i64` local, returning its index.
+    /// Reserve a fresh `i64` local, returning its index. Local index 0 is the
+    /// `entry_rip` parameter, so the first reserved local is index 1.
     fn local(&mut self) -> u32 {
-        let idx = self.i64_locals;
+        let idx = PARAM_COUNT + self.i64_locals;
         self.i64_locals += 1;
         idx
     }
@@ -475,6 +498,98 @@ fn emit_of(body: &mut Body, a_local: u32, b_local: u32, r_local: u32, size: u8, 
     body.binop(op::I64_AND);
 }
 
+// ── Condition codes + branch terminators ──────────────────────────────────────
+
+/// Push the boolean (i64 0/1) value of a single RFLAGS bit (`mask` is the bit's
+/// mask, a single set bit) onto the stack: `(rflags & mask) != 0`.
+fn push_flag_bool(body: &mut Body, mask: u64) {
+    body.load_rflags();
+    body.i64_const(mask as i64);
+    body.binop(op::I64_AND);
+    let pos = mask.trailing_zeros();
+    if pos != 0 {
+        body.i64_const(i64::from(pos));
+        body.binop(op::I64_SHR_U);
+    }
+}
+
+/// Emit the *base* condition (i64 0/1) for `cc >> 1`, mirroring the
+/// interpreter's [`super::x64::Cpu::cond`]:
+///   0=O(of) 1=B(cf) 2=E(zf) 3=BE(cf|zf) 4=S(sf) 5=P(pf) 6=L(sf!=of) 7=LE((sf!=of)|zf)
+fn emit_cond_base(body: &mut Body, group: u8) {
+    match group {
+        0 => push_flag_bool(body, OF), // O
+        1 => push_flag_bool(body, CF), // B / C
+        2 => push_flag_bool(body, ZF), // E / Z
+        3 => {
+            // BE = cf | zf
+            push_flag_bool(body, CF);
+            push_flag_bool(body, ZF);
+            body.binop(op::I64_OR);
+        }
+        4 => push_flag_bool(body, SF), // S
+        5 => push_flag_bool(body, PF), // P
+        6 => {
+            // L = sf != of
+            push_flag_bool(body, SF);
+            push_flag_bool(body, OF);
+            body.binop(op::I64_NE);
+            body.binop(op::I64_EXTEND_I32_U);
+        }
+        _ => {
+            // LE = (sf != of) | zf
+            push_flag_bool(body, SF);
+            push_flag_bool(body, OF);
+            body.binop(op::I64_NE);
+            body.binop(op::I64_EXTEND_I32_U);
+            push_flag_bool(body, ZF);
+            body.binop(op::I64_OR);
+        }
+    }
+}
+
+/// Emit the full condition `cc` (the low nibble of a `Jcc` opcode) as an **i32**
+/// 0/1 on the stack (usable directly as a `select` predicate). `cc & 1` inverts
+/// the base, exactly as the interpreter does.
+fn emit_cond_i32(body: &mut Body, cc: u8) {
+    emit_cond_base(body, cc >> 1);
+    // base is i64 0/1 → i32 0/1 via (base != 0).
+    body.binop(op::I64_EQZ); // i32: 1 if base == 0
+    if cc & 1 == 0 {
+        // Want (base != 0): negate the eqz result.
+        body.binop(op::I32_EQZ);
+    }
+    // If cc&1==1 (inverted condition) we want !base == (base == 0), which is
+    // exactly the I64_EQZ result already on the stack.
+}
+
+/// Push `entry_rip + off` (the absolute guest RIP for a block-relative offset)
+/// onto the stack. Branch targets are computed against the runtime `$entry_rip`
+/// parameter so a translated block is position-independent.
+fn push_rip_at(body: &mut Body, off: u64) {
+    body.local_get(ENTRY_RIP_LOCAL);
+    body.i64_const(off as i64);
+    body.binop(op::I64_ADD);
+}
+
+/// Emit an *unconditional* branch terminator: `next_rip = entry_rip + taken_off`
+/// (the resolved jump destination as a block-relative offset).
+fn emit_jmp(body: &mut Body, next_rip_local: u32, taken_off: u64) {
+    push_rip_at(body, taken_off);
+    body.local_set(next_rip_local);
+}
+
+/// Emit a *conditional* branch terminator: `next_rip = cond ? entry+taken_off :
+/// entry+fallthru_off`, selected at runtime from the block's computed RFLAGS.
+fn emit_jcc(body: &mut Body, next_rip_local: u32, cc: u8, taken_off: u64, fallthru_off: u64) {
+    // select pops (taken, fallthru, cond_i32) → taken if cond else fallthru.
+    push_rip_at(body, taken_off);
+    push_rip_at(body, fallthru_off);
+    emit_cond_i32(body, cc);
+    body.byte(op::SELECT);
+    body.local_set(next_rip_local);
+}
+
 // ── Instruction decode + emit ─────────────────────────────────────────────────
 
 /// One supported ALU operation (the group-1 digit / opcode high-nibble>>3).
@@ -655,12 +770,12 @@ fn emit_ea(body: &mut Body, ea: &MemEa, insn_end_off: usize) -> u32 {
     let addr = body.local();
     if ea.rip_rel {
         // Absolute address = entry_rip + insn_end_off + disp (seg base is 0 in
-        // the flat long-mode segments this translator targets).
-        let abs = body
-            .entry_rip
-            .wrapping_add(insn_end_off as u64)
-            .wrapping_add(ea.disp as u64);
-        body.i64_const(abs as i64);
+        // the flat long-mode segments this translator targets). `entry_rip` is
+        // the runtime `$entry_rip` parameter so a block re-used at a different
+        // entry resolves RIP-relative operands against the call's RIP.
+        body.local_get(ENTRY_RIP_LOCAL);
+        body.i64_const((insn_end_off as u64).wrapping_add(ea.disp as u64) as i64);
+        body.binop(op::I64_ADD);
         body.local_set(addr);
         return addr;
     }
@@ -804,7 +919,8 @@ fn emit_alu(
 ///
 /// `code` is a contiguous slice of guest machine code from the block entry. The
 /// translator decodes supported register-direct integer instructions until it
-/// hits an unsupported byte, a control-flow / memory operand, a 16-bit operand,
+/// hits an unsupported byte, a non-branch control transfer, a 16-bit operand, a
+/// relative branch (`JMP`/`Jcc` — which it *includes* as the block terminator),
 /// or the end of the slice, then emits **one** Wasm module covering the
 /// instructions it consumed. Returns `None` if the *first* instruction is
 /// unsupported (the caller interprets that instruction instead).
@@ -814,22 +930,36 @@ pub fn translate_block(code: &[u8]) -> Option<TranslatedBlock> {
 }
 
 /// Translate a block whose entry guest `rip` is `entry_rip`. Identical to
-/// [`translate_block`] except RIP-relative memory operands are resolved against
-/// `entry_rip` (a block with no RIP-relative operand is insensitive to it).
+/// [`translate_block`] except RIP-relative memory operands and relative branch
+/// targets are resolved against `entry_rip`. Note that `entry_rip` is also passed
+/// to `run` at call time (the `$entry_rip` parameter), so a register-only block
+/// with no RIP-relative operand or branch is insensitive to the value baked here.
 #[must_use]
 pub fn translate_block_at(code: &[u8], entry_rip: u64) -> Option<TranslatedBlock> {
-    let mut body = Body::new(entry_rip);
+    let _ = entry_rip; // RIP is supplied at call time via the `$entry_rip` param.
+    let mut body = Body::new();
+    // `next_rip` accumulator local — branches overwrite it; otherwise it ends as
+    // the fall-through RIP. Reserved first so its index is stable.
+    let next_rip_local = body.local();
     let mut dec = Decoder::new(code);
     let mut insns: u32 = 0;
+    let mut terminated = false;
 
     loop {
         let start = dec.pos;
         if dec.peek().is_none() {
             break; // end of slice
         }
-        match decode_one(&mut dec, &mut body) {
+        match decode_one(&mut dec, &mut body, next_rip_local) {
             DecodeResult::Ok => {
                 insns += 1;
+            }
+            DecodeResult::Terminator => {
+                // A relative JMP/Jcc: included in the block; it has set
+                // `next_rip_local`. End the block here.
+                insns += 1;
+                terminated = true;
+                break;
             }
             DecodeResult::Stop => {
                 // Roll back any partial decode of this instruction.
@@ -843,8 +973,14 @@ pub fn translate_block_at(code: &[u8], entry_rip: u64) -> Option<TranslatedBlock
         return None; // first instruction unsupported — let the interpreter run
     }
 
-    // `run` returns the number of guest instructions executed.
-    body.i32_const(insns as i32);
+    if !terminated {
+        // Fall-through: next_rip = entry_rip + bytes consumed.
+        emit_jmp(&mut body, next_rip_local, dec.pos as u64);
+    }
+
+    // `run` returns (next_rip, insns).
+    body.local_get(next_rip_local);
+    body.i64_const(i64::from(insns));
 
     let wasm = encode_module(&body);
     Some(TranslatedBlock {
@@ -855,16 +991,23 @@ pub fn translate_block_at(code: &[u8], entry_rip: u64) -> Option<TranslatedBlock
 }
 
 enum DecodeResult {
+    /// A non-control instruction was decoded and emitted; continue the block.
     Ok,
+    /// A relative branch (`JMP`/`Jcc`) was decoded and emitted as the block
+    /// terminator (it set `next_rip`); end the block, counting this instruction.
+    Terminator,
+    /// The instruction is unsupported / a non-branch control transfer; end the
+    /// block *before* it (roll back, fall through to the interpreter).
     Stop,
 }
 
 /// Decode and emit one instruction. On `Stop`, `body` may have had partial code
 /// appended — but `translate_block` only emits once a full instruction succeeds,
 /// because a `Stop` ends the loop and the trailing (return-value) code is the
-/// only thing appended after the last good instruction. Each `Ok` path appends a
-/// complete, self-contained instruction.
-fn decode_one(dec: &mut Decoder, body: &mut Body) -> DecodeResult {
+/// only thing appended after the last good instruction. Each `Ok`/`Terminator`
+/// path appends a complete, self-contained instruction. `next_rip_local` is the
+/// accumulator a branch terminator writes its resolved destination into.
+fn decode_one(dec: &mut Decoder, body: &mut Body, next_rip_local: u32) -> DecodeResult {
     // We must not append partial code on Stop. So decode fully into locals first
     // by peeking; we use a scratch sub-decoder for the header, then commit.
     let mut rex = 0u8;
@@ -1012,6 +1155,53 @@ fn decode_one(dec: &mut Decoder, body: &mut Body) -> DecodeResult {
             let addr = maybe_ea(body, &d.rm, dec.pos);
             emit_inc_dec(body, &d.rm, addr, digit == 1, size);
             DecodeResult::Ok
+        }
+        // ── relative branch terminators (these END the block, included) ──
+        // JMP rel8 (0xEB): next_rip = instruction_end + sext(rel8).
+        0xeb => {
+            let Some(rel) = dec.u8() else {
+                return DecodeResult::Stop;
+            };
+            let taken = (dec.pos as u64).wrapping_add(rel as i8 as i64 as u64);
+            emit_jmp(body, next_rip_local, taken);
+            DecodeResult::Terminator
+        }
+        // JMP rel32 (0xE9): next_rip = instruction_end + sext(rel32).
+        0xe9 => {
+            let Some(rel) = dec.u32_le() else {
+                return DecodeResult::Stop;
+            };
+            let taken = (dec.pos as u64).wrapping_add(rel as i32 as i64 as u64);
+            emit_jmp(body, next_rip_local, taken);
+            DecodeResult::Terminator
+        }
+        // Jcc rel8 (0x70..0x7F): taken iff cond(op-0x70); fall-through otherwise.
+        0x70..=0x7f => {
+            let Some(rel) = dec.u8() else {
+                return DecodeResult::Stop;
+            };
+            let fallthru = dec.pos as u64;
+            let taken = fallthru.wrapping_add(rel as i8 as i64 as u64);
+            emit_jcc(body, next_rip_local, op - 0x70, taken, fallthru);
+            DecodeResult::Terminator
+        }
+        // 0x0F two-byte: only Jcc rel32 (0x80..0x8F) is a supported terminator;
+        // every other 0x0F opcode stops the block (interpreter handles it).
+        0x0f => {
+            let Some(op2) = dec.u8() else {
+                return DecodeResult::Stop;
+            };
+            if (0x80..=0x8f).contains(&op2) {
+                let Some(rel) = dec.u32_le() else {
+                    return DecodeResult::Stop;
+                };
+                let fallthru = dec.pos as u64;
+                let taken = fallthru.wrapping_add(rel as i32 as i64 as u64);
+                emit_jcc(body, next_rip_local, op2 - 0x80, taken, fallthru);
+                DecodeResult::Terminator
+            } else {
+                DecodeResult::Stop
+            }
         }
         _ => DecodeResult::Stop,
     }
@@ -1190,17 +1380,19 @@ fn encode_module(body: &Body) -> Vec<u8> {
     out.extend_from_slice(&[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
 
     // Type section — three types:
-    //   0: () -> i32                  (the exported `run`)
+    //   0: (i64) -> (i64, i64)        (the exported `run`: entry_rip -> next_rip,insns)
     //   1: (i64, i32) -> i64          (env.load(addr, size) -> value)
     //   2: (i64, i32, i64) -> ()      (env.store(addr, size, value))
     {
         let mut p = Vec::new();
         leb_u32(&mut p, 3); // 3 types
-                            // type 0: () -> i32
+                            // type 0: (i64) -> (i64, i64)
         p.push(0x60);
-        leb_u32(&mut p, 0); // 0 params
-        leb_u32(&mut p, 1); // 1 result
-        p.push(0x7f); // i32
+        leb_u32(&mut p, 1); // 1 param
+        p.push(0x7e); // i64 ($entry_rip)
+        leb_u32(&mut p, 2); // 2 results
+        p.push(0x7e); // i64 (next_rip)
+        p.push(0x7e); // i64 (insns)
                       // type 1: (i64, i32) -> i64
         p.push(0x60);
         leb_u32(&mut p, 2); // 2 params
