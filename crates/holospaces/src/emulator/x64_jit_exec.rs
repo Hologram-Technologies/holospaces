@@ -1,18 +1,35 @@
 //! **CC-48 JIT execution driver** — the `std`-only fast-execution path that runs
-//! the [`x64_jit`](super::x64_jit) translator's blocks on a real Wasm engine
-//! (`wasmtime`) from inside the [`x64`](super::x64) interpreter's run loop.
+//! the [`x64_jit`](super::x64_jit) translator's **regions** (traces) on a real Wasm
+//! engine (`wasmtime`) from inside the [`x64`](super::x64) interpreter's run loop.
 //!
 //! The interpreter ([`Cpu::run`](super::x64::Cpu::run)) decodes and dispatches
-//! every guest instruction on every execution; for a hot straight-line block of
-//! register/memory integer ops that per-instruction dispatch dominates. This
-//! driver removes it: it translates such a block *once*
-//! ([`super::x64_jit::translate_block_at`]) into a Wasm function the host runs
-//! natively, caches the compiled module by the block's *physical* entry address,
-//! and on every subsequent visit runs it in a single Wasm call instead of N
-//! interpreter dispatches. Anything the translator does not cover (a syscall, an
-//! MMIO touch, a page fault, an unsupported opcode) falls back to the interpreter
-//! for exactly one instruction, so the JIT is a pure accelerator over the
-//! qemu-validated core — never a second, divergent implementation.
+//! every guest instruction on every execution; for a hot run of register/memory
+//! integer ops — including a whole loop — that per-instruction dispatch dominates.
+//! This driver removes it: it translates a hot **region** *once*
+//! ([`super::x64_jit::translate_region_at`]) — several basic blocks reachable by
+//! direct branches, with an internal `br_table` dispatch loop — into a Wasm function
+//! the host runs natively, caches the compiled module by the region's *physical*
+//! entry address, and on every subsequent visit runs many guest instructions in a
+//! single Wasm call instead of N interpreter dispatches. Anything the translator
+//! does not cover (a syscall, an MMIO touch, a page fault, an unsupported opcode)
+//! falls back to the interpreter for exactly one instruction, so the JIT is a pure
+//! accelerator over the qemu-validated core — never a second, divergent core.
+//!
+//! ## Timer/interrupt ordering (load-bearing)
+//!
+//! `run` advances the platform timers (`sys_tick`) and then delivers a pending
+//! interrupt (`take_pending_interrupt`) *before* each instruction's `step`. The
+//! driver mirrors this exactly for an interpreted instruction — `jit_sys_tick_n(1)`
+//! then `take_pending` then `step` — because an interpreted `RDTSC`/`RDRAND` reads
+//! the TSC, and the kernel's `RDRAND` (with `random.trust_cpu`) mixes the TSC into
+//! its output; ticking *after* the instruction (the natural place for a batched
+//! region) would feed it a TSC one step behind the interpreter and every
+//! random/canary/ASLR value would diverge, crashing userspace. A region retires
+//! many instructions per call and contains no `RDTSC`/`RDRAND` (those stop a block),
+//! so it is ticked by its retired count *after* the call — observationally
+//! identical. A region's budget is also capped at the instructions-until-next-timer
+//! ([`Cpu::jit_steps_to_next_timer`]) so a long region exits at the timer deadline
+//! and the IRQ is delivered promptly, matching the interpreter's cadence.
 //!
 //! ## Correctness model
 //!
@@ -71,7 +88,7 @@ use wasmtime::{
 };
 
 use super::x64::{Cpu, Halt};
-use super::x64_jit::translate_block_at;
+use super::x64_jit::translate_region_at;
 
 /// A minimal, fast hasher for the block caches, whose keys are physical addresses
 /// (`u64`). The cache is looked up on *every* block dispatch (millions of times per
@@ -105,6 +122,18 @@ const RFLAGS_OFF: usize = 128;
 /// Byte offset of the fault-restart RIP slot a block stamps before each memory
 /// access (must match `x64_jit`'s `FAULT_RIP_OFF`).
 const FAULT_RIP_OFF: usize = 136;
+/// Byte offset of the retired-instruction slot a region stamps before each memory
+/// access (must match `x64_jit`'s `RETIRED_OFF`) — how many instructions the region
+/// had retired before the aborting one, so a trap credits the timer correctly.
+const RETIRED_OFF: usize = 144;
+
+/// The instruction budget passed to a region `run` call — the cadence at which the
+/// region returns to the driver so timer/interrupt bookkeeping is pumped. Large
+/// enough that a hot loop runs thousands of guest instructions in one Wasm call
+/// (the whole point), small enough that the periodic timer and interrupt delivery
+/// stay fine-grained (the driver advances the timer by the real retired count via
+/// [`Cpu::jit_sys_tick_n`] and pumps a pending interrupt each return).
+const REGION_BUDGET: u64 = 4096;
 
 /// How many times an entry must be interpreted before the driver compiles it (the
 /// JIT tiering threshold). High enough that a one-shot or rarely-taken block never
@@ -122,39 +151,41 @@ const HOTNESS_REJECTED: u32 = u32::MAX;
 /// Kept below that cap with headroom.
 const CACHE_CAP: usize = 8192;
 
-/// A compiled, instantiated translated block, cached by its physical entry
-/// address. The register file is the executor's shared [`Memory`]; a block holds
-/// only its `run` entry point and bookkeeping.
-struct CachedBlock {
+/// A compiled, instantiated translated **region** (trace), cached by its physical
+/// entry address. The register file is the executor's shared [`Memory`]; a region
+/// holds only its `run` entry point and bookkeeping. Its `run` runs many guest
+/// instructions (a hot loop entirely) in one Wasm call, taking an instruction
+/// budget and returning `(exit_rip, insns_retired)`.
+struct CachedRegion {
     /// The instantiated module. Held to keep the instance (and thus its imported
     /// `run` function) alive in the store for the cache entry's lifetime.
     #[allow(dead_code)]
     instance: Instance,
-    run: TypedFunc<i64, (i64, i64)>,
-    /// Guest instructions the block retires (the `run` second result).
-    insns: u32,
-    /// Whether the block emits any guest-memory access — if not, it never calls a
+    run: TypedFunc<(i64, i64), (i64, i64)>,
+    /// Whether the region emits any guest-memory access — if not, it never calls a
     /// host import, so the driver can run it without lending the `Cpu`.
     touches_mem: bool,
-    /// The physical page (`phys >> 12`) the block's code lives on — the SMC
-    /// invalidation key. A block is dropped when its page leaves the `Cpu`'s
-    /// `jit_code_pages` set (a store overwrote its source bytes).
+    /// The physical page (`phys >> 12`) the region's code lives on — the SMC
+    /// invalidation key (a region never crosses a page). A region is dropped when its
+    /// page leaves the `Cpu`'s `jit_code_pages` set (a store overwrote source bytes).
     page: u64,
 }
 
-/// The outcome of attempting a translated block at the current `rip`.
+/// The outcome of attempting a translated region at the current `rip`.
 enum BlockRun {
-    /// No usable translation (the first instruction is unsupported) — the driver
+    /// No usable translation (the entry instruction is unsupported) — the driver
     /// interprets one instruction.
     Interpret,
-    /// The block ran to completion: continue at `next_rip`, having retired `insns`.
-    Done { next_rip: u64, insns: u32 },
+    /// The region ran to a region exit or its budget: continue at `next_rip`, having
+    /// retired `insns` guest instructions (across the blocks it ran in one call).
+    Done { next_rip: u64, insns: u64 },
     /// A host `load`/`store` import trapped (a page fault or MMIO access). The
     /// architectural register/flag state of the instruction *before* the aborting
     /// one has been synced into the `Cpu`; `fault_rip` is the aborting instruction's
-    /// guest rip. The driver resumes the interpreter there (clearing any latched
-    /// fault) so it re-runs that one instruction with full side effects.
-    Trapped { fault_rip: u64 },
+    /// guest rip, and `retired` is the number of instructions the region had fully
+    /// retired before it (to credit the timer). The driver resumes the interpreter
+    /// there (clearing any latched fault) so it re-runs that one instruction.
+    Trapped { fault_rip: u64, retired: u64 },
 }
 
 /// The CC-48 JIT engine + block cache. Construct one per boot and drive it with
@@ -176,8 +207,8 @@ pub struct X64JitExec {
     /// registers into / out of it around each block call (a block run is serial, so
     /// no two blocks ever use it at once).
     regfile: Memory,
-    /// Compiled blocks keyed by physical entry address.
-    cache: PhysMap<CachedBlock>,
+    /// Compiled regions keyed by physical entry address.
+    cache: PhysMap<CachedRegion>,
     /// Per-entry execution counter for blocks not yet compiled — the JIT *tiering*
     /// gate. Compiling a block on `wasmtime`/Cranelift costs hundreds of
     /// microseconds, so a block that runs only a handful of times never amortises
@@ -211,16 +242,20 @@ pub struct X64JitExec {
     /// The physical address of the last block run — an inline cache so a hot loop
     /// re-entering the same block skips the hash-map lookup.
     last_phys: u64,
-    /// Guest instructions retired through translated blocks (coverage probe).
+    /// Guest instructions retired through translated regions (coverage probe).
     pub jit_insns: u64,
     /// Guest instructions retired through the interpreter fallback (coverage probe).
     pub interp_insns: u64,
-    /// Translated blocks executed (cache hits + first runs).
+    /// Translated regions executed (cache hits + first runs) — the number of Wasm
+    /// `run` calls the driver made.
     pub blocks_run: u64,
-    /// Distinct blocks compiled (translation-cache misses).
+    /// Distinct regions compiled (translation-cache misses).
     pub blocks_translated: u64,
-    /// Blocks that aborted via a host trap (a guest page fault / MMIO touch).
+    /// Regions that aborted via a host trap (a guest page fault / MMIO touch).
     pub blocks_trapped: u64,
+    /// Sum of the static basic-block count over every compiled region (so the boot
+    /// can report the average region size = `region_blocks_total / blocks_translated`).
+    pub region_blocks_total: u64,
 }
 
 impl Default for X64JitExec {
@@ -260,6 +295,7 @@ impl X64JitExec {
             blocks_run: 0,
             blocks_translated: 0,
             blocks_trapped: 0,
+            region_blocks_total: 0,
         }
     }
 
@@ -342,15 +378,16 @@ impl X64JitExec {
         self.last_phys = u64::MAX; // invalidate the inline cache
     }
 
-    /// Compile and instantiate a translated block for `code` (entry `entry_rip`),
-    /// returning whether a block was cached. The instance imports the executor's
-    /// shared register file as `env.mem`; the `env.load`/`env.store` imports trap on
-    /// a `None` from [`Cpu::jit_mem`] (a page fault / MMIO), aborting the block.
+    /// Compile and instantiate a translated **region** for `code` (entry
+    /// `entry_rip`), returning whether a region was cached. The instance imports the
+    /// executor's shared register file as `env.mem`; the `env.load`/`env.store`
+    /// imports trap on a `None` from [`Cpu::jit_mem`] (a page fault / MMIO), aborting
+    /// the region (resumed at the faulting instruction by the driver).
     fn translate_and_cache(&mut self, phys: u64, code: &[u8], entry_rip: u64) -> bool {
-        let Some(tb) = translate_block_at(code, entry_rip) else {
+        let Some(tr) = translate_region_at(code, entry_rip) else {
             return false;
         };
-        let Ok(module) = Module::new(&self.engine, &tb.wasm) else {
+        let Ok(module) = Module::new(&self.engine, &tr.wasm) else {
             return false;
         };
         let regfile: wasmtime::Extern = self.regfile.into();
@@ -383,33 +420,37 @@ impl X64JitExec {
         ) else {
             return false;
         };
-        let Ok(run) = instance.get_typed_func::<i64, (i64, i64)>(&mut self.store, "run") else {
+        let Ok(run) = instance.get_typed_func::<(i64, i64), (i64, i64)>(&mut self.store, "run")
+        else {
             return false;
         };
 
         self.blocks_translated += 1;
+        self.region_blocks_total += u64::from(tr.blocks);
         self.instances_live += 1;
         self.cache.insert(
             phys,
-            CachedBlock {
+            CachedRegion {
                 instance,
                 run,
-                insns: tb.insns,
-                touches_mem: tb.touches_mem,
+                touches_mem: tr.touches_mem,
                 page: phys >> 12,
             },
         );
         true
     }
 
-    /// Run (translate-on-miss, then execute) the block at physical address `phys`
-    /// for the current `cpu` state. The 16 GPRs + rflags are copied into the block's
-    /// register file, `run(entry_rip)` is called, and on success copied back into
-    /// `cpu`. Returns the [`BlockRun`] outcome. Guest code bytes are fetched (from
-    /// `cpu`) **only on a cache miss**. `entry_rip` is the guest virtual `rip`.
-    fn run_block(&mut self, cpu: &mut Cpu, phys: u64, entry_rip: u64) -> BlockRun {
+    /// Run (translate-on-miss, then execute) the **region** at physical entry `phys`
+    /// for the current `cpu` state, with instruction `budget`. The 16 GPRs + rflags
+    /// are copied into the shared register file, `run(entry_rip, budget)` is called
+    /// (running many guest instructions across the region's blocks in one Wasm call),
+    /// and the registers are left in the Wasm file (lazy sync). Returns the
+    /// [`BlockRun`] outcome. Guest code bytes are fetched (from `cpu`, page-sized for
+    /// region discovery) **only on a cache miss**. `entry_rip` is the guest virtual
+    /// `rip`.
+    fn run_block(&mut self, cpu: &mut Cpu, phys: u64, entry_rip: u64, budget: u64) -> BlockRun {
         // Tiering gate: only compiled (cached) entries run natively. The inline
-        // last-block cache shortcuts a hot loop re-entering the same block.
+        // last-region cache shortcuts a hot loop re-entering the same region.
         if phys != self.last_phys && !self.cache.contains_key(&phys) {
             // Cold entry — count it; compile only once it crosses the threshold.
             let count = self.hotness.entry(phys).or_insert(0);
@@ -427,73 +468,77 @@ impl X64JitExec {
                 self.sync_from_wasm(cpu);
                 self.rebuild_store();
             }
-            // Compile and cache (or park as rejected).
-            let code = cpu.jit_fetch_code(phys);
+            // Compile and cache (or park as rejected). Fetch a page's worth so the
+            // region can discover direct-branch-reachable blocks across the page.
+            let code = cpu.jit_fetch_code(phys, 4096);
             if !self.translate_and_cache(phys, &code, entry_rip) {
                 self.hotness.insert(phys, HOTNESS_REJECTED);
                 return BlockRun::Interpret;
             }
             self.hotness.remove(&phys);
-            // The phys page now carries a cached block — mark it so the interpreter
+            // The phys page now carries a cached region — mark it so the interpreter
             // write path detects SMC against it.
             cpu.jit_mark_code_page(phys >> 12);
         }
         self.last_phys = phys;
 
-        let (run, insns, touches_mem) = {
+        let (run, touches_mem) = {
             let b = self.cache.get(&phys).expect("just inserted/contained");
-            (b.run.clone(), b.insns, b.touches_mem)
+            (b.run.clone(), b.touches_mem)
         };
         let mem = self.regfile;
 
         self.sync_to_wasm(cpu);
 
         let result = if touches_mem {
-            // Memory-touching block: lend the real core to the host imports for the
+            // Memory-touching region: lend the real core to the host imports for the
             // call (a cheap struct move — RAM/TLB are heap-backed).
             core::mem::swap(cpu, self.store.data_mut());
-            let r = run.call(&mut self.store, entry_rip as i64);
+            let r = run.call(&mut self.store, (entry_rip as i64, budget as i64));
             core::mem::swap(cpu, self.store.data_mut());
             r
         } else {
-            // Register-only block: it calls no host import, so it cannot trap and
+            // Register-only region: it calls no host import, so it cannot trap and
             // needs no `Cpu` lent into the store — the cheapest path.
-            run.call(&mut self.store, entry_rip as i64)
+            run.call(&mut self.store, (entry_rip as i64, budget as i64))
         };
 
         match result {
             Ok((next_rip, ran)) => {
-                // The block left the updated registers in the shared Wasm file; keep
-                // them there (lazy sync) — a following JIT block reuses them with no
+                // The region left the updated registers in the shared Wasm file; keep
+                // them there (lazy sync) — a following JIT region reuses them with no
                 // copy, and the driver flushes them to `cpu` only at a boundary that
                 // needs them. `regs_in_wasm` is already `true` (set by `sync_to_wasm`).
                 debug_assert!(self.regs_in_wasm);
-                debug_assert_eq!(ran as u32, insns, "run() insn count drift");
                 self.blocks_run += 1;
                 BlockRun::Done {
                     next_rip: next_rip as u64,
-                    insns: ran as u32,
+                    insns: ran as u64,
                 }
             }
-            // A host import trapped: the block aborted on a guest page fault / MMIO
+            // A host import trapped: the region aborted on a guest page fault / MMIO
             // access. The shared register file holds the architectural state *as of
-            // the last completed instruction* (every prior instruction committed its
-            // register/flag/RAM effects; the aborting instruction committed none —
-            // its memory access is its first or last effect, so a partial register
-            // write cannot precede it). Sync that state into `cpu` and resume the
-            // interpreter at the aborting instruction's rip (stamped into
-            // `FAULT_RIP_OFF` by the block before the access). The interpreter then
-            // re-runs *only* that one instruction — re-deriving the #PF or running
-            // the MMIO op with side effects — exactly as `step` would.
+            // the last completed instruction* (every prior instruction in the region
+            // committed its register/flag/RAM effects; the aborting instruction
+            // committed none — its memory access is its first or last effect). Sync
+            // that state into `cpu` and resume the interpreter at the aborting
+            // instruction's rip (stamped into `FAULT_RIP_OFF` by the region before the
+            // access), crediting the timer with the instructions the region retired
+            // before the abort (stamped into `RETIRED_OFF`). The interpreter then
+            // re-runs *only* that one instruction with full side effects.
             Err(_) => {
+                let data = mem.data(&self.store);
                 let mut rb = [0u8; 8];
-                rb.copy_from_slice(&mem.data(&self.store)[FAULT_RIP_OFF..FAULT_RIP_OFF + 8]);
+                rb.copy_from_slice(&data[FAULT_RIP_OFF..FAULT_RIP_OFF + 8]);
                 let fault_rip = u64::from_le_bytes(rb);
+                let mut nb = [0u8; 8];
+                nb.copy_from_slice(&data[RETIRED_OFF..RETIRED_OFF + 8]);
+                let retired = u64::from_le_bytes(nb);
                 // Flush the pre-fault register/flag state (held in the Wasm file) into
                 // `cpu`, making it authoritative for the interpreter.
                 self.sync_from_wasm(cpu);
                 self.blocks_trapped += 1;
-                BlockRun::Trapped { fault_rip }
+                BlockRun::Trapped { fault_rip, retired }
             }
         }
     }
@@ -518,11 +563,14 @@ impl Cpu {
     pub fn run_jit(&mut self, exec: &mut X64JitExec, max_steps: u64) -> Halt {
         let mut steps = 0u64;
         while steps < max_steps {
-            // Per-iteration bookkeeping identical to `run`. `pump_net`/`sys_tick` and
-            // the halted check touch only device/timer state, not the GPRs, so the
-            // live registers may stay in the Wasm file across them (lazy sync).
+            // Per-iteration device/timer bookkeeping. Unlike `run` (which `sys_tick`s
+            // once per instruction), a region retires *many* instructions per
+            // iteration, so the timer is advanced by the iteration's *actual* retired
+            // count (`jit_sys_tick_n`) at the END of the iteration — keeping the
+            // periodic timer/jiffies on the real instruction clock. The pending
+            // interrupt latched by that advance is delivered at the next iteration's
+            // top (a latency bounded by `REGION_BUDGET`, far under any timer period).
             self.jit_pump_net(steps);
-            self.jit_sys_tick();
             if self.jit_halted() {
                 exec.sync_from_wasm(self); // make `cpu` registers authoritative on exit
                 return Halt::Halted;
@@ -536,7 +584,7 @@ impl Cpu {
             self.jit_take_pending_interrupt();
 
             // If a prior interpreter store hit a cached code page, flush the stale
-            // block(s) before this iteration translates/runs anything.
+            // region(s) before this iteration translates/runs anything.
             if self.jit_take_dirty() {
                 exec.flush_invalidated(self);
             }
@@ -547,23 +595,44 @@ impl Cpu {
             let rip = self.rip();
             let interpret_one;
             if let Some(phys) = self.jit_fetch_phys(rip) {
-                match exec.run_block(self, phys, rip) {
+                // Cap the region's budget by (a) the remaining step allowance, so the
+                // driver honours `max_steps`, and (b) the instructions until the next
+                // armed timer fires, so a long region exits exactly at the timer
+                // deadline and the driver delivers the IRQ promptly — keeping the
+                // interrupt cadence close to the interpreter's (a region cannot deliver
+                // an interrupt mid-run, so stranding one for a whole region breaks the
+                // kernel's timing-sensitive paths).
+                let budget = REGION_BUDGET
+                    .min(max_steps - steps)
+                    .min(self.jit_steps_to_next_timer())
+                    .max(1);
+                match exec.run_block(self, phys, rip, budget) {
                     BlockRun::Done { next_rip, insns } => {
                         self.jit_set_rip(next_rip);
-                        self.jit_add_insns(u64::from(insns));
-                        exec.jit_insns += u64::from(insns);
-                        steps += u64::from(insns);
+                        self.jit_add_insns(insns);
+                        exec.jit_insns += insns;
+                        steps += insns;
+                        // Advance the timer by the region's retired count. The region
+                        // contains no `RDTSC`/`RDRAND` (those stop a block → always
+                        // interpreted), so it observes no TSC and advancing it here
+                        // (after the run) is indistinguishable from per-instruction.
+                        self.jit_sys_tick_n(insns);
                         interpret_one = false;
                     }
-                    // A load/store aborted: the register state before the aborting
-                    // instruction is already in `cpu`; resume the interpreter at that
-                    // instruction (re-deriving the #PF / running the MMIO op).
-                    BlockRun::Trapped { fault_rip } => {
+                    // A load/store aborted mid-region: the register state before the
+                    // aborting instruction is already in `cpu`; credit the timer with
+                    // the instructions the region retired before the abort, then
+                    // resume the interpreter at the faulting instruction.
+                    BlockRun::Trapped { fault_rip, retired } => {
+                        self.jit_add_insns(retired);
+                        exec.jit_insns += retired;
+                        steps += retired;
+                        self.jit_sys_tick_n(retired);
                         self.jit_set_rip(fault_rip);
                         self.jit_clear_fault();
                         interpret_one = true;
                     }
-                    // The head instruction is untranslatable: clear any latched fault
+                    // The entry instruction is untranslatable: clear any latched fault
                     // (the rip-fetch translate above may have filled the TLB only) and
                     // interpret one instruction exactly as `run` does.
                     BlockRun::Interpret => {
@@ -581,10 +650,27 @@ impl Cpu {
                 // flush the live state out of the Wasm file first (a no-op if it is
                 // already in `cpu` — e.g. just after a trap).
                 exec.sync_from_wasm(self);
-                // Interpret exactly one instruction, mirroring `run`'s loop tail
-                // (`step()` → on Err return the halt; the #PF take is inside
-                // `step`). The per-iteration `sys_tick` / interrupt were pumped
-                // above, so they are not re-pumped here.
+                // Interpret EXACTLY as `run`'s loop body does, in the same order:
+                //   sys_tick  →  take_pending_interrupt  →  step
+                // (1) Advance the timer for THIS instruction *before* executing it.
+                //     Load-bearing: `RDTSC`/`RDRAND` are interpreted here and observe
+                //     the TSC — ticking after the step (a region's pattern) would feed
+                //     them a TSC one step behind the interpreter, and `RDRAND` mixes the
+                //     TSC into its output, so every random/canary/ASLR value would
+                //     diverge and crash userspace.
+                self.jit_sys_tick_n(1);
+                // (2) Deliver any interrupt latched by *this* instruction's tick before
+                //     executing it — exactly as `run` does. (The top-of-loop
+                //     `take_pending` delivers at a region's entry; for a single
+                //     interpreted instruction the architecturally-correct delivery point
+                //     is here, right after its tick, so the interrupt cadence matches
+                //     `run` instruction-for-instruction.)
+                if self.jit_interrupt_pending() {
+                    exec.sync_from_wasm(self);
+                }
+                self.jit_take_pending_interrupt();
+                // (3) Interpret one instruction (`step()` → on Err return the halt; the
+                //     post-`step` #PF vector is inside `step`).
                 match self.jit_interpret_one() {
                     Ok(()) => {}
                     Err(h) => return h,

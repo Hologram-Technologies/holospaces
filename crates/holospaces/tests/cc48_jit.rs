@@ -14,7 +14,9 @@
 //! Then it prints an interpreter-vs-JIT MIPS/speedup comparison on a hot block.
 
 use holospaces::emulator::x64::{self, Cpu};
-use holospaces::emulator::x64_jit::{translate_block, translate_block_at, TranslatedBlock};
+use holospaces::emulator::x64_jit::{
+    translate_block, translate_block_at, translate_region_at, TranslatedBlock, TranslatedRegion,
+};
 use wasmtime::{Caller, Engine, Func, Instance, Memory, MemoryType, Module, Store, TypedFunc};
 
 // The five arithmetic flag bits the translator computes.
@@ -248,6 +250,172 @@ fn check_mem(label: &str, code: &[u8], init: &[u64; 16], init_ram: &[u8]) {
         panic!(
             "[{label}] RAM mismatch at {off:#x}: interp={:#x} jit={:#x}",
             iram[off], jram[off]
+        );
+    }
+}
+
+// ── Region (trace) differential harness ───────────────────────────────────────
+
+/// Instantiate a translated *region* on wasmtime over a host memory seeded with the
+/// register file (rflags @128 = 0x2) and a flat RAM backing `env.load`/`env.store`,
+/// then call `run(entry_rip, budget)`. Returns the final GPRs, flags, the returned
+/// `(exit_rip, insns)`, and the final RAM.
+#[allow(clippy::type_complexity)]
+fn run_region(
+    tr: &TranslatedRegion,
+    init: &[u64; 16],
+    init_ram_full: &[u8],
+    entry_rip: u64,
+    budget: u64,
+) -> ([u64; 16], u64, u64, u64, Vec<u8>) {
+    let engine = Engine::default();
+    let module = Module::new(&engine, &tr.wasm).expect("translated region must validate");
+    let mut store = Store::new(&engine, init_ram_full.to_vec());
+    let mem = Memory::new(&mut store, MemoryType::new(1, None)).expect("memory");
+    let data = mem.data_mut(&mut store);
+    for (i, &v) in init.iter().enumerate() {
+        data[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    data[RFLAGS_OFF..RFLAGS_OFF + 8].copy_from_slice(&0x2u64.to_le_bytes());
+
+    let load = Func::wrap(
+        &mut store,
+        |caller: Caller<'_, Vec<u8>>, addr: i64, size: i32| -> i64 {
+            let ram = caller.data();
+            let a = addr as u64 as usize;
+            let mut v = 0u64;
+            for i in 0..size as usize {
+                v |= u64::from(ram.get(a + i).copied().unwrap_or(0)) << (8 * i);
+            }
+            v as i64
+        },
+    );
+    let store_fn = Func::wrap(
+        &mut store,
+        |mut caller: Caller<'_, Vec<u8>>, addr: i64, size: i32, val: i64| {
+            let a = addr as u64 as usize;
+            let v = val as u64;
+            let ram = caller.data_mut();
+            for i in 0..size as usize {
+                if let Some(b) = ram.get_mut(a + i) {
+                    *b = (v >> (8 * i)) as u8;
+                }
+            }
+        },
+    );
+
+    let instance = Instance::new(
+        &mut store,
+        &module,
+        &[mem.into(), load.into(), store_fn.into()],
+    )
+    .expect("instantiate region");
+    let run: TypedFunc<(i64, i64), (i64, i64)> = instance
+        .get_typed_func(&mut store, "run")
+        .expect("run export");
+    let (exit_rip, ran) = run
+        .call(&mut store, (entry_rip as i64, budget as i64))
+        .expect("region run call");
+
+    let data = mem.data(&store);
+    let mut regs = [0u64; 16];
+    for (i, slot) in regs.iter_mut().enumerate() {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&data[i * 8..i * 8 + 8]);
+        *slot = u64::from_le_bytes(b);
+    }
+    let mut fb = [0u8; 8];
+    fb.copy_from_slice(&data[RFLAGS_OFF..RFLAGS_OFF + 8]);
+    let flags = u64::from_le_bytes(fb) & ARITH_FLAGS;
+    let ram = store.data().clone();
+    (regs, flags, exit_rip as u64, ran as u64, ram)
+}
+
+/// Assert the interpreter and the region translator agree, bit-for-bit, on a
+/// (possibly looping / branching) region from `init` register state and `init_ram`
+/// flat RAM. The region is driven to its natural exit through one or more `run`
+/// calls of `budget` instructions each (so `budget` smaller than the region's total
+/// retired count exercises the instruction-budget early-exit + re-entry path,
+/// mirroring the driver): each call returns `(exit_rip, insns)`; a re-entry
+/// re-translates a region at `exit_rip` and continues with the register file carried
+/// in the shared memory. The interpreter then runs exactly the summed instruction
+/// count and the two must match on the 16 GPRs, the 5 flags, the full RAM, and the
+/// final rip.
+fn check_region(label: &str, code: &[u8], init: &[u64; 16], init_ram: &[u8], budget: u64) {
+    // The full page slice the region discovers over (entry at BLOCK_BASE). We pass
+    // the whole code slice; the region scans direct-branch-reachable blocks.
+    let tr = match translate_region_at(code, BLOCK_BASE) {
+        Some(tr) => tr,
+        None => panic!("[{label}] translate_region_at returned None for a supported region"),
+    };
+    assert!(tr.blocks >= 1, "[{label}] region must have >= 1 block");
+
+    let _ = &tr; // (the first translation; re-done per re-entry below)
+
+    // Drive the region to its natural exit, carrying RAM + registers across calls.
+    let mut ram = starting_ram(code, init, init_ram);
+    let mut regs = *init;
+    let mut flags = 0u64;
+    let mut rip = BLOCK_BASE;
+    let mut total: u64 = 0;
+    let mut calls = 0u32;
+    loop {
+        // The region exited outside the translatable code slice — done.
+        let off = (rip - BLOCK_BASE) as i64;
+        if off < 0 || off as usize >= code.len() {
+            break;
+        }
+        // Re-translate at the current rip (block 0 = current entry). On the first
+        // call `off == 0` (the whole slice); on a budget re-entry the sub-slice from
+        // the current rip is scanned, exactly as the driver would re-tier at the new
+        // hot rip.
+        let Some(sub_tr) = translate_region_at(&code[off as usize..], rip) else {
+            break; // rip lands on an untranslatable lead — the interpreter would step it
+        };
+        let (r2, f2, exit_rip, ran, ram2) = run_region(&sub_tr, &regs, &ram, rip, budget);
+        regs = r2;
+        flags = f2;
+        ram = ram2;
+        total += ran;
+        if ran == 0 {
+            break; // no progress (budget 0, or an immediate region exit at rip)
+        }
+        rip = exit_rip;
+        assert!(
+            calls < 100_000 && total < 5_000_000,
+            "[{label}] region did not converge to an exit"
+        );
+        calls += 1;
+    }
+
+    // Run the interpreter for exactly the summed retired count and compare.
+    let (iregs, iflags, irip, iram) = run_interp(code, init, init_ram, total as u32);
+
+    assert_eq!(
+        irip, rip,
+        "[{label}] exit rip mismatch: interp={irip:#x} region={rip:#x} \
+         (total insns {total}, {calls} re-entries, budget {budget})"
+    );
+    for i in 0..16 {
+        assert_eq!(
+            iregs[i], regs[i],
+            "[{label}] r{i} mismatch: interp={:#x} region={:#x}",
+            iregs[i], regs[i]
+        );
+    }
+    assert_eq!(
+        iflags, flags,
+        "[{label}] flags mismatch: interp={iflags:#x} region={flags:#x}"
+    );
+    if iram != ram {
+        let pos = iram
+            .iter()
+            .zip(ram.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or(0);
+        panic!(
+            "[{label}] RAM mismatch at {pos:#x}: interp={:#x} region={:#x}",
+            iram[pos], ram[pos]
         );
     }
 }
@@ -1810,6 +1978,311 @@ fn handwritten_branch_edges() {
         blk.extend(instr_g1_imm8(true, 5, 0, 3)); // sub rax, 3 → ZF=0
         blk.extend(instr_jcc_rel8(0x4, 0x20)); // JE not taken
         check("sub-nonzero then JE (not taken)", &blk, &base);
+    }
+}
+
+// ── Region (trace) differential cases ─────────────────────────────────────────
+
+/// Programs with internal loops and forward/backward conditional branches, each run
+/// through the region translator (one Wasm call covering many blocks) and asserted
+/// bit-for-bit against the interpreter — including an instruction-budget early-exit
+/// case (a loop longer than the budget → multiple region calls → identical result).
+#[test]
+fn region_loops_and_branches() {
+    let base: [u64; 16] = [0, 0, 0, 0, STACK_TOP, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let ram = seeded_ram();
+
+    // ── A back-edge sum loop: rax = sum(1..=N), rcx = N counter ──
+    //   loop:  add rax, rcx      48 01 C8
+    //          dec rcx           48 FF C9
+    //          jnz loop          75 F8   (cc=5 JNE/JNZ, rel8 back to loop)
+    //   exit:  (fall through)
+    let sum_loop = |n: u64| -> ([u64; 16], Vec<u8>) {
+        let mut init = base;
+        init[0] = 0; // rax accumulator
+        init[1] = n; // rcx counter
+        let mut blk = Vec::new();
+        blk.extend(instr_rr(true, 0x01, 1, 0)); // add rax, rcx  (3 bytes)
+        blk.extend(instr_incdec(true, 1, true)); // dec rcx       (3 bytes)
+                                                 // jnz back to the top of the block: branch byte is at offset 6, rel8 covers
+                                                 // (next=8) + rel = 0 → rel = -8.
+        blk.extend(instr_jcc_rel8(5, -8)); // jnz loop (2 bytes)
+        (init, blk)
+    };
+    for &n in &[1u64, 2, 5, 17, 64] {
+        let (init, blk) = sum_loop(n);
+        check_region(&format!("sum loop N={n}"), &blk, &init, &ram, 1_000_000);
+    }
+
+    // ── Budget early-exit: the SAME loop, but a budget far smaller than the loop's
+    // retired count, so it takes many region calls (each exiting mid-loop and being
+    // re-entered) and must still produce the identical final state. ──
+    {
+        let (init, blk) = sum_loop(64);
+        for &budget in &[1u64, 2, 3, 7, 13] {
+            check_region(
+                &format!("sum loop N=64 budget={budget}"),
+                &blk,
+                &init,
+                &ram,
+                budget,
+            );
+        }
+    }
+
+    // ── A forward conditional skip inside a loop (nested branches) ──
+    //   loop:  test rcx, 1        (low bit)
+    //          jz   even          (skip the odd-only add)
+    //          add  rax, rcx
+    //   even:  dec  rcx
+    //          jnz  loop
+    {
+        let mut init = base;
+        init[0] = 0;
+        init[1] = 20; // count down from 20
+        let mut blk = Vec::new();
+        let test = instr_test_imm_rr(true, 1, 1); // test rcx, 1   (F7 /0 imm32)
+        let add = instr_rr(true, 0x01, 1, 0); // add rax, rcx
+        let dec = instr_incdec(true, 1, true); // dec rcx
+                                               // Compute the JZ rel8 to skip `add`: from end-of-jz to start-of `dec`.
+        let jz_len = 2i32;
+        let jz_skip = add.len() as i32; // skip exactly the add
+        blk.extend(&test);
+        blk.extend(instr_jcc_rel8(4, jz_skip as i8)); // jz even (cc=4 ZF)
+        blk.extend(&add);
+        // even:
+        let even_off = blk.len();
+        blk.extend(&dec);
+        // jnz back to loop top (offset 0).
+        let after = blk.len() + 2; // end of the jnz
+        let back = -(after as i32); // rel = 0 - after
+        blk.extend(instr_jcc_rel8(5, back as i8));
+        let _ = (jz_len, even_off);
+        check_region("loop with inner JZ skip", &blk, &init, &ram, 1_000_000);
+        check_region("loop with inner JZ skip (budget 4)", &blk, &init, &ram, 4);
+    }
+
+    // ── A memcpy-style loop touching memory both ways ──
+    //   loop:  mov rdx, [r13 + rcx*8]     ; load src word
+    //          mov [r14 + rcx*8], rdx     ; store to dst
+    //          dec rcx
+    //          jns loop                   ; while rcx >= 0  (cc=9 JNS)
+    {
+        let mut init = base;
+        init[1] = 7; // copy 8 words (indices 7..=0)
+        init[13] = DATA; // src base
+        init[14] = DATA + 0x100; // dst base (disjoint)
+        let mut blk = Vec::new();
+        blk.extend(instr_rm(
+            true,
+            0x8B,
+            2,
+            Mem::Sib {
+                base: 13,
+                index: 1,
+                scale: 3,
+                disp: 0,
+            },
+        )); // mov rdx, [r13 + rcx*8]
+        blk.extend(instr_rm(
+            true,
+            0x89,
+            2,
+            Mem::Sib {
+                base: 14,
+                index: 1,
+                scale: 3,
+                disp: 0,
+            },
+        )); // mov [r14 + rcx*8], rdx
+        blk.extend(instr_incdec(true, 1, true)); // dec rcx
+        let after = blk.len() + 2;
+        let back = -(after as i32);
+        blk.extend(instr_jcc_rel8(9, back as i8)); // jns loop (cc=9, SF=0)
+        check_region("memcpy loop", &blk, &init, &ram, 1_000_000);
+        check_region("memcpy loop (budget 3)", &blk, &init, &ram, 3);
+    }
+
+    // ── A MANY-block region: a chain of conditional skips (a decision tree) that
+    // discovers 5+ basic blocks with forward Jcc targets, fall-through edges, and a
+    // back-edge — the multi-block dispatch shape the boot exercises. Several initial
+    // states drive different paths through the tree. ──
+    {
+        // for each k in 0..count(rcx): if (rax & (1<<low3(rax))) accumulate; a mix of
+        // forward Jcc (skip), fall-through into the next compare, and a back-edge.
+        //   loop:                          ; idx0
+        //     test al, al                  ; (8-bit? no — use test rax,1)
+        //     jz   b1                      ; forward skip
+        //     add  rbx, rax                ; idx between
+        //   b1:
+        //     test rax, 2
+        //     jz   b2
+        //     add  rbx, rcx
+        //   b2:
+        //     test rax, 4
+        //     jz   b3
+        //     sub  rbx, rdx
+        //   b3:
+        //     add  rax, r8                 ; advance
+        //     dec  rcx
+        //     jnz  loop                    ; back-edge
+        let build = || -> Vec<u8> {
+            let mut blk = Vec::new();
+            // test rax,1 ; jz +len(add)
+            blk.extend(instr_test_imm_rr(true, 0, 1));
+            let add1 = instr_rr(true, 0x01, 0, 3); // add rbx, rax
+            blk.extend(instr_jcc_rel8(4, add1.len() as i8));
+            blk.extend(&add1);
+            // test rax,2 ; jz +len(add)
+            blk.extend(instr_test_imm_rr(true, 0, 2));
+            let add2 = instr_rr(true, 0x01, 1, 3); // add rbx, rcx
+            blk.extend(instr_jcc_rel8(4, add2.len() as i8));
+            blk.extend(&add2);
+            // test rax,4 ; jz +len(sub)
+            blk.extend(instr_test_imm_rr(true, 0, 4));
+            let sub3 = instr_rr(true, 0x29, 2, 3); // sub rbx, rdx
+            blk.extend(instr_jcc_rel8(4, sub3.len() as i8));
+            blk.extend(&sub3);
+            // add rax, r8 ; dec rcx ; jnz loop
+            blk.extend(instr_rr(true, 0x01, 8, 0)); // add rax, r8
+            blk.extend(instr_incdec(true, 1, true)); // dec rcx
+            let after = blk.len() + 2;
+            blk.extend(instr_jcc_rel8(5, -(after as i32) as i8));
+            blk
+        };
+        let blk = build();
+        for &(rax, rcx, r8) in &[
+            (0b101u64, 4u64, 1u64),
+            (0b010, 6, 3),
+            (0b111, 8, 1),
+            (0, 5, 2),
+            (0xff, 3, 7),
+        ] {
+            let mut init = base;
+            init[0] = rax;
+            init[1] = rcx;
+            init[2] = 0x10;
+            init[3] = 0; // rbx accumulator
+            init[8] = r8;
+            check_region(
+                &format!("decision-tree region rax={rax:#x} rcx={rcx}"),
+                &blk,
+                &init,
+                &ram,
+                1_000_000,
+            );
+            // Also exercise the budget early-exit re-entry through the many blocks.
+            check_region(
+                &format!("decision-tree region (budget 5) rax={rax:#x}"),
+                &blk,
+                &init,
+                &ram,
+                5,
+            );
+        }
+    }
+
+    // ── A not-taken Jcc chain ending in a 0-instruction exit block ──
+    // Mirrors a discovered region shape from the real boot: a chain of conditional
+    // branches that all fall through (not taken) into the next block, the last
+    // falling through to an *untranslatable* instruction (a `NOP`, 0x90) — which
+    // discovery records as a 0-instruction `Leave` block that the multi-block
+    // dispatch must enter (set $cur) and immediately exit from. Exercises the
+    // continue-into-a-zero-insn-block path with 5+ blocks.
+    {
+        // rcx != 0 so every `cmp rcx, k`/`jne` (k from 1..) is TAKEN... we want NOT
+        // taken (fall through), so use `je` against a non-matching constant.
+        let mut blk = Vec::new();
+        // b0: add rax, r8 ; cmp rcx, 0xAA ; je +skip0
+        blk.extend(instr_rr(true, 0x01, 8, 0)); // add rax, r8
+        blk.extend(instr_g1_imm8(true, 7, 1, 0x11)); // cmp rcx, 0x11  (7=cmp)
+        let body1 = instr_rr(true, 0x01, 9, 0); // add rax, r9
+        blk.extend(instr_jcc_rel8(4, body1.len() as i8)); // je skip (not taken → fall to body1)
+                                                          // b1: add rax, r9 ; cmp rcx, 0x22 ; je +skip1
+        blk.extend(&body1);
+        blk.extend(instr_g1_imm8(true, 7, 1, 0x22));
+        let body2 = instr_rr(true, 0x01, 10, 0); // add rax, r10
+        blk.extend(instr_jcc_rel8(4, body2.len() as i8));
+        // b2: add rax, r10 ; cmp rcx, 0x33 ; je +skip2
+        blk.extend(&body2);
+        blk.extend(instr_g1_imm8(true, 7, 1, 0x33));
+        let body3 = instr_rr(true, 0x01, 11, 0); // add rax, r11
+        blk.extend(instr_jcc_rel8(4, body3.len() as i8));
+        // b3: add rax, r11 ; then a NOP (untranslatable → 0-insn Leave block)
+        blk.extend(&body3);
+        blk.push(0x90); // NOP — the region exits here (interpreter would step it)
+        let mut init = base;
+        init[0] = 0; // rax accumulator
+        init[1] = 0x99; // rcx — matches none of the cmp constants → all fall through
+        init[8] = 1;
+        init[9] = 2;
+        init[10] = 4;
+        init[11] = 8;
+        // The region runs b0..b3 (all fall-through) then exits at the NOP; rax should
+        // be 1+2+4+8 = 15. A large budget runs the whole chain in one region call.
+        check_region(
+            "not-taken chain to 0-insn exit",
+            &blk,
+            &init,
+            &ram,
+            1_000_000,
+        );
+        check_region("not-taken chain (budget 2)", &blk, &init, &ram, 2);
+    }
+
+    // ── A region whose blocks' Jcc NOT-TAKEN arms each land on an untranslatable
+    // instruction (a 0-instruction `Leave` block dispatched via the `else` arm),
+    // while the TAKEN arms thread forward through real blocks — a faithful copy of a
+    // discovered boot-region shape (5+ blocks, several 0-insn dispatched exits). ──
+    {
+        // b0: test rcx,rcx ; jnz over_nop0 ; nop(exit) ; <b1>
+        // each "over the nop" jumps to the next real block; the nop is the not-taken
+        // 0-insn exit. Chained 4 deep to force ≥5 discovered blocks.
+        let nop = 0x90u8;
+        let mut blk = Vec::new();
+        // b0
+        blk.extend(instr_rr(true, 0x85, 1, 1)); // test rcx, rcx (3)
+        blk.extend(instr_jcc_rel8(5, 1)); // jnz +1 (skip the nop) ; ft = nop
+        blk.push(nop); // 0-insn exit block (idx for ft)
+                       // b1
+        blk.extend(instr_rr(true, 0x01, 8, 0)); // add rax, r8 (3)
+        blk.extend(instr_rr(true, 0x85, 2, 2)); // test rdx, rdx (3)
+        blk.extend(instr_jcc_rel8(5, 1)); // jnz +1 ; ft = nop
+        blk.push(nop);
+        // b2
+        blk.extend(instr_rr(true, 0x01, 9, 0)); // add rax, r9
+        blk.extend(instr_rr(true, 0x85, 3, 3)); // test rbx, rbx
+        blk.extend(instr_jcc_rel8(5, 1));
+        blk.push(nop);
+        // b3
+        blk.extend(instr_rr(true, 0x01, 10, 0)); // add rax, r10
+        blk.push(nop); // final exit
+        let mut init = base;
+        init[0] = 0;
+        init[1] = 1; // rcx != 0 → jnz taken (thread forward)
+        init[2] = 1; // rdx != 0
+        init[3] = 1; // rbx != 0
+        init[8] = 0x100;
+        init[9] = 0x200;
+        init[10] = 0x400;
+        check_region(
+            "Jcc-not-taken-to-0insn region",
+            &blk,
+            &init,
+            &ram,
+            1_000_000,
+        );
+        // a path where one not-taken arm IS taken (rdx==0 → exit at b1's nop)
+        let mut init2 = init;
+        init2[2] = 0; // rdx == 0 → b1's jnz NOT taken → exit at b1's nop
+        check_region(
+            "Jcc-not-taken exit mid-region",
+            &blk,
+            &init2,
+            &ram,
+            1_000_000,
+        );
+        check_region("Jcc-not-taken region (budget 3)", &blk, &init, &ram, 3);
     }
 }
 
