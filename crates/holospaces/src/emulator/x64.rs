@@ -3004,11 +3004,22 @@ impl Cpu {
         cmdline: &str,
         disk: Option<super::VirtioBlk>,
     ) -> Self {
+        // Validate the guest sizing up front so callers of the public
+        // `boot_linux*` APIs get a clear message rather than a slice OOB / e820
+        // underflow deep inside. The boot needs the legacy 1 MiB region plus room
+        // for the NUL-terminated command line at CMDLINE_ADDR.
+        let cl = cmdline.as_bytes();
+        let cmdline_end = CMDLINE_ADDR as usize + cl.len() + 1;
+        assert!(
+            ram_bytes > 0x0010_0000 && ram_bytes >= cmdline_end,
+            "boot_linux: ram_bytes={ram_bytes:#x} too small — need > 1 MiB and \
+             ≥ {cmdline_end:#x} for the command line at {CMDLINE_ADDR:#x}",
+        );
+
         let mut cpu = Cpu::new(ram_bytes);
         let entry = cpu.load_elf64(kernel);
 
         // The command line + the zero page (boot_params).
-        let cl = cmdline.as_bytes();
         cpu.ram[CMDLINE_ADDR as usize..CMDLINE_ADDR as usize + cl.len()].copy_from_slice(cl);
         cpu.ram[CMDLINE_ADDR as usize + cl.len()] = 0;
         cpu.build_boot_params(cmdline, ram_bytes as u64, disk.is_some());
@@ -3161,7 +3172,9 @@ impl Cpu {
         entries.push((0x000f_0000, 0x0001_0000, 2));
         // Main RAM from 1 MiB up to the MMIO window (kept below 0xD000_0000).
         let main_end = ram_bytes.min(VIRTIO_BLK_BASE);
-        entries.push((0x0010_0000, main_end - 0x0010_0000, 1));
+        // `saturating_sub`: `main_end ≥ 1 MiB` is guaranteed by the sizing assert
+        // in `boot_linux_inner`, but stay underflow-safe regardless of caller.
+        entries.push((0x0010_0000, main_end.saturating_sub(0x0010_0000), 1));
         // The virtio-mmio + APIC windows are reserved (not RAM).
         entries.push((VIRTIO_BLK_BASE, LAPIC_END - VIRTIO_BLK_BASE, 2));
         // Any RAM above 4 GiB (if sized that large) is usable.
