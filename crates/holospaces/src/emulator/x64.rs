@@ -2583,7 +2583,13 @@ impl Cpu {
                     }
                     return Err(Halt::Halted);
                 }
-                self.rip = start; // re-execute HLT until an interrupt arrives
+                // Leave `rip` *past* the HLT — the architectural state a wakeup
+                // interrupt resumes from. The interrupt that ends the halt pushes
+                // this address, so `IRET` returns to the instruction after HLT
+                // (e.g. the `cli; ret` tail of `default_idle`), letting the idle
+                // loop re-check `need_resched` and run a task woken by the timer
+                // IRQ. Resetting `rip` back onto HLT would make `IRET` re-enter the
+                // halt forever, stranding the woken task — the NO_HZ idle deadlock.
                 self.idle_until_interrupt();
             }
             0xfe => {
