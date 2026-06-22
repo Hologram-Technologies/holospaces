@@ -477,6 +477,11 @@ pub struct Cpu {
     rip: u64,
     /// The flags register (`RFLAGS`).
     rflags: u64,
+    /// Retired-instruction counter — a monotonic count of guest instructions the
+    /// core has executed (informational throughput probe; the x86-64 analogue of
+    /// the RISC-V `INSTRET` CSR). Used to measure guest MIPS for the substrate
+    /// fast-execution path (CC-48).
+    insns: u64,
     /// Control registers: `cr0` (paging/protection), `cr2` (page-fault address),
     /// `cr3` (the PML4 physical base), `cr4` (PAE et al.).
     cr0: u64,
@@ -591,6 +596,7 @@ impl Cpu {
             r: [0; 16],
             rip: RAM_BASE,
             rflags: 0x2, // bit 1 is reserved-1
+            insns: 0,
             dr: [0; 8],
             cr0: 0,
             cr2: 0,
@@ -912,6 +918,15 @@ impl Cpu {
         self.rip
     }
 
+    /// Retired guest-instruction count — a monotonic tally of executed
+    /// instructions (the x86-64 analogue of RISC-V `INSTRET`). The throughput
+    /// probe divides this by wall-clock to report guest MIPS, the measured bar the
+    /// substrate fast-execution path must clear (CC-48).
+    #[must_use]
+    pub fn insns(&self) -> u64 {
+        self.insns
+    }
+
     // ── Memory ───────────────────────────────────────────────────────────────
     fn rd(&mut self, addr: u64, size: u8) -> u64 {
         let user = self.cpl == 3;
@@ -1117,7 +1132,7 @@ impl Cpu {
                 );
             }
             match self.step() {
-                Ok(()) => {}
+                Ok(()) => self.insns = self.insns.wrapping_add(1),
                 Err(h) => return h,
             }
             #[cfg(feature = "cc44-trace")]
