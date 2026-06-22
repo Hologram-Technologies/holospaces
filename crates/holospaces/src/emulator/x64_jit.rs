@@ -24,7 +24,9 @@
 //! ## Emitted module shape
 //!
 //! ```wat
-//! (import "env" "mem" (memory 1))      ;; host-provided linear memory
+//! (import "env" "mem"   (memory 1))                          ;; register file
+//! (import "env" "load"  (func (param i64 i32) (result i64))) ;; load(addr,size)
+//! (import "env" "store" (func (param i64 i32 i64)))          ;; store(addr,size,val)
 //! (func (export "run") (result i32) ... )  ;; returns guest instructions executed
 //! ```
 //!
@@ -33,6 +35,21 @@
 //! 128. The function reads/writes a register via `i64.load`/`i64.store` at
 //! `reg*8` (rflags at 128) and returns the number of guest instructions it
 //! executed (the same retired-instruction count the interpreter would report).
+//!
+//! ## Memory operands
+//!
+//! ModRM memory forms (`mod` 0/1/2, including SIB and RIP-relative) are
+//! supported. The translator computes the effective address exactly as the
+//! interpreter's [`super::x64::Cpu::modrm`] does — `EA = base + index*scale +
+//! disp`, with REX.B/REX.X extending base/index, the `mod==0` `rm==5`
+//! RIP-relative (relative to the *end* of the instruction) and SIB `base==5`
+//! no-base special cases — and routes every guest memory access through two
+//! imported host functions (`env.load` / `env.store`). The host keeps the
+//! paging / MMIO / fault semantics (the interpreter's `rd`/`wr`); the JIT only
+//! computes addresses. Operand `size_in_bytes` is 4 or 8 (16/8-bit forms still
+//! stop the block). Because the absolute RIP-relative address depends on the
+//! block's entry `rip`, [`translate_block_at`] takes it (and [`translate_block`]
+//! assumes a zero entry `rip`, for register-only blocks where it is irrelevant).
 //!
 //! `no_std` + `alloc`: the WebAssembly encoder is hand-rolled (LEB128 + a
 //! function-body/module builder) so the translator compiles into the same Wasm
@@ -122,6 +139,7 @@ fn leb_i32(out: &mut Vec<u8>, v: i32) {
 // ── Wasm opcodes used by the emitter ──────────────────────────────────────────
 mod op {
     pub const END: u8 = 0x0b;
+    pub const CALL: u8 = 0x10;
     pub const LOCAL_GET: u8 = 0x20;
     pub const LOCAL_SET: u8 = 0x21;
     pub const I64_LOAD: u8 = 0x29;
@@ -152,13 +170,22 @@ struct Body {
     code: Vec<u8>,
     /// Number of extra `i64` locals (beyond the zero parameters) declared.
     i64_locals: u32,
+    /// The guest `rip` at the block entry — the base against which a
+    /// RIP-relative operand's instruction-end address is resolved.
+    entry_rip: u64,
 }
 
+/// Wasm function index of the imported `env.load(addr,size)->i64`.
+const FN_LOAD: u32 = 0;
+/// Wasm function index of the imported `env.store(addr,size,val)`.
+const FN_STORE: u32 = 1;
+
 impl Body {
-    fn new() -> Self {
+    fn new(entry_rip: u64) -> Self {
         Body {
             code: Vec::new(),
             i64_locals: 0,
+            entry_rip,
         }
     }
 
@@ -228,6 +255,30 @@ impl Body {
 
     fn binop(&mut self, b: u8) {
         self.byte(b);
+    }
+
+    /// Emit a `call` to function index `f`.
+    fn call(&mut self, f: u32) {
+        self.byte(op::CALL);
+        leb_u32(&mut self.code, f);
+    }
+
+    /// Emit `env.load(addr, size)` where the address is in `addr_local` and the
+    /// loaded (host-zero-extended) value is left on the stack.
+    fn emit_load(&mut self, addr_local: u32, size: u8) {
+        self.local_get(addr_local);
+        self.i32_const(i32::from(size));
+        self.call(FN_LOAD);
+    }
+
+    /// Emit `env.store(addr, size, value)` where the address is in `addr_local`
+    /// and the value is produced by `f` (pushed after the address/size operands,
+    /// as the import's signature requires `(addr, size, value)`).
+    fn emit_store(&mut self, addr_local: u32, size: u8, f: impl FnOnce(&mut Self)) {
+        self.local_get(addr_local);
+        self.i32_const(i32::from(size));
+        f(self);
+        self.call(FN_STORE);
     }
 }
 
@@ -491,29 +542,206 @@ impl<'a> Decoder<'a> {
     }
 }
 
-/// A decoded register-direct ModRM: the (REX-extended) reg and rm register
-/// indices. Returns `None` if the operand is a memory form (`mod != 3`).
-struct ModRm {
-    reg: u32,
-    rm: u32,
+/// A decoded effective-address recipe for a ModRM memory operand, mirroring
+/// [`super::x64::Cpu::modrm`]'s computation: `EA = base + index*scale + disp`
+/// with the `mod==0` `rm==5` RIP-relative and SIB `base==5` no-base special
+/// cases. Resolved to an `i64` address by [`Body`] code at emit time.
+struct MemEa {
+    /// Base register (REX.B-extended), or `None` for the no-base SIB form and
+    /// the RIP-relative form.
+    base: Option<u32>,
+    /// Index register (REX.X-extended) shifted by `scale`, or `None`.
+    index: Option<u32>,
+    /// SIB scale shift (0..=3); only meaningful when `index` is `Some`.
+    scale: u8,
+    /// Displacement. For a RIP-relative operand (`rip_rel`), this is the raw
+    /// disp32; the absolute address is `entry_rip + insn_end_off + disp`.
+    disp: i64,
+    /// Whether this is the `mod==0` `rm==5` RIP-relative form.
+    rip_rel: bool,
 }
 
+/// A decoded ModRM operand: the (REX-extended) `reg` field plus the r/m operand,
+/// which is either a register or a memory effective address.
+struct ModRm {
+    reg: u32,
+    rm: RmLoc,
+}
+
+/// The r/m operand location: a register index or a memory effective address.
+enum RmLoc {
+    Reg(u32),
+    Mem(MemEa),
+}
+
+/// Decode the ModRM (and any SIB / displacement) into `(reg, rm)`. Returns
+/// `None` only on truncation. Memory forms are now *supported* (`RmLoc::Mem`),
+/// matching the interpreter's [`super::x64::Cpu::modrm`] byte-for-byte.
 fn decode_modrm(dec: &mut Decoder, rex: u8) -> Option<ModRm> {
     let m = dec.u8()?;
     let md = m >> 6;
-    if md != 3 {
-        return None; // memory operand — unsupported, stop the block
-    }
     let reg = u32::from((m >> 3) & 7) | (u32::from((rex >> 2) & 1) << 3); // REX.R
-    let rm = u32::from(m & 7) | (u32::from(rex & 1) << 3); // REX.B
-    Some(ModRm { reg, rm })
+    let rm_field = m & 7;
+    if md == 3 {
+        let rm = u32::from(rm_field) | (u32::from(rex & 1) << 3); // REX.B
+        return Some(ModRm {
+            reg,
+            rm: RmLoc::Reg(rm),
+        });
+    }
+
+    // Memory operand.
+    let base: Option<u32>;
+    let mut index: Option<u32> = None;
+    let mut scale: u8 = 0;
+    let mut disp: i64 = 0;
+
+    if rm_field == 4 {
+        // SIB byte.
+        let sib = dec.u8()?;
+        scale = sib >> 6;
+        let idx = u32::from((sib >> 3) & 7) | (u32::from((rex >> 1) & 1) << 3); // REX.X
+        let base_field = u32::from(sib & 7) | (u32::from(rex & 1) << 3); // REX.B
+        if idx != 4 {
+            index = Some(idx); // index==4 (no REX.X) means "no index"
+        }
+        if (sib & 7) == 5 && md == 0 {
+            // disp32, no base.
+            base = None;
+            disp = i64::from(dec.u32_le()? as i32);
+        } else {
+            base = Some(base_field);
+        }
+    } else if rm_field == 5 && md == 0 {
+        // RIP-relative: disp32 relative to the instruction-end rip.
+        let d = i64::from(dec.u32_le()? as i32);
+        return Some(ModRm {
+            reg,
+            rm: RmLoc::Mem(MemEa {
+                base: None,
+                index: None,
+                scale: 0,
+                disp: d,
+                rip_rel: true,
+            }),
+        });
+    } else {
+        base = Some(u32::from(rm_field) | (u32::from(rex & 1) << 3)); // REX.B
+    }
+
+    match md {
+        1 => disp = disp.wrapping_add(i64::from(dec.u8()? as i8)),
+        2 => disp = disp.wrapping_add(i64::from(dec.u32_le()? as i32)),
+        _ => {}
+    }
+
+    Some(ModRm {
+        reg,
+        rm: RmLoc::Mem(MemEa {
+            base,
+            index,
+            scale,
+            disp,
+            rip_rel: false,
+        }),
+    })
 }
 
-/// Emit one ALU op `dst (op)= src_b` where both operands are register values.
-/// `dst` is the register written (skipped for CMP); `a` is the destination's
-/// current value, `b` is the source. Flags are set per the op.
+/// Emit code that computes the effective address of `ea` into a fresh i64 local,
+/// returning the local index. `insn_end_off` is the offset of the *end* of the
+/// current instruction within the block (the interpreter's instruction-end
+/// `rip` offset), used to resolve a RIP-relative operand against `entry_rip`.
+fn emit_ea(body: &mut Body, ea: &MemEa, insn_end_off: usize) -> u32 {
+    let addr = body.local();
+    if ea.rip_rel {
+        // Absolute address = entry_rip + insn_end_off + disp (seg base is 0 in
+        // the flat long-mode segments this translator targets).
+        let abs = body
+            .entry_rip
+            .wrapping_add(insn_end_off as u64)
+            .wrapping_add(ea.disp as u64);
+        body.i64_const(abs as i64);
+        body.local_set(addr);
+        return addr;
+    }
+    // Start from the base (or 0), add index*scale, add disp — all wrapping i64.
+    if let Some(b) = ea.base {
+        body.load_reg(b);
+    } else {
+        body.i64_const(0);
+    }
+    if let Some(i) = ea.index {
+        body.load_reg(i);
+        if ea.scale != 0 {
+            body.i64_const(i64::from(ea.scale));
+            body.binop(op::I64_SHL);
+        }
+        body.binop(op::I64_ADD);
+    }
+    if ea.disp != 0 {
+        body.i64_const(ea.disp);
+        body.binop(op::I64_ADD);
+    }
+    body.local_set(addr);
+    addr
+}
+
+/// Read the value of an r/m operand into a fresh i64 local, returning its index.
+/// A register operand is masked to `size`; a memory operand is fetched via the
+/// host `env.load(EA, size)` (which already zero-extends), then masked to `size`
+/// for parity with the interpreter's `& mask(size)`. `addr_local` must hold the
+/// pre-computed EA for the memory form.
+fn read_rm(body: &mut Body, rm: &RmLoc, size: u8, addr_local: Option<u32>) -> u32 {
+    let v = body.local();
+    match rm {
+        RmLoc::Reg(reg) => {
+            push_masked_reg(body, *reg, size);
+        }
+        RmLoc::Mem(_) => {
+            body.emit_load(addr_local.expect("memory operand needs an EA"), size);
+            if size < 8 {
+                body.i64_const(size_mask(size));
+                body.binop(op::I64_AND);
+            }
+        }
+    }
+    body.local_set(v);
+    v
+}
+
+/// Write `val_local` into an r/m operand. A register destination honours the
+/// x86-64 zero-extension rule (a 32-bit write clears the upper 32 bits); a memory
+/// destination stores `size` bytes via `env.store(EA, size, val & mask)`.
+fn write_rm(body: &mut Body, rm: &RmLoc, size: u8, addr_local: Option<u32>, val_local: u32) {
+    match rm {
+        RmLoc::Reg(reg) => write_reg(body, *reg, size, val_local),
+        RmLoc::Mem(_) => {
+            let addr = addr_local.expect("memory operand needs an EA");
+            body.emit_store(addr, size, |b| {
+                b.local_get(val_local);
+                if size < 8 {
+                    b.i64_const(size_mask(size));
+                    b.binop(op::I64_AND);
+                }
+            });
+        }
+    }
+}
+
+/// Emit one ALU op `dst (op)= src_b`. `dst` is the destination operand (a
+/// register or a memory location, skipped for CMP); `a_local` holds the
+/// destination's current value, `b_local` the source. `dst_addr` is the
+/// pre-computed EA when `dst` is memory. Flags are set per the op.
 #[allow(clippy::too_many_arguments)]
-fn emit_alu(body: &mut Body, op: AluOp, dst: u32, a_local: u32, b_local: u32, size: u8) {
+fn emit_alu(
+    body: &mut Body,
+    op: AluOp,
+    dst: &RmLoc,
+    dst_addr: Option<u32>,
+    a_local: u32,
+    b_local: u32,
+    size: u8,
+) {
     // result local
     let r = body.local();
     // compute the raw result, then mask it.
@@ -568,7 +796,7 @@ fn emit_alu(body: &mut Body, op: AluOp, dst: u32, a_local: u32, b_local: u32, si
     }
     // Write the destination unless this is CMP (which discards the result).
     if op != AluOp::Cmp {
-        write_reg(body, dst, size, r);
+        write_rm(body, dst, size, dst_addr, r);
     }
 }
 
@@ -582,7 +810,15 @@ fn emit_alu(body: &mut Body, op: AluOp, dst: u32, a_local: u32, b_local: u32, si
 /// unsupported (the caller interprets that instruction instead).
 #[must_use]
 pub fn translate_block(code: &[u8]) -> Option<TranslatedBlock> {
-    let mut body = Body::new();
+    translate_block_at(code, 0)
+}
+
+/// Translate a block whose entry guest `rip` is `entry_rip`. Identical to
+/// [`translate_block`] except RIP-relative memory operands are resolved against
+/// `entry_rip` (a block with no RIP-relative operand is insensitive to it).
+#[must_use]
+pub fn translate_block_at(code: &[u8], entry_rip: u64) -> Option<TranslatedBlock> {
+    let mut body = Body::new(entry_rip);
     let mut dec = Decoder::new(code);
     let mut insns: u32 = 0;
 
@@ -664,29 +900,31 @@ fn decode_one(dec: &mut Decoder, body: &mut Body) -> DecodeResult {
         // ── ALU reg forms: r/m,r (0x01..) and r,r/m (0x03..) ──
         0x01 | 0x09 | 0x21 | 0x29 | 0x31 | 0x39 => {
             // op r/m, r  : dst = r/m, a = r/m, b = reg
-            let Some(d) = stage_modrm(dec, rex) else {
+            let Some(d) = decode_modrm(dec, rex) else {
                 return DecodeResult::Stop;
             };
             let Some(alu) = AluOp::from_digit(op >> 3) else {
                 return DecodeResult::Stop;
             };
-            emit_reg_reg(body, alu, d.rm, d.rm, d.reg, size);
+            let addr = maybe_ea(body, &d.rm, dec.pos);
+            emit_alu_rm_reg(body, alu, &d.rm, addr, d.reg, size);
             DecodeResult::Ok
         }
         0x03 | 0x0b | 0x23 | 0x2b | 0x33 | 0x3b => {
             // op r, r/m  : dst = reg, a = reg, b = r/m
-            let Some(d) = stage_modrm(dec, rex) else {
+            let Some(d) = decode_modrm(dec, rex) else {
                 return DecodeResult::Stop;
             };
             let Some(alu) = AluOp::from_digit(op >> 3) else {
                 return DecodeResult::Stop;
             };
-            emit_reg_reg(body, alu, d.reg, d.reg, d.rm, size);
+            let addr = maybe_ea(body, &d.rm, dec.pos);
+            emit_alu_reg_rm(body, alu, d.reg, &d.rm, addr, size);
             DecodeResult::Ok
         }
         // ── group1: 0x81 /digit imm32-sext, 0x83 /digit imm8-sext ──
         0x81 | 0x83 => {
-            let Some(d) = stage_modrm(dec, rex) else {
+            let Some(d) = decode_modrm(dec, rex) else {
                 return DecodeResult::Stop;
             };
             let digit = d.reg & 7; // /digit lives in the reg field (low 3 bits)
@@ -705,23 +943,28 @@ fn decode_one(dec: &mut Decoder, body: &mut Body) -> DecodeResult {
                 };
                 (v as i32 as i64) as u64
             };
-            emit_reg_imm(body, alu, d.rm, imm, size);
+            // EA resolves against the instruction-end rip (after the immediate),
+            // exactly as the interpreter fetches the immediate before load_rm.
+            let addr = maybe_ea(body, &d.rm, dec.pos);
+            emit_alu_rm_imm(body, alu, &d.rm, addr, imm, size);
             DecodeResult::Ok
         }
         // ── mov r/m, r (0x89) ──
         0x89 => {
-            let Some(d) = stage_modrm(dec, rex) else {
+            let Some(d) = decode_modrm(dec, rex) else {
                 return DecodeResult::Stop;
             };
-            emit_mov_reg(body, d.rm, d.reg, size);
+            let addr = maybe_ea(body, &d.rm, dec.pos);
+            emit_mov_rm_reg(body, &d.rm, addr, d.reg, size);
             DecodeResult::Ok
         }
         // ── mov r, r/m (0x8B) ──
         0x8b => {
-            let Some(d) = stage_modrm(dec, rex) else {
+            let Some(d) = decode_modrm(dec, rex) else {
                 return DecodeResult::Stop;
             };
-            emit_mov_reg(body, d.reg, d.rm, size);
+            let addr = maybe_ea(body, &d.rm, dec.pos);
+            emit_mov_reg_rm(body, d.reg, &d.rm, addr, size);
             DecodeResult::Ok
         }
         // ── mov r, imm (0xB8+r): imm64 if REX.W else imm32 zero-extended ──
@@ -743,7 +986,7 @@ fn decode_one(dec: &mut Decoder, body: &mut Body) -> DecodeResult {
         }
         // ── mov r/m, imm32-sext (0xC7 /0) ──
         0xc7 => {
-            let Some(d) = stage_modrm(dec, rex) else {
+            let Some(d) = decode_modrm(dec, rex) else {
                 return DecodeResult::Stop;
             };
             if d.reg & 7 != 0 {
@@ -753,53 +996,84 @@ fn decode_one(dec: &mut Decoder, body: &mut Body) -> DecodeResult {
                 return DecodeResult::Stop;
             };
             let imm = (v as i32 as i64) as u64;
-            emit_mov_imm(body, d.rm, imm, size);
+            let addr = maybe_ea(body, &d.rm, dec.pos);
+            emit_mov_rm_imm(body, &d.rm, addr, imm, size);
             DecodeResult::Ok
         }
         // ── inc/dec via 0xFF /0 (inc) and /1 (dec) ──
         0xff => {
-            let Some(d) = stage_modrm(dec, rex) else {
+            let Some(d) = decode_modrm(dec, rex) else {
                 return DecodeResult::Stop;
             };
-            match d.reg & 7 {
-                0 => {
-                    emit_inc_dec(body, d.rm, false, size);
-                    DecodeResult::Ok
-                }
-                1 => {
-                    emit_inc_dec(body, d.rm, true, size);
-                    DecodeResult::Ok
-                }
-                _ => DecodeResult::Stop, // call/jmp/push — control flow / memory
+            let digit = d.reg & 7;
+            if digit != 0 && digit != 1 {
+                return DecodeResult::Stop; // call/jmp/push — control flow
             }
+            let addr = maybe_ea(body, &d.rm, dec.pos);
+            emit_inc_dec(body, &d.rm, addr, digit == 1, size);
+            DecodeResult::Ok
         }
         _ => DecodeResult::Stop,
     }
 }
 
-/// Decode a register-direct ModRM, returning `None` (→ Stop) on a memory form or
-/// truncation.
-fn stage_modrm(dec: &mut Decoder, rex: u8) -> Option<ModRm> {
-    decode_modrm(dec, rex)
+/// If `rm` is a memory operand, emit code computing its EA into a fresh local and
+/// return that local; for a register operand return `None`. `insn_end_off` is the
+/// decoder position at the *end* of the instruction (for RIP-relative resolution).
+fn maybe_ea(body: &mut Body, rm: &RmLoc, insn_end_off: usize) -> Option<u32> {
+    match rm {
+        RmLoc::Reg(_) => None,
+        RmLoc::Mem(ea) => Some(emit_ea(body, ea, insn_end_off)),
+    }
 }
 
-/// `op dst, b` where both `a` (dst's value) and `b` are registers.
-fn emit_reg_reg(body: &mut Body, alu: AluOp, dst: u32, a_reg: u32, b_reg: u32, size: u8) {
-    let a = body.local();
+/// `op rm, reg` (digit forms 0x01.. and the digit-in-rm sense): the destination
+/// is `rm` (its current value is operand `a`), the source is register `reg_src`.
+/// `rm_addr` is the pre-computed EA when `rm` is memory.
+fn emit_alu_rm_reg(
+    body: &mut Body,
+    alu: AluOp,
+    rm: &RmLoc,
+    rm_addr: Option<u32>,
+    reg_src: u32,
+    size: u8,
+) {
+    let a = read_rm(body, rm, size, rm_addr);
     let b = body.local();
-    push_masked_reg(body, a_reg, size);
-    body.local_set(a);
-    push_masked_reg(body, b_reg, size);
+    push_masked_reg(body, reg_src, size);
     body.local_set(b);
-    emit_alu(body, alu, dst, a, b, size);
+    emit_alu(body, alu, rm, rm_addr, a, b, size);
 }
 
-/// `op dst, imm` (imm already sign-extended to a u64).
-fn emit_reg_imm(body: &mut Body, alu: AluOp, dst: u32, imm: u64, size: u8) {
+/// `op reg, rm` (0x03.. forms): the destination is register `reg_dst` (its value
+/// is operand `a`), the source is `rm`. `rm_addr` is the EA when `rm` is memory.
+fn emit_alu_reg_rm(
+    body: &mut Body,
+    alu: AluOp,
+    reg_dst: u32,
+    rm: &RmLoc,
+    rm_addr: Option<u32>,
+    size: u8,
+) {
     let a = body.local();
-    let b = body.local();
-    push_masked_reg(body, dst, size);
+    push_masked_reg(body, reg_dst, size);
     body.local_set(a);
+    let b = read_rm(body, rm, size, rm_addr);
+    emit_alu(body, alu, &RmLoc::Reg(reg_dst), None, a, b, size);
+}
+
+/// `op rm, imm` (group-1 0x81/0x83; imm already sign-extended to a u64). The
+/// destination and operand `a` are `rm`; the source is the immediate.
+fn emit_alu_rm_imm(
+    body: &mut Body,
+    alu: AluOp,
+    rm: &RmLoc,
+    rm_addr: Option<u32>,
+    imm: u64,
+    size: u8,
+) {
+    let a = read_rm(body, rm, size, rm_addr);
+    let b = body.local();
     // b = imm & mask(size)
     body.i64_const(imm as i64);
     if size < 8 {
@@ -807,19 +1081,39 @@ fn emit_reg_imm(body: &mut Body, alu: AluOp, dst: u32, imm: u64, size: u8) {
         body.binop(op::I64_AND);
     }
     body.local_set(b);
-    emit_alu(body, alu, dst, a, b, size);
+    emit_alu(body, alu, rm, rm_addr, a, b, size);
 }
 
-/// `mov dst, src` (register to register), flag-neutral.
-fn emit_mov_reg(body: &mut Body, dst: u32, src: u32, size: u8) {
+/// `mov dst, src` where `src` is a register and `dst` is an r/m operand (0x89),
+/// flag-neutral.
+fn emit_mov_rm_reg(body: &mut Body, dst: &RmLoc, dst_addr: Option<u32>, src: u32, size: u8) {
     let v = body.local();
     push_masked_reg(body, src, size);
     body.local_set(v);
+    write_rm(body, dst, size, dst_addr, v);
+}
+
+/// `mov reg, src` where `src` is an r/m operand (0x8B), flag-neutral.
+fn emit_mov_reg_rm(body: &mut Body, dst: u32, src: &RmLoc, src_addr: Option<u32>, size: u8) {
+    let v = read_rm(body, src, size, src_addr);
     write_reg(body, dst, size, v);
 }
 
-/// `mov dst, imm`, flag-neutral. For size 4 the imm is already a 32-bit value
-/// (zero-extended); for size 8 it is the full imm64.
+/// `mov dst, imm` where `dst` is an r/m operand (0xC7 /0), flag-neutral.
+fn emit_mov_rm_imm(body: &mut Body, dst: &RmLoc, dst_addr: Option<u32>, imm: u64, size: u8) {
+    let v = body.local();
+    body.i64_const(imm as i64);
+    if size < 8 {
+        body.i64_const(size_mask(size));
+        body.binop(op::I64_AND);
+    }
+    body.local_set(v);
+    write_rm(body, dst, size, dst_addr, v);
+}
+
+/// `mov reg, imm` (0xB8+r — always a register destination), flag-neutral. For
+/// size 4 the imm is already a 32-bit value (zero-extended); for size 8 it is
+/// the full imm64.
 fn emit_mov_imm(body: &mut Body, dst: u32, imm: u64, size: u8) {
     let v = body.local();
     body.i64_const(imm as i64);
@@ -831,15 +1125,13 @@ fn emit_mov_imm(body: &mut Body, dst: u32, imm: u64, size: u8) {
     write_reg(body, dst, size, v);
 }
 
-/// `inc`/`dec` r/m (register form). These set OF/SF/ZF/PF from the result but
-/// PRESERVE CF (matching the interpreter's 0xFF /0,/1 handler: `flags_arith`
-/// with `b=1`, then CF restored).
-fn emit_inc_dec(body: &mut Body, dst: u32, sub: bool, size: u8) {
-    let a = body.local();
+/// `inc`/`dec` r/m. These set OF/SF/ZF/PF from the result but PRESERVE CF
+/// (matching the interpreter's 0xFF /0,/1 handler: `flags_arith` with `b=1`,
+/// then CF restored). `dst_addr` is the EA when `dst` is memory.
+fn emit_inc_dec(body: &mut Body, dst: &RmLoc, dst_addr: Option<u32>, sub: bool, size: u8) {
+    let a = read_rm(body, dst, size, dst_addr);
     let b = body.local();
     let r = body.local();
-    push_masked_reg(body, dst, size);
-    body.local_set(a);
     body.i64_const(1);
     body.local_set(b);
     // r = (a +/- 1) & mask
@@ -870,7 +1162,7 @@ fn emit_inc_dec(body: &mut Body, dst: u32, sub: bool, size: u8) {
         bd.binop(op::I64_OR);
     });
 
-    write_reg(body, dst, size, r);
+    write_rm(body, dst, size, dst_addr, r);
 }
 
 // ── Module encoding ───────────────────────────────────────────────────────────
@@ -897,34 +1189,67 @@ fn encode_module(body: &Body) -> Vec<u8> {
     // Magic + version.
     out.extend_from_slice(&[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
 
-    // Type section: one type — () -> i32.
+    // Type section — three types:
+    //   0: () -> i32                  (the exported `run`)
+    //   1: (i64, i32) -> i64          (env.load(addr, size) -> value)
+    //   2: (i64, i32, i64) -> ()      (env.store(addr, size, value))
     {
         let mut p = Vec::new();
-        leb_u32(&mut p, 1); // count
-        p.push(0x60); // func type
+        leb_u32(&mut p, 3); // 3 types
+                            // type 0: () -> i32
+        p.push(0x60);
         leb_u32(&mut p, 0); // 0 params
         leb_u32(&mut p, 1); // 1 result
         p.push(0x7f); // i32
+                      // type 1: (i64, i32) -> i64
+        p.push(0x60);
+        leb_u32(&mut p, 2); // 2 params
+        p.push(0x7e); // i64
+        p.push(0x7f); // i32
+        leb_u32(&mut p, 1); // 1 result
+        p.push(0x7e); // i64
+                      // type 2: (i64, i32, i64) -> ()
+        p.push(0x60);
+        leb_u32(&mut p, 3); // 3 params
+        p.push(0x7e); // i64
+        p.push(0x7f); // i32
+        p.push(0x7e); // i64
+        leb_u32(&mut p, 0); // 0 results
         push_section(&mut out, sec::TYPE, &p);
     }
 
-    // Import section: (import "env" "mem" (memory 1)).
+    // Import section:
+    //   (import "env" "mem"   (memory 1))
+    //   (import "env" "load"  (func (type 1)))   ;; func index 0
+    //   (import "env" "store" (func (type 2)))   ;; func index 1
     {
+        let push_name = |p: &mut Vec<u8>, s: &[u8]| {
+            leb_u32(p, s.len() as u32);
+            p.extend_from_slice(s);
+        };
         let mut p = Vec::new();
-        leb_u32(&mut p, 1); // 1 import
-        let module = b"env";
-        leb_u32(&mut p, module.len() as u32);
-        p.extend_from_slice(module);
-        let name = b"mem";
-        leb_u32(&mut p, name.len() as u32);
-        p.extend_from_slice(name);
+        leb_u32(&mut p, 3); // 3 imports
+                            // memory
+        push_name(&mut p, b"env");
+        push_name(&mut p, b"mem");
         p.push(0x02); // import kind: memory
-        p.push(0x00); // limits: min only (no max)
+        p.push(0x00); // limits: min only
         leb_u32(&mut p, 1); // min 1 page
+                            // load
+        push_name(&mut p, b"env");
+        push_name(&mut p, b"load");
+        p.push(0x00); // import kind: func
+        leb_u32(&mut p, 1); // type index 1
+                            // store
+        push_name(&mut p, b"env");
+        push_name(&mut p, b"store");
+        p.push(0x00); // import kind: func
+        leb_u32(&mut p, 2); // type index 2
         push_section(&mut out, sec::IMPORT, &p);
     }
 
-    // Function section: one function of type 0.
+    // Function section: one defined function of type 0 (becomes func index 2,
+    // after the two imported functions).
     {
         let mut p = Vec::new();
         leb_u32(&mut p, 1); // 1 function
@@ -932,7 +1257,7 @@ fn encode_module(body: &Body) -> Vec<u8> {
         push_section(&mut out, sec::FUNCTION, &p);
     }
 
-    // Export section: export "run" func 0.
+    // Export section: export "run" → func index 2 (the defined function).
     {
         let mut p = Vec::new();
         leb_u32(&mut p, 1); // 1 export
@@ -940,7 +1265,7 @@ fn encode_module(body: &Body) -> Vec<u8> {
         leb_u32(&mut p, name.len() as u32);
         p.extend_from_slice(name);
         p.push(0x00); // export kind: func
-        leb_u32(&mut p, 0); // func index 0
+        leb_u32(&mut p, 2); // func index 2
         push_section(&mut out, sec::EXPORT, &p);
     }
 

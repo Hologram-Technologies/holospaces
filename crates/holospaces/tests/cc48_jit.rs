@@ -14,8 +14,8 @@
 //! Then it prints an interpreter-vs-JIT MIPS/speedup comparison on a hot block.
 
 use holospaces::emulator::x64::{self, Cpu};
-use holospaces::emulator::x64_jit::{translate_block, TranslatedBlock};
-use wasmtime::{Engine, Instance, Memory, MemoryType, Module, Store, TypedFunc};
+use holospaces::emulator::x64_jit::{translate_block, translate_block_at, TranslatedBlock};
+use wasmtime::{Caller, Engine, Func, Instance, Memory, MemoryType, Module, Store, TypedFunc};
 
 // The five arithmetic flag bits the translator computes.
 const CF: u64 = 1 << 0;
@@ -27,10 +27,25 @@ const ARITH_FLAGS: u64 = CF | PF | ZF | SF | OF;
 
 const RFLAGS_OFF: usize = 128;
 
-/// Run `code` (a register-only block) on the interpreter from `init` register
-/// state, executing exactly `insns` block instructions. Returns the final 16
-/// GPRs and the arithmetic flags.
-fn run_interp(code: &[u8], init: &[u64; 16], insns: u32) -> ([u64; 16], u64) {
+/// Flat RAM size, shared by the interpreter core and the JIT host `load`/`store`
+/// buffer so identity (paging-off) addresses index the same bytes in both.
+const RAM_BYTES: usize = 64 * 1024;
+
+/// The 16-byte-per-mov setup program installs the initial register state; the
+/// block therefore begins at this guest address (its entry `rip`). Each setup
+/// `mov reg, imm64` is REX.W + 0xB8+r + imm64 = 10 bytes; 16 of them = 160.
+const BLOCK_BASE: u64 = 16 * 10;
+
+/// Run `code` on the interpreter from `init` register state and `init_ram` flat
+/// RAM (paging off → identity addressing), executing exactly `insns` block
+/// instructions. Returns the final 16 GPRs, the arithmetic flags, and the full
+/// final RAM (so a memory-touching block can be compared byte-for-byte).
+fn run_interp(
+    code: &[u8],
+    init: &[u64; 16],
+    init_ram: &[u8],
+    insns: u32,
+) -> ([u64; 16], u64, Vec<u8>) {
     // The interpreter exposes no public register setter, so we prepend a
     // `mov reg, imm64` (REX.W + 0xB8+r) for each of the 16 GPRs to install the
     // known initial state, then run those 16 setup instructions plus the block.
@@ -42,9 +57,13 @@ fn run_interp(code: &[u8], init: &[u64; 16], insns: u32) -> ([u64; 16], u64) {
         prog.push(0xB8 + (r as u8 & 7));
         prog.extend_from_slice(&v.to_le_bytes());
     }
+    assert_eq!(prog.len() as u64, BLOCK_BASE, "setup program size drift");
     prog.extend_from_slice(code);
 
-    let mut cpu = Cpu::new(64 * 1024);
+    let mut cpu = Cpu::new(RAM_BYTES);
+    // Seed the flat RAM (the block's data region) first, then overlay the code —
+    // `load_at` writes the program bytes and resets rip/rsp.
+    cpu.vv_ram_write(0, init_ram);
     cpu.load_at(0, &prog);
     // 16 setup movs + the block's instruction count.
     let halt = cpu.run(16 + u64::from(insns));
@@ -58,16 +77,25 @@ fn run_interp(code: &[u8], init: &[u64; 16], insns: u32) -> ([u64; 16], u64) {
     for (i, slot) in regs.iter_mut().enumerate() {
         *slot = cpu.reg(i);
     }
-    (regs, cpu.rflags() & ARITH_FLAGS)
+    let ram = cpu.vv_ram_read(0, RAM_BYTES);
+    (regs, cpu.rflags() & ARITH_FLAGS, ram)
 }
 
 /// Instantiate a translated block on wasmtime over a host memory seeded with the
 /// 16-u64 register file (rflags at offset 128 starts at the interpreter default
-/// `0x2`), run `run`, and read the register file back.
-fn run_jit(tb: &TranslatedBlock, init: &[u64; 16]) -> ([u64; 16], u64, u32) {
+/// `0x2`), with `env.load`/`env.store` backed by a flat RAM buffer that mirrors
+/// the interpreter's RAM (`init_ram_full`, identity-addressed). Runs `run`, then
+/// returns the final GPRs, flags, the executed-insn count, and the final RAM.
+fn run_jit(
+    tb: &TranslatedBlock,
+    init: &[u64; 16],
+    init_ram_full: &[u8],
+) -> ([u64; 16], u64, u32, Vec<u8>) {
     let engine = Engine::default();
     let module = Module::new(&engine, &tb.wasm).expect("translated module must validate");
-    let mut store = Store::new(&engine, ());
+
+    // The Store data holds the guest flat RAM the host load/store imports act on.
+    let mut store = Store::new(&engine, init_ram_full.to_vec());
     // One page (64 KiB) of host memory; the register file lives at offset 0.
     let mem = Memory::new(&mut store, MemoryType::new(1, None)).expect("memory");
 
@@ -79,7 +107,42 @@ fn run_jit(tb: &TranslatedBlock, init: &[u64; 16]) -> ([u64; 16], u64, u32) {
     }
     data[RFLAGS_OFF..RFLAGS_OFF + 8].copy_from_slice(&0x2u64.to_le_bytes());
 
-    let instance = Instance::new(&mut store, &module, &[mem.into()]).expect("instantiate");
+    // Host memory imports — mirror the interpreter's `rd`/`wr` over flat RAM:
+    // load(addr, size) zero-extends `size` little-endian bytes; store writes them.
+    // Out-of-range accesses read 0 / are dropped (matching the interpreter's
+    // bounds-checked `ram.get`/`ram.get_mut`).
+    let load = Func::wrap(
+        &mut store,
+        |caller: Caller<'_, Vec<u8>>, addr: i64, size: i32| -> i64 {
+            let ram = caller.data();
+            let a = addr as u64 as usize;
+            let mut v = 0u64;
+            for i in 0..size as usize {
+                v |= u64::from(ram.get(a + i).copied().unwrap_or(0)) << (8 * i);
+            }
+            v as i64
+        },
+    );
+    let store_fn = Func::wrap(
+        &mut store,
+        |mut caller: Caller<'_, Vec<u8>>, addr: i64, size: i32, val: i64| {
+            let a = addr as u64 as usize;
+            let v = val as u64;
+            let ram = caller.data_mut();
+            for i in 0..size as usize {
+                if let Some(b) = ram.get_mut(a + i) {
+                    *b = (v >> (8 * i)) as u8;
+                }
+            }
+        },
+    );
+
+    let instance = Instance::new(
+        &mut store,
+        &module,
+        &[mem.into(), load.into(), store_fn.into()],
+    )
+    .expect("instantiate");
     let run: TypedFunc<(), i32> = instance
         .get_typed_func(&mut store, "run")
         .expect("run export");
@@ -95,12 +158,44 @@ fn run_jit(tb: &TranslatedBlock, init: &[u64; 16]) -> ([u64; 16], u64, u32) {
     let mut fb = [0u8; 8];
     fb.copy_from_slice(&data[RFLAGS_OFF..RFLAGS_OFF + 8]);
     let flags = u64::from_le_bytes(fb) & ARITH_FLAGS;
-    (regs, flags, ran)
+    let ram = store.data().clone();
+    (regs, flags, ran, ram)
 }
 
-/// Assert the interpreter and JIT agree, bit-for-bit, on a block from `init`.
+/// Assert the interpreter and JIT agree, bit-for-bit, on a register-only block
+/// from `init` (no memory operands, flat RAM is all-zero).
 fn check(label: &str, code: &[u8], init: &[u64; 16]) {
-    let tb = match translate_block(code) {
+    check_mem(label, code, init, &[]);
+}
+
+/// Build the interpreter's starting RAM: `init_ram` overlaid (at offset 0) with
+/// the 16 setup `mov`s plus the block `code` (what `load_at` writes). The JIT's
+/// host RAM buffer must start identical so a memory-touching block compares
+/// byte-for-byte against the interpreter's final RAM.
+fn starting_ram(code: &[u8], init: &[u64; 16], init_ram: &[u8]) -> Vec<u8> {
+    let mut ram = vec![0u8; RAM_BYTES];
+    let n = init_ram.len().min(RAM_BYTES);
+    ram[..n].copy_from_slice(&init_ram[..n]);
+    let mut prog = Vec::new();
+    for (r, &v) in init.iter().enumerate() {
+        let rex = 0x48 | (if r >= 8 { 0x01 } else { 0x00 });
+        prog.push(rex);
+        prog.push(0xB8 + (r as u8 & 7));
+        prog.extend_from_slice(&v.to_le_bytes());
+    }
+    prog.extend_from_slice(code);
+    let m = prog.len().min(RAM_BYTES);
+    ram[..m].copy_from_slice(&prog[..m]);
+    ram
+}
+
+/// Assert the interpreter and JIT agree, bit-for-bit, on a (possibly
+/// memory-touching) block from `init` register state and `init_ram` flat RAM
+/// (identity-addressed, paging off): final 16 GPRs, the 5 arithmetic flags, AND
+/// the full final RAM must match. The block runs at guest `rip == BLOCK_BASE`
+/// (the JIT is told so, for RIP-relative parity).
+fn check_mem(label: &str, code: &[u8], init: &[u64; 16], init_ram: &[u8]) {
+    let tb = match translate_block_at(code, BLOCK_BASE) {
         Some(tb) => tb,
         None => panic!("[{label}] translate_block returned None for a supported block"),
     };
@@ -110,8 +205,9 @@ fn check(label: &str, code: &[u8], init: &[u64; 16]) {
         "[{label}] translator should consume the whole supported block"
     );
 
-    let (iregs, iflags) = run_interp(code, init, tb.insns);
-    let (jregs, jflags, ran) = run_jit(&tb, init);
+    let start_ram = starting_ram(code, init, init_ram);
+    let (iregs, iflags, iram) = run_interp(code, init, init_ram, tb.insns);
+    let (jregs, jflags, ran, jram) = run_jit(&tb, init, &start_ram);
 
     assert_eq!(
         ran, tb.insns,
@@ -134,6 +230,18 @@ fn check(label: &str, code: &[u8], init: &[u64; 16]) {
         iflags & SF != 0, jflags & SF != 0,
         iflags & OF != 0, jflags & OF != 0,
     );
+    // Compare RAM byte-for-byte; on mismatch report the first differing offset.
+    if iram != jram {
+        let off = iram
+            .iter()
+            .zip(jram.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or(0);
+        panic!(
+            "[{label}] RAM mismatch at {off:#x}: interp={:#x} jit={:#x}",
+            iram[off], jram[off]
+        );
+    }
 }
 
 // ── REX/ModRM assembly helpers ────────────────────────────────────────────────
@@ -189,6 +297,133 @@ fn instr_movc7(w: bool, rm: u8, imm32: i32) -> Vec<u8> {
 fn instr_incdec(w: bool, rm: u8, dec: bool) -> Vec<u8> {
     let digit = if dec { 1 } else { 0 };
     vec![rex(w, digit, rm), 0xFF, modrm_rr(digit, rm)]
+}
+
+// ── Memory-operand ModRM assembly ─────────────────────────────────────────────
+
+/// A memory effective-address spec for the test assembler.
+#[derive(Clone, Copy)]
+enum Mem {
+    /// `[base + disp]` (base != rsp/rbp low-3 special cases handled via SIB).
+    Base { base: u8, disp: i32 },
+    /// `[base + index*scale + disp]` via a SIB byte.
+    Sib {
+        base: u8,
+        index: u8,
+        scale: u8,
+        disp: i32,
+    },
+    /// `[index*scale + disp32]` — SIB no-base form (mod=0, base field = 5).
+    NoBase { index: u8, scale: u8, disp: i32 },
+    /// `[rip + disp32]` — RIP-relative.
+    Rip { disp: i32 },
+}
+
+/// Choose the ModRM `mod` field for a displacement: 0 if it can be omitted
+/// (only when the base's low 3 bits aren't 5/rbp), 1 for a disp8, else 2.
+fn disp_mod(disp: i32, base_low5: bool) -> u8 {
+    if disp == 0 && !base_low5 {
+        0
+    } else if (-128..=127).contains(&disp) {
+        1
+    } else {
+        2
+    }
+}
+
+fn push_disp(v: &mut Vec<u8>, md: u8, disp: i32) {
+    match md {
+        1 => v.push(disp as i8 as u8),
+        2 => v.extend_from_slice(&disp.to_le_bytes()),
+        _ => {}
+    }
+}
+
+/// Encode a memory operand: returns `(rex_xb, bytes)` where `rex_xb` carries the
+/// REX.X/REX.B extension bits for the index/base and `bytes` is the
+/// ModRM(+SIB+disp) sequence, with the ModRM `reg` field left as `reg & 7`.
+fn enc_mem(reg: u8, mem: Mem) -> (u8, Vec<u8>) {
+    let regbits = (reg & 7) << 3;
+    match mem {
+        Mem::Base { base, disp } => {
+            let blow = base & 7;
+            // rsp (low3==4) forces a SIB; handle via the Sib/NoBase encoders.
+            assert!(blow != 4, "use Mem::Sib for an rsp/r12 base");
+            let md = disp_mod(disp, blow == 5);
+            let mut v = vec![(md << 6) | regbits | blow];
+            push_disp(&mut v, md, disp);
+            let rex_b = (base >> 3) & 1;
+            (rex_b, v)
+        }
+        Mem::Sib {
+            base,
+            index,
+            scale,
+            disp,
+        } => {
+            let blow = base & 7;
+            // base low3==5 with mod==0 is the no-base form, so force a disp.
+            let md = disp_mod(disp, blow == 5);
+            let sib = (scale << 6) | ((index & 7) << 3) | blow;
+            let mut v = vec![(md << 6) | regbits | 4, sib];
+            push_disp(&mut v, md, disp);
+            let rex_xb = (((index >> 3) & 1) << 1) | ((base >> 3) & 1);
+            (rex_xb, v)
+        }
+        Mem::NoBase { index, scale, disp } => {
+            // mod=0, rm=4 (SIB), SIB.base=5 → disp32, no base.
+            let sib = (scale << 6) | ((index & 7) << 3) | 5;
+            let mut v = vec![regbits | 4, sib];
+            v.extend_from_slice(&disp.to_le_bytes());
+            let rex_x = ((index >> 3) & 1) << 1;
+            (rex_x, v)
+        }
+        Mem::Rip { disp } => {
+            // mod=0, rm=5 → RIP-relative disp32.
+            let mut v = vec![regbits | 5];
+            v.extend_from_slice(&disp.to_le_bytes());
+            (0, v)
+        }
+    }
+}
+
+/// REX byte for a memory-operand instruction with ModRM.reg = `reg`.
+fn rex_mem(w: bool, reg: u8, rex_xb: u8) -> u8 {
+    0x40 | (u8::from(w) << 3) | (((reg >> 3) & 1) << 2) | rex_xb
+}
+
+/// `op mem, reg` / `op reg, mem` two-operand instruction: `[rex, opcode, ModRM…]`.
+fn instr_rm(w: bool, opcode: u8, reg: u8, mem: Mem) -> Vec<u8> {
+    let (rex_xb, modrm) = enc_mem(reg, mem);
+    let mut v = vec![rex_mem(w, reg, rex_xb), opcode];
+    v.extend_from_slice(&modrm);
+    v
+}
+
+/// group1 `0x83 /digit mem, imm8`.
+fn instr_g1m_imm8(w: bool, digit: u8, mem: Mem, imm8: i8) -> Vec<u8> {
+    let mut v = instr_rm(w, 0x83, digit, mem);
+    v.push(imm8 as u8);
+    v
+}
+
+/// group1 `0x81 /digit mem, imm32`.
+fn instr_g1m_imm32(w: bool, digit: u8, mem: Mem, imm32: i32) -> Vec<u8> {
+    let mut v = instr_rm(w, 0x81, digit, mem);
+    v.extend_from_slice(&imm32.to_le_bytes());
+    v
+}
+
+/// `mov mem, imm32-sext` (0xC7 /0).
+fn instr_movc7_m(w: bool, mem: Mem, imm32: i32) -> Vec<u8> {
+    let mut v = instr_rm(w, 0xC7, 0, mem);
+    v.extend_from_slice(&imm32.to_le_bytes());
+    v
+}
+
+/// `inc`/`dec` mem (0xFF /0 or /1).
+fn instr_incdec_m(w: bool, mem: Mem, dec: bool) -> Vec<u8> {
+    instr_rm(w, 0xFF, if dec { 1 } else { 0 }, mem)
 }
 
 // ── Hand-written edge-case blocks ─────────────────────────────────────────────
@@ -347,6 +582,376 @@ fn handwritten_edges() {
     check("linear multi-insn block", &block, &base);
 }
 
+// ── Hand-written memory-operand blocks ────────────────────────────────────────
+
+/// The data region the memory-operand tests address (disjoint from the code at
+/// `[0, BLOCK_BASE + block)` and the stack at the top of RAM).
+const DATA: u64 = 0x1000;
+
+/// A flat RAM image with a varied, sign-bit-mixing 64-bit pattern across the data
+/// region so loads/stores at any size exercise real bytes.
+fn seeded_ram() -> Vec<u8> {
+    let mut ram = vec![0u8; RAM_BYTES];
+    let pat: [u64; 8] = [
+        0x0011_2233_4455_6677,
+        0x8899_aabb_ccdd_eeff,
+        0xffff_ffff_ffff_ffff,
+        0x8000_0000_0000_0000,
+        0x7fff_ffff_7fff_ffff,
+        0x0000_0001_0000_0001,
+        0xdead_beef_cafe_babe,
+        0x1234_5678_9abc_def0,
+    ];
+    for (i, w) in pat.iter().enumerate() {
+        let off = DATA as usize + i * 8;
+        ram[off..off + 8].copy_from_slice(&w.to_le_bytes());
+    }
+    ram
+}
+
+/// An `init` register state where several registers point into the data region
+/// (so register-based effective addresses land there).
+fn mem_init() -> [u64; 16] {
+    let mut init = [0u64; 16];
+    init[0] = 5; // rax — a value to store
+    init[1] = 0x0f0f_0f0f_0f0f_0f0f; // rcx — a value to AND/etc.
+    init[2] = 7;
+    init[3] = DATA; // rbx → data base
+    init[4] = 2; // rsp-slot reused only as an index value here
+    init[5] = DATA + 0x40; // rbp → data base + 0x40
+    init[6] = DATA + 0x10; // rsi → data base + 0x10
+    init[7] = DATA + 0x20; // rdi → data base + 0x20
+    init[8] = 0xabcd_ef01; // r8
+    init[9] = 4; // r9 — an index value
+    init[10] = DATA + 0x30; // r10 → data base + 0x30
+    init[11] = 0x99;
+    init[12] = DATA + 0x8; // r12 → data base + 8 (r12 base forces a SIB)
+    init[13] = 1;
+    init[14] = DATA + 0x18; // r14
+    init[15] = 0xfeed; // r15
+    init
+}
+
+#[test]
+fn handwritten_mem_edges() {
+    let ram = seeded_ram();
+    let init = mem_init();
+
+    // ── addressing-mode coverage via `mov reg, [mem]` (0x8B) ──
+    // [base] (mod=0), every non-special base register.
+    for &b in &[0u8, 1, 3, 5, 6, 7, 10, 12, 14] {
+        // r3/r5/r6/r7/r10/r12/r14 point into DATA; r0/r1 do not but reads are
+        // bounds-safe (out-of-range → 0 in both engines).
+        let mem = if (b & 7) == 4 || (b & 7) == 5 {
+            Mem::Sib {
+                base: b,
+                index: 4,
+                scale: 0,
+                disp: 0,
+            }
+        } else {
+            Mem::Base { base: b, disp: 0 }
+        };
+        check_mem(
+            &format!("mov r2,[r{b}] (mod0)"),
+            &instr_rm(true, 0x8B, 2, mem),
+            &init,
+            &ram,
+        );
+    }
+
+    // disp8 / disp32 forms.
+    check_mem(
+        "mov r0,[rbx+8] disp8",
+        &instr_rm(true, 0x8B, 0, Mem::Base { base: 3, disp: 8 }),
+        &init,
+        &ram,
+    );
+    check_mem(
+        "mov r0,[rbx+0x30] disp32",
+        &instr_rm(
+            true,
+            0x8B,
+            0,
+            Mem::Base {
+                base: 3,
+                disp: 0x30,
+            },
+        ),
+        &init,
+        &ram,
+    );
+    check_mem(
+        "mov r0,[rbx-8] negative disp8",
+        &instr_rm(
+            true,
+            0x8B,
+            0,
+            Mem::Base {
+                base: 5, // rbp → DATA+0x40
+                disp: -8,
+            },
+        ),
+        &init,
+        &ram,
+    );
+
+    // SIB base+index*scale, all scales.
+    for &scale in &[0u8, 1, 2, 3] {
+        check_mem(
+            &format!("mov r0,[rbx+r9*{}+8]", 1 << scale),
+            &instr_rm(
+                true,
+                0x8B,
+                0,
+                Mem::Sib {
+                    base: 3,
+                    index: 9, // r9 = 4
+                    scale,
+                    disp: 8,
+                },
+            ),
+            &init,
+            &ram,
+        );
+    }
+    // SIB with an extended base (r12 forces SIB) and extended index.
+    check_mem(
+        "mov r0,[r12+r9*2]",
+        &instr_rm(
+            true,
+            0x8B,
+            0,
+            Mem::Sib {
+                base: 12,
+                index: 9,
+                scale: 1,
+                disp: 0,
+            },
+        ),
+        &init,
+        &ram,
+    );
+    // SIB no-base: [index*scale + disp32].
+    check_mem(
+        "mov r0,[r9*4 + DATA]",
+        &instr_rm(
+            true,
+            0x8B,
+            0,
+            Mem::NoBase {
+                index: 9, // 4
+                scale: 2, // *4 = 16
+                disp: DATA as i32,
+            },
+        ),
+        &init,
+        &ram,
+    );
+    // SIB index==none (index field 4): [base + disp].
+    check_mem(
+        "mov r0,[rbx + (no index) + 0x18]",
+        &instr_rm(
+            true,
+            0x8B,
+            0,
+            Mem::Sib {
+                base: 3,
+                index: 4, // no index
+                scale: 0,
+                disp: 0x18,
+            },
+        ),
+        &init,
+        &ram,
+    );
+
+    // RIP-relative: pick disp so EA = DATA. The block is one instruction;
+    // instr_rm(0x8B reg,Rip) is REX+opcode+ModRM(1)+disp32(4) = 7 bytes, so the
+    // instruction end is BLOCK_BASE + 7.
+    {
+        let len = instr_rm(true, 0x8B, 0, Mem::Rip { disp: 0 }).len() as i64;
+        let disp = (DATA as i64) - (BLOCK_BASE as i64 + len);
+        check_mem(
+            "mov r0,[rip+disp]",
+            &instr_rm(true, 0x8B, 0, Mem::Rip { disp: disp as i32 }),
+            &init,
+            &ram,
+        );
+    }
+
+    // ── 32-bit operand loads (zero-extend the destination register) ──
+    check_mem(
+        "mov32 r0,[rbx] (zext)",
+        &instr_rm(false, 0x8B, 0, Mem::Base { base: 3, disp: 0 }),
+        &init,
+        &ram,
+    );
+
+    // ── memory DESTINATION: mov [mem], reg (0x89) ──
+    check_mem(
+        "mov [rbx],rax (0x89)",
+        &instr_rm(true, 0x89, 0, Mem::Base { base: 3, disp: 0 }),
+        &init,
+        &ram,
+    );
+    check_mem(
+        "mov32 [rbx+0x10],rcx (0x89, 4-byte store)",
+        &instr_rm(
+            false,
+            0x89,
+            1,
+            Mem::Base {
+                base: 3,
+                disp: 0x10,
+            },
+        ),
+        &init,
+        &ram,
+    );
+    // mov [mem], imm32 (0xC7 /0).
+    check_mem(
+        "mov qword [rbx+0x18], -1 (C7)",
+        &instr_movc7_m(
+            true,
+            Mem::Base {
+                base: 3,
+                disp: 0x18,
+            },
+            -1,
+        ),
+        &init,
+        &ram,
+    );
+    check_mem(
+        "mov dword [rbx+0x20], 0x7fffffff (C7)",
+        &instr_movc7_m(
+            false,
+            Mem::Base {
+                base: 3,
+                disp: 0x20,
+            },
+            0x7fff_ffff,
+        ),
+        &init,
+        &ram,
+    );
+
+    // ── ALU with a memory operand, both directions, every op + flag edge ──
+    for &(name, op_rm, op_r) in &[
+        ("add", 0x01u8, 0x03u8),
+        ("or", 0x09, 0x0B),
+        ("and", 0x21, 0x23),
+        ("sub", 0x29, 0x2B),
+        ("xor", 0x31, 0x33),
+        ("cmp", 0x39, 0x3B),
+    ] {
+        // op [mem], reg  (memory destination — load, compute, store; cmp no store)
+        for &w in &[true, false] {
+            check_mem(
+                &format!("{name} [rbx+8],rcx w={w}"),
+                &instr_rm(w, op_rm, 1, Mem::Base { base: 3, disp: 8 }),
+                &init,
+                &ram,
+            );
+            // op reg, [mem]  (memory source)
+            check_mem(
+                &format!("{name} rax,[rbx+0x10] w={w}"),
+                &instr_rm(
+                    w,
+                    op_r,
+                    0,
+                    Mem::Base {
+                        base: 3,
+                        disp: 0x10,
+                    },
+                ),
+                &init,
+                &ram,
+            );
+        }
+    }
+
+    // ── group1 imm to memory, both widths, every digit ──
+    for &digit in &[0u8, 1, 4, 5, 6, 7] {
+        check_mem(
+            &format!("g1 imm8 d{digit} [rbx+0x28]"),
+            &instr_g1m_imm8(
+                true,
+                digit,
+                Mem::Base {
+                    base: 3,
+                    disp: 0x28,
+                },
+                -1,
+            ),
+            &init,
+            &ram,
+        );
+        check_mem(
+            &format!("g1 imm32 d{digit} [rbx+0x28] (32-bit)"),
+            &instr_g1m_imm32(
+                false,
+                digit,
+                Mem::Base {
+                    base: 3,
+                    disp: 0x28,
+                },
+                0x1234_5678,
+            ),
+            &init,
+            &ram,
+        );
+    }
+
+    // ── inc / dec memory (CF preserved), both widths ──
+    check_mem(
+        "inc qword [rbx]",
+        &instr_incdec_m(true, Mem::Base { base: 3, disp: 0 }, false),
+        &init,
+        &ram,
+    );
+    check_mem(
+        "dec dword [rbx+8]",
+        &instr_incdec_m(false, Mem::Base { base: 3, disp: 8 }, true),
+        &init,
+        &ram,
+    );
+
+    // ── a multi-instruction block mixing register and memory operands ──
+    let mut block = Vec::new();
+    block.extend(instr_rm(true, 0x8B, 0, Mem::Base { base: 3, disp: 0 })); // mov rax,[rbx]
+    block.extend(instr_g1_imm8(true, 0, 0, 5)); // add rax, 5
+    block.extend(instr_rm(true, 0x89, 0, Mem::Base { base: 3, disp: 8 })); // mov [rbx+8],rax
+    block.extend(instr_rm(
+        true,
+        0x01,
+        1,
+        Mem::Base {
+            base: 3,
+            disp: 0x10,
+        },
+    )); // add [rbx+0x10],rcx
+    block.extend(instr_incdec_m(
+        true,
+        Mem::Base {
+            base: 3,
+            disp: 0x18,
+        },
+        false,
+    )); // inc qword [rbx+0x18]
+    block.extend(instr_rm(
+        true,
+        0x33,
+        2,
+        Mem::Base {
+            base: 3,
+            disp: 0x20,
+        },
+    )); // xor rdx,[rbx+0x20]
+    check_mem("mixed reg+mem block", &block, &init, &ram);
+}
+
 // ── Randomized fuzzing ────────────────────────────────────────────────────────
 
 /// A tiny xorshift PRNG (deterministic, no external crate).
@@ -417,6 +1022,125 @@ fn randomized_fuzz() {
     }
 }
 
+/// Emit one random supported instruction that may carry a MEMORY operand, into
+/// `out`. To keep the interpreter and JIT in lock-step over a flat RAM, every
+/// effective address is constrained to the data region `[DATA, DATA+0x300)`:
+///   * memory bases are the reserved pointer registers r13/r14/r15 (which point
+///     into the data region and are never written by a fuzz instruction);
+///   * indices are the reserved small-value registers r11/r12 (or none);
+///   * displacements are bounded to `[0, 0x80)`.
+///
+/// All register operands (reg field and register r/m) are drawn from r0..=r10,
+/// so the reserved registers stay constant for the whole block.
+fn random_mem_insn(rng: &mut Rng, out: &mut Vec<u8>) {
+    let alu_ops_rm = [0x01u8, 0x09, 0x21, 0x29, 0x31, 0x39];
+    let alu_ops_r = [0x03u8, 0x0B, 0x23, 0x2B, 0x33, 0x3B];
+    let w = rng.next() & 1 == 0;
+    let reg = (rng.next() % 11) as u8; // r0..=r10 only
+
+    // A random data-region memory operand.
+    let mk_mem = |rng: &mut Rng| -> Mem {
+        let base = *rng.pick(&[13u8, 14, 15]);
+        let disp = (rng.next() % 0x80) as i32;
+        match rng.next() % 4 {
+            0 => Mem::Base { base, disp },
+            1 => Mem::Sib {
+                base,
+                index: 4, // no index
+                scale: (rng.next() % 4) as u8,
+                disp,
+            },
+            2 => Mem::Sib {
+                base,
+                index: *rng.pick(&[11u8, 12]),
+                scale: (rng.next() % 4) as u8,
+                disp,
+            },
+            _ => Mem::NoBase {
+                index: *rng.pick(&[11u8, 12]),
+                scale: (rng.next() % 4) as u8,
+                disp: DATA as i32 + disp,
+            },
+        }
+    };
+    let mem = mk_mem(rng);
+
+    match rng.next() % 8 {
+        0 => out.extend(instr_rm(w, *rng.pick(&alu_ops_rm), reg, mem)), // op [mem], reg
+        1 => out.extend(instr_rm(w, *rng.pick(&alu_ops_r), reg, mem)),  // op reg, [mem]
+        2 => {
+            let digit = *rng.pick(&[0u8, 1, 4, 5, 6, 7]);
+            out.extend(instr_g1m_imm8(w, digit, mem, rng.next() as i8));
+        }
+        3 => {
+            let digit = *rng.pick(&[0u8, 1, 4, 5, 6, 7]);
+            out.extend(instr_g1m_imm32(w, digit, mem, rng.next() as i32));
+        }
+        4 => out.extend(instr_rm(w, 0x89, reg, mem)), // mov [mem], reg
+        5 => out.extend(instr_rm(w, 0x8B, reg, mem)), // mov reg, [mem]
+        6 => out.extend(instr_movc7_m(w, mem, rng.next() as i32)),
+        _ => out.extend(instr_incdec_m(w, mem, rng.next() & 1 == 0)),
+    }
+}
+
+#[test]
+fn randomized_fuzz_mem() {
+    let mut rng = Rng(0xfeed_face_dead_c0de);
+    for case in 0..2000 {
+        // Seed the data region with a random pattern; reserved pointer/index
+        // registers are fixed, the rest (r0..=r10) are random edge values.
+        let mut ram = vec![0u8; RAM_BYTES];
+        for off in (DATA as usize..DATA as usize + 0x300).step_by(8) {
+            ram[off..off + 8].copy_from_slice(&rng.next().to_le_bytes());
+        }
+        let mut init = [0u64; 16];
+        for slot in init.iter_mut().take(11) {
+            *slot = match rng.next() % 5 {
+                0 => 0,
+                1 => u64::MAX,
+                2 => 1u64 << 63,
+                3 => 0x7fff_ffff_ffff_ffff,
+                _ => rng.next(),
+            };
+        }
+        init[11] = 1; // index regs: small values so index*scale stays bounded
+        init[12] = 2;
+        init[13] = DATA; // pointer bases into the data region
+        init[14] = DATA + 0x100;
+        init[15] = DATA + 0x200;
+
+        // A block of 1..=6 random memory-or-register instructions.
+        let n = 1 + (rng.next() % 6);
+        let mut code = Vec::new();
+        for _ in 0..n {
+            if rng.next() & 1 == 0 {
+                random_mem_insn(&mut rng, &mut code);
+            } else {
+                // a register-only instruction touching only r0..=r10
+                let a = (rng.next() % 11) as u8;
+                let b = (rng.next() % 11) as u8;
+                match rng.next() % 4 {
+                    0 => code.extend(instr_rr(
+                        rng.next() & 1 == 0,
+                        *rng.pick(&[0x01u8, 0x21, 0x29, 0x31, 0x39]),
+                        a,
+                        b,
+                    )),
+                    1 => code.extend(instr_rr(rng.next() & 1 == 0, 0x89, a, b)),
+                    2 => code.extend(instr_incdec(rng.next() & 1 == 0, a, rng.next() & 1 == 0)),
+                    _ => code.extend(instr_g1_imm8(
+                        rng.next() & 1 == 0,
+                        *rng.pick(&[0u8, 1, 4, 5, 6, 7]),
+                        a,
+                        rng.next() as i8,
+                    )),
+                }
+            }
+        }
+        check_mem(&format!("mem fuzz case {case}"), &code, &init, &ram);
+    }
+}
+
 // ── Speed comparison ──────────────────────────────────────────────────────────
 
 #[test]
@@ -470,7 +1194,9 @@ fn speed_comparison() {
     // ── JIT: instantiate once, call run() ITERS times. ──
     let engine = Engine::default();
     let module = Module::new(&engine, &tb.wasm).expect("module");
-    let mut store = Store::new(&engine, ());
+    // The module now always imports env.load/env.store; this hot block is
+    // register-only so they are never called, but must be supplied.
+    let mut store: Store<Vec<u8>> = Store::new(&engine, Vec::new());
     let mem = Memory::new(&mut store, MemoryType::new(1, None)).expect("mem");
     {
         let data = mem.data_mut(&mut store);
@@ -479,7 +1205,20 @@ fn speed_comparison() {
         }
         data[RFLAGS_OFF..RFLAGS_OFF + 8].copy_from_slice(&0x2u64.to_le_bytes());
     }
-    let instance = Instance::new(&mut store, &module, &[mem.into()]).expect("inst");
+    let load = Func::wrap(
+        &mut store,
+        |_c: Caller<'_, Vec<u8>>, _a: i64, _s: i32| -> i64 { 0 },
+    );
+    let store_fn = Func::wrap(
+        &mut store,
+        |_c: Caller<'_, Vec<u8>>, _a: i64, _s: i32, _v: i64| {},
+    );
+    let instance = Instance::new(
+        &mut store,
+        &module,
+        &[mem.into(), load.into(), store_fn.into()],
+    )
+    .expect("inst");
     let run: TypedFunc<(), i32> = instance.get_typed_func(&mut store, "run").expect("run");
 
     let jit_start = std::time::Instant::now();
