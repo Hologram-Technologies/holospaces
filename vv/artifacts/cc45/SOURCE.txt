@@ -1,0 +1,53 @@
+CC-45 — amd64 (x86-64) devcontainer authority artifacts (a stock linux-amd64 binary runs).
+
+The witness (crates/holospaces/tests/cc44_x64_boot.rs ::
+an_amd64_devcontainer_runs_a_stock_linux_amd64_binary) assembles the rootfs below
+into an ext4 image with the in-crate Layer Assembler (CC-7 / κ-disk content) and
+boots the amd64 Linux kernel below on the holospaces x86-64 core — which mounts
+that rootfs over its virtio-blk device (the shared substrate-backed device bus,
+emulator::devbus) and runs the **stock, unmodified linux-amd64 busybox** as PID 1.
+The differential oracle is qemu-system-x86_64 on the same kernel + rootfs.
+
+Pins
+  Commit (linux v6.6): torvalds/linux tag v6.6
+  busybox: 1.36.1 (https://busybox.net/downloads/busybox-1.36.1.tar.bz2)
+  Toolchain: native x86_64 gcc (the build host is amd64 — no cross compile).
+
+linux/vmlinux.gz, linux/bzImage
+  A real, unmodified Linux 6.6.0 amd64 kernel (torvalds/linux v6.6), built for
+  this witness like the CC-44 kernel but with **no embedded initramfs**
+  (INITRAMFS_SOURCE="", BLK_DEV_INITRD disabled) so it mounts a real virtio-blk
+  root, plus VIRTIO_MMIO + VIRTIO_MMIO_CMDLINE_DEVICES + VIRTIO_BLK + EXT4 +
+  virtio-net/9p + IP autoconf + 8250 serial console. 4-level paging
+  (X86_5LEVEL disabled — the core implements 4-level, so kernel and MMU agree).
+  The κ-disk is discovered via the cmdline `virtio_mmio.device=0x200@0xd0000000:11`
+  (x86 has no device tree). Reproducible build env (KBUILD_BUILD_TIMESTAMP="Fri 31
+  May 2026 00:00:00 UTC", USER=holospaces, HOST=cc45, .version=0); the resolved
+  kernel/.config is committed. vmlinux.gz is the gzip'd uncompressed ELF the
+  emulator boots; bzImage is the self-decompressing image qemu boots.
+
+rootfs/busybox, rootfs/layer.tar.gz
+  A **static linux-amd64 busybox 1.36.1** — the canonical glibc stock binary
+  (the same busybox the CC-22/CC-37 devcontainers use, here built for amd64 with
+  `make ARCH=x86_64 defconfig` + CONFIG_STATIC=y, stripped). layer.tar.gz is a
+  reproducible tar+gzip of /bin/busybox, the OCI image layer the Layer Assembler
+  overlays into the rootfs. This is the real binary the witness runs: it executes
+  its baseline SSE2 memcpy/memset/strlen (mandatory on x86-64), forks children
+  that fault copy-on-write pages, and dispatches applets over fork+exec — all on
+  the emulator, with no freestanding shim and no per-ISA workaround.
+
+init.sh
+  The amd64 devcontainer's PID 1: the busybox shell brings up the
+  pseudo-filesystems, installs the applet symlinks, then runs **unmodified
+  linux-amd64 applets** over fork+exec and command substitution — `uname -m`
+  (→ x86_64), a shell computation (sum 1..1000 == 500500), and `head` reading the
+  real /proc/version — before powering off (busybox `poweroff` → reboot syscall →
+  native_machine_halt → `hlt` → the emulator halts). The witness asserts these
+  markers, and qemu-system-x86_64 produces them on the same rootfs.
+
+cc45.sha256
+  Checksums of the committed artifacts.
+
+Reproduce: ./build.sh  (clones v6.6, builds the kernel + busybox, packs the
+layer). The qemu-system-x86_64 differential is run by
+vv/suites/cc45-x64-devcontainer.sh when qemu is present.

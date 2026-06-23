@@ -17,23 +17,55 @@
 //! [`holospaces::emulator::x64`]: holospaces::emulator::x64
 
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use hologram_store_mem::MemKappaStore;
 use hologram_substrate_core::KappaStore;
 use holospaces::emulator::x64::{Cpu, Halt};
 
+/// Gunzip a committed `.gz` artifact.
+fn gunzip(path: &Path) -> Vec<u8> {
+    let mut out = Vec::new();
+    flate2::read::GzDecoder::new(&std::fs::read(path).expect("read gz")[..])
+        .read_to_end(&mut out)
+        .expect("gunzip");
+    out
+}
+
 /// The committed, *uncompressed* ELF kernel (`vmlinux`), gunzipped. The x86-64
 /// core loads its `PT_LOAD` segments and enters `startup_64` directly — the
 /// 64-bit boot protocol, no in-guest decompressor.
 fn vmlinux_elf() -> Vec<u8> {
-    let gz = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vv/artifacts/cc44/linux/vmlinux.gz");
-    let mut img = Vec::new();
-    flate2::read::GzDecoder::new(&std::fs::read(&gz).expect("read cc44 vmlinux.gz")[..])
-        .read_to_end(&mut img)
-        .expect("gunzip the kernel ELF");
-    img
+    gunzip(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vv/artifacts/cc44/linux/vmlinux.gz"))
 }
+
+fn cc45_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vv/artifacts/cc45")
+}
+
+/// Assemble the **amd64 devcontainer** rootfs: the stock `linux-amd64` busybox
+/// layer (`cc45/rootfs/layer.tar.gz`, the canonical glibc binary) overlaid into
+/// an `ext4` image by the in-crate Layer Assembler (`CC-7`), with the
+/// busybox-shell `/init` injected — a bootable, writable disk taken into the
+/// κ-disk on attach. No freestanding shim: the stock glibc binary itself runs.
+fn assemble_cc45_rootfs() -> Vec<u8> {
+    use holospaces::assembly::{assemble_ext4_bootable, Layer};
+    let init = std::fs::read(cc45_dir().join("init.sh")).expect("cc45 busybox init.sh");
+    let layer = std::fs::read(cc45_dir().join("rootfs/layer.tar.gz")).expect("cc45 busybox layer");
+    let layers = [Layer {
+        media_type: "application/vnd.oci.image.layer.v1.tar+gzip",
+        blob: &layer,
+    }];
+    assemble_ext4_bootable(&layers, &init, 64 * 1024 * 1024)
+        .expect("assemble the amd64 busybox rootfs")
+}
+
+/// The kernel command line for the amd64 devcontainer boot. The κ-disk
+/// `virtio-blk` device sits at MMIO `0xd000_0000` (size `0x200`, IRQ 11); x86 has
+/// no device tree, so the kernel discovers it via `virtio_mmio.device=` (the
+/// `VIRTIO_MMIO_CMDLINE_DEVICES` config) and mounts it as the `/dev/vda` root.
+const CC45_CMDLINE: &str = "console=ttyS0 root=/dev/vda rw init=/init \
+     virtio_mmio.device=0x200@0xd0000000:11 random.trust_cpu=on";
 
 #[test]
 #[ignore = "boots a real amd64 Linux to userspace (~release) — run by the CC-44 vv suite"]
@@ -224,4 +256,84 @@ fn an_amd64_linux_boots_from_an_occupancy_indexed_build_capable_disk() {
         console.contains("HOLOSPACES-LINUX-USERSPACE-OK"),
         "PID 1 printed its marker — the real amd64 kernel booted from the 8 GiB occupancy κ-disk"
     );
+}
+
+/// The flagship **`CC-45`** witness: an amd64 devcontainer boots from its κ-disk
+/// `virtio-blk` rootfs on the x86-64 core and runs the **stock, unmodified
+/// `linux-amd64` busybox** as PID 1 — `uname -m` reports `x86_64`, a busybox shell
+/// computation runs (sum 1..=1000 == 500500), and `head` reads the real
+/// `/proc/version` over the mounted rootfs. No freestanding shim, no per-ISA
+/// workaround (Law L4): the stock glibc binary itself executes its SSE string
+/// routines, forks children, and faults copy-on-write pages on the emulator. The
+/// differential oracle is `qemu-system-x86_64` on the same kernel + rootfs
+/// (`vv/suites/cc45-x64-devcontainer.sh`).
+#[test]
+#[ignore = "boots a real amd64 devcontainer (~release) — run by the CC-45 vv suite"]
+fn an_amd64_devcontainer_runs_a_stock_linux_amd64_binary() {
+    let kernel = gunzip(&cc45_dir().join("linux/vmlinux.gz"));
+    let rootfs = assemble_cc45_rootfs();
+    let mut cpu = Cpu::boot_linux_disk(512 * 1024 * 1024, &kernel, rootfs, CC45_CMDLINE);
+    let halt = cpu.run(40_000_000_000);
+    let console = String::from_utf8_lossy(cpu.console());
+    eprintln!(
+        "---- guest console (amd64 devcontainer) ----\n{console}\n---- end ----  (halt: {halt:?})"
+    );
+
+    assert!(
+        console.contains("CC45-DEVCONTAINER-UP"),
+        "the amd64 devcontainer booted from its κ-disk virtio-blk rootfs"
+    );
+    // The stock linux-amd64 binary executed its own logic (a real computation).
+    assert!(
+        console.contains("CC45-COMPUTE:500500"),
+        "the stock linux-amd64 binary ran its computation (sum 1..=1000 == 500500)"
+    );
+    // … and reports the guest architecture via the uname syscall.
+    assert!(
+        console.contains("CC45-ARCH:x86_64"),
+        "the stock binary's uname syscall reports x86_64"
+    );
+    assert!(
+        console.contains("Linux version 6.6.0"),
+        "the stock binary read the real /proc/version over the mounted rootfs"
+    );
+    assert_eq!(
+        halt,
+        Halt::Halted,
+        "the devcontainer powered off cleanly (poweroff → reboot syscall → hlt)"
+    );
+}
+
+/// The same amd64 devcontainer, but its κ-disk is **paged from a `KappaStore` by
+/// streaming sectors** — the exact path the browser peer's `X64Workspace` takes
+/// (the rootfs is read sector-by-sector from OPFS into an OPFS-backed store; here a
+/// `MemKappaStore` stands in). The full image is never held as one `Vec`. Proves
+/// the streamed paged κ-disk boots the x86-64 core identically to the flat-image
+/// boot — the substrate-native, OOM-free path for a real amd64 image.
+#[test]
+#[ignore = "boots a real amd64 devcontainer paged from a κ-store (~release) — CC-45 vv suite"]
+fn an_amd64_devcontainer_boots_paged_from_a_kappa_store() {
+    let kernel = gunzip(&cc45_dir().join("linux/vmlinux.gz"));
+    let rootfs = assemble_cc45_rootfs();
+    let sector_count = (rootfs.len() as u64).div_ceil(512);
+    let read = move |i: u64, buf: &mut [u8]| {
+        let off = (i * 512) as usize;
+        let n = buf.len().min(rootfs.len().saturating_sub(off));
+        buf[..n].copy_from_slice(&rootfs[off..off + n]); // sparse tail stays zero
+    };
+    let mut cpu = Cpu::boot_linux_disk_streamed(
+        512 * 1024 * 1024,
+        &kernel,
+        CC45_CMDLINE,
+        Box::new(MemKappaStore::new()),
+        sector_count,
+        read,
+    );
+    let halt = cpu.run(40_000_000_000);
+    let console = String::from_utf8_lossy(cpu.console());
+    assert!(
+        console.contains("CC45-DEVCONTAINER-UP") && console.contains("CC45-ARCH:x86_64"),
+        "the amd64 devcontainer booted from its streamed paged κ-disk; console:\n{console}"
+    );
+    assert_eq!(halt, Halt::Halted, "powered off cleanly");
 }
