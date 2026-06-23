@@ -3161,6 +3161,33 @@ impl Cpu {
         )
     }
 
+    /// Boot like [`Cpu::boot_linux_disk_streamed`], but page the κ-disk by its
+    /// **occupancy** — the *build-capable* boot path (`CC-45`). The guest sees a
+    /// `sector_count`-sector disk (declare it multi-GiB, room to compile in-guest),
+    /// yet only the sectors `occupied` yields as `(index, bytes)` — the non-zero
+    /// blocks the sparse assembler actually wrote — are indexed and paged. Boot
+    /// setup is therefore **O(content), not O(disk)**: an 8 GiB disk holding a few
+    /// hundred MiB boots as fast as its content, because the holes are skipped
+    /// entirely (Laws L3/L4). Parametric in the image — any devcontainer / OCI
+    /// rootfs of any declared size, the same `KappaBacking` every core uses.
+    #[must_use]
+    pub fn boot_linux_disk_occupancy<I: IntoIterator<Item = (u64, [u8; super::DISK_SECTOR])>>(
+        ram_bytes: usize,
+        kernel: &[u8],
+        cmdline: &str,
+        store: alloc::boxed::Box<dyn hologram_substrate_core::KappaStore>,
+        sector_count: u64,
+        occupied: I,
+    ) -> Self {
+        let backing = super::KappaBacking::from_occupancy(store, sector_count, occupied);
+        Self::boot_linux_inner(
+            ram_bytes,
+            kernel,
+            cmdline,
+            Some(super::VirtioBlk::with_backing(backing)),
+        )
+    }
+
     fn boot_linux_inner(
         ram_bytes: usize,
         kernel: &[u8],

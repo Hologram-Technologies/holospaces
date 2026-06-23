@@ -25,17 +25,31 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WITNESS="$ROOT/crates/holospaces/tests/cc44_x64_boot.rs"
 ROOTFS="$ROOT/vv/artifacts/cc45/rootfs"
 
+command -v cargo >/dev/null 2>&1 || { echo "cc45-x64-devcontainer: SKIP — cargo absent"; exit 127; }
+
+# Section B — the build-capable disk (occupancy-index boot, O(content) not
+# O(disk)) — is the first increment and is LIVE: these witnesses pass for real.
+# An ≥ 8 GiB disk is declarable and boots promptly because only occupied sectors
+# are paged. Run them as the standing proof of the build-capable path.
+cargo test --manifest-path "$ROOT/Cargo.toml" -p holospaces --lib \
+    emulator::tests::occupancy_index_pages_only_content_for_a_multi_gib_disk \
+    -- --nocapture || exit 1
+cargo test --release --manifest-path "$ROOT/Cargo.toml" -p holospaces \
+    --test cc44_x64_boot an_amd64_linux_boots_from_an_occupancy_indexed_build_capable_disk \
+    -- --ignored --nocapture || exit 1
+
+# The full bar (differential busybox + arbitrary multi-layer image + build-in-guest)
+# also requires the stock linux-amd64 rootfs fixture and the differential witness.
 if [ -f "$WITNESS" ] && grep -q 'an_amd64_devcontainer_runs_a_stock_linux_amd64_binary' "$WITNESS" 2>/dev/null \
    && [ -d "$ROOTFS" ]; then
-    command -v cargo >/dev/null 2>&1 || { echo "cc45-x64-devcontainer: SKIP — cargo absent"; exit 127; }
     cargo test --release --manifest-path "$ROOT/Cargo.toml" -p holospaces \
         --test cc44_x64_boot an_amd64_devcontainer_runs_a_stock_linux_amd64_binary \
         -- --ignored --nocapture || exit 1
     exit 0
 fi
 
-echo "cc45-x64-devcontainer: RED — TARGET not yet live."
-echo "  needed: CC-44 boot path; a stock linux-amd64 busybox fixture (vv/artifacts/cc45/rootfs)."
-echo "  spec:   an amd64 devcontainer boots on the x86-64 core and runs an unmodified"
-echo "          linux-amd64 binary (qemu-system-x86_64 differential)."
+echo "cc45-x64-devcontainer: RED — build-capable disk (occupancy index) is LIVE; full bar pending."
+echo "  done:   occupancy-index boot path — an ≥ 8 GiB disk boots O(content) (witnesses above, green)."
+echo "  needed: a stock linux-amd64 busybox fixture (vv/artifacts/cc45/rootfs) + the differential"
+echo "          witness; arbitrary multi-layer images; build-in-guest. See issue #13 / CC-45."
 exit 1
