@@ -38,9 +38,10 @@
 #   the substrate-native (wasm-exec) extension host — no emulated-guest server, no
 #   vscode-web web host, no Node on the host, no deployment outside the holospace.
 #
-# Status: TARGET — not yet live. Expected RED (non-gating). The substrate-native
-#   Node-API ext-host runtime is the open build (S1); until it exists the witness
-#   reports honest RED.
+# Status: LIVE (promoted to vv/suites/ — gated). A Node-only Open VSX extension
+#   (editorconfig.editorconfig, committed + sha256-pinned in vv/artifacts/cc48)
+#   genuinely activates in the substrate-native (wasm-exec) ext host, witnessed in
+#   headless Chromium.
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -57,6 +58,10 @@ if [ -f "$WITNESS" ] \
    && ! grep -qE 'additionalBuiltinExtensions.*EXT|extensions: \[EXT\]' "$WITNESS" 2>/dev/null; then
     command -v node >/dev/null 2>&1 || { echo "cc48-ext-host: SKIP — node absent"; exit 127; }
     command -v wasm-pack >/dev/null 2>&1 || { echo "cc48-ext-host: SKIP — wasm-pack absent"; exit 127; }
+    # Artifact-drift gate: the committed Open VSX .vsix the witness installs must
+    # re-derive to its pinned sha256 (Law L5) — a tampered/updated fixture is refused.
+    ( cd "$ROOT/vv/artifacts/cc48" && sha256sum -c cc48.sha256 ) >/dev/null 2>&1 \
+        || { echo "cc48-ext-host: artifact drift from cc48.sha256" >&2; exit 1; }
     # Fast core gate: the substrate-native ext-host runtime (the CommonJS module
     # loader + Node API surface + vscode passthrough + activate harness) must load a
     # Node-only extension and run activate() — verified in Node, no browser needed.
