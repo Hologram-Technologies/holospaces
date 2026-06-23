@@ -54,20 +54,6 @@ pub mod aarch64;
 /// `virtio`/κ-disk device substrate. Conformance: `CC-43`.
 pub mod x64;
 
-/// The **x86-64 → WebAssembly dynamic binary translator** ([`x64_jit`]) — the
-/// core of the CC-48 substrate fast-execution path. It translates a linear run
-/// of register-direct integer instructions into one Wasm function the host runs
-/// natively, validated bit-for-bit against the [`x64`] interpreter.
-pub mod x64_jit;
-
-/// The **CC-48 JIT execution driver** ([`x64_jit_exec`]) — a `std`-only path that
-/// runs the [`x64_jit`] translator's blocks on a real Wasm engine (`wasmtime`)
-/// inside the [`x64`] interpreter's run loop, falling back to the interpreter for
-/// anything the translator does not cover. The fast-execution surface CC-48
-/// boots a real amd64 Linux to userspace through.
-#[cfg(feature = "std")]
-pub mod x64_jit_exec;
-
 /// The shared virtio-mmio device bus: the substrate-backed `virtio` devices and
 /// their split-virtqueue servicing, used by **both** the RISC-V and AArch64
 /// machines (one κ-disk/9p/NAT implementation, two thin MMIO transports).
