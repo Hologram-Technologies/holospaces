@@ -69,6 +69,12 @@ self.onmessage = async (e) => {
     const handle = await fh.createSyncAccessHandle();
     let imageLen;
     try {
+      // Safety net for re-provisioning: assembleIntoOpfs writes only the non-zero
+      // blocks and truncates to the final length, so if removeEntry failed above and
+      // the file already exists, stale non-zero blocks from the old image (in regions
+      // the new image leaves sparse) would survive and corrupt the rootfs. Zero the
+      // file first so only this image's content is present.
+      handle.truncate(0);
       imageLen = prov.assembleIntoOpfs(handle, diskBytes);
     } finally {
       try { handle.close(); } catch {}
