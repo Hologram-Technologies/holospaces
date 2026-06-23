@@ -19,6 +19,8 @@
 use std::io::Read;
 use std::path::Path;
 
+use hologram_store_mem::MemKappaStore;
+use hologram_substrate_core::KappaStore;
 use holospaces::emulator::x64::{Cpu, Halt};
 
 /// The committed, *uncompressed* ELF kernel (`vmlinux`), gunzipped. The x86-64
@@ -90,5 +92,65 @@ fn an_amd64_linux_kernel_boots_to_userspace() {
     assert!(
         console.contains("HOLOSPACES-LINUX-USERSPACE-OK"),
         "PID 1 printed its marker"
+    );
+}
+
+/// The deployed Platform-Manager path: an x64 holospace selected from the
+/// architecture picker boots its provisioned amd64 image on the x86-64 core with
+/// the κ-disk **streamed** sector-by-sector from a [`KappaStore`] (no full image in
+/// RAM) — the exact mechanism `X64Workspace::boot_devcontainer_opfs_streamed` drives
+/// in the browser tab (the OPFS-backed store + a sector reader), the x86-64 analogue
+/// of `Aarch64Workspace`. This witnesses [`Cpu::boot_linux_disk_streamed`]: the
+/// real amd64 kernel boots to userspace with a paged `virtio-blk` κ-disk attached
+/// and serviced (probed) during boot, content-addressed through the store — proving
+/// the streamed boot the deployed x64 selection relies on. (A real, unmodified
+/// `linux-amd64` *rootfs* over this κ-disk root is `CC-45`, the x86-64 analogue of
+/// `CC-37`'s arm64 busybox fixture.)
+#[test]
+#[ignore = "boots a real amd64 Linux from a streamed κ-disk (~release) — the deployed X64Workspace path"]
+fn an_amd64_linux_boots_from_a_streamed_kappa_disk() {
+    let kernel = vmlinux_elf();
+
+    // A real paged κ-disk: an 8 MiB image streamed into a KappaStore one sector at
+    // a time through the same `read(i, buf)` reader the browser peer uses (there it
+    // reads each sector from the OPFS rootfs file). A deterministic non-zero pattern
+    // so the sectors genuinely content-address through the store (sparse-zero
+    // sectors short-circuit). The whole image is never materialized in the core's
+    // RAM — "the KappaStore IS the memory, RAM is a cache" (Law L3).
+    const DISK_BYTES: usize = 8 * 1024 * 1024;
+    let sector_count = (DISK_BYTES / 512) as u64;
+    let store: Box<dyn KappaStore> = Box::new(MemKappaStore::new());
+    let read = |i: u64, buf: &mut [u8]| {
+        for (j, b) in buf.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_add(j as u8).wrapping_mul(31).wrapping_add(7);
+        }
+    };
+    let mut cpu = Cpu::boot_linux_disk_streamed(
+        1024 * 1024 * 1024,
+        &kernel,
+        // Same boot posture as the kernel-only boot; the embedded initramfs PID 1
+        // reaches userspace, and the attached `virtio-blk` κ-disk is probed (its
+        // capacity + sector 0 read through the streamed backing) during boot.
+        "earlyprintk=serial,ttyS0 console=ttyS0 random.trust_cpu=on",
+        store,
+        sector_count,
+        read,
+    );
+    let halt = cpu.run(40_000_000_000);
+    let console = String::from_utf8_lossy(cpu.console());
+    eprintln!("---- guest console (streamed κ-disk) ----\n{console}\n---- end ----  (halt: {halt:?})");
+
+    assert!(
+        console.contains("Run /init as init process"),
+        "the kernel handed control to PID 1 with the streamed κ-disk attached"
+    );
+    assert_eq!(
+        halt,
+        Halt::Halted,
+        "PID 1 powered the machine off — a clean boot through the streamed κ-disk path"
+    );
+    assert!(
+        console.contains("HOLOSPACES-LINUX-USERSPACE-OK"),
+        "PID 1 printed its marker — the real amd64 kernel booted from the streamed κ-disk"
     );
 }

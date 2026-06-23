@@ -84,6 +84,9 @@ node terminal-test.mjs
 echo "==> running the streaming-assembly boot test in Chromium (CC-50: the rootfs streamed sparse straight into an OPFS file BOOTS to userspace via the shipped paged-κ-disk path — the deployed assembleIntoOpfs path, not a byte-identity substitute)"
 node cc50-streaming-boot-test.mjs
 
+echo "==> running the DEPLOYED provision->boot test in Chromium (a registry image pulled via DevcontainerProvision, assembled SPARSE into OPFS via the deployed assembleIntoOpfs, and BOOTED to userspace — the exact deployed provisioning path no other witness exercised; the regression guard for 'the deploy can't boot a real image')"
+node provision-boot-test.mjs
+
 echo "==> running the LSP-over-bridge test in Chromium (CC-18 deployed / ADR-020: real language intelligence from a server in the devcontainer OS, over the in-process substrate bridge — no Node)"
 node lsp-test.mjs
 

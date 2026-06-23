@@ -274,6 +274,7 @@ try {
       defaultImage: window.hs.default_devcontainer_image(),
       hasTable: !!document.querySelector("#rows") || !!document.querySelector("#holospaces"),
       hasArchPicker: !!document.querySelector("#harch") && document.querySelector("#harch").options.length >= 2,
+      archOptions: document.querySelector("#harch") ? Array.from(document.querySelector("#harch").options).map((o) => o.value) : [],
       hasSettings: !!document.querySelector("#drawer"),
       hasEgressField: !!document.querySelector("#d-egress"),
       hasExtIndicator: (() => {
@@ -304,7 +305,11 @@ try {
   check(dash.contentNetNoForge, "a κ no peer holds resolves to nothing on the content network (no forging)");
   check(dash.defaultImage.includes("buildpack-deps"), `the usable default image is exposed to the page (${dash.defaultImage})`);
   check(dash.hasTable, "the management console renders the holospaces dashboard");
-  check(dash.hasArchPicker, "the launch form offers the architecture picker (riscv64/aarch64)");
+  check(dash.hasArchPicker, "the launch form offers the architecture picker");
+  check(
+    ["riscv64", "aarch64", "x64"].every((a) => dash.archOptions.includes(a)),
+    `the architecture picker offers riscv64, aarch64, and x64 (amd64 — the ubiquitous registry/Codespaces arch) [${dash.archOptions.join(", ")}]`,
+  );
   check(dash.hasSettings, "the console exposes a per-guest settings drawer");
   check(dash.hasEgressField, "the settings drawer offers a per-guest egress node (the holospaces-node the guest's internet routes through, CC-39)");
   check(dash.hasExtDownload, "the console offers the local egress extension for download + manual install (CC-41, until it is in the Chrome store)");
