@@ -213,71 +213,6 @@ function createNodeExtHost({ vscode, fsAdapter, files, extensionPath = "/extensi
 
   return {
     builtins,
-    /**
-     * Fetch the extension's module graph into `files` from an async `fetcher`
-     * (e.g. Open VSX's per-file API, `GET /api/{pub}/{name}/{ver}/file/{path}`),
-     * so the sync `require` graph is fully resident before `activate`. BFS from
-     * `main`, following relative `require("./…")` literals; bare requires that are
-     * not built-ins resolve under `node_modules/<pkg>` (best-effort, by the dep's
-     * own `main`). `fetcher(extPath) -> string | Uint8Array | null` is keyed by the
-     * extension-relative POSIX path (e.g. `extension/out/extension.js`). A bundled
-     * extension (the baseline subject) resolves to just `package.json` + `main`.
-     */
-    async preload({ packageJson, fetcher }) {
-      // `extRel` is the extension-relative POSIX path (no leading "extension/");
-      // the Open VSX per-file API is keyed "extension/<extRel>". Returns the
-      // absolute fileMap key, or null if the file does not exist.
-      const want = async (extRel) => {
-        const abs = pathMod.join(extensionPath, extRel);
-        if (fileMap[abs] != null) return abs;
-        const body = await fetcher("extension/" + extRel);
-        if (body == null) return null;
-        fileMap[abs] = body;
-        return abs;
-      };
-      const relOf = (abs) => pathMod.relative(extensionPath, abs); // abs -> extRel
-      // Seed package.json + main.
-      if (packageJson) fileMap[pathMod.join(extensionPath, "package.json")] = JSON.stringify(packageJson);
-      const main = (packageJson && packageJson.main) || "extension.js";
-      const seen = new Set();
-      const queue = [];
-      const seed = await want(main);
-      if (seed) queue.push(seed);
-      const reqRe = /require\(\s*["'`]([^"'`]+)["'`]\s*\)/g;
-      while (queue.length) {
-        const modAbs = queue.shift();
-        if (seen.has(modAbs)) continue;
-        seen.add(modAbs);
-        if (modAbs.endsWith(".json")) continue;
-        const src = srcOf(fileMap[modAbs]);
-        let m;
-        while ((m = reqRe.exec(src))) {
-          const id = m[1];
-          if (Object.prototype.hasOwnProperty.call(builtins, id)) continue; // built-in
-          let cand;
-          if (id.startsWith(".")) {
-            // Relative module — resolve against this module's dir.
-            const base = pathMod.join(pathMod.dirname(modAbs), id);
-            cand = [base, base + ".js", base + ".json", pathMod.join(base, "index.js")];
-          } else {
-            // Bare dependency under node_modules (best-effort).
-            const root = pathMod.join(extensionPath, "node_modules", id);
-            cand = [pathMod.join(root, "package.json"), pathMod.join(root, "index.js")];
-          }
-          for (const c of cand) {
-            const got = await want(relOf(c));
-            if (got) {
-              if (got.endsWith("package.json")) {
-                // Pull the dep's `main` too.
-                try { const dm = JSON.parse(srcOf(fileMap[got])).main; if (dm) await want(relOf(pathMod.join(pathMod.dirname(got), dm))); } catch { /* ignore */ }
-              } else { queue.push(got); }
-              break;
-            }
-          }
-        }
-      }
-      return Object.keys(fileMap).length;
-    },
     /** Load the extension's `main` and run `activate(context)`; returns the context. */
     async activate(packageJson, contextOverrides = {}) {
       const main = (packageJson && packageJson.main) || "extension.js";
@@ -304,14 +239,59 @@ function createNodeExtHost({ vscode, fsAdapter, files, extensionPath = "/extensi
   };
 }
 
+// ── Read a `.vsix` (a ZIP) into a file map, browser-safe ──────────────────────
+//
+// Open VSX's per-file API serves only curated files (README, package.json), not
+// source — so the extension's code comes from its `.vsix` (the download URL). A
+// `.vsix` is a plain ZIP; entries live under `extension/`. This is a minimal ZIP
+// reader: it walks the central directory and inflates each entry with the
+// platform `DecompressionStream("deflate-raw")` (present in browsers and Node ≥18)
+// — no zip library, no host filesystem. Returns a map of entry path -> Uint8Array.
+async function unzipVsix(buf) {
+  const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  // End Of Central Directory: scan back for signature 0x06054b50.
+  let eocd = -1;
+  for (let i = u8.length - 22; i >= 0 && i >= u8.length - 22 - 65536; i--) {
+    if (dv.getUint32(i, true) === 0x0605_4b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error("unzipVsix: not a zip (no EOCD)");
+  const count = dv.getUint16(eocd + 10, true);
+  let p = dv.getUint32(eocd + 16, true); // central directory offset
+  const inflateRaw = async (slice) =>
+    new Uint8Array(await new Response(new Response(slice).body.pipeThrough(new DecompressionStream("deflate-raw"))).arrayBuffer());
+  const out = {};
+  for (let n = 0; n < count; n++) {
+    if (dv.getUint32(p, true) !== 0x0201_4b50) break; // central file header
+    const method = dv.getUint16(p + 10, true);
+    const compSize = dv.getUint32(p + 20, true);
+    const nameLen = dv.getUint16(p + 28, true);
+    const extraLen = dv.getUint16(p + 30, true);
+    const commentLen = dv.getUint16(p + 32, true);
+    const localOff = dv.getUint32(p + 42, true);
+    const name = new TextDecoder().decode(u8.subarray(p + 46, p + 46 + nameLen));
+    // Local header: data starts after its own name+extra fields.
+    const lNameLen = dv.getUint16(localOff + 26, true);
+    const lExtraLen = dv.getUint16(localOff + 28, true);
+    const dataStart = localOff + 30 + lNameLen + lExtraLen;
+    const comp = u8.subarray(dataStart, dataStart + compSize);
+    if (!name.endsWith("/")) {
+      out[name] = method === 0 ? comp.slice() : await inflateRaw(comp);
+    }
+    p += 46 + nameLen + extraLen + commentLen;
+  }
+  return out;
+}
+
 // ── Install + activate a Node-only Open VSX extension in the substrate-native host
 //
-// The full CC-48 install path: resolve the extension on Open VSX, REFUSE it unless
-// it is genuinely Node-only (a `main`, no `browser` entrypoint — so it cannot run
-// in vscode-web's web host and its activation proves the substrate-native host did
-// the work), fetch its module graph over the per-file API, and run `activate`. No
-// host filesystem, no Node process, no emulated guest — the extension's JS runs on
-// the browser peer's own engine with the holospace's primitives behind the Node API.
+// The full CC-48 install path: resolve the extension on Open VSX, download its
+// `.vsix`, unzip it, REFUSE it unless its (unzipped) manifest is genuinely Node-only
+// (a `main`, no `browser` entrypoint — so it cannot run in vscode-web's web host and
+// its activation proves the substrate-native host did the work), then run `activate`
+// against the unzipped files. No host filesystem, no Node process, no emulated guest
+// — the extension's JS runs on the browser peer's own engine with the holospace's
+// primitives behind the Node API.
 async function installFromOpenVsx({ vscode, extId, fsAdapter, fetchImpl, registryBase = "https://open-vsx.org" } = {}) {
   const doFetch = fetchImpl || (typeof fetch !== "undefined" ? fetch : null);
   if (!doFetch) throw new Error("installFromOpenVsx: no fetch available");
@@ -322,11 +302,22 @@ async function installFromOpenVsx({ vscode, extId, fsAdapter, fetchImpl, registr
   const meta = await (await doFetch(`${registryBase}/api/${ns}/${name}/latest`)).json();
   const version = meta && meta.version;
   if (!version) throw new Error(`installFromOpenVsx: ${extId} not found on Open VSX`);
-  const manifestUrl = meta.files && meta.files.manifest;
-  const packageJson = manifestUrl ? await (await doFetch(manifestUrl)).json() : null;
-  if (!packageJson) throw new Error(`installFromOpenVsx: no manifest for ${extId}`);
+  const vsixUrl = meta.files && meta.files.download;
+  if (!vsixUrl) throw new Error(`installFromOpenVsx: no .vsix download for ${extId}`);
 
-  // The CC-48 gate: the subject MUST be Node-only.
+  // Download + unzip the .vsix; its files live under `extension/`.
+  const vsixBytes = new Uint8Array(await (await doFetch(vsixUrl)).arrayBuffer());
+  const entries = await unzipVsix(vsixBytes);
+  const extensionPath = `/ext/${ns}.${name}`;
+  const files = {};
+  for (const [path, bytes] of Object.entries(entries)) {
+    if (path.startsWith("extension/")) files[pathMod.join(extensionPath, path.slice("extension/".length))] = bytes;
+  }
+  const pkgKey = pathMod.join(extensionPath, "package.json");
+  if (files[pkgKey] == null) throw new Error(`installFromOpenVsx: ${extId} .vsix has no extension/package.json`);
+  const packageJson = JSON.parse(srcOf(files[pkgKey]));
+
+  // The CC-48 gate: the subject MUST be Node-only (verified from the .vsix manifest).
   const nodeOnly = typeof packageJson.main === "string" && packageJson.main.length > 0 && packageJson.browser == null;
   if (!nodeOnly) {
     throw new Error(
@@ -335,16 +326,9 @@ async function installFromOpenVsx({ vscode, extId, fsAdapter, fetchImpl, registr
     );
   }
 
-  // Per-file fetcher over Open VSX (files live under `extension/` in the .vsix).
-  const fetcher = async (filePath) => {
-    const r = await doFetch(`${registryBase}/api/${ns}/${name}/${version}/file/${filePath}`);
-    return r && r.ok ? new Uint8Array(await r.arrayBuffer()) : null;
-  };
-
-  const host = createNodeExtHost({ vscode, fsAdapter, extensionPath: `/ext/${ns}.${name}` });
-  await host.preload({ packageJson, fetcher });
+  const host = createNodeExtHost({ vscode, fsAdapter, extensionPath, files });
   const activated = await host.activate(packageJson);
-  return { host, extId, version, packageJson, ...activated };
+  return { host, extId, version, packageJson, fileCount: Object.keys(files).length, ...activated };
 }
 
 function memState() {
@@ -375,4 +359,4 @@ function makeBuffer() {
 // CommonJS, like `extension.js`), and the Node self-test does too. Kept CommonJS
 // (no top-level `export`) so a single file is both `require`-able in the browser
 // ext host and runnable under Node.
-module.exports = { createNodeExtHost, installFromOpenVsx, EventEmitter, path: pathMod, os: osMod, makeFs };
+module.exports = { createNodeExtHost, installFromOpenVsx, unzipVsix, EventEmitter, path: pathMod, os: osMod, makeFs };

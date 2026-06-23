@@ -6,7 +6,43 @@
 // reaches the (recording) vscode API. This is the load-bearing core the browser
 // witness then drives end-to-end.
 const assert = require("node:assert");
-const { createNodeExtHost, installFromOpenVsx } = require("./node-exthost.js");
+const { createNodeExtHost, installFromOpenVsx, unzipVsix } = require("./node-exthost.js");
+
+// Build a minimal STORED (uncompressed) .vsix/zip from a {path: string} map — so
+// the install self-test exercises the real download+unzip path offline, without a
+// deflate encoder. `unzipVsix` copies stored entries verbatim (it does not check
+// CRC), so CRC fields are left 0.
+function makeStoredZip(files) {
+  const enc = new TextEncoder();
+  const locals = [];
+  const central = [];
+  let offset = 0;
+  for (const [name, content] of Object.entries(files)) {
+    const nameB = enc.encode(name);
+    const data = typeof content === "string" ? enc.encode(content) : content;
+    const lh = Buffer.alloc(30);
+    lh.writeUInt32LE(0x04034b50, 0); lh.writeUInt16LE(20, 4); lh.writeUInt16LE(0, 6);
+    lh.writeUInt16LE(0, 8); /*method=stored*/ lh.writeUInt32LE(0, 14); /*crc*/
+    lh.writeUInt32LE(data.length, 18); lh.writeUInt32LE(data.length, 22);
+    lh.writeUInt16LE(nameB.length, 26); lh.writeUInt16LE(0, 28);
+    const local = Buffer.concat([lh, Buffer.from(nameB), Buffer.from(data)]);
+    const ch = Buffer.alloc(46);
+    ch.writeUInt32LE(0x02014b50, 0); ch.writeUInt16LE(20, 4); ch.writeUInt16LE(20, 6);
+    ch.writeUInt16LE(0, 8); ch.writeUInt16LE(0, 10); /*method=stored*/
+    ch.writeUInt32LE(0, 16); /*crc*/ ch.writeUInt32LE(data.length, 20); ch.writeUInt32LE(data.length, 24);
+    ch.writeUInt16LE(nameB.length, 28); ch.writeUInt32LE(offset, 42);
+    central.push(Buffer.concat([ch, Buffer.from(nameB)]));
+    locals.push(local);
+    offset += local.length;
+  }
+  const localBuf = Buffer.concat(locals);
+  const centralBuf = Buffer.concat(central);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(central.length, 8); eocd.writeUInt16LE(central.length, 10);
+  eocd.writeUInt32LE(centralBuf.length, 12); eocd.writeUInt32LE(localBuf.length, 16);
+  return new Uint8Array(Buffer.concat([localBuf, centralBuf, eocd]));
+}
 
 // A recording `vscode` API stand-in (the browser passes the real workbench API).
 function recordingVscode() {
@@ -74,52 +110,41 @@ const files = {
   assert.strictEqual(path.join("/a", "b", "../c"), "/a/c", "path.join normalizes");
   assert.strictEqual(os.platform(), "linux", "os reports the holospace identity");
 
-  // ── preload(): fetch the module graph from an async per-file API (Open VSX) ──
-  // Simulate Open VSX's GET /file/{path}: serve package.json + main + a relative
-  // dep on demand; assert the BFS pulls exactly the graph and activate() then runs.
-  const remote = {
-    "extension/package.json": JSON.stringify({ name: "demo2", main: "dist/main.js" }),
-    "extension/dist/main.js": `const vscode=require("vscode");const u=require("./util");function activate(c){c.subscriptions.push(vscode.commands.registerCommand("demo2."+u.id(),()=>{}));return{ok:true};}module.exports={activate};`,
-    "extension/dist/util.js": `module.exports={ id: () => "go" };`,
-  };
-  let fetches = 0;
-  const fetcher = async (p) => { fetches++; return Object.prototype.hasOwnProperty.call(remote, p) ? remote[p] : null; };
-  const v2 = recordingVscode();
-  const host2 = createNodeExtHost({ vscode: v2, extensionPath: "/extension" });
-  const pkg2 = JSON.parse(remote["extension/package.json"]);
-  await host2.preload({ packageJson: pkg2, fetcher });
-  const r2 = await host2.activate(pkg2);
-  assert.strictEqual(r2.api.ok, true, "preload fetched main + its relative dep; activate() ran");
-  assert.deepStrictEqual(v2.rec.commands, ["demo2.go"], "the fetched relative dep resolved (util.id() -> command id)");
-  assert.ok(fetches >= 2, "preload fetched the module graph over the (async) per-file API");
+  // ── unzipVsix(): a stored .vsix round-trips to its file map ─────────────────
+  const zb = makeStoredZip({ "extension/package.json": '{"name":"z"}', "extension/out/a.js": "module.exports=1;" });
+  const ents = await unzipVsix(zb);
+  assert.strictEqual(new TextDecoder().decode(ents["extension/out/a.js"]), "module.exports=1;", "unzipVsix extracts a stored entry verbatim");
 
-  // ── installFromOpenVsx(): resolve + Node-only gate + install + activate ──────
-  // A fake Open VSX (the real API shape): /api/{ns}/{name}/latest -> { version,
-  // files:{manifest} }; the manifest URL -> package.json; the per-file API ->
-  // module bytes. Verifies the full install path AND that a browser-entrypoint
-  // subject is REFUSED (it would be CC-19, not CC-48).
+  // ── installFromOpenVsx(): resolve + download .vsix + unzip + Node-only gate +
+  // install + activate. Fake Open VSX (the real API shape): /api/{ns}/{name}/latest
+  // -> { version, files:{download} }; the download URL -> the .vsix bytes. Verifies
+  // the full path AND that a browser-entrypoint subject is REFUSED (CC-19, not CC-48).
   const REG = "https://fake-vsx.test";
+  const goodVsix = makeStoredZip({
+    "extension/package.json": JSON.stringify({ name: "good", publisher: "acme", main: "out/ext.js" }), // Node-only
+    "extension/out/ext.js":
+      `const vscode=require("vscode");const u=require("./util");function activate(c){c.subscriptions.push(vscode.commands.registerCommand("good."+u.id(),()=>{}));const i=vscode.window.createStatusBarItem(1,1);i.text="GOOD-ACTIVE";i.show();return{ok:true};}module.exports={activate};`,
+    "extension/out/util.js": `module.exports={ id: () => "run" };`,
+  });
+  const webVsix = makeStoredZip({
+    "extension/package.json": JSON.stringify({ name: "web", publisher: "acme", main: "out/ext.js", browser: "out/web.js" }),
+    "extension/out/ext.js": "module.exports={activate(){}};",
+  });
   const registry = {
-    [`${REG}/api/acme/good/latest`]: { version: "2.0.0", files: { manifest: `${REG}/m/good` } },
-    [`${REG}/m/good`]: { name: "good", publisher: "acme", main: "out/ext.js" }, // Node-only
-    [`${REG}/api/acme/good/2.0.0/file/extension/out/ext.js`]:
-      `const vscode=require("vscode");function activate(c){c.subscriptions.push(vscode.commands.registerCommand("good.run",()=>{}));const i=vscode.window.createStatusBarItem(1,1);i.text="GOOD-ACTIVE";i.show();return{ok:true};}module.exports={activate};`,
-    [`${REG}/api/acme/web/latest`]: { version: "1.0.0", files: { manifest: `${REG}/m/web` } },
-    [`${REG}/m/web`]: { name: "web", publisher: "acme", main: "out/ext.js", browser: "out/web.js" }, // has browser → reject
+    [`${REG}/api/acme/good/latest`]: { version: "2.0.0", files: { download: `${REG}/d/good.vsix` } },
+    [`${REG}/api/acme/web/latest`]: { version: "1.0.0", files: { download: `${REG}/d/web.vsix` } },
   };
+  const bin = { [`${REG}/d/good.vsix`]: goodVsix, [`${REG}/d/web.vsix`]: webVsix };
   const fakeFetch = async (url) => {
+    if (bin[url]) return { ok: true, arrayBuffer: async () => bin[url].buffer };
     const body = registry[url];
-    return {
-      ok: body != null,
-      json: async () => body,
-      arrayBuffer: async () => new TextEncoder().encode(typeof body === "string" ? body : JSON.stringify(body)).buffer,
-    };
+    return { ok: body != null, json: async () => body, arrayBuffer: async () => new Uint8Array().buffer };
   };
 
   const v3 = recordingVscode();
   const inst = await installFromOpenVsx({ vscode: v3, extId: "acme.good", fetchImpl: fakeFetch, registryBase: REG });
-  assert.strictEqual(inst.api.ok, true, "installFromOpenVsx resolved + preloaded + activated the Node-only extension");
-  assert.deepStrictEqual(v3.rec.commands, ["good.run"], "the installed extension registered its command");
+  assert.strictEqual(inst.api.ok, true, "installFromOpenVsx downloaded + unzipped the .vsix and activated the Node-only extension");
+  assert.deepStrictEqual(v3.rec.commands, ["good.run"], "the installed extension registered its command (relative dep from the .vsix resolved)");
   assert.deepStrictEqual(v3.rec.statusBar, ["GOOD-ACTIVE"], "the installed extension's contribution reached the workbench API");
 
   let rejected = false;
@@ -127,5 +152,5 @@ const files = {
   catch (e) { rejected = /not Node-only/.test(String(e)); }
   assert.ok(rejected, "a browser-entrypoint extension is REFUSED (CC-19, not CC-48)");
 
-  console.log("NODE-EXTHOST-CORE-TEST: PASS — the substrate-native ext host loads a Node-only extension (preload + installFromOpenVsx, Node-only gate enforced), provides the Node API surface + vscode passthrough, and runs activate()");
+  console.log("NODE-EXTHOST-CORE-TEST: PASS — the substrate-native ext host loads a Node-only extension (unzip .vsix + installFromOpenVsx, Node-only gate enforced), provides the Node API surface + vscode passthrough, and runs activate()");
 })().catch((e) => { console.error("NODE-EXTHOST-CORE-TEST: FAIL —", e && e.stack ? e.stack : e); process.exit(1); });
