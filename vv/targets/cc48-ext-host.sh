@@ -57,6 +57,10 @@ if [ -f "$WITNESS" ] \
    && ! grep -qE 'additionalBuiltinExtensions.*EXT|extensions: \[EXT\]' "$WITNESS" 2>/dev/null; then
     command -v node >/dev/null 2>&1 || { echo "cc48-ext-host: SKIP — node absent"; exit 127; }
     command -v wasm-pack >/dev/null 2>&1 || { echo "cc48-ext-host: SKIP — wasm-pack absent"; exit 127; }
+    # Fast core gate: the substrate-native ext-host runtime (the CommonJS module
+    # loader + Node API surface + vscode passthrough + activate harness) must load a
+    # Node-only extension and run activate() — verified in Node, no browser needed.
+    ( cd "$WEB/builtin-extensions/holospace-fs" && node node-exthost.test.cjs ) || exit 1
     # Build the wasm peer (carries the substrate-native ext-host runtime) so the
     # witness always runs against the product, not a stale bundle.
     if [ ! -f "$WEB/pkg/holospaces_web_bg.wasm" ]; then
