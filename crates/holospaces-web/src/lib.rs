@@ -1322,15 +1322,20 @@ impl Workspace {
         let store = Box::new(opfs_store::OpfsKappaStore::new(disk_handle));
         let total = rootfs_handle.get_size().map_err(js_err)? as u64;
         let sector_count = total.div_ceil(512);
+        let rootfs = rootfs_handle.clone();
         let read = move |i: u64, buf: &mut [u8]| {
             let opts = web_sys::FileSystemReadWriteOptions::new();
             opts.set_at((i * 512) as f64);
             // A short read at the tail leaves the rest of `buf` zero (sparse pad).
-            let _ = rootfs_handle.read_with_u8_array_and_options(buf, &opts);
+            let _ = rootfs.read_with_u8_array_and_options(buf, &opts);
         };
         let machine = MachineSpec::devcontainer_net()
             .boot_net_streamed(kernel, sector_count, read, Box::new(egress), store)
             .map_err(js_err)?;
+        // The κ-disk is fully ingested (every sector read up front), so release the
+        // rootfs file's exclusive OPFS sync-access lock — otherwise re-provisioning
+        // or removing `provisioned/<id>` is blocked and the handle leaks (quota).
+        rootfs_handle.close();
         Ok(Workspace {
             machine,
             store: MemKappaStore::new(),
@@ -1726,10 +1731,11 @@ impl Aarch64Workspace {
         let store = Box::new(opfs_store::OpfsKappaStore::new(disk_handle));
         let total = rootfs_handle.get_size().map_err(js_err)? as u64;
         let sector_count = total.div_ceil(512);
+        let rootfs = rootfs_handle.clone();
         let read = move |i: u64, buf: &mut [u8]| {
             let opts = web_sys::FileSystemReadWriteOptions::new();
             opts.set_at((i * 512) as f64);
-            let _ = rootfs_handle.read_with_u8_array_and_options(buf, &opts);
+            let _ = rootfs.read_with_u8_array_and_options(buf, &opts);
         };
         let cpu = aarch64::Cpu::boot_linux_disk_streamed(
             512 * 1024 * 1024,
@@ -1739,6 +1745,9 @@ impl Aarch64Workspace {
             sector_count,
             read,
         );
+        // The κ-disk is fully ingested up front; release the rootfs's exclusive OPFS
+        // lock so re-provisioning/removal isn't blocked and the handle doesn't leak.
+        rootfs_handle.close();
         Ok(Aarch64Workspace {
             cpu,
             halted: false,
@@ -1764,10 +1773,11 @@ impl Aarch64Workspace {
         let store = Box::new(opfs_store::OpfsKappaStore::new(disk_handle));
         let total = rootfs_handle.get_size().map_err(js_err)? as u64;
         let sector_count = total.div_ceil(512);
+        let rootfs = rootfs_handle.clone();
         let read = move |i: u64, buf: &mut [u8]| {
             let opts = web_sys::FileSystemReadWriteOptions::new();
             opts.set_at((i * 512) as f64);
-            let _ = rootfs_handle.read_with_u8_array_and_options(buf, &opts);
+            let _ = rootfs.read_with_u8_array_and_options(buf, &opts);
         };
         let mut cpu = aarch64::Cpu::boot_linux_disk_streamed(
             512 * 1024 * 1024,
@@ -1777,6 +1787,9 @@ impl Aarch64Workspace {
             sector_count,
             read,
         );
+        // The κ-disk is fully ingested up front; release the rootfs's exclusive OPFS
+        // lock so re-provisioning/removal isn't blocked and the handle doesn't leak.
+        rootfs_handle.close();
         // Seed the shared workspace, attach the router-backed network, and enable
         // the in-process bridge — all serviced by the shared devbus over the GIC.
         cpu.attach_workspace(&[]);
@@ -1920,10 +1933,11 @@ impl X64Workspace {
         let store = Box::new(opfs_store::OpfsKappaStore::new(disk_handle));
         let total = rootfs_handle.get_size().map_err(js_err)? as u64;
         let sector_count = total.div_ceil(512);
+        let rootfs = rootfs_handle.clone();
         let read = move |i: u64, buf: &mut [u8]| {
             let opts = web_sys::FileSystemReadWriteOptions::new();
             opts.set_at((i * 512) as f64);
-            let _ = rootfs_handle.read_with_u8_array_and_options(buf, &opts);
+            let _ = rootfs.read_with_u8_array_and_options(buf, &opts);
         };
         let cpu = x64::Cpu::boot_linux_disk_streamed(
             512 * 1024 * 1024,
@@ -1933,6 +1947,9 @@ impl X64Workspace {
             sector_count,
             read,
         );
+        // The κ-disk is fully ingested up front; release the rootfs's exclusive OPFS
+        // lock so re-provisioning/removal isn't blocked and the handle doesn't leak.
+        rootfs_handle.close();
         Ok(X64Workspace {
             cpu,
             halted: false,

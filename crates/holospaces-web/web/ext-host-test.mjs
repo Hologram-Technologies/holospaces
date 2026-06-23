@@ -56,7 +56,7 @@ const check = (c, m) => (c ? console.log("  ✓", m) : ((failed = true), console
 // builds `pkg/` before invoking this witness. If genuinely absent, fail honestly.
 async function present(p) { try { await stat(path.join(DIR, p)); return true; } catch { return false; } }
 if (!(await present("pkg/holospaces_web_bg.wasm"))) {
-  console.error("EXT-HOST-TEST: RED — the wasm peer (pkg/) is absent; run vv/targets/cc48-ext-host.sh");
+  console.error("EXT-HOST-TEST: RED — the wasm peer (pkg/) is absent; run vv/suites/cc48-ext-host.sh");
   console.error("  (it builds the peer with wasm-pack before driving this witness).");
   process.exit(1);
 }

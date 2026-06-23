@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# CC-48 (TARGET) — The SUBSTRATE-NATIVE extension host activates an arbitrary
-#                  Node-only marketplace extension
+# CC-48 (LIVE) — The SUBSTRATE-NATIVE extension host activates an arbitrary
+#                Node-only marketplace extension
 #
 # OPM process: SD4 Working. Closes the CC-19 / CC-34 / ADR-020 frontier.
 #
@@ -75,10 +75,10 @@ if [ -f "$WITNESS" ] \
     exit 0
 fi
 
-echo "cc48-ext-host: RED — TARGET not yet live (substrate-native ext host)."
-echo "  needed: a JS/Node-API extension-host runtime as a wasm codemodule on the"
-echo "          browser peer's exec surface (NOT the emulated guest, NOT vscode-web's"
-echo "          web host), reached over the CC-33 bridge, backed by CC-15/CC-11/CC-16."
-echo "  spec:   a Node-only (package.json main, NO browser) Open VSX extension"
-echo "          activates in that host; contribution observable in the real workbench."
+echo "cc48-ext-host: FAILED — the witness does not encode the substrate-native, Node-only bar,"
+echo "  or a prerequisite is missing. ext-host-test.mjs must: assert NODE-EXTHOST-LIVE, gate on a"
+echo "  Node-only subject (package.json main, NO browser), and NOT relabel a web extension."
+echo "  runtime prereqs: node + wasm-pack (to build pkg/) + Chromium (Playwright) to drive it."
+echo "  the host itself runs as native hologram exec on the browser peer's wasm exec surface,"
+echo "  reached over the CC-33 bridge, backed by CC-15/CC-11/CC-16 — not the emulated guest."
 exit 1
