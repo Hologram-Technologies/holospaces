@@ -47,7 +47,7 @@ use holospaces::assembly::{assemble_ext4, assemble_ext4_bootable, Layer};
 use holospaces::boot::{devcontainer, provision, LifecycleError, ReadVerify, Resolver, Session};
 use holospaces::config::{Configuration, Directive, LifecycleAction};
 use holospaces::content_net::ContentPeer;
-use holospaces::emulator::{aarch64, net, Emulator, Halt};
+use holospaces::emulator::{aarch64, net, x64, Emulator, Halt};
 use holospaces::identity::{Operator, Roster};
 use holospaces::machine::MachineSpec;
 use holospaces::oci::ImagePull;
@@ -1886,5 +1886,96 @@ impl Aarch64Workspace {
     #[must_use]
     pub fn guest_is_open(&self, id: u32) -> bool {
         self.cpu.guest_is_open(id)
+    }
+}
+
+/// A booted **x86-64** (amd64) devcontainer on the holospaces x64 core
+/// (`CC-43`/`CC-44`/`CC-45`) — the ubiquitous registry/Codespaces architecture,
+/// so a launched x64 holospace runs the ecosystem's stock `linux/amd64` images and
+/// their x64 extensions. The browser-peer analogue of [`Aarch64Workspace`]: the
+/// provisioned amd64 image is paged from OPFS (`CC-7`, no full image in RAM) and
+/// the page drives the integrated terminal. Selected from the Platform Manager's
+/// architecture picker (ADR-021; the arch is fixed at provisioning, part of the
+/// holospace's content-addressed identity, Law L1).
+#[wasm_bindgen]
+pub struct X64Workspace {
+    cpu: x64::Cpu,
+    halted: bool,
+    console_cursor: usize,
+}
+
+#[wasm_bindgen]
+impl X64Workspace {
+    /// Boot a provisioned amd64 image, **streaming** its κ-disk from OPFS (no full
+    /// image in RAM): `rootfs_handle` is the provisioned rootfs (read
+    /// sector-by-sector into the OPFS-backed store on `disk_handle`). Drive with
+    /// [`run`](X64Workspace::run), rendering [`terminal_delta`](X64Workspace::terminal_delta)
+    /// between chunks. The x64 analogue of
+    /// [`Aarch64Workspace::boot_devcontainer_opfs_streamed`].
+    pub fn boot_devcontainer_opfs_streamed(
+        kernel: &[u8],
+        rootfs_handle: web_sys::FileSystemSyncAccessHandle,
+        disk_handle: web_sys::FileSystemSyncAccessHandle,
+    ) -> Result<X64Workspace, JsValue> {
+        let store = Box::new(opfs_store::OpfsKappaStore::new(disk_handle));
+        let total = rootfs_handle.get_size().map_err(js_err)? as u64;
+        let sector_count = total.div_ceil(512);
+        let read = move |i: u64, buf: &mut [u8]| {
+            let opts = web_sys::FileSystemReadWriteOptions::new();
+            opts.set_at((i * 512) as f64);
+            let _ = rootfs_handle.read_with_u8_array_and_options(buf, &opts);
+        };
+        let cpu = x64::Cpu::boot_linux_disk_streamed(
+            512 * 1024 * 1024,
+            kernel,
+            "console=ttyS0 root=/dev/vda rw init=/init",
+            store,
+            sector_count,
+            read,
+        );
+        Ok(X64Workspace {
+            cpu,
+            halted: false,
+            console_cursor: 0,
+        })
+    }
+
+    /// Run a chunk of guest execution; returns `true` once the machine halts.
+    pub fn run(&mut self, budget: f64) -> bool {
+        if self.halted {
+            return true;
+        }
+        if !matches!(self.cpu.run(budget as u64), x64::Halt::OutOfBudget) {
+            self.halted = true;
+        }
+        self.halted
+    }
+
+    /// The full console the guest has produced.
+    #[must_use]
+    pub fn terminal(&self) -> String {
+        String::from_utf8_lossy(self.cpu.console()).into_owned()
+    }
+
+    /// The console bytes produced since the last call (the integrated terminal
+    /// streams these).
+    pub fn terminal_delta(&mut self) -> Vec<u8> {
+        let console = self.cpu.console();
+        let from = self.console_cursor.min(console.len());
+        let delta = console[from..].to_vec();
+        self.console_cursor = console.len();
+        delta
+    }
+
+    /// Feed keystrokes to the guest's serial console.
+    pub fn feed_input(&mut self, bytes: &[u8]) {
+        self.cpu.feed_console(bytes);
+    }
+
+    /// Whether the machine has powered off.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn halted(&self) -> bool {
+        self.halted
     }
 }

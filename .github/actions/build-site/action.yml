@@ -45,6 +45,7 @@ runs:
         mkdir -p "$SITE"
         cp crates/holospaces-web/web/index.html "$SITE"/        # the management console
         cp crates/holospaces-web/web/workspace.html "$SITE"/    # the VS Code workspace IDE
+        cp crates/holospaces-web/web/provision-worker.mjs "$SITE"/  # sparse OPFS provisioning worker (arbitrary images, no dense OOM)
         cp crates/holospaces-web/web/fixture.holo "$SITE"/
         cp crates/holospaces-web/web/fixture-userland.wasm "$SITE"/
         cp -r crates/holospaces-web/web/pkg "$SITE"/pkg
@@ -83,6 +84,11 @@ runs:
         # when the holospace's arch is aarch64 (the Aarch64Workspace boots it,
         # paged from OPFS).
         cp vv/artifacts/cc37/linux/Image.gz "$SITE"/devcontainer-arm64-kernel.gz
+        # The real amd64 vmlinux (uncompressed ELF, gzipped for transport) booted on
+        # the x64 core (CC-44) — the kernel holospace-fs fetches when the holospace's
+        # arch is x64 (the X64Workspace boots it, paged from OPFS). amd64 is the
+        # ubiquitous registry/Codespaces architecture.
+        cp vv/artifacts/cc44/linux/vmlinux.gz "$SITE"/devcontainer-x64-kernel.gz
         nmfdig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['manifests'][0]['digest'].split(':')[1])" vv/artifacts/cc16/image/index.json)
         nldig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['layers'][0]['digest'].split(':')[1])" "vv/artifacts/cc16/image/blobs/sha256/$nmfdig")
         cp "vv/artifacts/cc16/image/blobs/sha256/$nldig" "$SITE"/devcontainer-net-layer.tar.gz
