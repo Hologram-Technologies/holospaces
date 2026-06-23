@@ -1072,7 +1072,6 @@ impl Cpu {
         }
     }
 
-
     fn fetch_u8(&mut self) -> u8 {
         let vaddr = self.rip;
         // Inline code-page cache: the bytes after the first in an instruction are on
