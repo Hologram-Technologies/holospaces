@@ -693,7 +693,7 @@ impl Cpu {
         if !self.paging() {
             return vaddr;
         }
-        self.walk(vaddr).map_or(vaddr, |(pa, _, _)| pa)
+        self.walk(vaddr).map_or(vaddr, |(pa, _, _, _)| pa)
     }
 
     /// Walk the 4-level page tables for `vaddr`, returning the physical address or
@@ -701,12 +701,14 @@ impl Cpu {
     /// real long-mode boot takes — the kernel maps boot data lazily on `#PF`).
     /// `write`/`user` shape the error code; when paging is off the address is
     /// physical (the identity-mapped boot core before it installs `CR3`).
-    fn walk(&self, vaddr: u64) -> Result<(u64, bool, bool), ()> {
+    fn walk(&self, vaddr: u64) -> Result<(u64, bool, bool, u64), ()> {
         // The caller (`translate_acc`/`translate`) checks paging is on. The returned
-        // tuple is `(physical address, writable, user-accessible)` — the effective
-        // R/W and U/S permissions are the AND of those bits across every walked
-        // level, so the caller can enforce write-protection (COW) and the
-        // user/supervisor boundary. `Err(())` means a level was not-present.
+        // tuple is `(physical address, writable, user-accessible, leaf-entry phys
+        // addr)` — the effective R/W and U/S permissions are the AND of those bits
+        // across every walked level (so the caller can enforce write-protection and
+        // the user/supervisor boundary), and the leaf address lets it set the
+        // Accessed/Dirty bits like real hardware. `Err(())` means a level was
+        // not-present.
         let pml4 = self.cr3 & 0x000f_ffff_ffff_f000;
         let idx = |lvl: u32| ((vaddr >> (12 + 9 * lvl)) & 0x1ff) * 8;
         let ent = |base: u64, i: u64| self.rd_phys(base + i, 8);
@@ -720,6 +722,7 @@ impl Cpu {
             return Err(());
         }
         let (mut w, mut u) = (rw(e4), us(e4));
+        let a3 = next(e4) + idx(2);
         let e3 = ent(next(e4), idx(2));
         if !present(e3) {
             return Err(());
@@ -728,8 +731,9 @@ impl Cpu {
         u &= us(e3);
         if e3 & (1 << 7) != 0 {
             // 1 GiB page
-            return Ok(((e3 & 0x000f_ffff_c000_0000) | (vaddr & 0x3fff_ffff), w, u));
+            return Ok(((e3 & 0x000f_ffff_c000_0000) | (vaddr & 0x3fff_ffff), w, u, a3));
         }
+        let a2 = next(e3) + idx(1);
         let e2 = ent(next(e3), idx(1));
         if !present(e2) {
             return Err(());
@@ -738,15 +742,34 @@ impl Cpu {
         u &= us(e2);
         if e2 & (1 << 7) != 0 {
             // 2 MiB page
-            return Ok(((e2 & 0x000f_ffff_ffe0_0000) | (vaddr & 0x1f_ffff), w, u));
+            return Ok(((e2 & 0x000f_ffff_ffe0_0000) | (vaddr & 0x1f_ffff), w, u, a2));
         }
+        let a1 = next(e2) + idx(0);
         let e1 = ent(next(e2), idx(0));
         if !present(e1) {
             return Err(());
         }
         w &= rw(e1);
         u &= us(e1);
-        Ok(((e1 & 0x000f_ffff_ffff_f000) | (vaddr & 0xfff), w, u))
+        Ok(((e1 & 0x000f_ffff_ffff_f000) | (vaddr & 0xfff), w, u, a1))
+    }
+
+    /// Set the Accessed (and, for a write, Dirty) bit in a leaf paging-structure
+    /// entry at physical `leaf` — what x86 hardware does on a translation. Linux
+    /// depends on the Dirty bit; without it, it falls back to write-protect dirty
+    /// tracking (re-marking a page read-only after each write to catch the next),
+    /// which makes every write a `#PF` — a fault storm that stalls a real boot. Done
+    /// only when a translation fills the TLB (not per access), so it adds no
+    /// hot-path cost: a physical read + conditional 8-byte write.
+    fn set_accessed_dirty(&mut self, leaf: u64, write: bool) {
+        let pte = self.rd_phys(leaf, 8);
+        let want = pte | (1 << 5) | if write { 1 << 6 } else { 0 };
+        if want != pte {
+            let a = leaf as usize;
+            if a + 8 <= self.ram.len() {
+                self.ram[a..a + 8].copy_from_slice(&want.to_le_bytes());
+            }
+        }
     }
 
     /// Translate a linear address for the executing core, latching a [`PageFault`]
@@ -784,9 +807,12 @@ impl Cpu {
         let denied = |writable: bool, user_ok: bool| {
             (user && !user_ok) || (write && !writable && (user || wp))
         };
-        // Resolve the frame + its effective permissions, from the TLB or a walk.
+        // Resolve the frame + its effective permissions, from the TLB or a walk. A
+        // fresh walk also yields the leaf-entry address; a TLB hit yields `None`, so
+        // the A/D bits are touched only when a translation *fills* the TLB (the hot
+        // path adds no cost).
         let mut from_tlb = false;
-        let (frame, writable, user_ok) = {
+        let (frame, writable, user_ok, walk_leaf) = {
             let e = self.tlb[set];
             if e.valid
                 && e.gen == self.tlb_gen
@@ -795,10 +821,10 @@ impl Cpu {
                 && e.tag == page
             {
                 from_tlb = true;
-                (e.frame, e.writable, e.user_ok)
+                (e.frame, e.writable, e.user_ok, None)
             } else {
                 match self.walk(vaddr) {
-                    Ok((pa, w, u)) => {
+                    Ok((pa, w, u, lf)) => {
                         self.tlb[set] = TlbEntry {
                             tag: page,
                             frame: pa & !0xfff,
@@ -809,7 +835,7 @@ impl Cpu {
                             gen: self.tlb_gen,
                             pgen: self.pcid_gen[pcid],
                         };
-                        (pa & !0xfff, w, u)
+                        (pa & !0xfff, w, u, Some(lf))
                     }
                     Err(()) => {
                         // Not-present (P=0): the kernel's #PF handler maps the page.
@@ -829,7 +855,7 @@ impl Cpu {
             // denial sourced from the TLB, re-walk to confirm before faulting (qemu's
             // hardware TLB is always coherent; ours must be made so on the fault edge).
             if from_tlb {
-                if let Ok((pa, w, u)) = self.walk(vaddr) {
+                if let Ok((pa, w, u, lf)) = self.walk(vaddr) {
                     self.tlb[set] = TlbEntry {
                         tag: page,
                         frame: pa & !0xfff,
@@ -841,6 +867,7 @@ impl Cpu {
                         pgen: self.pcid_gen[pcid],
                     };
                     if !denied(w, u) {
+                        self.set_accessed_dirty(lf, write);
                         return (pa & !0xfff) | (vaddr & 0xfff);
                     }
                 }
@@ -850,6 +877,13 @@ impl Cpu {
                 | (if user { PF_ERR_USER } else { 0 });
             self.fault = Some(PageFault { addr: vaddr, error });
             return 0;
+        }
+        // The access is permitted. On a TLB fill (a fresh walk), set the Accessed
+        // (and Dirty, for a write) bit in the leaf entry — like real hardware — so
+        // Linux's dirty/aging machinery works and it does not fall back to the
+        // write-protect dirty-tracking fault storm. TLB hits skip this (no cost).
+        if let Some(lf) = walk_leaf {
+            self.set_accessed_dirty(lf, write);
         }
         frame | (vaddr & 0xfff)
     }
