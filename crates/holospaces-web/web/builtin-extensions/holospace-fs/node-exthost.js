@@ -213,6 +213,71 @@ function createNodeExtHost({ vscode, fsAdapter, files, extensionPath = "/extensi
 
   return {
     builtins,
+    /**
+     * Fetch the extension's module graph into `files` from an async `fetcher`
+     * (e.g. Open VSX's per-file API, `GET /api/{pub}/{name}/{ver}/file/{path}`),
+     * so the sync `require` graph is fully resident before `activate`. BFS from
+     * `main`, following relative `require("./…")` literals; bare requires that are
+     * not built-ins resolve under `node_modules/<pkg>` (best-effort, by the dep's
+     * own `main`). `fetcher(extPath) -> string | Uint8Array | null` is keyed by the
+     * extension-relative POSIX path (e.g. `extension/out/extension.js`). A bundled
+     * extension (the baseline subject) resolves to just `package.json` + `main`.
+     */
+    async preload({ packageJson, fetcher }) {
+      // `extRel` is the extension-relative POSIX path (no leading "extension/");
+      // the Open VSX per-file API is keyed "extension/<extRel>". Returns the
+      // absolute fileMap key, or null if the file does not exist.
+      const want = async (extRel) => {
+        const abs = pathMod.join(extensionPath, extRel);
+        if (fileMap[abs] != null) return abs;
+        const body = await fetcher("extension/" + extRel);
+        if (body == null) return null;
+        fileMap[abs] = body;
+        return abs;
+      };
+      const relOf = (abs) => pathMod.relative(extensionPath, abs); // abs -> extRel
+      // Seed package.json + main.
+      if (packageJson) fileMap[pathMod.join(extensionPath, "package.json")] = JSON.stringify(packageJson);
+      const main = (packageJson && packageJson.main) || "extension.js";
+      const seen = new Set();
+      const queue = [];
+      const seed = await want(main);
+      if (seed) queue.push(seed);
+      const reqRe = /require\(\s*["'`]([^"'`]+)["'`]\s*\)/g;
+      while (queue.length) {
+        const modAbs = queue.shift();
+        if (seen.has(modAbs)) continue;
+        seen.add(modAbs);
+        if (modAbs.endsWith(".json")) continue;
+        const src = srcOf(fileMap[modAbs]);
+        let m;
+        while ((m = reqRe.exec(src))) {
+          const id = m[1];
+          if (Object.prototype.hasOwnProperty.call(builtins, id)) continue; // built-in
+          let cand;
+          if (id.startsWith(".")) {
+            // Relative module — resolve against this module's dir.
+            const base = pathMod.join(pathMod.dirname(modAbs), id);
+            cand = [base, base + ".js", base + ".json", pathMod.join(base, "index.js")];
+          } else {
+            // Bare dependency under node_modules (best-effort).
+            const root = pathMod.join(extensionPath, "node_modules", id);
+            cand = [pathMod.join(root, "package.json"), pathMod.join(root, "index.js")];
+          }
+          for (const c of cand) {
+            const got = await want(relOf(c));
+            if (got) {
+              if (got.endsWith("package.json")) {
+                // Pull the dep's `main` too.
+                try { const dm = JSON.parse(srcOf(fileMap[got])).main; if (dm) await want(relOf(pathMod.join(pathMod.dirname(got), dm))); } catch { /* ignore */ }
+              } else { queue.push(got); }
+              break;
+            }
+          }
+        }
+      }
+      return Object.keys(fileMap).length;
+    },
     /** Load the extension's `main` and run `activate(context)`; returns the context. */
     async activate(packageJson, contextOverrides = {}) {
       const main = (packageJson && packageJson.main) || "extension.js";
