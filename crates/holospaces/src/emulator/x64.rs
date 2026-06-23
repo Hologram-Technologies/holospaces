@@ -460,6 +460,16 @@ const DCACHE_MISS_CYCLES: u64 = 32;
 struct TlbEntry {
     tag: u64,
     frame: u64,
+    /// The effective page permissions (the AND of the R/W and U/S bits across the
+    /// walked levels), cached so the fast path enforces write-protection (COW) and
+    /// user/supervisor access exactly as a fresh walk would.
+    writable: bool,
+    user_ok: bool,
+    /// Cleared by a single-page `INVLPG` (a precise invalidation) without disturbing
+    /// the rest of the TLB — so a COW/unmap flush of one page does not cold-flush the
+    /// whole address space, which is the difference between a warm and a perpetually
+    /// cold TLB under a `fork`+`exec`-heavy userspace.
+    valid: bool,
     pcid: u16,
     gen: u64,
     pgen: u64,
@@ -494,6 +504,12 @@ pub struct Cpu {
     /// breakpoints are armed during the boot, so they are plain storage that reads
     /// back what was written (DR4/DR5 alias DR6/DR7 architecturally, immaterial here).
     dr: [u64; 8],
+    /// The 16 **SSE** registers `XMM0..XMM15` (128-bit each). The x86-64 baseline
+    /// ISA mandates SSE2, so every stock `linux-amd64` binary uses them: glibc's
+    /// IFUNC-selected string/memory routines (`memcpy`/`memset`/`strlen`/`memchr`
+    /// …) are SSE2, and `movd`/`movq`/`movdqa` appear from process startup. The
+    /// integer + data-movement SSE/SSE2 instructions operate on these (`sse_0f`).
+    xmm: [u128; 16],
     /// The six segment registers (`ES,CS,SS,DS,FS,GS` — indexed by [`SegId`]).
     /// In long mode the bases are 0 except `FS`/`GS`; `CS.long` selects 64-bit.
     seg: [Seg; 6],
@@ -584,6 +600,10 @@ enum SegId {
 const RFLAGS_IF: u64 = 1 << 9;
 /// `CR4.PCIDE` — process-context identifiers enable.
 const CR4_PCIDE: u64 = 1 << 17;
+/// `CR0.WP` — write protect. When set, even a supervisor (CPL 0) write to a
+/// read-only page faults; the kernel sets it so copy-on-write is enforced for its
+/// own `copy_*_user` accesses to user pages, not only for CPL 3.
+const CR0_WP: u64 = 1 << 16;
 /// `RFLAGS.DF` — the direction flag (string-op increment/decrement).
 const RFLAGS_DF: u64 = 1 << 10;
 /// `RFLAGS.AC` — the alignment-check / access-control flag. Under `CR4.SMAP`, a
@@ -617,6 +637,7 @@ impl Cpu {
             rflags: 0x2, // bit 1 is reserved-1
             insns: 0,
             dr: [0; 8],
+            xmm: [0; 16],
             cr0: 0,
             cr2: 0,
             cr3: 0,
@@ -632,6 +653,9 @@ impl Cpu {
                 TlbEntry {
                     tag: 0,
                     frame: 0,
+                    writable: false,
+                    user_ok: false,
+                    valid: false,
                     pcid: 0,
                     gen: 0,
                     pgen: 0,
@@ -666,7 +690,10 @@ impl Cpu {
     /// and tests ([`Cpu::vv_dbg`], the paging unit test); the executing core
     /// translates through [`Cpu::translate_acc`], which delivers a `#PF` instead.
     fn translate(&self, vaddr: u64) -> u64 {
-        self.walk(vaddr).unwrap_or(vaddr)
+        if !self.paging() {
+            return vaddr;
+        }
+        self.walk(vaddr).map_or(vaddr, |(pa, _, _)| pa)
     }
 
     /// Walk the 4-level page tables for `vaddr`, returning the physical address or
@@ -674,56 +701,52 @@ impl Cpu {
     /// real long-mode boot takes — the kernel maps boot data lazily on `#PF`).
     /// `write`/`user` shape the error code; when paging is off the address is
     /// physical (the identity-mapped boot core before it installs `CR3`).
-    fn walk(&self, vaddr: u64) -> Result<u64, u64> {
-        if !self.paging() {
-            return Ok(vaddr);
-        }
-        let err = |present: bool, write: bool, user: bool| {
-            (if present { PF_ERR_PRESENT } else { 0 })
-                | (if write { PF_ERR_WRITE } else { 0 })
-                | (if user { PF_ERR_USER } else { 0 })
-        };
-        let np = err(false, false, false);
+    fn walk(&self, vaddr: u64) -> Result<(u64, bool, bool), ()> {
+        // The caller (`translate_acc`/`translate`) checks paging is on. The returned
+        // tuple is `(physical address, writable, user-accessible)` — the effective
+        // R/W and U/S permissions are the AND of those bits across every walked
+        // level, so the caller can enforce write-protection (COW) and the
+        // user/supervisor boundary. `Err(())` means a level was not-present.
         let pml4 = self.cr3 & 0x000f_ffff_ffff_f000;
         let idx = |lvl: u32| ((vaddr >> (12 + 9 * lvl)) & 0x1ff) * 8;
         let ent = |base: u64, i: u64| self.rd_phys(base + i, 8);
         let present = |e: u64| e & 1 != 0;
         let next = |e: u64| e & 0x000f_ffff_ffff_f000;
+        let rw = |e: u64| (e >> 1) & 1 != 0;
+        let us = |e: u64| (e >> 2) & 1 != 0;
 
         let e4 = ent(pml4, idx(3));
         if !present(e4) {
-            return Err(np);
+            return Err(());
         }
+        let (mut w, mut u) = (rw(e4), us(e4));
         let e3 = ent(next(e4), idx(2));
         if !present(e3) {
-            return Err(np);
+            return Err(());
         }
+        w &= rw(e3);
+        u &= us(e3);
         if e3 & (1 << 7) != 0 {
             // 1 GiB page
-            return Ok((e3 & 0x000f_ffff_c000_0000) | (vaddr & 0x3fff_ffff));
+            return Ok(((e3 & 0x000f_ffff_c000_0000) | (vaddr & 0x3fff_ffff), w, u));
         }
         let e2 = ent(next(e3), idx(1));
         if !present(e2) {
-            return Err(np);
+            return Err(());
         }
+        w &= rw(e2);
+        u &= us(e2);
         if e2 & (1 << 7) != 0 {
             // 2 MiB page
-            return Ok((e2 & 0x000f_ffff_ffe0_0000) | (vaddr & 0x1f_ffff));
+            return Ok(((e2 & 0x000f_ffff_ffe0_0000) | (vaddr & 0x1f_ffff), w, u));
         }
         let e1 = ent(next(e2), idx(0));
         if !present(e1) {
-            return Err(np);
+            return Err(());
         }
-        #[cfg(feature = "cc44-trace")]
-        if TP_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) && vaddr < 0x0001_0000_0000_0000 {
-            use std::io::Write as _;
-            let _ = writeln!(
-                std::io::stderr(),
-                "[cc44-trace] WALK va={vaddr:#x} cr3={:#x} pml4={pml4:#x} i4={:#x} i3={:#x} i2={:#x} i1={:#x} e4={e4:#x} e3={e3:#x} e2={e2:#x} e1={e1:#x}",
-                self.cr3, idx(3), idx(2), idx(1), idx(0),
-            );
-        }
-        Ok((e1 & 0x000f_ffff_ffff_f000) | (vaddr & 0xfff))
+        w &= rw(e1);
+        u &= us(e1);
+        Ok(((e1 & 0x000f_ffff_ffff_f000) | (vaddr & 0xfff), w, u))
     }
 
     /// Translate a linear address for the executing core, latching a [`PageFault`]
@@ -748,46 +771,60 @@ impl Cpu {
         // does not re-walk the 4-level page table on every access (the dominant
         // interpreter cost). It holds only successful (present) walks; a miss or a
         // not-present page falls through to the full walk below.
-        let paging = self.paging();
+        if !self.paging() {
+            return vaddr;
+        }
         let pcid = self.active_pcid();
-        if paging {
-            let page = vaddr & !0xfff;
-            let set = (page >> 12) as usize & (TLB_SETS - 1);
+        let page = vaddr & !0xfff;
+        let set = (page >> 12) as usize & (TLB_SETS - 1);
+        // Resolve the frame + its effective permissions, from the TLB or a walk.
+        let (frame, writable, user_ok) = {
             let e = self.tlb[set];
-            if e.gen == self.tlb_gen
+            if e.valid
+                && e.gen == self.tlb_gen
                 && e.pcid as usize == pcid
                 && e.pgen == self.pcid_gen[pcid]
                 && e.tag == page
             {
-                return e.frame | (vaddr & 0xfff);
+                (e.frame, e.writable, e.user_ok)
+            } else {
+                match self.walk(vaddr) {
+                    Ok((pa, w, u)) => {
+                        self.tlb[set] = TlbEntry {
+                            tag: page,
+                            frame: pa & !0xfff,
+                            writable: w,
+                            user_ok: u,
+                            valid: true,
+                            pcid: pcid as u16,
+                            gen: self.tlb_gen,
+                            pgen: self.pcid_gen[pcid],
+                        };
+                        (pa & !0xfff, w, u)
+                    }
+                    Err(()) => {
+                        // Not-present (P=0): the kernel's #PF handler maps the page.
+                        let error = (if write { PF_ERR_WRITE } else { 0 })
+                            | (if user { PF_ERR_USER } else { 0 });
+                        self.fault = Some(PageFault { addr: vaddr, error });
+                        return 0;
+                    }
+                }
             }
+        };
+        // Protection check on a present page (P=1): a user access to a supervisor
+        // page, or a write to a read-only page (when CPL=3 or CR0.WP=1), faults —
+        // this is what makes copy-on-write (and so `fork`) work. The kernel's
+        // handler copies the page and re-runs the instruction.
+        let wp = self.cr0 & CR0_WP != 0;
+        if (user && !user_ok) || (write && !writable && (user || wp)) {
+            let error = PF_ERR_PRESENT
+                | (if write { PF_ERR_WRITE } else { 0 })
+                | (if user { PF_ERR_USER } else { 0 });
+            self.fault = Some(PageFault { addr: vaddr, error });
+            return 0;
         }
-        match self.walk(vaddr) {
-            Ok(pa) => {
-                if paging {
-                    let page = vaddr & !0xfff;
-                    let set = (page >> 12) as usize & (TLB_SETS - 1);
-                    self.tlb[set] = TlbEntry {
-                        tag: page,
-                        frame: pa & !0xfff,
-                        pcid: pcid as u16,
-                        gen: self.tlb_gen,
-                        pgen: self.pcid_gen[pcid],
-                    };
-                }
-                pa
-            }
-            Err(mut error) => {
-                if write {
-                    error |= PF_ERR_WRITE;
-                }
-                if user {
-                    error |= PF_ERR_USER;
-                }
-                self.fault = Some(PageFault { addr: vaddr, error });
-                0
-            }
-        }
+        frame | (vaddr & 0xfff)
     }
 
     /// Flush the whole software TLB (bump the global generation) — the architected
@@ -2278,6 +2315,20 @@ impl Cpu {
         } else {
             4
         };
+        // If a prefix/opcode fetch itself faulted (a demand-paged *code* page — the
+        // common case once a real userspace binary runs from disk), `translate_acc`
+        // has latched the `#PF` and the fetch returned a fallback byte. Do NOT decode
+        // that garbage: it can spuriously be an "undefined" opcode and abort the
+        // machine. Vector the page fault now and restart the instruction once the
+        // kernel maps the code page (operand faults *inside* an arm are handled by
+        // the end-of-step vectoring below, which restores the snapshot).
+        if let Some(pf) = self.fault.take() {
+            self.restore_snapshot(snap);
+            self.rip = start;
+            self.cr2 = pf.addr;
+            self.raise_exception(VEC_PAGE_FAULT, pf.error, true);
+            return Ok(());
+        }
         match op {
             // ── ALU group (add/or/adc/sbb/and/sub/xor/cmp), all six forms ──
             0x00 | 0x08 | 0x10 | 0x18 | 0x20 | 0x28 | 0x30 | 0x38 => {
@@ -2433,7 +2484,17 @@ impl Cpu {
                     s.selector = sel;
                 }
             }
-            0x90 => {} // nop
+            0x90..=0x97 => {
+                // XCHG rAX, r (0x90 with no REX.B is the canonical NOP). REX.B
+                // extends the register; the swap is at the operand size.
+                let g = (op as usize - 0x90) | (((rex & 1) as usize) << 3);
+                if g != RAX {
+                    let a = self.r[RAX] & Self::mask(size);
+                    let b = self.r[g] & Self::mask(size);
+                    self.store_rm(Rm::Reg(RAX), size, b);
+                    self.store_rm(Rm::Reg(g), size, a);
+                }
+            }
             0xa8 => {
                 let (a, b) = (self.r[0] & 0xff, self.fetch(1));
                 self.flags_logic(a & b, 1);
@@ -3008,7 +3069,10 @@ impl Cpu {
                         };
                         self.store_rm(Rm::Reg(g), size, swapped);
                     }
-                    _ => return Err(Halt::Undefined(start)),
+                    // Everything else in the `0F` map is an SSE/SSE2 (or related)
+                    // instruction — the x86-64 baseline vector ISA every stock glibc
+                    // binary uses. Dispatch on the mandatory prefix (66/F3/F2/none).
+                    other => self.sse_0f(other, rex, opsz, rep, start)?,
                 }
             }
             0xcc => {
@@ -3076,6 +3140,7 @@ impl Cpu {
             rflags: self.rflags,
             seg: self.seg,
             cpl: self.cpl,
+            xmm: self.xmm,
         }
     }
 
@@ -3086,6 +3151,7 @@ impl Cpu {
         self.rflags = s.rflags;
         self.seg = s.seg;
         self.cpl = s.cpl;
+        self.xmm = s.xmm;
     }
 }
 
@@ -3099,6 +3165,7 @@ struct RegSnapshot {
     rflags: u64,
     seg: [Seg; 6],
     cpl: u8,
+    xmm: [u128; 16],
 }
 
 // The guest-physical layout the 64-bit boot protocol uses (a low region below
@@ -4159,14 +4226,525 @@ impl Cpu {
                 self.wr(addr + 2, 8, base);
             }
             7 => {
-                // INVLPG — invalidate the active address space's mapping for the
-                // page (coarsened to the whole active PCID; a correct over-flush).
-                let pcid = self.active_pcid();
-                self.flush_pcid(pcid);
+                // INVLPG — invalidate the TLB entry for *this page only*. A precise
+                // single-page invalidation (not a whole-PCID flush) keeps the rest of
+                // the address space warm; the kernel issues INVLPG on every COW/unmap,
+                // so over-flushing here cold-flushes the TLB constantly and makes a
+                // fork+exec-heavy userspace ~80× slower.
+                let page = addr & !0xfff;
+                let set = (page >> 12) as usize & (TLB_SETS - 1);
+                self.tlb[set].valid = false;
             }
             _ => {}
         }
         Ok(())
+    }
+
+    // ── SSE / SSE2 (the x86-64 baseline vector ISA) ──────────────────────────
+
+    /// Read a 128-bit value from an SSE r/m operand — an `XMM` register or 16
+    /// bytes of memory (little-endian: low qword first). A `#PF` on the memory
+    /// form is latched and the instruction restarts (`reg_snapshot` includes the
+    /// XMM file).
+    fn xmm_load_rm(&mut self, rm: Rm) -> u128 {
+        match rm {
+            Rm::Reg(i) => self.xmm[i],
+            _ => {
+                let a = self.rm_addr(rm).unwrap_or(0);
+                let lo = u128::from(self.rd(a, 8));
+                let hi = u128::from(self.rd(a.wrapping_add(8), 8));
+                lo | (hi << 64)
+            }
+        }
+    }
+
+    /// Write a 128-bit value to an SSE r/m operand (XMM register or 16 bytes).
+    fn xmm_store_rm(&mut self, rm: Rm, val: u128) {
+        match rm {
+            Rm::Reg(i) => self.xmm[i] = val,
+            _ => {
+                let a = self.rm_addr(rm).unwrap_or(0);
+                self.wr(a, 8, val as u64);
+                self.wr(a.wrapping_add(8), 8, (val >> 64) as u64);
+            }
+        }
+    }
+
+    /// Read up to 64 bits from an SSE r/m operand's *low* lanes (an XMM register's
+    /// low bits, or `size` bytes of memory) — for `MOVSS`/`MOVSD`/`MOVQ`/`MOVD`.
+    fn xmm_load_rm_lo(&mut self, rm: Rm, size: u8) -> u64 {
+        match rm {
+            Rm::Reg(i) => (self.xmm[i] as u64) & Self::mask(size),
+            _ => {
+                let a = self.rm_addr(rm).unwrap_or(0);
+                self.rd(a, size)
+            }
+        }
+    }
+
+    /// Execute an SSE/SSE2 instruction `0F <op2>` whose mandatory prefix is given
+    /// by (`p66` = `66`, the `rep` kind = `F3`/`F2`, or none). These are the
+    /// integer + data-movement vector instructions a stock `linux-amd64` glibc
+    /// binary uses (its IFUNC string/memory routines, and `movd`/`movq`/`movdqa`
+    /// from process startup). The XMM register file is [`Cpu::xmm`]. Returns
+    /// [`Halt::Undefined`] for an opcode not modelled.
+    #[allow(clippy::too_many_lines)]
+    fn sse_0f(
+        &mut self,
+        op2: u8,
+        rex: u8,
+        p66: bool,
+        rep: RepKind,
+        start: u64,
+    ) -> Result<(), Halt> {
+        let f3 = rep == RepKind::Rep;
+        let f2 = rep == RepKind::Repne;
+        match op2 {
+            // Multi-byte NOP / PREFETCH*/HINT_NOP (0F 18..0F 1F): consume the ModRM.
+            0x18..=0x1f => {
+                let _ = self.modrm(rex);
+            }
+            // LFENCE/MFENCE/SFENCE/(L/ST)MXCSR/FXSAVE — group 15 (0F AE). The
+            // fences are no-ops here (a single in-order core); STMXCSR returns the
+            // default MXCSR; LDMXCSR/FXSAVE/FXRSTOR are accepted and ignored.
+            0xae => {
+                let modrm_peek = *self
+                    .ram
+                    .get(self.translate(self.rip) as usize)
+                    .unwrap_or(&0);
+                if modrm_peek >> 6 == 3 {
+                    let _ = self.modrm(rex); // fence (register form) — no-op
+                } else {
+                    let (ext, rm) = self.modrm(rex);
+                    if ext & 7 == 3 {
+                        self.xmm_store_lo32(rm, 0x1f80); // STMXCSR (default MXCSR)
+                    }
+                }
+            }
+            0x77 => {} // EMMS — no MMX state to clear
+            // MOVUPS/MOVUPD/MOVSS/MOVSD — reg ← r/m.
+            0x10 => {
+                let (reg, rm) = self.modrm(rex);
+                if f3 {
+                    // MOVSS: reg←mem zero-extends to 128; reg←reg keeps [127:32].
+                    let v = self.xmm_load_rm_lo(rm, 4);
+                    self.xmm[reg] = if matches!(rm, Rm::Reg(_)) {
+                        (self.xmm[reg] & !0xffff_ffff) | u128::from(v)
+                    } else {
+                        u128::from(v)
+                    };
+                } else if f2 {
+                    let v = self.xmm_load_rm_lo(rm, 8);
+                    self.xmm[reg] = if matches!(rm, Rm::Reg(_)) {
+                        (self.xmm[reg] & !u128::from(u64::MAX)) | u128::from(v)
+                    } else {
+                        u128::from(v)
+                    };
+                } else {
+                    self.xmm[reg] = self.xmm_load_rm(rm); // MOVUPS/MOVUPD
+                }
+            }
+            // store form — r/m ← reg.
+            0x11 => {
+                let (reg, rm) = self.modrm(rex);
+                if f3 {
+                    self.xmm_store_lo(rm, self.xmm[reg] as u64, 4);
+                } else if f2 {
+                    self.xmm_store_lo(rm, self.xmm[reg] as u64, 8);
+                } else {
+                    self.xmm_store_rm(rm, self.xmm[reg]);
+                }
+            }
+            // MOVLPS/MOVLPD (m64→low) or MOVHLPS (reg: src high→dst low).
+            0x12 => {
+                let (reg, rm) = self.modrm(rex);
+                let lo = if matches!(rm, Rm::Reg(_)) {
+                    (self.xmm_load_rm(rm) >> 64) as u64 // MOVHLPS
+                } else {
+                    self.xmm_load_rm_lo(rm, 8) // MOVLPS/MOVLPD
+                };
+                self.xmm[reg] = (self.xmm[reg] & !u128::from(u64::MAX)) | u128::from(lo);
+            }
+            0x13 => {
+                let (reg, rm) = self.modrm(rex); // MOVLPS store low64
+                self.xmm_store_lo(rm, self.xmm[reg] as u64, 8);
+            }
+            // MOVHPS/MOVHPD (m64→high) or MOVLHPS (reg: src low→dst high).
+            0x16 => {
+                let (reg, rm) = self.modrm(rex);
+                let hi = if matches!(rm, Rm::Reg(_)) {
+                    self.xmm_load_rm(rm) as u64 // MOVLHPS
+                } else {
+                    self.xmm_load_rm_lo(rm, 8) // MOVHPS/MOVHPD
+                };
+                self.xmm[reg] = (self.xmm[reg] & u128::from(u64::MAX)) | (u128::from(hi) << 64);
+            }
+            0x17 => {
+                let (reg, rm) = self.modrm(rex); // MOVHPS store high64
+                self.xmm_store_lo(rm, (self.xmm[reg] >> 64) as u64, 8);
+            }
+            0x14 => {
+                let (reg, rm) = self.modrm(rex); // UNPCKLPS/PD
+                let s = self.xmm_load_rm(rm);
+                self.xmm[reg] = if p66 {
+                    unpckl_qwords(self.xmm[reg], s)
+                } else {
+                    unpckl_dwords(self.xmm[reg], s)
+                };
+            }
+            0x15 => {
+                let (reg, rm) = self.modrm(rex); // UNPCKHPS/PD
+                let s = self.xmm_load_rm(rm);
+                self.xmm[reg] = if p66 {
+                    unpckh_qwords(self.xmm[reg], s)
+                } else {
+                    unpckh_dwords(self.xmm[reg], s)
+                };
+            }
+            // MOVAPS/MOVAPD — reg ← r/m (128, alignment not enforced).
+            0x28 => {
+                let (reg, rm) = self.modrm(rex);
+                self.xmm[reg] = self.xmm_load_rm(rm);
+            }
+            0x29 => {
+                let (reg, rm) = self.modrm(rex);
+                self.xmm_store_rm(rm, self.xmm[reg]);
+            }
+            // MOVMSKPS/PD — gpr ← the sign bits of the 4 floats / 2 doubles.
+            0x50 => {
+                let (reg, rm) = self.modrm(rex);
+                let v = self.xmm_load_rm(rm);
+                let m = if p66 {
+                    (((v >> 63) & 1) | (((v >> 127) & 1) << 1)) as u64
+                } else {
+                    let b = v.to_le_bytes();
+                    let mut m = 0u64;
+                    for i in 0..4 {
+                        m |= u64::from(b[i * 4 + 3] >> 7) << i;
+                    }
+                    m
+                };
+                self.store_rm(Rm::Reg(reg), 4, m);
+            }
+            // MOVD/MOVQ — xmm ← r/m (gpr or mem); REX.W ⇒ 64-bit, zero-extended.
+            0x6e => {
+                let (reg, rm) = self.modrm(rex);
+                let sz = if rex & 8 != 0 { 8 } else { 4 };
+                let v = self.load_rm(rm, sz);
+                self.xmm[reg] = u128::from(v);
+            }
+            // MOVDQA (66) / MOVDQU (F3) — reg ← r/m (128).
+            0x6f => {
+                let (reg, rm) = self.modrm(rex);
+                self.xmm[reg] = self.xmm_load_rm(rm);
+                let _ = (p66, f3); // both forms move 128 bits
+            }
+            0x7f => {
+                let (reg, rm) = self.modrm(rex);
+                self.xmm_store_rm(rm, self.xmm[reg]);
+            }
+            0x7e => {
+                let (reg, rm) = self.modrm(rex);
+                if f3 {
+                    // MOVQ xmm ← xmm/m64 (low 64, zero upper).
+                    let v = self.xmm_load_rm_lo(rm, 8);
+                    self.xmm[reg] = u128::from(v);
+                } else {
+                    // MOVD/MOVQ r/m ← xmm (REX.W ⇒ 64).
+                    let sz = if rex & 8 != 0 { 8 } else { 4 };
+                    self.store_rm(rm, sz, self.xmm[reg] as u64);
+                }
+            }
+            // MOVQ — r/m ← xmm (store low 64; 66 0F D6).
+            0xd6 => {
+                let (reg, rm) = self.modrm(rex);
+                self.xmm_store_lo(rm, self.xmm[reg] as u64, 8);
+            }
+            // SHUFPS/SHUFPD imm8.
+            0xc6 => {
+                let (reg, rm) = self.modrm(rex);
+                let imm = self.fetch_u8();
+                let s = self.xmm_load_rm(rm);
+                let d = self.xmm[reg];
+                self.xmm[reg] = if p66 {
+                    let dq = [d as u64, (d >> 64) as u64];
+                    let sq = [s as u64, (s >> 64) as u64];
+                    u128::from(dq[(imm & 1) as usize])
+                        | (u128::from(sq[((imm >> 1) & 1) as usize]) << 64)
+                } else {
+                    let dd = to_dwords(d);
+                    let sd = to_dwords(s);
+                    from_dwords([
+                        dd[(imm & 3) as usize],
+                        dd[((imm >> 2) & 3) as usize],
+                        sd[((imm >> 4) & 3) as usize],
+                        sd[((imm >> 6) & 3) as usize],
+                    ])
+                };
+            }
+            // PSHUFD (66) / PSHUFLW (F2) / PSHUFHW (F3) imm8.
+            0x70 => {
+                let (reg, rm) = self.modrm(rex);
+                let imm = self.fetch_u8();
+                let s = self.xmm_load_rm(rm);
+                self.xmm[reg] = if f2 {
+                    let w = to_words(s);
+                    let mut o = w;
+                    for i in 0..4 {
+                        o[i] = w[((imm >> (2 * i)) & 3) as usize];
+                    }
+                    from_words(o)
+                } else if f3 {
+                    let w = to_words(s);
+                    let mut o = w;
+                    for i in 0..4 {
+                        o[4 + i] = w[4 + ((imm >> (2 * i)) & 3) as usize];
+                    }
+                    from_words(o)
+                } else {
+                    let dw = to_dwords(s);
+                    from_dwords([
+                        dw[(imm & 3) as usize],
+                        dw[((imm >> 2) & 3) as usize],
+                        dw[((imm >> 4) & 3) as usize],
+                        dw[((imm >> 6) & 3) as usize],
+                    ])
+                };
+            }
+            // PINSRW imm8 — insert a 16-bit lane from a gpr/m16.
+            0xc4 => {
+                let (reg, rm) = self.modrm(rex);
+                let v = self.load_rm(rm, 2) as u16;
+                let imm = self.fetch_u8();
+                let mut w = to_words(self.xmm[reg]);
+                w[(imm & 7) as usize] = v;
+                self.xmm[reg] = from_words(w);
+            }
+            // PEXTRW imm8 — extract a 16-bit lane into a gpr.
+            0xc5 => {
+                let (reg, rm) = self.modrm(rex);
+                let imm = self.fetch_u8();
+                let w = to_words(self.xmm_load_rm(rm));
+                self.store_rm(Rm::Reg(reg), 4, u64::from(w[(imm & 7) as usize]));
+            }
+            // PMOVMSKB — gpr ← the sign bit of each of the 16 bytes.
+            0xd7 => {
+                let (reg, rm) = self.modrm(rex);
+                let b = self.xmm_load_rm(rm).to_le_bytes();
+                let mut m = 0u64;
+                for (i, &byte) in b.iter().enumerate() {
+                    m |= u64::from(byte >> 7) << i;
+                }
+                self.store_rm(Rm::Reg(reg), 4, m);
+            }
+            // Bitwise: PAND/PANDN/POR/PXOR.
+            0xdb => self.sse_bin(rex, |a, b| a & b),
+            0xdf => self.sse_bin(rex, |a, b| !a & b),
+            0xeb => self.sse_bin(rex, |a, b| a | b),
+            0xef => self.sse_bin(rex, |a, b| a ^ b),
+            // PCMPEQB/W/D.
+            0x74 => self.sse_packed_b(rex, |a, b| if a == b { 0xff } else { 0 }),
+            0x75 => self.sse_packed_w(rex, |a, b| if a == b { 0xffff } else { 0 }),
+            0x76 => self.sse_packed_d(rex, |a, b| if a == b { 0xffff_ffff } else { 0 }),
+            // PCMPGTB/W/D (signed).
+            0x64 => self.sse_packed_b(rex, |a, b| if (a as i8) > (b as i8) { 0xff } else { 0 }),
+            0x65 => self.sse_packed_w(rex, |a, b| if (a as i16) > (b as i16) { 0xffff } else { 0 }),
+            0x66 => self.sse_packed_d(rex, |a, b| {
+                if (a as i32) > (b as i32) {
+                    0xffff_ffff
+                } else {
+                    0
+                }
+            }),
+            // PADDB/W/D/Q and PSUBB/W/D/Q.
+            0xfc => self.sse_packed_b(rex, |a, b| a.wrapping_add(b)),
+            0xfd => self.sse_packed_w(rex, |a, b| a.wrapping_add(b)),
+            0xfe => self.sse_packed_d(rex, |a, b| a.wrapping_add(b)),
+            0xd4 => self.sse_packed_q(rex, |a, b| a.wrapping_add(b)),
+            0xf8 => self.sse_packed_b(rex, |a, b| a.wrapping_sub(b)),
+            0xf9 => self.sse_packed_w(rex, |a, b| a.wrapping_sub(b)),
+            0xfa => self.sse_packed_d(rex, |a, b| a.wrapping_sub(b)),
+            0xfb => self.sse_packed_q(rex, |a, b| a.wrapping_sub(b)),
+            // PMINUB/PMAXUB (unsigned bytes), PMINSW/PMAXSW (signed words).
+            0xda => self.sse_packed_b(rex, |a, b| a.min(b)),
+            0xde => self.sse_packed_b(rex, |a, b| a.max(b)),
+            0xea => self.sse_packed_w(rex, |a, b| (a as i16).min(b as i16) as u16),
+            0xee => self.sse_packed_w(rex, |a, b| (a as i16).max(b as i16) as u16),
+            // PADDUSB/PSUBUSB/PADDUSW/PSUBUSW (saturating unsigned).
+            0xdc => self.sse_packed_b(rex, |a, b| a.saturating_add(b)),
+            0xd8 => self.sse_packed_b(rex, |a, b| a.saturating_sub(b)),
+            0xdd => self.sse_packed_w(rex, |a, b| a.saturating_add(b)),
+            0xd9 => self.sse_packed_w(rex, |a, b| a.saturating_sub(b)),
+            // PMULLW (low 16 of the product).
+            0xd5 => self.sse_packed_w(rex, |a, b| a.wrapping_mul(b)),
+            // PUNPCKL/H BW/WD/DQ/QDQ.
+            0x60 => self.sse_unpack(rex, Unpack::LoB),
+            0x61 => self.sse_unpack(rex, Unpack::LoW),
+            0x62 => self.sse_unpack(rex, Unpack::LoD),
+            0x6c => self.sse_unpack(rex, Unpack::LoQ),
+            0x68 => self.sse_unpack(rex, Unpack::HiB),
+            0x69 => self.sse_unpack(rex, Unpack::HiW),
+            0x6a => self.sse_unpack(rex, Unpack::HiD),
+            0x6d => self.sse_unpack(rex, Unpack::HiQ),
+            // PACKUSWB/PACKSSWB/PACKSSDW (saturating pack).
+            0x67 => self.sse_packus_wb(rex),
+            // PSLLW/D/Q & PSRLW/D/Q & PSRAW/D by imm8 (group 0F 71/72/73).
+            0x71..=0x73 => {
+                let (ext, rm) = self.modrm(rex);
+                let imm = u32::from(self.fetch_u8());
+                let Rm::Reg(i) = rm else { return Ok(()) };
+                self.xmm[i] = shift_imm(op2, (ext & 7) as u8, self.xmm[i], imm);
+            }
+            // PSRLW/D/Q, PSLLW/D/Q, PSRAW/D by an XMM/m count.
+            0xd1 => self.sse_shift_var(rex, ShiftKind::SrlW),
+            0xd2 => self.sse_shift_var(rex, ShiftKind::SrlD),
+            0xd3 => self.sse_shift_var(rex, ShiftKind::SrlQ),
+            0xf1 => self.sse_shift_var(rex, ShiftKind::SllW),
+            0xf2 => self.sse_shift_var(rex, ShiftKind::SllD),
+            0xf3 => self.sse_shift_var(rex, ShiftKind::SllQ),
+            0xe1 => self.sse_shift_var(rex, ShiftKind::SraW),
+            0xe2 => self.sse_shift_var(rex, ShiftKind::SraD),
+            // PSADBW — sum of absolute byte differences into two word lanes.
+            0xf6 => {
+                let (reg, rm) = self.modrm(rex);
+                let a = self.xmm[reg].to_le_bytes();
+                let b = self.xmm_load_rm(rm).to_le_bytes();
+                let mut lo = 0u64;
+                let mut hi = 0u64;
+                for i in 0..8 {
+                    lo += u64::from(a[i].abs_diff(b[i]));
+                    hi += u64::from(a[8 + i].abs_diff(b[8 + i]));
+                }
+                self.xmm[reg] = u128::from(lo) | (u128::from(hi) << 64);
+            }
+            _ => {
+                #[cfg(feature = "cc44-trace")]
+                {
+                    let b = self.translate(start);
+                    eprintln!(
+                        "[sse] UNDEF op2={op2:#04x} p66={p66} f3={f3} f2={f2} @ {start:#x}  bytes={:02x?}",
+                        (0..8).map(|k| *self.ram.get(b as usize + k).unwrap_or(&0)).collect::<Vec<_>>()
+                    );
+                }
+                return Err(Halt::Undefined(start));
+            }
+        }
+        Ok(())
+    }
+
+    /// Store the low `size` bytes of an SSE value to an r/m operand — the
+    /// store-form moves (`MOVSS`/`MOVSD`/`MOVLPS`/`MOVHPS`/`MOVQ`). For a register
+    /// destination only the low `size` bytes are replaced.
+    fn xmm_store_lo(&mut self, rm: Rm, val: u64, size: u8) {
+        match rm {
+            Rm::Reg(i) => {
+                let m = u128::from(Self::mask(size));
+                self.xmm[i] = (self.xmm[i] & !m) | (u128::from(val) & m);
+            }
+            _ => {
+                let a = self.rm_addr(rm).unwrap_or(0);
+                self.wr(a, size, val);
+            }
+        }
+    }
+
+    /// Store a 32-bit value to a memory r/m operand (STMXCSR); register form ignored.
+    fn xmm_store_lo32(&mut self, rm: Rm, val: u32) {
+        if let Some(a) = self.rm_addr(rm) {
+            self.wr(a, 4, u64::from(val));
+        }
+    }
+
+    /// `dst = f(dst, src)` over the whole 128-bit value (the bitwise SSE ops).
+    fn sse_bin(&mut self, rex: u8, f: impl Fn(u128, u128) -> u128) {
+        let (reg, rm) = self.modrm(rex);
+        let s = self.xmm_load_rm(rm);
+        self.xmm[reg] = f(self.xmm[reg], s);
+    }
+
+    /// Per-byte packed op `dst[i] = f(dst[i], src[i])`.
+    fn sse_packed_b(&mut self, rex: u8, f: impl Fn(u8, u8) -> u8) {
+        let (reg, rm) = self.modrm(rex);
+        let a = self.xmm[reg].to_le_bytes();
+        let b = self.xmm_load_rm(rm).to_le_bytes();
+        let mut o = [0u8; 16];
+        for i in 0..16 {
+            o[i] = f(a[i], b[i]);
+        }
+        self.xmm[reg] = u128::from_le_bytes(o);
+    }
+
+    /// Per-word (16-bit) packed op.
+    fn sse_packed_w(&mut self, rex: u8, f: impl Fn(u16, u16) -> u16) {
+        let (reg, rm) = self.modrm(rex);
+        let a = to_words(self.xmm[reg]);
+        let b = to_words(self.xmm_load_rm(rm));
+        let mut o = [0u16; 8];
+        for i in 0..8 {
+            o[i] = f(a[i], b[i]);
+        }
+        self.xmm[reg] = from_words(o);
+    }
+
+    /// Per-dword (32-bit) packed op.
+    fn sse_packed_d(&mut self, rex: u8, f: impl Fn(u32, u32) -> u32) {
+        let (reg, rm) = self.modrm(rex);
+        let a = to_dwords(self.xmm[reg]);
+        let b = to_dwords(self.xmm_load_rm(rm));
+        let mut o = [0u32; 4];
+        for i in 0..4 {
+            o[i] = f(a[i], b[i]);
+        }
+        self.xmm[reg] = from_dwords(o);
+    }
+
+    /// Per-qword (64-bit) packed op.
+    fn sse_packed_q(&mut self, rex: u8, f: impl Fn(u64, u64) -> u64) {
+        let (reg, rm) = self.modrm(rex);
+        let d = self.xmm[reg];
+        let s = self.xmm_load_rm(rm);
+        let lo = f(d as u64, s as u64);
+        let hi = f((d >> 64) as u64, (s >> 64) as u64);
+        self.xmm[reg] = u128::from(lo) | (u128::from(hi) << 64);
+    }
+
+    /// `PUNPCKL/H` interleave of `dst` and `src` at the byte/word/dword/qword
+    /// granularity, from the low or high half.
+    fn sse_unpack(&mut self, rex: u8, kind: Unpack) {
+        let (reg, rm) = self.modrm(rex);
+        let d = self.xmm[reg];
+        let s = self.xmm_load_rm(rm);
+        self.xmm[reg] = match kind {
+            Unpack::LoB => unpack_bytes(d, s, false),
+            Unpack::HiB => unpack_bytes(d, s, true),
+            Unpack::LoW => unpack_words(d, s, false),
+            Unpack::HiW => unpack_words(d, s, true),
+            Unpack::LoD => unpckl_dwords(d, s),
+            Unpack::HiD => unpckh_dwords(d, s),
+            Unpack::LoQ => unpckl_qwords(d, s),
+            Unpack::HiQ => unpckh_qwords(d, s),
+        };
+    }
+
+    /// `PACKUSWB` — pack 8+8 signed words into 16 unsigned-saturated bytes.
+    fn sse_packus_wb(&mut self, rex: u8) {
+        let (reg, rm) = self.modrm(rex);
+        let a = to_words(self.xmm[reg]);
+        let b = to_words(self.xmm_load_rm(rm));
+        let sat = |w: u16| -> u8 { (w as i16).clamp(0, 255) as u8 };
+        let mut o = [0u8; 16];
+        for i in 0..8 {
+            o[i] = sat(a[i]);
+            o[8 + i] = sat(b[i]);
+        }
+        self.xmm[reg] = u128::from_le_bytes(o);
+    }
+
+    /// Variable (by an XMM/m count) packed shift.
+    fn sse_shift_var(&mut self, rex: u8, kind: ShiftKind) {
+        let (reg, rm) = self.modrm(rex);
+        let cnt = (self.xmm_load_rm(rm) as u64).min(255) as u32;
+        self.xmm[reg] = shift_lanes(kind, self.xmm[reg], cnt);
     }
 
     /// `LTR` — load the task register: read the 64-bit TSS descriptor `sel`
@@ -4224,6 +4802,157 @@ fn sign_extend(v: u64, size: u8) -> i64 {
         4 => v as u32 as i32 as i64,
         _ => v as i64,
     }
+}
+
+// ── SSE packed-lane helpers (little-endian lane order) ───────────────────────
+
+fn to_words(v: u128) -> [u16; 8] {
+    let b = v.to_le_bytes();
+    core::array::from_fn(|i| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]))
+}
+fn from_words(w: [u16; 8]) -> u128 {
+    let mut b = [0u8; 16];
+    for i in 0..8 {
+        b[2 * i..2 * i + 2].copy_from_slice(&w[i].to_le_bytes());
+    }
+    u128::from_le_bytes(b)
+}
+fn to_dwords(v: u128) -> [u32; 4] {
+    let b = v.to_le_bytes();
+    core::array::from_fn(|i| {
+        u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]])
+    })
+}
+fn from_dwords(d: [u32; 4]) -> u128 {
+    let mut b = [0u8; 16];
+    for i in 0..4 {
+        b[4 * i..4 * i + 4].copy_from_slice(&d[i].to_le_bytes());
+    }
+    u128::from_le_bytes(b)
+}
+
+/// `PUNPCKL/HBW` — interleave bytes of `a` (even result lanes) and `b` (odd) from
+/// the low (`hi=false`) or high (`hi=true`) half.
+fn unpack_bytes(a: u128, b: u128, hi: bool) -> u128 {
+    let (ab, bb) = (a.to_le_bytes(), b.to_le_bytes());
+    let base = if hi { 8 } else { 0 };
+    let mut o = [0u8; 16];
+    for i in 0..8 {
+        o[2 * i] = ab[base + i];
+        o[2 * i + 1] = bb[base + i];
+    }
+    u128::from_le_bytes(o)
+}
+fn unpack_words(a: u128, b: u128, hi: bool) -> u128 {
+    let (aw, bw) = (to_words(a), to_words(b));
+    let base = if hi { 4 } else { 0 };
+    let mut o = [0u16; 8];
+    for i in 0..4 {
+        o[2 * i] = aw[base + i];
+        o[2 * i + 1] = bw[base + i];
+    }
+    from_words(o)
+}
+fn unpckl_dwords(a: u128, b: u128) -> u128 {
+    let (ad, bd) = (to_dwords(a), to_dwords(b));
+    from_dwords([ad[0], bd[0], ad[1], bd[1]])
+}
+fn unpckh_dwords(a: u128, b: u128) -> u128 {
+    let (ad, bd) = (to_dwords(a), to_dwords(b));
+    from_dwords([ad[2], bd[2], ad[3], bd[3]])
+}
+fn unpckl_qwords(a: u128, b: u128) -> u128 {
+    (a & u128::from(u64::MAX)) | (b << 64)
+}
+fn unpckh_qwords(a: u128, b: u128) -> u128 {
+    (a >> 64) | ((b >> 64) << 64)
+}
+
+/// The granularity + direction of a packed shift selected by the `0F 71/72/73`
+/// group's ModRM.reg field.
+fn shift_imm(op2: u8, ext: u8, v: u128, cnt: u32) -> u128 {
+    // 0x73 /3 = PSRLDQ, /7 = PSLLDQ — whole-register *byte* shifts.
+    if op2 == 0x73 && ext == 3 {
+        return if cnt >= 16 { 0 } else { v >> (cnt * 8) };
+    }
+    if op2 == 0x73 && ext == 7 {
+        return if cnt >= 16 { 0 } else { v << (cnt * 8) };
+    }
+    let kind = match (op2, ext) {
+        (0x71, 2) => ShiftKind::SrlW,
+        (0x71, 4) => ShiftKind::SraW,
+        (0x71, 6) => ShiftKind::SllW,
+        (0x72, 2) => ShiftKind::SrlD,
+        (0x72, 4) => ShiftKind::SraD,
+        (0x72, 6) => ShiftKind::SllD,
+        (0x73, 2) => ShiftKind::SrlQ,
+        (0x73, 6) => ShiftKind::SllQ,
+        _ => return v,
+    };
+    shift_lanes(kind, v, cnt)
+}
+
+/// Apply a per-lane logical/arithmetic shift by `cnt` (a count ≥ the lane width
+/// produces 0, or a full sign-fill for the arithmetic forms).
+fn shift_lanes(kind: ShiftKind, v: u128, cnt: u32) -> u128 {
+    match kind {
+        ShiftKind::SrlW => from_words(to_words(v).map(|x| if cnt >= 16 { 0 } else { x >> cnt })),
+        ShiftKind::SllW => from_words(to_words(v).map(|x| if cnt >= 16 { 0 } else { x << cnt })),
+        ShiftKind::SraW => from_words(to_words(v).map(|x| {
+            let s = cnt.min(15);
+            ((x as i16) >> s) as u16
+        })),
+        ShiftKind::SrlD => from_dwords(to_dwords(v).map(|x| if cnt >= 32 { 0 } else { x >> cnt })),
+        ShiftKind::SllD => from_dwords(to_dwords(v).map(|x| if cnt >= 32 { 0 } else { x << cnt })),
+        ShiftKind::SraD => from_dwords(to_dwords(v).map(|x| {
+            let s = cnt.min(31);
+            ((x as i32) >> s) as u32
+        })),
+        ShiftKind::SrlQ => {
+            let lo = if cnt >= 64 { 0 } else { (v as u64) >> cnt };
+            let hi = if cnt >= 64 {
+                0
+            } else {
+                ((v >> 64) as u64) >> cnt
+            };
+            u128::from(lo) | (u128::from(hi) << 64)
+        }
+        ShiftKind::SllQ => {
+            let lo = if cnt >= 64 { 0 } else { (v as u64) << cnt };
+            let hi = if cnt >= 64 {
+                0
+            } else {
+                ((v >> 64) as u64) << cnt
+            };
+            u128::from(lo) | (u128::from(hi) << 64)
+        }
+    }
+}
+
+/// The interleave selector for `PUNPCKL/H {BW,WD,DQ,QDQ}`.
+#[derive(Clone, Copy)]
+enum Unpack {
+    LoB,
+    HiB,
+    LoW,
+    HiW,
+    LoD,
+    HiD,
+    LoQ,
+    HiQ,
+}
+
+/// A packed-shift lane width + direction.
+#[derive(Clone, Copy)]
+enum ShiftKind {
+    SrlW,
+    SllW,
+    SraW,
+    SrlD,
+    SllD,
+    SraD,
+    SrlQ,
+    SllQ,
 }
 
 /// A decoded ModRM r/m operand: a register index, a resolved effective address,
