@@ -34,7 +34,7 @@ const index = JSON.parse(await readFile(path.join(CC22, "index.json"), "utf8"));
 const MANIFEST_DIGEST = index.manifests[0].digest.split(":")[1];
 const MANIFEST_MT = index.manifests[0].mediaType;
 const REPO = "dev/busybox";
-const DISK = 2 * 1024 * 1024 * 1024; // a realistic devcontainer disk — sparse, so it costs only content
+const DISK = 512 * 1024 * 1024; // sparse, so it costs only content; sized like cc50 so the per-sector boot index stays fast
 
 let failed = false;
 const check = (c, m) => (c ? console.log("  ✓", m) : ((failed = true), console.error("PROVISION-BOOT-TEST: FAIL —", m)));
