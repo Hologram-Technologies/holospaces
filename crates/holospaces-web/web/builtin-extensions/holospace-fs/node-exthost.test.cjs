@@ -74,5 +74,24 @@ const files = {
   assert.strictEqual(path.join("/a", "b", "../c"), "/a/c", "path.join normalizes");
   assert.strictEqual(os.platform(), "linux", "os reports the holospace identity");
 
-  console.log("NODE-EXTHOST-CORE-TEST: PASS — the substrate-native ext host loads a Node-only extension, provides the Node API surface + vscode passthrough, and runs activate()");
+  // ── preload(): fetch the module graph from an async per-file API (Open VSX) ──
+  // Simulate Open VSX's GET /file/{path}: serve package.json + main + a relative
+  // dep on demand; assert the BFS pulls exactly the graph and activate() then runs.
+  const remote = {
+    "extension/package.json": JSON.stringify({ name: "demo2", main: "dist/main.js" }),
+    "extension/dist/main.js": `const vscode=require("vscode");const u=require("./util");function activate(c){c.subscriptions.push(vscode.commands.registerCommand("demo2."+u.id(),()=>{}));return{ok:true};}module.exports={activate};`,
+    "extension/dist/util.js": `module.exports={ id: () => "go" };`,
+  };
+  let fetches = 0;
+  const fetcher = async (p) => { fetches++; return Object.prototype.hasOwnProperty.call(remote, p) ? remote[p] : null; };
+  const v2 = recordingVscode();
+  const host2 = createNodeExtHost({ vscode: v2, extensionPath: "/extension" });
+  const pkg2 = JSON.parse(remote["extension/package.json"]);
+  await host2.preload({ packageJson: pkg2, fetcher });
+  const r2 = await host2.activate(pkg2);
+  assert.strictEqual(r2.api.ok, true, "preload fetched main + its relative dep; activate() ran");
+  assert.deepStrictEqual(v2.rec.commands, ["demo2.go"], "the fetched relative dep resolved (util.id() -> command id)");
+  assert.ok(fetches >= 2, "preload fetched the module graph over the (async) per-file API");
+
+  console.log("NODE-EXTHOST-CORE-TEST: PASS — the substrate-native ext host loads a Node-only extension (incl. async preload from a per-file API), provides the Node API surface + vscode passthrough, and runs activate()");
 })().catch((e) => { console.error("NODE-EXTHOST-CORE-TEST: FAIL —", e && e.stack ? e.stack : e); process.exit(1); });
