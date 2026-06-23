@@ -106,12 +106,24 @@ const utilMod = {
 // Build the `fs` shim over an injected holospace FS adapter (CC-15). The adapter
 // is async (reads route over the bridge); the sync `fs` surface is intentionally
 // minimal — extensions that need heavy sync fs are out of the Node-only baseline.
-function makeFs(adapter) {
+function makeFs(adapter, fileMap) {
   const a = adapter || {};
+  const fm = fileMap || {};
   const enc = new TextEncoder();
+  // A bundled extension file (from the unzipped .vsix, already in memory) read
+  // synchronously — this is what a load-time `fs.readFileSync` actually wants (a
+  // resource shipped inside the extension, e.g. a `.wasm` blob), as opposed to a
+  // workspace file (which lives on the holospace FS and is async-only). Returns the
+  // raw bytes, or null if the path is not a bundled file.
+  const bundled = (p) => {
+    const key = String(p);
+    if (fm[key] != null) return fm[key];
+    return null;
+  };
   const promises = {
     readFile: async (p, opts) => {
-      const bytes = await a.readFile(String(p));
+      const b = bundled(p);
+      const bytes = b != null ? b : await a.readFile(String(p));
       const encoding = typeof opts === "string" ? opts : opts && opts.encoding;
       return encoding ? new TextDecoder().decode(bytes) : bytes;
     },
@@ -125,12 +137,16 @@ function makeFs(adapter) {
   };
   return {
     promises,
-    existsSync: (p) => (a.existsSync ? !!a.existsSync(String(p)) : false),
+    existsSync: (p) => (bundled(p) != null ? true : a.existsSync ? !!a.existsSync(String(p)) : false),
     readFileSync: (p, opts) => {
-      if (!a.readFileSync) throw new Error("fs.readFileSync unsupported in the substrate-native host (use fs.promises)");
-      const bytes = a.readFileSync(String(p));
+      // Bundled extension resources (the unzipped .vsix) are in memory → real sync
+      // read. A workspace file is on the holospace FS (async over the bridge) and
+      // cannot be read synchronously here — extensions needing that are out of the
+      // Node-only baseline (use fs.promises).
+      const b = bundled(p) ?? (a.readFileSync ? a.readFileSync(String(p)) : null);
+      if (b == null) throw new Error(`ENOENT (sync): '${p}' is not a bundled extension file; use fs.promises for holospace files`);
       const encoding = typeof opts === "string" ? opts : opts && opts.encoding;
-      return encoding ? new TextDecoder().decode(bytes) : bytes;
+      return encoding ? new TextDecoder().decode(b) : b;
     },
     constants: { F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1 },
   };
@@ -165,8 +181,8 @@ function createNodeExtHost({ vscode, fsAdapter, files, extensionPath = "/extensi
     assert: makeAssert(),
     process: processShim, "node:process": processShim,
     buffer: { Buffer: globalThis.Buffer || makeBuffer() }, "node:buffer": { Buffer: globalThis.Buffer || makeBuffer() },
-    fs: makeFs(fsAdapter), "node:fs": makeFs(fsAdapter),
-    "fs/promises": makeFs(fsAdapter).promises, "node:fs/promises": makeFs(fsAdapter).promises,
+    fs: makeFs(fsAdapter, fileMap), "node:fs": makeFs(fsAdapter, fileMap),
+    "fs/promises": makeFs(fsAdapter, fileMap).promises, "node:fs/promises": makeFs(fsAdapter, fileMap).promises,
   };
 
   const cache = Object.create(null);
