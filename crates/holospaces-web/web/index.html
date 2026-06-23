@@ -390,9 +390,12 @@
       // old window path assembled a dense 1 GiB Vec and OOM-trapped on a real
       // image. Sync access handles are worker-only, but the router transport is
       // window-only, so the window relays each layer fetch for the worker.
-      // The disk is sized generously (sparse, so it costs only the content) to give
-      // a real devcontainer room for the shell + light work.
-      const PROVISION_DISK_BYTES = 2 * 1024 * 1024 * 1024;
+      // 1 GiB sparse — historical parity (the deploy booted at this size before the
+      // dense-Vec OOM regression). Sparse, so it costs only the image's content, not
+      // a gigabyte allocation. (A larger build-capable disk awaits the occupancy-index
+      // boot path: today the κ-disk indexer reads every sector of the declared disk,
+      // so the size also bounds boot-setup time — tracked as the next refinement.)
+      const PROVISION_DISK_BYTES = 1024 * 1024 * 1024;
       async function provisionToOpfs(kappa, image, arch) {
         const worker = new Worker("./provision-worker.mjs", { type: "module" });
         try {
