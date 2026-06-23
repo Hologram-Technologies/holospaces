@@ -522,6 +522,20 @@ pub struct Cpu {
     /// A direct-mapped software TLB over [`Cpu::translate_acc`] (see [`TlbEntry`]).
     tlb: Vec<TlbEntry>,
     tlb_gen: u64,
+    /// Inline instruction-fetch translation cache. A single instruction decodes
+    /// through several `fetch_u8` calls (prefixes, opcode, ModRM/SIB, displacement,
+    /// immediate) — almost always on one code page — and every byte would otherwise
+    /// re-run [`translate_acc`]'s TLB lookup. This caches the *current code page's*
+    /// VA→frame translation so the bytes after the first are a direct RAM read. It is
+    /// validated against `tlb_gen` + the active PCID's `pcid_gen` (so any TLB/paging
+    /// flush invalidates it for free) and is purely a read-through accelerator over
+    /// `translate_acc` — portable (no JIT/`std` dependency). `ifetch_gen == 0` (the
+    /// reserved pre-flush generation, real generations start at 1) means "empty".
+    ifetch_tag: u64,
+    ifetch_frame: u64,
+    ifetch_gen: u64,
+    ifetch_pgen: u64,
+    ifetch_pcid: u16,
     /// Per-PCID TLB generations (`CR4.PCIDE`). A `CR3` load without the no-flush
     /// hint bumps only the loaded PCID's generation, so the other address spaces'
     /// cached translations survive — the kernel reuses a handful of ASIDs and
@@ -632,6 +646,11 @@ impl Cpu {
                 TLB_SETS
             ],
             tlb_gen: 1,
+            ifetch_tag: 0,
+            ifetch_frame: 0,
+            ifetch_gen: 0,
+            ifetch_pgen: 0,
+            ifetch_pcid: 0,
             pcid_gen: vec![1; 4096],
             sys: Some(Box::new(Sys::new())),
             jit_code_pages: BTreeSet::new(),
@@ -1416,10 +1435,41 @@ impl Cpu {
     }
 
     fn fetch_u8(&mut self) -> u8 {
+        let vaddr = self.rip;
+        // Inline code-page cache: the bytes after the first in an instruction are on
+        // the same code page, so reuse its VA→frame translation (validated against the
+        // TLB/PCID generations) instead of re-running `translate_acc` per byte. A
+        // pending fault disables it (don't read past a fault). Byte-identical to
+        // `translate_acc` on a hit (same frame the TLB holds), and any flush bumps a
+        // generation so a stale entry can never be used.
+        if self.fault.is_none() {
+            let page = vaddr & !0xfff;
+            let pcid = self.active_pcid();
+            if self.ifetch_gen == self.tlb_gen
+                && self.ifetch_tag == page
+                && self.ifetch_pcid as usize == pcid
+                && self.ifetch_pgen == self.pcid_gen[pcid]
+            {
+                let p = (self.ifetch_frame | (vaddr & 0xfff)) as usize;
+                let b = *self.ram.get(p).unwrap_or(&0);
+                self.rip = vaddr.wrapping_add(1);
+                return b;
+            }
+        }
         let user = self.cpl == 3;
-        let p = self.translate_acc(self.rip, false, user) as usize;
-        let b = *self.ram.get(p).unwrap_or(&0);
-        self.rip = self.rip.wrapping_add(1);
+        let pa = self.translate_acc(vaddr, false, user);
+        // Refresh the cache only on a successful (present) paged translation — exactly
+        // the condition under which `translate_acc` filled the TLB.
+        if self.fault.is_none() && self.paging() {
+            self.ifetch_tag = vaddr & !0xfff;
+            self.ifetch_frame = pa & !0xfff;
+            self.ifetch_gen = self.tlb_gen;
+            let pcid = self.active_pcid();
+            self.ifetch_pcid = pcid as u16;
+            self.ifetch_pgen = self.pcid_gen[pcid];
+        }
+        let b = *self.ram.get(pa as usize).unwrap_or(&0);
+        self.rip = vaddr.wrapping_add(1);
         b
     }
 
