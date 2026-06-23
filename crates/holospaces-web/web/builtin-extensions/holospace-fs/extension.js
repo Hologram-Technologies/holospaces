@@ -806,18 +806,22 @@ function holospaceFsAdapter() {
 }
 
 function startNodeExtHost(context, out) {
+  // Mirror every step to the output channel AND the page console (`[CC48] …`), so
+  // the witness can see the bring-up chain and any failure reason.
+  const dbg = (m) => { try { out && out.appendLine("holospace: " + m); } catch (_e) { /* */ } try { console.warn("[CC48] " + m); } catch (_e) { /* */ } };
   (async () => {
     await readyPromise;
-    if (bootError) return; // the holospace did not boot; the LSP path already logged it
+    if (bootError) { dbg("CC-48 skipped — holospace did not boot"); return; }
     // Load the substrate-native ext-host runtime (a CommonJS module host + Node API
     // surface, pure-JS/browser-safe), served beside this extension. Try a relative
     // `require` first; fall back to fetching + evaluating the served source (the web
     // ext host does not always resolve relative requires).
     let host = null;
-    try { const h = require("./node-exthost.js"); if (h && h.installFromOpenVsx) host = h; } catch { /* fall through */ }
+    try { const h = require("./node-exthost.js"); if (h && h.installFromOpenVsx) { host = h; dbg("ext-host runtime loaded via require()"); } } catch (_e) { /* fall through */ }
     if (!host) {
       try {
         const srcUri = vscode.Uri.joinPath(context.extensionUri, "node-exthost.js");
+        dbg("loading ext-host runtime via fetch/fs; scheme=" + srcUri.scheme);
         let src;
         if (/^https?:$/.test(srcUri.scheme + ":")) {
           src = await (await fetch(srcUri.toString(true))).text();
@@ -827,15 +831,16 @@ function startNodeExtHost(context, out) {
         const mod = { exports: {} };
         new Function("module", "exports", "globalThis", src)(mod, mod.exports, globalThis);
         host = mod.exports;
+        dbg("ext-host runtime loaded via " + srcUri.scheme + " (" + src.length + " bytes)");
       } catch (e) {
-        out && out.appendLine("holospace: CC-48 node ext host runtime unavailable (" + String(e).split("\n")[0] + ")");
+        dbg("CC-48 node ext host runtime unavailable — " + String(e && e.stack ? e.stack : e).split("\n").slice(0, 2).join(" | "));
         return;
       }
     }
-    if (!host || !host.installFromOpenVsx) { out && out.appendLine("holospace: CC-48 node ext host runtime missing installFromOpenVsx"); return; }
+    if (!host || !host.installFromOpenVsx) { dbg("CC-48 node ext host runtime missing installFromOpenVsx"); return; }
     const extId =
       (vscode.workspace.getConfiguration("holospace").get("cc48Extension")) || CC48_DEFAULT_EXT;
-    out && out.appendLine("holospace: bringing up the substrate-native Node-API ext host; installing " + extId + " from Open VSX…");
+    dbg("bringing up the substrate-native Node-API ext host; installing " + extId + " from Open VSX…");
     try {
       const rec = { commands: [], statusBar: [] };
       const installed = await host.installFromOpenVsx({
@@ -843,6 +848,7 @@ function startNodeExtHost(context, out) {
         extId,
         fsAdapter: holospaceFsAdapter(),
       });
+      dbg("installed " + extId + "@" + installed.version + " (" + installed.fileCount + " files); activate() returned");
       // Keep the activated extension's disposables tied to our lifetime.
       if (installed.context && Array.isArray(installed.context.subscriptions)) {
         for (const d of installed.context.subscriptions) if (d && d.dispose) context.subscriptions.push(d);
@@ -862,9 +868,9 @@ function startNodeExtHost(context, out) {
       context.subscriptions.push(status);
     } catch (e) {
       // Honest: the host is not live until a Node-only extension genuinely activates.
-      out && out.appendLine("holospace: CC-48 substrate-native ext host not live yet — " + String(e && e.message ? e.message : e).split("\n")[0]);
+      dbg("CC-48 substrate-native ext host not live yet — " + String(e && e.stack ? e.stack : e).split("\n").slice(0, 3).join(" | "));
     }
-  })().catch((e) => out && out.appendLine("holospace: CC-48 node ext host error — " + e));
+  })().catch((e) => dbg("CC-48 node ext host error — " + String(e && e.stack ? e.stack : e).split("\n").slice(0, 3).join(" | ")));
 }
 
 function activate(context) {

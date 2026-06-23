@@ -171,15 +171,39 @@ function createNodeExtHost({ vscode, fsAdapter, files, extensionPath = "/extensi
 
   const cache = Object.create(null);
 
-  const resolveLocal = (from, id) => {
-    const base = id.startsWith("/") ? id : pathMod.join(pathMod.dirname(from), id);
-    const cands = [base, base + ".js", base + ".json", pathMod.join(base, "index.js")];
-    // package.json "main" for a directory require.
+  // Resolve a `base` path as a file (with .js/.json/index.js + package.json `main`
+  // for a directory) against the in-memory file map. Returns the key or null.
+  const resolveBase = (base) => {
+    const cands = [base, base + ".js", base + ".json"];
     const pj = pathMod.join(base, "package.json");
     if (fileMap[pj] != null) {
-      try { const m = JSON.parse(srcOf(fileMap[pj])).main; if (m) cands.unshift(pathMod.join(base, m), pathMod.join(base, m) + ".js"); } catch { /* ignore */ }
+      try {
+        const m = JSON.parse(srcOf(fileMap[pj])).main;
+        if (m) cands.push(pathMod.join(base, m), pathMod.join(base, m) + ".js", pathMod.join(base, m, "index.js"));
+      } catch { /* ignore */ }
     }
+    cands.push(pathMod.join(base, "index.js"));
     for (const c of cands) if (fileMap[c] != null) return c;
+    return null;
+  };
+
+  // Node-style module resolution: relative/absolute ids resolve against the
+  // requiring module's dir; bare ids (a package) walk up `node_modules` from the
+  // requiring dir to the extension root — exactly how the bundled deps in a .vsix
+  // are laid out (`extension/node_modules/<pkg>`).
+  const resolveLocal = (from, id) => {
+    if (id.startsWith(".") || id.startsWith("/")) {
+      return resolveBase(id.startsWith("/") ? id : pathMod.join(pathMod.dirname(from), id));
+    }
+    let dir = pathMod.dirname(from);
+    for (;;) {
+      const hit = resolveBase(pathMod.join(dir, "node_modules", id));
+      if (hit) return hit;
+      if (!dir || dir === "/" || dir === ".") break;
+      const parent = pathMod.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
     return null;
   };
 
