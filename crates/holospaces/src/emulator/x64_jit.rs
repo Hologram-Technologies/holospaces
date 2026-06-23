@@ -1815,10 +1815,15 @@ pub fn translate_block_at(code: &[u8], entry_rip: u64) -> Option<TranslatedBlock
 // ── Region (trace) translation ─────────────────────────────────────────────────
 
 /// The maximum number of basic blocks a region may contain. A larger cap captures
-/// bigger traces (more throughput), but a region's blocks all run in one Wasm call
-/// with no interrupt-delivery point between them; capped conservatively here. Beyond
-/// this, the discovery treats further direct-branch targets as region exits.
-const MAX_REGION_BLOCKS: usize = 4;
+/// bigger traces (more throughput): a hot trace of straight-line blocks joined by
+/// direct branches then retires in a single Wasm `run` call instead of one call per
+/// few blocks, so the per-call overhead (regfile sync + the memory-touching swap +
+/// the wasmtime dispatch) is amortised over far more guest instructions. Interrupt
+/// cadence is unaffected — a region's internal dispatch loop honours the per-call
+/// instruction `budget` (capped by the driver at the next-timer deadline), so it
+/// exits to deliver an IRQ regardless of how many blocks it *could* contain. Beyond
+/// this, discovery treats further direct-branch targets as region exits.
+const MAX_REGION_BLOCKS: usize = 32;
 /// The maximum guest-byte span of a region from its entry (a region never crosses a
 /// guest page — the driver fetches at most a page — and is further capped here).
 const MAX_REGION_BYTES: usize = 4096;
