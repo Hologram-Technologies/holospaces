@@ -777,7 +777,15 @@ impl Cpu {
         let pcid = self.active_pcid();
         let page = vaddr & !0xfff;
         let set = (page >> 12) as usize & (TLB_SETS - 1);
+        let wp = self.cr0 & CR0_WP != 0;
+        // The access is denied if a user access hits a supervisor page, or a write
+        // hits a read-only page (when CPL=3 or CR0.WP=1). This is what makes
+        // copy-on-write (and so `fork`) work.
+        let denied = |writable: bool, user_ok: bool| {
+            (user && !user_ok) || (write && !writable && (user || wp))
+        };
         // Resolve the frame + its effective permissions, from the TLB or a walk.
+        let mut from_tlb = false;
         let (frame, writable, user_ok) = {
             let e = self.tlb[set];
             if e.valid
@@ -786,6 +794,7 @@ impl Cpu {
                 && e.pgen == self.pcid_gen[pcid]
                 && e.tag == page
             {
+                from_tlb = true;
                 (e.frame, e.writable, e.user_ok)
             } else {
                 match self.walk(vaddr) {
@@ -812,12 +821,30 @@ impl Cpu {
                 }
             }
         };
-        // Protection check on a present page (P=1): a user access to a supervisor
-        // page, or a write to a read-only page (when CPL=3 or CR0.WP=1), faults —
-        // this is what makes copy-on-write (and so `fork`) work. The kernel's
-        // handler copies the page and re-runs the instruction.
-        let wp = self.cr0 & CR0_WP != 0;
-        if (user && !user_ok) || (write && !writable && (user || wp)) {
+        if denied(writable, user_ok) {
+            // A TLB-cached permission can be stale: the kernel may upgrade a page
+            // RO→RW (COW / dirty-bit / access-flag set) and then — seeing the live
+            // PTE already permits the access — never re-flush, so a stale software-TLB
+            // entry would fault forever. The page tables are the source of truth: on a
+            // denial sourced from the TLB, re-walk to confirm before faulting (qemu's
+            // hardware TLB is always coherent; ours must be made so on the fault edge).
+            if from_tlb {
+                if let Ok((pa, w, u)) = self.walk(vaddr) {
+                    self.tlb[set] = TlbEntry {
+                        tag: page,
+                        frame: pa & !0xfff,
+                        writable: w,
+                        user_ok: u,
+                        valid: true,
+                        pcid: pcid as u16,
+                        gen: self.tlb_gen,
+                        pgen: self.pcid_gen[pcid],
+                    };
+                    if !denied(w, u) {
+                        return (pa & !0xfff) | (vaddr & 0xfff);
+                    }
+                }
+            }
             let error = PF_ERR_PRESENT
                 | (if write { PF_ERR_WRITE } else { 0 })
                 | (if user { PF_ERR_USER } else { 0 });
@@ -4230,7 +4257,8 @@ impl Cpu {
                 // single-page invalidation (not a whole-PCID flush) keeps the rest of
                 // the address space warm; the kernel issues INVLPG on every COW/unmap,
                 // so over-flushing here cold-flushes the TLB constantly and makes a
-                // fork+exec-heavy userspace ~80× slower.
+                // fork+exec-heavy userspace boot ~80× slower. (Stale-permission
+                // coherence is handled on the fault edge by `translate_acc`'s re-walk.)
                 let page = addr & !0xfff;
                 let set = (page >> 12) as usize & (TLB_SETS - 1);
                 self.tlb[set].valid = false;
@@ -5062,6 +5090,62 @@ mod tests {
             cpu.rd_phys(0x5040, 4),
             0xdead_beef,
             "the write hit frame 0x5000"
+        );
+    }
+
+    /// The software TLB caches a page's R/W permission, but the kernel can upgrade
+    /// a page RO→RW (COW / dirty / access-flag set) and — seeing the live PTE
+    /// already permits the access — never re-flush. A naive cache would then fault
+    /// forever on that stale `writable=false` (the `fork`/exec COW storm that
+    /// stalls a real busybox boot). The MMU must re-validate a TLB-sourced
+    /// permission denial against the live page tables before faulting, exactly as
+    /// qemu's hardware TLB stays coherent. This reproduces the upgrade-without-flush
+    /// and asserts the write then succeeds (no infinite fault loop).
+    #[test]
+    fn software_tlb_revalidates_stale_write_permission() {
+        let mut cpu = Cpu::new(256 * 1024);
+        let put = |cpu: &mut Cpu, at: usize, e: u64| {
+            cpu.ram[at..at + 8].copy_from_slice(&e.to_le_bytes());
+        };
+        // VA 0 → frame 0x6000 through PML4→PDPT→PD→PT; upper entries present+RW,
+        // the leaf present but **read-only** (RW=0) — a supervisor page.
+        put(&mut cpu, 0x1000, 0x2000 | 0b11);
+        put(&mut cpu, 0x2000, 0x3000 | 0b11);
+        put(&mut cpu, 0x3000, 0x4000 | 0b11);
+        put(&mut cpu, 0x4000, 0x6000 | 0b001); // leaf: present, RW=0
+        cpu.cr3 = 0x1000;
+        cpu.cr4 = 1 << 5; // PAE
+        cpu.efer = 1 << 8; // LME
+        cpu.cr0 = (1 << 31) | CR0_WP; // PG | WP (enforce RW for supervisor too)
+        cpu.cpl = 0;
+
+        // A read caches the translation with writable=false.
+        let _ = cpu.rd(0x10, 4);
+        assert!(cpu.fault.is_none(), "reading a present page does not fault");
+
+        // A write to the read-only page faults (the COW edge), as on real hardware.
+        cpu.wr(0x10, 4, 0x1111_2222);
+        assert!(
+            cpu.fault.is_some(),
+            "a write to a read-only page faults (COW)"
+        );
+        cpu.fault = None; // ...the kernel's #PF handler runs.
+
+        // The kernel upgrades the leaf RO→RW but does NOT flush our software TLB
+        // (it relies on the spurious-fault path; the live PTE now permits the write).
+        put(&mut cpu, 0x4000, 0x6000 | 0b011); // leaf: present, RW=1
+
+        // The write must now succeed — the MMU re-walks on the stale denial and sees
+        // the live PTE permits it — instead of faulting forever on the stale entry.
+        cpu.wr(0x10, 4, 0x1111_2222);
+        assert!(
+            cpu.fault.is_none(),
+            "after RO→RW upgrade the write succeeds (no stale-TLB COW fault storm)"
+        );
+        assert_eq!(
+            cpu.rd_phys(0x6010, 4),
+            0x1111_2222,
+            "the write landed at the frame, not the phys-0 fault scratch"
         );
     }
 
