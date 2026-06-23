@@ -122,7 +122,10 @@ fn an_amd64_linux_boots_from_a_streamed_kappa_disk() {
     let store: Box<dyn KappaStore> = Box::new(MemKappaStore::new());
     let read = |i: u64, buf: &mut [u8]| {
         for (j, b) in buf.iter_mut().enumerate() {
-            *b = (i as u8).wrapping_add(j as u8).wrapping_mul(31).wrapping_add(7);
+            *b = (i as u8)
+                .wrapping_add(j as u8)
+                .wrapping_mul(31)
+                .wrapping_add(7);
         }
     };
     let mut cpu = Cpu::boot_linux_disk_streamed(
@@ -138,7 +141,9 @@ fn an_amd64_linux_boots_from_a_streamed_kappa_disk() {
     );
     let halt = cpu.run(40_000_000_000);
     let console = String::from_utf8_lossy(cpu.console());
-    eprintln!("---- guest console (streamed κ-disk) ----\n{console}\n---- end ----  (halt: {halt:?})");
+    eprintln!(
+        "---- guest console (streamed κ-disk) ----\n{console}\n---- end ----  (halt: {halt:?})"
+    );
 
     assert!(
         console.contains("Run /init as init process"),
