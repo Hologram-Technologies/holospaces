@@ -1232,10 +1232,22 @@ impl Cpu {
             return u64::from(self.lapic_read((pa - LAPIC_BASE) as u32));
         }
         self.dcache_touch(pa);
+        // Same-page accesses (the common case) map to contiguous physical bytes
+        // `pa..pa+size`; the first-byte translate above filled the TLB + A/D bits, so
+        // the rest need no re-translation — byte-identical to the per-byte loop, one
+        // translation instead of `size`. Only a page crossing falls back to per-byte.
+        let last = addr.wrapping_add(u64::from(size).saturating_sub(1));
+        let same_page = (addr >> 12) == (last >> 12);
         let mut v = 0u64;
-        for i in 0..u64::from(size) {
-            let p = self.translate_acc(addr.wrapping_add(i), false, user) as usize;
-            v |= u64::from(*self.ram.get(p).unwrap_or(&0)) << (8 * i);
+        if same_page {
+            for i in 0..u64::from(size) {
+                v |= u64::from(*self.ram.get((pa + i) as usize).unwrap_or(&0)) << (8 * i);
+            }
+        } else {
+            for i in 0..u64::from(size) {
+                let p = self.translate_acc(addr.wrapping_add(i), false, user) as usize;
+                v |= u64::from(*self.ram.get(p).unwrap_or(&0)) << (8 * i);
+            }
         }
         #[cfg(feature = "cc44-trace")]
         if addr == 0xffff_ffff_827b_b1e8 && TP_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1274,10 +1286,20 @@ impl Cpu {
             );
             let _ = std::io::stderr().flush();
         }
-        for i in 0..u64::from(size) {
-            let p = self.translate_acc(addr.wrapping_add(i), true, user) as usize;
-            if let Some(b) = self.ram.get_mut(p) {
-                *b = (val >> (8 * i)) as u8;
+        let last = addr.wrapping_add(u64::from(size).saturating_sub(1));
+        if (addr >> 12) == (last >> 12) {
+            // Same-page store: contiguous physical bytes, one translation (above).
+            for i in 0..u64::from(size) {
+                if let Some(b) = self.ram.get_mut((pa + i) as usize) {
+                    *b = (val >> (8 * i)) as u8;
+                }
+            }
+        } else {
+            for i in 0..u64::from(size) {
+                let p = self.translate_acc(addr.wrapping_add(i), true, user) as usize;
+                if let Some(b) = self.ram.get_mut(p) {
+                    *b = (val >> (8 * i)) as u8;
+                }
             }
         }
         // Self-modifying-code detection for the CC-48 JIT driver: if this store
@@ -1335,14 +1357,32 @@ impl Cpu {
             return None;
         }
         self.dcache_touch(pa);
+        // Fast path: an access that does not cross a page boundary (the common case)
+        // maps to `size` *contiguous* physical bytes `pa..pa+size` — the first-byte
+        // translation above already filled the TLB and set the page's accessed/dirty
+        // bits, so the remaining bytes need no further `translate_acc`. This is
+        // byte-identical to the per-byte loop (which would re-translate to the same
+        // contiguous page) but does one translation instead of `size`. Only a
+        // page-crossing access falls back to per-byte translation (each page resolved
+        // and fault-checked separately).
+        let last = addr.wrapping_add(u64::from(size).saturating_sub(1));
+        let same_page = (addr >> 12) == (last >> 12);
         if write {
-            for i in 0..u64::from(size) {
-                let p = self.translate_acc(addr.wrapping_add(i), true, user);
-                if self.fault.is_some() {
-                    return None;
+            if same_page {
+                for i in 0..u64::from(size) {
+                    if let Some(b) = self.ram.get_mut((pa + i) as usize) {
+                        *b = (val >> (8 * i)) as u8;
+                    }
                 }
-                if let Some(b) = self.ram.get_mut(p as usize) {
-                    *b = (val >> (8 * i)) as u8;
+            } else {
+                for i in 0..u64::from(size) {
+                    let p = self.translate_acc(addr.wrapping_add(i), true, user);
+                    if self.fault.is_some() {
+                        return None;
+                    }
+                    if let Some(b) = self.ram.get_mut(p as usize) {
+                        *b = (val >> (8 * i)) as u8;
+                    }
                 }
             }
             // Mirror wr's SMC bookkeeping for a write a JIT block performs.
@@ -1358,12 +1398,18 @@ impl Cpu {
             Some(0)
         } else {
             let mut v = 0u64;
-            for i in 0..u64::from(size) {
-                let p = self.translate_acc(addr.wrapping_add(i), false, user);
-                if self.fault.is_some() {
-                    return None;
+            if same_page {
+                for i in 0..u64::from(size) {
+                    v |= u64::from(*self.ram.get((pa + i) as usize).unwrap_or(&0)) << (8 * i);
                 }
-                v |= u64::from(*self.ram.get(p as usize).unwrap_or(&0)) << (8 * i);
+            } else {
+                for i in 0..u64::from(size) {
+                    let p = self.translate_acc(addr.wrapping_add(i), false, user);
+                    if self.fault.is_some() {
+                        return None;
+                    }
+                    v |= u64::from(*self.ram.get(p as usize).unwrap_or(&0)) << (8 * i);
+                }
             }
             Some(v)
         }
