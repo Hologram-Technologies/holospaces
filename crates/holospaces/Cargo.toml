@@ -28,7 +28,6 @@ std = [
     "hologram-exec/std",
     "hologram-backend/std",
     "hologram-store-mem/std",
-    "dep:wasmtime",
 ]
 # `net` (off by default) enables the internet *import boundary* (ADR-013): the
 # Repository Fetcher + OCI registry Image Fetcher (`CC-20`), an HTTP(S) client
@@ -89,16 +88,6 @@ wasmparser = { version = "0.221", optional = true }
 ureq = { version = "2", optional = true }
 # sha256 over a registry manifest (the OCI content digest) at the import boundary.
 sha2 = { version = "0.10", optional = true }
-# The CC-48 JIT driver's Wasm engine: `Cpu::run_jit` (the std-only fast-execution
-# path) instantiates each translated block on wasmtime and runs it natively over
-# the guest register file, with host `load`/`store` imports bound to the
-# interpreter's memory primitive. Gated by `std` (the `dep:wasmtime` feature
-# entry), so the portable peer core (wasm32 / bare-metal, `--no-default-features`)
-# never links it. Already in Cargo.lock via hologram-runtime-wasmtime.
-wasmtime = { version = "45.0", default-features = false, features = [
-    "cranelift",
-    "runtime",
-], optional = true }
 
 [dev-dependencies]
 # Named directly in the CC-8 witness (a source-peer KappaSync, SyncError, Bytes,
@@ -146,7 +135,3 @@ jsonschema = "0.46.5"
 # CC-9 OS-boot witness — decompress the pinned gzipped Linux kernel Image
 # (pure-Rust miniz_oxide backend; dev-only).
 flate2 = "1"
-# CC-48 — run the x86-64→Wasm translated blocks on the real Wasm engine for the
-# differential (interpreter-vs-JIT) correctness gate and the speed comparison.
-# Already in Cargo.lock via hologram-runtime-wasmtime, so no version risk.
-wasmtime = { version = "45.0", default-features = false, features = ["cranelift", "runtime"] }
