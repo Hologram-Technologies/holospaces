@@ -145,6 +145,10 @@ const browser = await chromium.launch();
 const ctx = await browser.newContext();
 const page = await ctx.newPage();
 page.on("pageerror", (e) => console.error("EXT-HOST-TEST: pageerror —", e.message));
+// Capture the substrate-native ext host's bring-up diagnostics ([CC48] …) so a
+// failure shows its reason instead of a silent missing marker.
+const cc48log = [];
+page.on("console", (m) => { const t = m.text(); if (t.includes("[CC48]")) { cc48log.push(t); console.log("  " + t); } });
 
 // The substrate-native ext host installs the subject — observe its package fetched
 // from Open VSX (the gallery install, not a listing icon).

@@ -123,8 +123,11 @@ const files = {
   const goodVsix = makeStoredZip({
     "extension/package.json": JSON.stringify({ name: "good", publisher: "acme", main: "out/ext.js" }), // Node-only
     "extension/out/ext.js":
-      `const vscode=require("vscode");const u=require("./util");function activate(c){c.subscriptions.push(vscode.commands.registerCommand("good."+u.id(),()=>{}));const i=vscode.window.createStatusBarItem(1,1);i.text="GOOD-ACTIVE";i.show();return{ok:true};}module.exports={activate};`,
+      `const vscode=require("vscode");const u=require("./util");const dep=require("helper");function activate(c){c.subscriptions.push(vscode.commands.registerCommand("good."+u.id()+dep.suffix(),()=>{}));const i=vscode.window.createStatusBarItem(1,1);i.text="GOOD-ACTIVE";i.show();return{ok:true};}module.exports={activate};`,
     "extension/out/util.js": `module.exports={ id: () => "run" };`,
+    // A bundled bare dependency (node_modules) — resolved by Node-style walk-up.
+    "extension/node_modules/helper/package.json": JSON.stringify({ name: "helper", main: "lib/main.js" }),
+    "extension/node_modules/helper/lib/main.js": `module.exports={ suffix: () => "-ok" };`,
   });
   const webVsix = makeStoredZip({
     "extension/package.json": JSON.stringify({ name: "web", publisher: "acme", main: "out/ext.js", browser: "out/web.js" }),
@@ -144,7 +147,7 @@ const files = {
   const v3 = recordingVscode();
   const inst = await installFromOpenVsx({ vscode: v3, extId: "acme.good", fetchImpl: fakeFetch, registryBase: REG });
   assert.strictEqual(inst.api.ok, true, "installFromOpenVsx downloaded + unzipped the .vsix and activated the Node-only extension");
-  assert.deepStrictEqual(v3.rec.commands, ["good.run"], "the installed extension registered its command (relative dep from the .vsix resolved)");
+  assert.deepStrictEqual(v3.rec.commands, ["good.run-ok"], "the installed extension registered its command (relative dep + bundled node_modules dep from the .vsix both resolved)");
   assert.deepStrictEqual(v3.rec.statusBar, ["GOOD-ACTIVE"], "the installed extension's contribution reached the workbench API");
 
   let rejected = false;
