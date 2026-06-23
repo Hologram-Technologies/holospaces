@@ -1952,6 +1952,110 @@ export class Workspace {
 if (Symbol.dispose) Workspace.prototype[Symbol.dispose] = Workspace.prototype.free;
 
 /**
+ * A booted **x86-64** (amd64) devcontainer on the holospaces x64 core
+ * (`CC-43`/`CC-44`/`CC-45`) — the ubiquitous registry/Codespaces architecture,
+ * so a launched x64 holospace runs the ecosystem's stock `linux/amd64` images and
+ * their x64 extensions. The browser-peer analogue of [`Aarch64Workspace`]: the
+ * provisioned amd64 image is paged from OPFS (`CC-7`, no full image in RAM) and
+ * the page drives the integrated terminal. Selected from the Platform Manager's
+ * architecture picker (ADR-021; the arch is fixed at provisioning, part of the
+ * holospace's content-addressed identity, Law L1).
+ */
+export class X64Workspace {
+    static __wrap(ptr) {
+        const obj = Object.create(X64Workspace.prototype);
+        obj.__wbg_ptr = ptr;
+        X64WorkspaceFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        X64WorkspaceFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_x64workspace_free(ptr, 0);
+    }
+    /**
+     * Boot a provisioned amd64 image, **streaming** its κ-disk from OPFS (no full
+     * image in RAM): `rootfs_handle` is the provisioned rootfs (read
+     * sector-by-sector into the OPFS-backed store on `disk_handle`). Drive with
+     * [`run`](X64Workspace::run), rendering [`terminal_delta`](X64Workspace::terminal_delta)
+     * between chunks. The x64 analogue of
+     * [`Aarch64Workspace::boot_devcontainer_opfs_streamed`].
+     * @param {Uint8Array} kernel
+     * @param {FileSystemSyncAccessHandle} rootfs_handle
+     * @param {FileSystemSyncAccessHandle} disk_handle
+     * @returns {X64Workspace}
+     */
+    static boot_devcontainer_opfs_streamed(kernel, rootfs_handle, disk_handle) {
+        const ptr0 = passArray8ToWasm0(kernel, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.x64workspace_boot_devcontainer_opfs_streamed(ptr0, len0, rootfs_handle, disk_handle);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return X64Workspace.__wrap(ret[0]);
+    }
+    /**
+     * Feed keystrokes to the guest's serial console.
+     * @param {Uint8Array} bytes
+     */
+    feed_input(bytes) {
+        const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.x64workspace_feed_input(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * Whether the machine has powered off.
+     * @returns {boolean}
+     */
+    get halted() {
+        const ret = wasm.x64workspace_halted(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
+     * Run a chunk of guest execution; returns `true` once the machine halts.
+     * @param {number} budget
+     * @returns {boolean}
+     */
+    run(budget) {
+        const ret = wasm.x64workspace_run(this.__wbg_ptr, budget);
+        return ret !== 0;
+    }
+    /**
+     * The full console the guest has produced.
+     * @returns {string}
+     */
+    terminal() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.x64workspace_terminal(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * The console bytes produced since the last call (the integrated terminal
+     * streams these).
+     * @returns {Uint8Array}
+     */
+    terminal_delta() {
+        const ret = wasm.x64workspace_terminal_delta(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+}
+if (Symbol.dispose) X64Workspace.prototype[Symbol.dispose] = X64Workspace.prototype.free;
+
+/**
  * The **usable default** Dev Container base image the peer provisions when a
  * repository declares no `devcontainer.json` (`buildpack-deps` — `curl`/`git`
  * over apt; the Dev Container spec's default, `CC-20`). Exposed so the
@@ -2119,6 +2223,9 @@ function __wbg_get_imports() {
         __wbg_channel_201dd300ab9cbf8c: function(arg0) {
             const ret = arg0.channel;
             return ret;
+        },
+        __wbg_close_1c114f4758b1c627: function(arg0) {
+            arg0.close();
         },
         __wbg_close_46a302f048f55362: function(arg0) {
             arg0.close();
@@ -2444,6 +2551,9 @@ const WebRtcLinkFinalization = (typeof FinalizationRegistry === 'undefined')
 const WorkspaceFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_workspace_free(ptr, 1));
+const X64WorkspaceFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_x64workspace_free(ptr, 1));
 
 function addToExternrefTable0(obj) {
     const idx = wasm.__externref_table_alloc();
