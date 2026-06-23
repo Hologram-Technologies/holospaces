@@ -62,8 +62,11 @@ if (!(await present("pkg/holospaces_web_bg.wasm"))) {
 // choice; override via CC48_EXT. The default is a stock Node-only Open VSX
 // extension. `isNodeOnly` gates acceptance: a `browser`-entrypoint subject is
 // rejected as a CC-19 relabel, not a CC-48 witness.
-const EXT = process.env.CC48_EXT || "ms-vscode.hexeditor";
-const ACTIVATION_SIGNAL = process.env.CC48_SIGNAL || "Hex Editor|hexEditor|hex editor";
+// `editorconfig.editorconfig` is a genuinely Node-only Open VSX extension (it has
+// a `main`, no `browser` entrypoint — verified below against the live registry) and
+// matches the host's default subject, so both install the same one. Override via
+// CC48_EXT (and the `holospace.cc48Extension` setting) to witness another subject.
+const EXT = process.env.CC48_EXT || "editorconfig.editorconfig";
 const [pub, name] = EXT.split(".");
 
 async function openVsxManifest(pubId, extName) {
@@ -163,12 +166,19 @@ try {
 
   // (3) the Node-only extension installs from Open VSX and ACTIVATES in that host,
   // its contribution OBSERVABLE in the real workbench DOM — the load-bearing proof.
+  // The host publishes the marker (a status-bar item, always in the DOM) NAMING the
+  // subject ONLY after its `activate()` returns, so the marker naming `EXT` proves
+  // THIS Node-only extension genuinely activated in the substrate-native host.
   await page.waitForTimeout(8000);
   check(installFetched, `the Node-only extension (${EXT}) installs from Open VSX into the substrate-native ext host`);
   const activated = await page
-    .waitForFunction((re) => new RegExp(re, "i").test(document.body.innerText || ""), ACTIVATION_SIGNAL, { timeout: 120000 })
+    .waitForFunction(
+      (id) => new RegExp("HOLOSPACE-NODE-EXTHOST-LIVE[^\\n]*" + id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i").test(document.body.innerText || ""),
+      EXT,
+      { timeout: 120000 },
+    )
     .then(() => true).catch(() => false);
-  check(activated, `the Node-only extension ACTIVATES in the substrate-native ext host — its contribution (\`${ACTIVATION_SIGNAL}\`) appears in the real workbench`);
+  check(activated, `the Node-only extension ${EXT} ACTIVATES in the substrate-native ext host — the host's marker naming it (published only after its activate() returns) appears in the real workbench`);
 
   console.log(
     failed
