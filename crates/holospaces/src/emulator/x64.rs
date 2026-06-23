@@ -586,6 +586,12 @@ const RFLAGS_IF: u64 = 1 << 9;
 const CR4_PCIDE: u64 = 1 << 17;
 /// `RFLAGS.DF` — the direction flag (string-op increment/decrement).
 const RFLAGS_DF: u64 = 1 << 10;
+/// `RFLAGS.AC` — the alignment-check / access-control flag. Under `CR4.SMAP`, a
+/// supervisor-mode access to a user page is permitted only while `AC = 1`; the
+/// kernel sets it with `STAC` around deliberate user accesses (`copy_*_user`,
+/// `clear_user`/`padzero`, …) and clears it with `CLAC`. Honouring `STAC`/`CLAC`
+/// is required for any SMAP-enabled kernel to load and run a userspace binary.
+const RFLAGS_AC: u64 = 1 << 18;
 
 // The model-specific registers the long-mode boot path drives.
 const MSR_EFER: u32 = 0xC000_0080;
@@ -4113,7 +4119,15 @@ impl Cpu {
                     self.r[RDX] = tsc >> 32;
                     self.r[RCX] = 0;
                 }
-                _ => {} // MONITOR/MWRC/etc. — no boot-path effect
+                // CLAC / STAC — clear/set RFLAGS.AC (the SMAP override the kernel
+                // wraps every deliberate user access in). Without these the kernel's
+                // `copy_*_user`/`clear_user` (e.g. `padzero` zeroing a BSS tail
+                // during `execve`) runs with AC=0, and its SMAP check faults the
+                // supervisor access to the user page — killing the first userspace
+                // binary. (`0F 01 CA` = CLAC, `0F 01 CB` = STAC.)
+                0xca => self.rflags &= !RFLAGS_AC,
+                0xcb => self.rflags |= RFLAGS_AC,
+                _ => {} // MONITOR/MWAIT/etc. — no boot-path effect
             }
             return Ok(());
         }
