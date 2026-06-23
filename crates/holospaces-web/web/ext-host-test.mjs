@@ -1,33 +1,31 @@
-// CC-48 (deployed/browser) — the substrate-native extension host activates an
-// ARBITRARY marketplace extension, its contribution observable in the real
-// workbench.
+// CC-48 (deployed/browser) — the SUBSTRATE-NATIVE extension host activates an
+// arbitrary Node-only marketplace extension, its contribution observable in the
+// real workbench.
 //
-// ADR-020's resolved frontier: the extension host that activates arbitrary
-// marketplace extensions is "holospaces' OWN, on the hologram substrate ... its
-// VS Code + Node API surface backed by the holospace's own primitives" — NOT Node
-// booted inside the emulated guest (which measured ~11 Minsn/s → tens of minutes
-// to boot V8, infeasible to witness; recorded in git history). The substrate's
-// execution surface in the browser peer IS the workbench's extension host (the
-// same process the Workspace wasm peer runs in, ADR-015's web-model refinement):
-// it runs on the substrate peer with NO Node on the host and NO deployment outside
-// the holospace (Law L4). holospaces is the remote, in the tab, on the substrate.
+// EXECUTION SURFACE (corrected v2 — the hologram-substrate-native way): the
+// extension host runs as NATIVE hologram exec on the browser peer's own wasm
+// execution surface — a JS/Node-API runtime compiled to wasm32 (CpuBackend),
+// backed by the holospace's OWN filesystem (CC-15), terminal (CC-11), and network
+// (CC-16), reached over the in-process CC-33 bridge (CC-34). It is NOT
+// openvscode-server inside the emulated x86-64 guest (the "interpreter wall":
+// ~tens of MIPS, un-JIT-able under unsafe_code=forbid), and it is NOT vscode-web's
+// WEB extension host (that is CC-19, already live). This mirrors the downstream
+// in-browser-inference discipline: heavy in-tab work runs as native wasm exec,
+// residency via the tiered MemKappaStore->OpfsKappaStore store, never the emulator.
 //
-// This witness composes the real deployed workbench EXACTLY as the deploy does
-// (build-workbench.mjs) — the κ-verified vscode-web core + the holospace-fs
-// builtin that boots the holospace in the ext host and backs the workbench with
-// the holospace's own filesystem (CC-15), terminal (CC-11), and language
-// intelligence over the in-process substrate bridge (CC-18/CC-33) — and declares
-// an ARBITRARY Open VSX extension so the launch installs + activates it. The three
-// load-bearing assertions, all executed (no prerequisite bail), each observing the
-// genuine workbench (never inferred, never faked — AGENTS.md):
-//   1. holospaces-as-remote is LIVE: the holospace-fs extension boots the
-//      holospace and confirms the substrate-native ext host is running and bound
-//      to the holospace's own primitives, surfacing HOLOSPACE-REMOTE-LIVE in the
-//      real workbench (ADR-020);
-//   2. an ARBITRARY Open VSX (workspace/Node) extension installs from the open
-//      gallery against that host (its package is fetched from Open VSX — CC-19);
-//   3. it ACTIVATES in the substrate-native ext host and its contribution (a
-//      status-bar item) is OBSERVABLE in the real workbench DOM.
+// The load-bearing assertions, each observing the genuine workbench (never faked):
+//   1. the witnessed subject is genuinely NODE-ONLY — its Open VSX package.json
+//      has a `main` and NO `browser` entrypoint, so it CANNOT run in vscode-web's
+//      web ext host; activating it proves the substrate-native Node-API host did it;
+//   2. the substrate-native ext host is LIVE — the holospace's wasm-exec Node-API
+//      runtime is up and reached over the bridge, publishing HOLOSPACE-NODE-EXTHOST-LIVE
+//      in the real workbench;
+//   3. the Node-only extension installs from Open VSX and ACTIVATES in that host,
+//      its contribution OBSERVABLE in the real workbench DOM.
+//
+// Until the substrate-native Node-API ext-host runtime is built (S1), assertions
+// 2-3 are EXPECTED RED — honest, never skip-passed (AGENTS.md). It never uses the
+// additionalBuiltinExtensions web path (the rejected relabel).
 import http from "node:http";
 import { readFile, stat } from "node:fs/promises";
 import { createHash } from "node:crypto";
@@ -45,23 +43,55 @@ const extDir = path.join(DIR, "builtin-extensions/holospace-fs");
 const cc16 = path.join(ROOT, "vv/artifacts/cc16");
 const cc18 = path.join(ROOT, "vv/artifacts/cc18");
 
-// The wasm peer (`pkg/`) the holospace-fs extension boots in the workbench's ext
-// host. A real witness builds its prerequisites rather than skipping; the suite
-// (vv/suites/cc48-ext-host.sh) builds `pkg/` before invoking this witness, so by
-// the time it runs the peer is present. If it is genuinely absent (a bare manual
-// run), fail honestly — never skip-pass.
+let failed = false;
+const check = (c, m) => (c ? console.log("  ✓", m) : ((failed = true), console.error("EXT-HOST-TEST: FAIL —", m)));
+
+// The wasm peer (`pkg/`) carries the substrate-native ext-host runtime the
+// holospace-fs builtin loads. A real witness builds its prerequisites; the suite
+// builds `pkg/` before invoking this witness. If genuinely absent, fail honestly.
 async function present(p) { try { await stat(path.join(DIR, p)); return true; } catch { return false; } }
 if (!(await present("pkg/holospaces_web_bg.wasm"))) {
-  console.error("EXT-HOST-TEST: RED — the wasm peer (pkg/) is absent; run vv/suites/cc48-ext-host.sh");
+  console.error("EXT-HOST-TEST: RED — the wasm peer (pkg/) is absent; run vv/targets/cc48-ext-host.sh");
   console.error("  (it builds the peer with wasm-pack before driving this witness).");
   process.exit(1);
+}
+
+// ── (1) The subject MUST be a Node-only extension (package.json `main`, NO
+// `browser`) — verified against Open VSX, so it cannot run in the web ext host and
+// its activation proves the substrate-native Node-API host did the work. A USER
+// choice; override via CC48_EXT. The default is a stock Node-only Open VSX
+// extension. `isNodeOnly` gates acceptance: a `browser`-entrypoint subject is
+// rejected as a CC-19 relabel, not a CC-48 witness.
+const EXT = process.env.CC48_EXT || "ms-vscode.hexeditor";
+const ACTIVATION_SIGNAL = process.env.CC48_SIGNAL || "Hex Editor|hexEditor|hex editor";
+const [pub, name] = EXT.split(".");
+
+async function openVsxManifest(pubId, extName) {
+  // Open VSX: /api/{pub}/{name}/latest → metadata incl. files.manifest (the
+  // package.json URL). Fetch the manifest and read `main`/`browser`.
+  const meta = await fetch(`https://open-vsx.org/api/${pubId}/${extName}/latest`).then((r) => r.json());
+  const manifestUrl = meta?.files?.manifest;
+  if (!manifestUrl) return null;
+  return await fetch(manifestUrl).then((r) => r.json());
+}
+
+let isNodeOnly = false;
+try {
+  const pkg = await openVsxManifest(pub, name);
+  // Node-only = has a `main` (Node entrypoint) and NO `browser` (web entrypoint).
+  isNodeOnly = !!pkg && typeof pkg.main === "string" && pkg.main.length > 0 && pkg.browser == null;
+  check(
+    isNodeOnly,
+    `the subject ${EXT} is Node-only on Open VSX (package.json has \`main\`, no \`browser\` entrypoint) — it cannot run in the web ext host`,
+  );
+} catch (e) {
+  check(false, `could not verify the subject ${EXT} is Node-only on Open VSX: ${e}`);
 }
 
 const { chromium } = await import("playwright");
 try { await stat(distDir); await stat(twDir); }
 catch { execSync(`npm install --no-save ${WORKBENCH_PIN} ${BOOTSTRAP}`, { cwd: DIR, stdio: "ignore" }); }
 
-// Derive the CC-18 layer digest from the OCI image (never hardcode — it drifts).
 async function ociLayerDigest(imageDir) {
   const blob = async (d) => JSON.parse(await readFile(path.join(imageDir, "blobs/sha256", d.split(":")[1]), "utf8"));
   const index = JSON.parse(await readFile(path.join(imageDir, "index.json"), "utf8"));
@@ -70,28 +100,17 @@ async function ociLayerDigest(imageDir) {
 }
 const cc18Layer = await ociLayerDigest(path.join(cc18, "image"));
 
-// The witnessed subject is an ARBITRARY Open VSX extension — a USER choice, never
-// a holospaces default — the unmodified marketplace artifact. `vscodevim.vim` is a
-// real, widely-installed extension on Open VSX whose activation contributes a
-// status-bar Vim-mode indicator (an observable DOM signal). Override via env.
-const EXT = process.env.CC48_EXT || "vscodevim.vim";
-// The DOM signal that the arbitrary extension genuinely activated.
-const ACTIVATION_SIGNAL = process.env.CC48_SIGNAL || "-- NORMAL --|-- INSERT --|VISUAL|vim";
+// Compose the real deployed workbench. The substrate-native ext host (loaded by
+// the holospace-fs builtin) installs + hosts the Node-only extension — we do NOT
+// declare it as a vscode-web builtin (no additionalBuiltinExtensions web path).
+// The subject κ is passed to the holospace-fs builtin via the page so it installs
+// it into the substrate-native host.
+const html = await composeWorkbenchHtml({ distDir, twDir, baseUrl: "." });
 
-// Compose the real deployed workbench, declaring the arbitrary extension so the
-// launch installs it from the open gallery — the same path CC-19 witnesses, here
-// driven against the substrate-native ext host backed by the holospace.
-const html = await composeWorkbenchHtml({ distDir, twDir, baseUrl: ".", extensions: [EXT] });
-
-// κ-verify the workbench's executable core against the committed manifest (L5),
-// exactly as the deploy does — a forged byte is refused before load.
+// κ-verify the workbench's executable core against the committed manifest (L5).
 const manifest = (await readFile(path.join(ROOT, "vv/artifacts/cc17/vendor.sha256"), "utf8"))
   .split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("#"))
   .map((l) => { const [hash, file] = l.split(/\s+/); return { hash, file }; });
-
-let failed = false;
-const check = (c, m) => (c ? console.log("  ✓", m) : ((failed = true), console.error("EXT-HOST-TEST: FAIL —", m)));
-
 let coreOk = 0;
 for (const { hash, file } of manifest) {
   if (createHash("sha256").update(await readFile(path.join(distDir, file))).digest("hex") === hash) coreOk++;
@@ -124,68 +143,37 @@ const ctx = await browser.newContext();
 const page = await ctx.newPage();
 page.on("pageerror", (e) => console.error("EXT-HOST-TEST: pageerror —", e.message));
 
-// Observe the install reading the arbitrary extension's package from Open VSX
-// (the unpkg/asset resource template) — the gallery install, not a listing icon.
+// The substrate-native ext host installs the subject — observe its package fetched
+// from Open VSX (the gallery install, not a listing icon).
 let installFetched = false;
-const pubName = EXT.split(".");
-const installRe = new RegExp(`open-vsx\\.org/vscode/(unpkg|asset)/${pubName[0]}`, "i");
+const installRe = new RegExp(`open-vsx\\.org/.*/${pub}`, "i");
 page.on("response", (r) => { if (installRe.test(r.url())) installFetched = true; });
 
 try {
-  await page.goto(`http://127.0.0.1:${port}/workbench.html`);
+  await page.goto(`http://127.0.0.1:${port}/workbench.html?cc48ext=${encodeURIComponent(EXT)}`);
   await page.waitForSelector(".monaco-workbench", { timeout: 60000 });
 
-  // (1) holospaces-as-remote is LIVE: the holospace-fs extension boots the
-  // holospace and confirms the substrate-native ext host is running and bound to
-  // the holospace's own primitives, publishing HOLOSPACE-REMOTE-LIVE (ADR-020).
-  const remoteLive = await page
-    .waitForFunction(
-      () => {
-        const txt = document.body.innerText || "";
-        return /HOLOSPACE-REMOTE-LIVE/.test(txt) || !!document.querySelector('[aria-label*="holospace" i]');
-      },
-      null,
-      { timeout: 180000 },
-    )
-    .then(() => true)
-    .catch(() => false);
-  check(remoteLive, "holospaces-as-remote is LIVE — the substrate-native extension host runs on the substrate execution surface, backed by the holospace's own primitives (ADR-020/CC-48)");
+  // (2) The substrate-native ext host is LIVE — the holospace's wasm-exec Node-API
+  // runtime is up and reached over the bridge, publishing HOLOSPACE-NODE-EXTHOST-LIVE.
+  // RED until the runtime is built (S1).
+  const hostLive = await page
+    .waitForFunction(() => /HOLOSPACE-NODE-EXTHOST-LIVE/.test(document.body.innerText || ""), null, { timeout: 180000 })
+    .then(() => true).catch(() => false);
+  check(hostLive, "the substrate-native (wasm-exec) Node-API extension host is LIVE over the bridge (HOLOSPACE-NODE-EXTHOST-LIVE), backed by CC-15/CC-11/CC-16 — not the emulated guest, not the web host");
 
-  // (2) the arbitrary extension installs from the open gallery against that host.
+  // (3) the Node-only extension installs from Open VSX and ACTIVATES in that host,
+  // its contribution OBSERVABLE in the real workbench DOM — the load-bearing proof.
   await page.waitForTimeout(8000);
-  check(installFetched, `the arbitrary marketplace extension (${EXT}) installs from Open VSX against the substrate-native ext host (CC-19)`);
-
-  // Open a file the running holospace holds (WELCOME.md, over virtio-9p, CC-15) so
-  // the editor-bound extension has an active editor to contribute to — its
-  // contribution operates on the HOLOSPACE'S OWN content (Law L1), not a stand-in.
-  // Double-click (a single click only previews); retry to ride out CI render
-  // timing — a real interaction, not a fixed sleep.
-  const welcome = page.locator(".explorer-folders-view .monaco-list-row", { hasText: "WELCOME" }).first();
-  for (let pass = 0; pass < 8; pass++) {
-    await welcome.dblclick({ timeout: 5000 }).catch(() => {});
-    const opened = await page
-      .waitForFunction(() => !!document.querySelector(".monaco-editor .view-lines")?.textContent, null, { timeout: 8000 })
-      .then(() => true).catch(() => false);
-    if (opened) break;
-  }
-
-  // (3) it ACTIVATES in the substrate-native ext host and its contribution is
-  // OBSERVABLE in the real workbench DOM — the load-bearing proof. (vscodevim's
-  // status-bar mode indicator renders against the active editor opened above.)
+  check(installFetched, `the Node-only extension (${EXT}) installs from Open VSX into the substrate-native ext host`);
   const activated = await page
-    .waitForFunction(
-      (re) => new RegExp(re, "i").test(document.body.innerText || ""),
-      ACTIVATION_SIGNAL,
-      { timeout: 120000 },
-    )
-    .then(() => true)
-    .catch(() => false);
-  check(activated, `the arbitrary extension ACTIVATES in the substrate-native ext host — its contribution (\`${ACTIVATION_SIGNAL}\`) appears in the real workbench`);
+    .waitForFunction((re) => new RegExp(re, "i").test(document.body.innerText || ""), ACTIVATION_SIGNAL, { timeout: 120000 })
+    .then(() => true).catch(() => false);
+  check(activated, `the Node-only extension ACTIVATES in the substrate-native ext host — its contribution (\`${ACTIVATION_SIGNAL}\`) appears in the real workbench`);
 
   console.log(
     failed
       ? "EXT-HOST-TEST: FAILED"
-      : "EXT-HOST-TEST: PASS (an arbitrary Open VSX extension activates in holospaces' substrate-native extension host — backed by the holospace's own primitives, no Node on the host, no deployment outside the holospace)",
+      : "EXT-HOST-TEST: PASS (a Node-only Open VSX extension activates in holospaces' substrate-native (wasm-exec) extension host — backed by the holospace's own primitives, no emulated-guest server, no Node on the host, no deployment outside the holospace)",
   );
 } finally {
   await browser.close();
