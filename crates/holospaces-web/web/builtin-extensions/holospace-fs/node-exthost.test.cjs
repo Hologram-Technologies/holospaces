@@ -6,7 +6,7 @@
 // reaches the (recording) vscode API. This is the load-bearing core the browser
 // witness then drives end-to-end.
 const assert = require("node:assert");
-const { createNodeExtHost } = require("./node-exthost.js");
+const { createNodeExtHost, installFromOpenVsx } = require("./node-exthost.js");
 
 // A recording `vscode` API stand-in (the browser passes the real workbench API).
 function recordingVscode() {
@@ -93,5 +93,39 @@ const files = {
   assert.deepStrictEqual(v2.rec.commands, ["demo2.go"], "the fetched relative dep resolved (util.id() -> command id)");
   assert.ok(fetches >= 2, "preload fetched the module graph over the (async) per-file API");
 
-  console.log("NODE-EXTHOST-CORE-TEST: PASS — the substrate-native ext host loads a Node-only extension (incl. async preload from a per-file API), provides the Node API surface + vscode passthrough, and runs activate()");
+  // ── installFromOpenVsx(): resolve + Node-only gate + install + activate ──────
+  // A fake Open VSX (the real API shape): /api/{ns}/{name}/latest -> { version,
+  // files:{manifest} }; the manifest URL -> package.json; the per-file API ->
+  // module bytes. Verifies the full install path AND that a browser-entrypoint
+  // subject is REFUSED (it would be CC-19, not CC-48).
+  const REG = "https://fake-vsx.test";
+  const registry = {
+    [`${REG}/api/acme/good/latest`]: { version: "2.0.0", files: { manifest: `${REG}/m/good` } },
+    [`${REG}/m/good`]: { name: "good", publisher: "acme", main: "out/ext.js" }, // Node-only
+    [`${REG}/api/acme/good/2.0.0/file/extension/out/ext.js`]:
+      `const vscode=require("vscode");function activate(c){c.subscriptions.push(vscode.commands.registerCommand("good.run",()=>{}));const i=vscode.window.createStatusBarItem(1,1);i.text="GOOD-ACTIVE";i.show();return{ok:true};}module.exports={activate};`,
+    [`${REG}/api/acme/web/latest`]: { version: "1.0.0", files: { manifest: `${REG}/m/web` } },
+    [`${REG}/m/web`]: { name: "web", publisher: "acme", main: "out/ext.js", browser: "out/web.js" }, // has browser → reject
+  };
+  const fakeFetch = async (url) => {
+    const body = registry[url];
+    return {
+      ok: body != null,
+      json: async () => body,
+      arrayBuffer: async () => new TextEncoder().encode(typeof body === "string" ? body : JSON.stringify(body)).buffer,
+    };
+  };
+
+  const v3 = recordingVscode();
+  const inst = await installFromOpenVsx({ vscode: v3, extId: "acme.good", fetchImpl: fakeFetch, registryBase: REG });
+  assert.strictEqual(inst.api.ok, true, "installFromOpenVsx resolved + preloaded + activated the Node-only extension");
+  assert.deepStrictEqual(v3.rec.commands, ["good.run"], "the installed extension registered its command");
+  assert.deepStrictEqual(v3.rec.statusBar, ["GOOD-ACTIVE"], "the installed extension's contribution reached the workbench API");
+
+  let rejected = false;
+  try { await installFromOpenVsx({ vscode: recordingVscode(), extId: "acme.web", fetchImpl: fakeFetch, registryBase: REG }); }
+  catch (e) { rejected = /not Node-only/.test(String(e)); }
+  assert.ok(rejected, "a browser-entrypoint extension is REFUSED (CC-19, not CC-48)");
+
+  console.log("NODE-EXTHOST-CORE-TEST: PASS — the substrate-native ext host loads a Node-only extension (preload + installFromOpenVsx, Node-only gate enforced), provides the Node API surface + vscode passthrough, and runs activate()");
 })().catch((e) => { console.error("NODE-EXTHOST-CORE-TEST: FAIL —", e && e.stack ? e.stack : e); process.exit(1); });

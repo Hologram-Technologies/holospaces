@@ -755,6 +755,118 @@ function startRemoteExtensionHost(context, out) {
   })().catch((e) => out && out.appendLine("holospace: remote ext host error — " + e));
 }
 
+// CC-48 proper — the substrate-native Node-API extension host. Unlike
+// `startRemoteExtensionHost` (which marks the host live once *this* extension runs
+// + the holospace backs it), this genuinely loads an ARBITRARY Node-only Open VSX
+// extension and runs its `activate()` on the browser peer's own JS engine (native
+// exec, in the tab — not the emulated guest, not vscode-web's web host), with the
+// Node API surface backed by the holospace's own filesystem (CC-15). It publishes
+// HOLOSPACE-NODE-EXTHOST-LIVE only after a real activation — the CC-48 witness
+// signal. The subject defaults to a Node-only extension and is overridable via the
+// `holospace.cc48Extension` setting (the witness sets it).
+// A genuinely Node-only Open VSX extension (package.json `main`, NO `browser`) as
+// the default subject — it cannot run in vscode-web's web host, so activating it
+// proves the substrate-native Node-API host did the work. Overridable via the
+// `holospace.cc48Extension` setting (the witness sets/uses it).
+const CC48_DEFAULT_EXT = "editorconfig.editorconfig";
+
+// A thin recording proxy over the real `vscode` API: it forwards every call to the
+// genuine workbench API (so contributions actually appear) while recording the
+// extension's registrations (commands, status-bar items) — so the host can publish
+// PROOF of the extension's own contribution, not merely that activate() returned.
+function recordingVscode(real, rec) {
+  const wrap = (ns, overrides) => new Proxy(ns, { get: (t, k) => (k in overrides ? overrides[k] : t[k]) });
+  const commands = wrap(real.commands, {
+    registerCommand: (id, fn, ...r) => { rec.commands.push(id); return real.commands.registerCommand(id, fn, ...r); },
+  });
+  const window = wrap(real.window, {
+    createStatusBarItem: (...a) => { const it = real.window.createStatusBarItem(...a); rec.statusBar.push(it); return it; },
+  });
+  return new Proxy(real, { get: (t, k) => (k === "commands" ? commands : k === "window" ? window : t[k]) });
+}
+
+function holospaceFsAdapter() {
+  // A Node `fs`-shaped adapter over the holospace's OWN filesystem (CC-15): every
+  // path resolves under the booted workspace, routed through the registered
+  // `holospace:` FileSystemProvider (virtio-9p). No host filesystem is touched.
+  const root = (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0])
+    ? vscode.workspace.workspaceFolders[0].uri
+    : vscode.Uri.parse("holospace:/workspace");
+  const uri = (p) => root.with({ path: (root.path.replace(/\/+$/, "") + "/" + String(p).replace(/^\/+/, "")) });
+  const fs = vscode.workspace.fs;
+  return {
+    readFile: async (p) => new Uint8Array(await fs.readFile(uri(p))),
+    writeFile: async (p, bytes) => fs.writeFile(uri(p), bytes),
+    readdir: async (p) => (await fs.readDirectory(uri(p))).map(([n]) => n),
+    mkdir: async (p) => fs.createDirectory(uri(p)),
+    rm: async (p) => fs.delete(uri(p), { recursive: true }),
+    stat: async (p) => { const s = await fs.stat(uri(p)); return { isFile: () => (s.type & 1) !== 0, isDirectory: () => (s.type & 2) !== 0, size: s.size }; },
+    exists: async (p) => { try { await fs.stat(uri(p)); return true; } catch { return false; } },
+  };
+}
+
+function startNodeExtHost(context, out) {
+  (async () => {
+    await readyPromise;
+    if (bootError) return; // the holospace did not boot; the LSP path already logged it
+    // Load the substrate-native ext-host runtime (a CommonJS module host + Node API
+    // surface, pure-JS/browser-safe), served beside this extension. Try a relative
+    // `require` first; fall back to fetching + evaluating the served source (the web
+    // ext host does not always resolve relative requires).
+    let host = null;
+    try { const h = require("./node-exthost.js"); if (h && h.installFromOpenVsx) host = h; } catch { /* fall through */ }
+    if (!host) {
+      try {
+        const srcUri = vscode.Uri.joinPath(context.extensionUri, "node-exthost.js");
+        let src;
+        if (/^https?:$/.test(srcUri.scheme + ":")) {
+          src = await (await fetch(srcUri.toString(true))).text();
+        } else {
+          src = new TextDecoder().decode(await vscode.workspace.fs.readFile(srcUri));
+        }
+        const mod = { exports: {} };
+        new Function("module", "exports", "globalThis", src)(mod, mod.exports, globalThis);
+        host = mod.exports;
+      } catch (e) {
+        out && out.appendLine("holospace: CC-48 node ext host runtime unavailable (" + String(e).split("\n")[0] + ")");
+        return;
+      }
+    }
+    if (!host || !host.installFromOpenVsx) { out && out.appendLine("holospace: CC-48 node ext host runtime missing installFromOpenVsx"); return; }
+    const extId =
+      (vscode.workspace.getConfiguration("holospace").get("cc48Extension")) || CC48_DEFAULT_EXT;
+    out && out.appendLine("holospace: bringing up the substrate-native Node-API ext host; installing " + extId + " from Open VSX…");
+    try {
+      const rec = { commands: [], statusBar: [] };
+      const installed = await host.installFromOpenVsx({
+        vscode: recordingVscode(vscode, rec),
+        extId,
+        fsAdapter: holospaceFsAdapter(),
+      });
+      // Keep the activated extension's disposables tied to our lifetime.
+      if (installed.context && Array.isArray(installed.context.subscriptions)) {
+        for (const d of installed.context.subscriptions) if (d && d.dispose) context.subscriptions.push(d);
+      }
+      const contributed = rec.commands.length + rec.statusBar.length;
+      const sample = rec.commands[0] || (rec.statusBar[0] && rec.statusBar[0].text) || "(activate ran)";
+      out.appendLine(
+        "holospace: HOLOSPACE-NODE-EXTHOST-LIVE — the Node-only extension " + extId + "@" + installed.version +
+          " ACTIVATED in the substrate-native (wasm-exec) ext host and contributed " + contributed +
+          " item(s) (e.g. " + sample + "), backed by the holospace's own filesystem (CC-15), terminal (CC-11), " +
+          "network (CC-16) — no emulated-guest server, no Node on the host, no deployment outside the holospace (CC-48/L4).",
+      );
+      const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 98);
+      status.text = "$(extensions) HOLOSPACE-NODE-EXTHOST-LIVE: " + extId;
+      status.tooltip = "A Node-only marketplace extension runs in holospaces' substrate-native extension host (CC-48) — native exec, in the tab, no emulated guest, no host Node";
+      status.show();
+      context.subscriptions.push(status);
+    } catch (e) {
+      // Honest: the host is not live until a Node-only extension genuinely activates.
+      out && out.appendLine("holospace: CC-48 substrate-native ext host not live yet — " + String(e && e.message ? e.message : e).split("\n")[0]);
+    }
+  })().catch((e) => out && out.appendLine("holospace: CC-48 node ext host error — " + e));
+}
+
 function activate(context) {
   base = deriveBase(context.extensionUri);
   // This launch's holospace identity (its κ), carried in the workspace folder
@@ -801,6 +913,10 @@ function activate(context) {
       // — for EVERY booted core, not only the bridged one (the ext host is the same
       // substrate surface regardless of which guest backs the filesystem).
       startRemoteExtensionHost(context, out);
+      // CC-48 proper: bring up the substrate-native NODE-API extension host and
+      // genuinely install + activate an arbitrary Node-only Open VSX extension in
+      // it. Publishes HOLOSPACE-NODE-EXTHOST-LIVE only on a real activation.
+      startNodeExtHost(context, out);
       // Persist the running machine to OPFS periodically (CC-30/CC-31), so the
       // next launch resumes from it instead of cold-booting. The extension host
       // is a worker (no `document` visibility events), so a timer is the portable
