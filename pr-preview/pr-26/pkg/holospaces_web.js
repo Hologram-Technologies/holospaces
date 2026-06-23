@@ -2224,6 +2224,9 @@ function __wbg_get_imports() {
             const ret = arg0.channel;
             return ret;
         },
+        __wbg_close_1c114f4758b1c627: function(arg0) {
+            arg0.close();
+        },
         __wbg_close_46a302f048f55362: function(arg0) {
             arg0.close();
         },
