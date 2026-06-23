@@ -87,6 +87,7 @@
             <select id="harch" title="The guest's instruction-set architecture — fixed for its life (part of its content-addressed identity, Law L1 / ADR-021).">
               <option value="riscv64">riscv64 (RV64GC)</option>
               <option value="aarch64">aarch64 (ARMv8-A)</option>
+              <option value="x64">x86-64 (amd64)</option>
             </select>
           </div>
           <button id="create" class="primary" disabled>Launch repository</button>
@@ -381,33 +382,48 @@
       // Provision a holospace's REAL OCI image in the browser and stage the
       // bootable rootfs in OPFS, where holospace-fs reads it (CC-42). The router
       // is the transport; the pull re-derives every blob (Law L5).
+      // Provision in a dedicated worker via the *streaming sparse* assembler
+      // (DevcontainerProvision.assembleIntoOpfs, CC-50) — it writes only the
+      // non-zero blocks into the OPFS file through a sync access handle, so peak
+      // heap tracks the image's content, not its declared disk. This is what makes
+      // an ARBITRARY base image (Debian/buildpack-deps, multi-GiB) provision: the
+      // old window path assembled a dense 1 GiB Vec and OOM-trapped on a real
+      // image. Sync access handles are worker-only, but the router transport is
+      // window-only, so the window relays each layer fetch for the worker.
+      // The disk is sized generously (sparse, so it costs only the content) to give
+      // a real devcontainer room for the shell + light work.
+      const PROVISION_DISK_BYTES = 2 * 1024 * 1024 * 1024;
       async function provisionToOpfs(kappa, image, arch) {
-        const prov = new window.hs.DevcontainerProvision(image, arch);
-        let steps = 0;
-        while (!prov.isDone()) {
-          const url = prov.nextUrl();
-          if (!url) break;
-          const headers = {};
-          const a = prov.nextAccept(); if (a) headers["Accept"] = a;
-          const b = prov.nextBearer(); if (b) headers["Authorization"] = "Bearer " + b;
-          const resp = await routerFetch(url, headers);
-          if (!resp) throw new Error("the router could not fetch " + url + " — is the extension enabled for this site?");
-          prov.deliver(resp.status, resp.contentType, resp.body);
-          if (++steps > 300) throw new Error("the image pull did not converge");
+        const worker = new Worker("./provision-worker.mjs", { type: "module" });
+        try {
+          await new Promise((resolve, reject) => {
+            worker.onmessage = async (e) => {
+              const m = e.data;
+              if (m && m.type === "fetch") {
+                const headers = {};
+                if (m.accept) headers["Accept"] = m.accept;
+                if (m.bearer) headers["Authorization"] = "Bearer " + m.bearer;
+                let resp;
+                try { resp = await routerFetch(m.url, headers); } catch { resp = null; }
+                if (!resp) { worker.postMessage({ type: "fetchResult", ok: false }); return; }
+                // Transfer the layer bytes zero-copy.
+                const buf = resp.body && resp.body.buffer ? resp.body.buffer : new Uint8Array(resp.body || []).buffer;
+                worker.postMessage(
+                  { type: "fetchResult", ok: true, status: resp.status, contentType: resp.contentType, body: buf },
+                  [buf],
+                );
+              } else if (m && m.type === "done") {
+                resolve(m.imageLen);
+              } else if (m && m.type === "error") {
+                reject(new Error(m.error));
+              }
+            };
+            worker.onerror = (e) => reject(new Error("provision worker error: " + (e.message || (e.filename + ":" + e.lineno))));
+            worker.postMessage({ type: "provision", image, arch, kappa, diskBytes: PROVISION_DISK_BYTES });
+          });
+        } finally {
+          worker.terminate();
         }
-        // Assemble a bootable rootfs with modest room to work. NOTE: the assembled
-        // image is a dense Vec of this size in the Manager tab, so it is kept
-        // bounded (1 GiB) to avoid OOM here — the paged κ-disk stores only the
-        // non-zero sectors, but the window assembles densely. Giving a large disk
-        // without a large Vec needs the streaming sparse assembly (the documented
-        // refinement). 1 GiB gives a typical image headroom for the shell + light work.
-        const rootfs = prov.assemble(1024 * 1024 * 1024);
-        const root = await navigator.storage.getDirectory();
-        const dir = await root.getDirectoryHandle("provisioned", { create: true });
-        const h = await dir.getFileHandle(kappa, { create: true });
-        const w = await h.createWritable();
-        await w.write(rootfs);
-        await w.close();
       }
 
       async function action(act, k) {
