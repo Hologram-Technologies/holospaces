@@ -31,6 +31,7 @@ import { readFile, stat } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { composeWorkbenchHtml, WORKBENCH_PIN } from "./build-workbench.mjs";
 
@@ -42,6 +43,10 @@ const twDir = path.join(DIR, "node_modules/@vscode/test-web");
 const extDir = path.join(DIR, "builtin-extensions/holospace-fs");
 const cc16 = path.join(ROOT, "vv/artifacts/cc16");
 const cc18 = path.join(ROOT, "vv/artifacts/cc18");
+const cc48 = path.join(ROOT, "vv/artifacts/cc48");
+// Reuse the host's own .vsix reader so the witness reads the fixture exactly as the
+// runtime does (a real ZIP read), no extra dependency.
+const { unzipVsix } = createRequire(import.meta.url)("./builtin-extensions/holospace-fs/node-exthost.js");
 
 let failed = false;
 const check = (c, m) => (c ? console.log("  ✓", m) : ((failed = true), console.error("EXT-HOST-TEST: FAIL —", m)));
@@ -57,39 +62,32 @@ if (!(await present("pkg/holospaces_web_bg.wasm"))) {
 }
 
 // ── (1) The subject MUST be a Node-only extension (package.json `main`, NO
-// `browser`) — verified against Open VSX, so it cannot run in the web ext host and
-// its activation proves the substrate-native Node-API host did the work. A USER
-// choice; override via CC48_EXT. The default is a stock Node-only Open VSX
-// extension. `isNodeOnly` gates acceptance: a `browser`-entrypoint subject is
-// rejected as a CC-19 relabel, not a CC-48 witness.
-// `editorconfig.editorconfig` is a genuinely Node-only Open VSX extension (it has
-// a `main`, no `browser` entrypoint — verified below against the live registry) and
-// matches the host's default subject, so both install the same one. Override via
-// CC48_EXT (and the `holospace.cc48Extension` setting) to witness another subject.
+// `browser`) — so it cannot run in vscode-web's web ext host, and activating it
+// proves the substrate-native Node-API host did the work (CC-48, not CC-19).
+//
+// The subject is the unmodified Open VSX `.vsix` committed under vv/artifacts/cc48
+// (provenance: build.sh + cc48.sha256). Hermetic + reproducible: the witness pins
+// the artifact by sha256 and serves it to the in-browser host by intercepting
+// open-vsx.org (below), so the gated suite never depends on a live third party —
+// while the deployed `holospace-fs` path resolves the real Open VSX registry,
+// unchanged. The subject defaults to the committed editorconfig fixture.
 const EXT = process.env.CC48_EXT || "editorconfig.editorconfig";
 const [pub, name] = EXT.split(".");
 
-async function openVsxManifest(pubId, extName) {
-  // Open VSX: /api/{pub}/{name}/latest → metadata incl. files.manifest (the
-  // package.json URL). Fetch the manifest and read `main`/`browser`.
-  const meta = await fetch(`https://open-vsx.org/api/${pubId}/${extName}/latest`).then((r) => r.json());
-  const manifestUrl = meta?.files?.manifest;
-  if (!manifestUrl) return null;
-  return await fetch(manifestUrl).then((r) => r.json());
-}
+const shaLine = (await readFile(path.join(cc48, "cc48.sha256"), "utf8")).trim();
+const [expectedSha, vsixName] = shaLine.split(/\s+/);
+const vsixBytes = await readFile(path.join(cc48, vsixName));
+const gotSha = createHash("sha256").update(vsixBytes).digest("hex");
+check(gotSha === expectedSha, `the committed ${EXT} .vsix re-derives to its pinned κ/sha256 (provenance, Law L5)`);
 
-let isNodeOnly = false;
-try {
-  const pkg = await openVsxManifest(pub, name);
-  // Node-only = has a `main` (Node entrypoint) and NO `browser` (web entrypoint).
-  isNodeOnly = !!pkg && typeof pkg.main === "string" && pkg.main.length > 0 && pkg.browser == null;
-  check(
-    isNodeOnly,
-    `the subject ${EXT} is Node-only on Open VSX (package.json has \`main\`, no \`browser\` entrypoint) — it cannot run in the web ext host`,
-  );
-} catch (e) {
-  check(false, `could not verify the subject ${EXT} is Node-only on Open VSX: ${e}`);
-}
+const vsixEntries = await unzipVsix(new Uint8Array(vsixBytes));
+const pkg = (() => { try { return JSON.parse(new TextDecoder().decode(vsixEntries["extension/package.json"])); } catch { return null; } })();
+const subjectVersion = (pkg && pkg.version) || "0.0.0";
+const isNodeOnly = !!pkg && typeof pkg.main === "string" && pkg.main.length > 0 && pkg.browser == null;
+check(
+  isNodeOnly,
+  `the subject ${EXT}@${subjectVersion} is Node-only (its .vsix package.json has \`main\`, no \`browser\` entrypoint) — it cannot run in the web ext host`,
+);
 
 const { chromium } = await import("playwright");
 try { await stat(distDir); await stat(twDir); }
@@ -149,6 +147,26 @@ page.on("pageerror", (e) => console.error("EXT-HOST-TEST: pageerror —", e.mess
 // failure shows its reason instead of a silent missing marker.
 const cc48log = [];
 page.on("console", (m) => { const t = m.text(); if (t.includes("[CC48]")) { cc48log.push(t); console.log("  " + t); } });
+
+// Hermetic Open VSX: serve the committed, sha256-pinned .vsix to the in-browser
+// host by intercepting open-vsx.org — `holospace-fs`'s real install path
+// (`GET /api/{ns}/{name}/latest` -> `files.download` -> the .vsix) runs unchanged,
+// but against the fixture, so the gate never depends on a live third party. The
+// deployed peer talks to the real registry.
+const vsixDownloadUrl = `https://open-vsx.org/api/${pub}/${name}/${subjectVersion}/file/${vsixName}`;
+await ctx.route(/open-vsx\.org/, async (route) => {
+  const url = route.request().url();
+  if (/\/api\/[^/]+\/[^/]+\/latest$/.test(url)) {
+    return route.fulfill({
+      status: 200, contentType: "application/json",
+      body: JSON.stringify({ namespace: pub, name, version: subjectVersion, files: { download: vsixDownloadUrl } }),
+    });
+  }
+  if (url === vsixDownloadUrl || url.endsWith(".vsix")) {
+    return route.fulfill({ status: 200, contentType: "application/octet-stream", body: Buffer.from(vsixBytes) });
+  }
+  return route.fulfill({ status: 404, body: "" });
+});
 
 // The substrate-native ext host installs the subject — observe its package fetched
 // from Open VSX (the gallery install, not a listing icon).

@@ -1,0 +1,3 @@
+editorconfig.editorconfig@0.18.2 — Open VSX (https://open-vsx.org), MIT-licensed.
+The unmodified .vsix (a ZIP). Node-only: package.json `main` ./out/editorConfigMain.js,
+no `browser` entrypoint. Re-fetch with build.sh; integrity pinned in cc48.sha256.
