@@ -159,3 +159,69 @@ fn an_amd64_linux_boots_from_a_streamed_kappa_disk() {
         "PID 1 printed its marker — the real amd64 kernel booted from the streamed κ-disk"
     );
 }
+
+/// The **build-capable** boot path (`CC-45`, section B): an x64 holospace may
+/// declare a *multi-GiB* disk — room to install toolchains and compile software
+/// in-guest — and still boot promptly, because the κ-disk is paged by its
+/// **occupancy**, not its declared size. [`Cpu::boot_linux_disk_occupancy`] indexes
+/// only the sectors the sparse assembler actually wrote (`from_occupancy`), so boot
+/// setup is O(content), not O(disk): here an **8 GiB** disk (16.7M sectors) is
+/// attached from a handful of occupied sectors and the real amd64 kernel boots to
+/// userspace with it probed — the same boot an 8 MiB disk produces, proving the
+/// disk-size ceiling is gone (the old dense index would be ~1.2 GB of RAM and a
+/// 16.7M-iteration build before the kernel even started). Parametric in the image
+/// (Law L4): the declared size is just a number; only content is paged.
+#[test]
+#[ignore = "boots a real amd64 Linux with an 8 GiB occupancy-indexed κ-disk (~release)"]
+fn an_amd64_linux_boots_from_an_occupancy_indexed_build_capable_disk() {
+    let kernel = vmlinux_elf();
+
+    // An 8 GiB *declared* disk — a build-capable size — paged by occupancy. Only a
+    // sparse scattering of sectors is populated (what a mostly-empty large rootfs
+    // looks like): a superblock-like region near the front and one block at the far
+    // end of the 8 GiB address space. The 16.7M holes are never indexed or read.
+    const DISK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+    let sector_count = DISK_BYTES / 512;
+    let occupied: Vec<(u64, [u8; 512])> = [0u64, 1, 2, 4096, sector_count - 1]
+        .iter()
+        .map(|&i| {
+            let mut s = [0u8; 512];
+            for (j, b) in s.iter_mut().enumerate() {
+                *b = (i as u8)
+                    .wrapping_mul(31)
+                    .wrapping_add(j as u8)
+                    .wrapping_add(1);
+            }
+            (i, s)
+        })
+        .collect();
+
+    let store: Box<dyn KappaStore> = Box::new(MemKappaStore::new());
+    let mut cpu = Cpu::boot_linux_disk_occupancy(
+        1024 * 1024 * 1024,
+        &kernel,
+        "earlyprintk=serial,ttyS0 console=ttyS0 random.trust_cpu=on",
+        store,
+        sector_count,
+        occupied,
+    );
+    let halt = cpu.run(40_000_000_000);
+    let console = String::from_utf8_lossy(cpu.console());
+    eprintln!(
+        "---- guest console (8 GiB occupancy κ-disk) ----\n{console}\n---- end ----  (halt: {halt:?})"
+    );
+
+    assert!(
+        console.contains("Run /init as init process"),
+        "the kernel handed control to PID 1 with the 8 GiB build-capable κ-disk attached"
+    );
+    assert_eq!(
+        halt,
+        Halt::Halted,
+        "PID 1 powered the machine off — a clean boot through the occupancy-indexed path"
+    );
+    assert!(
+        console.contains("HOLOSPACES-LINUX-USERSPACE-OK"),
+        "PID 1 printed its marker — the real amd64 kernel booted from the 8 GiB occupancy κ-disk"
+    );
+}

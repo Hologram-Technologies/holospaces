@@ -679,9 +679,19 @@ struct KappaBacking {
     /// wasm heap, paged on demand — "the KappaStore IS the memory, RAM is a
     /// cache"); the default is the owned in-memory store (native, tests).
     store: Box<dyn KappaStore>,
-    /// One entry per sector: the sector's content κ, or `None` for a sparse
-    /// (never-written, all-zero) sector.
-    index: Vec<Option<KappaLabel71>>,
+    /// The declared disk capacity in sectors — what the guest sees (e.g. a
+    /// multi-GiB build-capable disk), independent of how much content it holds.
+    sector_count: u64,
+    /// **Occupied sectors only**: sector index → content κ. A sparse
+    /// (never-written, all-zero) sector is simply absent — never stored, never
+    /// indexed. Keeping the index sparse (not one dense slot per declared sector)
+    /// makes both its residency *and* boot-time indexing O(content), not O(disk):
+    /// a holospace can declare an arbitrarily large disk (≥ 8 GiB, room to build
+    /// software in-guest) and still boot promptly, because only the blocks the
+    /// image actually populated are paged ("the KappaStore IS the memory, RAM is a
+    /// cache", Laws L3/L4). This is parametric in the image — any devcontainer /
+    /// OCI rootfs, of any size, indexes in proportion to its content (Law L4).
+    index: BTreeMap<u64, KappaLabel71>,
     /// A **bounded**, κ-keyed read-through cache of decoded sectors. Every
     /// `read_sector` would otherwise hit the (possibly OPFS-backed) store; this
     /// caches by content κ so dedup'd sectors share one entry, and is capped at
@@ -755,17 +765,20 @@ impl KappaBacking {
     /// OPFS-backed store so the disk's sectors live off the wasm heap.
     fn from_image_in(store: Box<dyn KappaStore>, image: &[u8]) -> Self {
         let sector_count = image.len().div_ceil(DISK_SECTOR);
-        let mut index = Vec::with_capacity(sector_count);
+        let mut index = BTreeMap::new();
         let mut sector = [0u8; DISK_SECTOR];
         for i in 0..sector_count {
             let start = i * DISK_SECTOR;
             let end = (start + DISK_SECTOR).min(image.len());
             sector.fill(0);
             sector[..end - start].copy_from_slice(&image[start..end]);
-            index.push(Self::store_sector(store.as_ref(), &sector));
+            if let Some(k) = Self::store_sector(store.as_ref(), &sector) {
+                index.insert(i as u64, k);
+            }
         }
         KappaBacking {
             store,
+            sector_count: sector_count as u64,
             index,
             read_cache: core::cell::RefCell::new(SectorCache::new()),
         }
@@ -781,15 +794,54 @@ impl KappaBacking {
         sector_count: u64,
         mut read: R,
     ) -> Self {
-        let mut index = Vec::with_capacity(sector_count as usize);
+        let mut index = BTreeMap::new();
         let mut sector = [0u8; DISK_SECTOR];
         for i in 0..sector_count {
             sector.fill(0);
             read(i, &mut sector);
-            index.push(Self::store_sector(store.as_ref(), &sector));
+            if let Some(k) = Self::store_sector(store.as_ref(), &sector) {
+                index.insert(i, k);
+            }
         }
         KappaBacking {
             store,
+            sector_count,
+            index,
+            read_cache: core::cell::RefCell::new(SectorCache::new()),
+        }
+    }
+
+    /// Load a κ-disk of `sector_count` declared sectors paging **only** the
+    /// occupied (non-zero) sectors — the **occupancy-index boot path**. `occupied`
+    /// yields `(sector_index, sector_bytes)` for each block the sparse assembler
+    /// actually wrote; every other sector of the declared disk is sparse (reads as
+    /// zeros) and is *never touched*. Unlike [`from_sectors`], which reads every
+    /// sector of the declared disk (O(disk)), this indexes in proportion to the
+    /// image's **content** (O(content)): a multi-GiB build-capable disk holding a
+    /// few hundred MiB boots promptly because the holes are skipped entirely, not
+    /// read-and-discarded. This is fully parametric in the image — any
+    /// devcontainer / OCI rootfs, of any declared size (Laws L3/L4, Law L4: one
+    /// path, no per-image or per-ISA workaround). An all-zero sector mistakenly
+    /// yielded stays sparse (`store_sector` returns `None`), so the invariant
+    /// "absent ⇔ all-zero" holds regardless of the iterator's fidelity.
+    fn from_occupancy<I: IntoIterator<Item = (u64, [u8; DISK_SECTOR])>>(
+        store: Box<dyn KappaStore>,
+        sector_count: u64,
+        occupied: I,
+    ) -> Self {
+        let mut index = BTreeMap::new();
+        for (i, sector) in occupied {
+            debug_assert!(
+                i < sector_count,
+                "an occupied sector lies within the declared disk"
+            );
+            if let Some(k) = Self::store_sector(store.as_ref(), &sector) {
+                index.insert(i, k);
+            }
+        }
+        KappaBacking {
+            store,
+            sector_count,
             index,
             read_cache: core::cell::RefCell::new(SectorCache::new()),
         }
@@ -804,17 +856,18 @@ impl KappaBacking {
         }
     }
 
-    /// The disk capacity in bytes.
+    /// The disk capacity in bytes — the **declared** size, independent of how many
+    /// sectors are occupied (a sparse multi-GiB disk reports its full capacity).
     fn len(&self) -> usize {
-        self.index.len() * DISK_SECTOR
+        self.sector_count as usize * DISK_SECTOR
     }
 
     /// Read sector `i` (sparse → zeros) as a 512-byte block, through the bounded
     /// κ-keyed read cache so a repeated or dedup'd sector resolves without a store
     /// round-trip (Law L3: the store is the memory, this is the RAM cache).
     fn read_sector(&self, i: usize) -> [u8; DISK_SECTOR] {
-        let Some(k) = &self.index[i] else {
-            return [0u8; DISK_SECTOR]; // sparse all-zero sector
+        let Some(k) = self.index.get(&(i as u64)) else {
+            return [0u8; DISK_SECTOR]; // sparse all-zero sector (absent ⇔ all-zero)
         };
         if let Some(hit) = self.read_cache.borrow().get(k) {
             return *hit;
@@ -855,14 +908,21 @@ impl KappaBacking {
             let so = pos % DISK_SECTOR;
             let n = (DISK_SECTOR - so).min(data.len() - done);
             sector[so..so + n].copy_from_slice(&data[done..done + n]);
-            let k = Self::store_sector(self.store.as_ref(), &sector);
-            // Populate the read cache with the just-written content so an
-            // immediate re-read is served without a store round-trip. Keys are
-            // content κ, so there is never a stale entry to invalidate.
-            if let Some(k) = &k {
-                self.read_cache.borrow_mut().insert(*k, sector);
+            match Self::store_sector(self.store.as_ref(), &sector) {
+                Some(k) => {
+                    // Populate the read cache with the just-written content so an
+                    // immediate re-read is served without a store round-trip. Keys
+                    // are content κ, so there is never a stale entry to invalidate.
+                    self.read_cache.borrow_mut().insert(k, sector);
+                    self.index.insert(si as u64, k);
+                }
+                // The write zeroed the sector — drop it from the index so the
+                // "absent ⇔ all-zero" invariant holds and the disk re-sparsifies
+                // (a `target/` cleaned in-guest reclaims its κ-store footprint).
+                None => {
+                    self.index.remove(&(si as u64));
+                }
             }
-            self.index[si] = k;
             done += n;
         }
     }
@@ -871,16 +931,15 @@ impl KappaBacking {
     /// content (the live store dedups; the snapshot captures the bytes).
     fn to_image(&self) -> Vec<u8> {
         let mut image = vec![0u8; self.len()];
-        for (i, slot) in self.index.iter().enumerate() {
-            if let Some(k) = slot {
-                let bytes = self
-                    .store
-                    .get(k)
-                    .ok()
-                    .flatten()
-                    .expect("κ-disk: a sector's content resolves for its κ");
-                image[i * DISK_SECTOR..(i + 1) * DISK_SECTOR].copy_from_slice(bytes.as_ref());
-            }
+        for (&i, k) in self.index.iter() {
+            let bytes = self
+                .store
+                .get(k)
+                .ok()
+                .flatten()
+                .expect("κ-disk: a sector's content resolves for its κ");
+            let i = i as usize;
+            image[i * DISK_SECTOR..(i + 1) * DISK_SECTOR].copy_from_slice(bytes.as_ref());
         }
         image
     }
@@ -5158,11 +5217,12 @@ mod tests {
         assert_eq!(disk.to_image(), image, "the κ-disk reconstructs its image");
         assert_eq!(disk.len(), 3 * DISK_SECTOR);
         assert!(
-            disk.index[1].is_none(),
-            "the all-zero sector is sparse (unstored)"
+            !disk.index.contains_key(&1),
+            "the all-zero sector is sparse (absent from the occupancy index)"
         );
         assert_eq!(
-            disk.index[0], disk.index[2],
+            disk.index.get(&0),
+            disk.index.get(&2),
             "identical sectors dedup to one κ (Law L1/L2)"
         );
 
@@ -5176,13 +5236,82 @@ mod tests {
         assert_eq!(&got, patch, "a straddling partial-sector write round-trips");
         // Sector 1 is no longer fully zero (it received the tail of the patch).
         assert!(
-            disk.index[1].is_some(),
+            disk.index.contains_key(&1),
             "the written sector is now content-addressed"
         );
         // Sector 2 (untouched) still shares sector 0's original κ.
         assert_eq!(
             disk.to_image()[2 * DISK_SECTOR..3 * DISK_SECTOR],
             image[0..DISK_SECTOR]
+        );
+    }
+
+    /// The **occupancy-index boot path** (`CC-45`, section B): a κ-disk declared
+    /// at a *build-capable* multi-GiB size pages **only** its occupied sectors, so
+    /// boot setup is O(content), not O(disk). This is the ceiling the deployed
+    /// Manager had to cap around; the test proves it is genuinely gone — an 8 GiB
+    /// disk (16.7M sectors) is constructed from a handful of occupied sectors
+    /// without ever allocating or touching a per-sector slot for the holes.
+    #[test]
+    fn occupancy_index_pages_only_content_for_a_multi_gib_disk() {
+        // An 8 GiB disk — far larger than the old dense-index ceiling. A dense
+        // `Vec<Option<κ>>` would be ~1.2 GB of RAM and a 16.7M-iteration build;
+        // the sparse occupancy index allocates one entry per *occupied* sector.
+        const DISK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+        let sector_count = DISK_BYTES / DISK_SECTOR as u64;
+
+        // A sparse scattering of populated sectors — content near the start (a
+        // superblock-like region) and one deep at the far end of the declared
+        // disk, exactly what an assembler emits for a mostly-empty large rootfs.
+        let occupied_idx = [0u64, 1, 2, 4096, sector_count - 1];
+        let content = |i: u64| -> [u8; DISK_SECTOR] {
+            let mut s = [0u8; DISK_SECTOR];
+            for (j, b) in s.iter_mut().enumerate() {
+                *b = (i as u8)
+                    .wrapping_mul(31)
+                    .wrapping_add(j as u8)
+                    .wrapping_add(1);
+            }
+            s
+        };
+        let occupied: Vec<(u64, [u8; DISK_SECTOR])> =
+            occupied_idx.iter().map(|&i| (i, content(i))).collect();
+
+        let disk =
+            KappaBacking::from_occupancy(Box::new(MemKappaStore::new()), sector_count, occupied);
+
+        // The guest sees the full declared capacity…
+        assert_eq!(
+            disk.len() as u64,
+            DISK_BYTES,
+            "the disk reports its declared 8 GiB"
+        );
+        // …but only the occupied sectors are indexed — O(content), not O(disk).
+        assert_eq!(
+            disk.index.len(),
+            occupied_idx.len(),
+            "only the occupied sectors are paged (the holes are never touched)"
+        );
+
+        // Every occupied sector reads back its content, including the one at the
+        // far end of the 8 GiB address space (no overflow in the sector math).
+        for &i in &occupied_idx {
+            assert_eq!(
+                disk.read_sector(i as usize),
+                content(i),
+                "occupied sector {i} reads its content"
+            );
+        }
+        // A hole between/around the occupied sectors reads as all-zero without ever
+        // having been stored (absent ⇔ all-zero).
+        assert_eq!(
+            disk.read_sector(100),
+            [0u8; DISK_SECTOR],
+            "an unoccupied sector reads as sparse zeros"
+        );
+        assert!(
+            !disk.index.contains_key(&100),
+            "a hole is never content-addressed"
         );
     }
 
