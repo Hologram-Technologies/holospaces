@@ -3006,6 +3006,31 @@ impl Cpu {
         )
     }
 
+    /// Boot like [`Cpu::boot_linux_disk`], but page the κ-disk from a supplied
+    /// [`KappaStore`](hologram_substrate_core::KappaStore) by **streaming**
+    /// `sector_count` sectors from `read` (no full image in RAM) — the x86-64
+    /// analogue of [`aarch64::Cpu::boot_linux_disk_streamed`](super::aarch64::Cpu::boot_linux_disk_streamed):
+    /// the browser peer reads each sector from the OPFS rootfs into the OPFS-backed
+    /// store, so a real amd64 image boots without ever materializing the whole
+    /// `Vec` (the paged κ-disk, the same `KappaBacking` every core uses, `CC-7`).
+    #[must_use]
+    pub fn boot_linux_disk_streamed<R: FnMut(u64, &mut [u8])>(
+        ram_bytes: usize,
+        kernel: &[u8],
+        cmdline: &str,
+        store: alloc::boxed::Box<dyn hologram_substrate_core::KappaStore>,
+        sector_count: u64,
+        read: R,
+    ) -> Self {
+        let backing = super::KappaBacking::from_sectors(store, sector_count, read);
+        Self::boot_linux_inner(
+            ram_bytes,
+            kernel,
+            cmdline,
+            Some(super::VirtioBlk::with_backing(backing)),
+        )
+    }
+
     fn boot_linux_inner(
         ram_bytes: usize,
         kernel: &[u8],

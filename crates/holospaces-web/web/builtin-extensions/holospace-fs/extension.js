@@ -269,16 +269,40 @@ async function bootHolospace() {
   // core; the per-guest egress node (CC-39), if set, rides the same folder query.
   const arch = query.get("arch") || "riscv64";
   const egress = query.get("egress");
-  // A real arm64 Linux for aarch64, else the networked RISC-V kernel.
+  // A real arm64 Linux for aarch64, a real amd64 vmlinux for x64, else the
+  // networked RISC-V kernel.
   const kernel = await gunzip(
     await fetchBytes(
       arch === "aarch64"
         ? `${base}/devcontainer-arm64-kernel.gz`
-        : `${base}/devcontainer-net-kernel.gz`,
+        : arch === "x64"
+          ? `${base}/devcontainer-x64-kernel.gz`
+          : `${base}/devcontainer-net-kernel.gz`,
     ),
   );
 
-  if (arch === "aarch64") {
+  if (arch === "x64") {
+    // x86-64 holospace: boot the provisioned amd64 image on the x64 core, paged
+    // from OPFS (CC-43/CC-44/CC-45) — a real amd64 devcontainer to a terminal, the
+    // ubiquitous registry/Codespaces architecture. (The x64 core's net/9p parity
+    // is the continued build, as on aarch64; this path drives the terminal.)
+    if (holoId) {
+      const rootfsHandle = await openProvisionedHandle(holoId);
+      if (rootfsHandle) {
+        const diskHandle = await openDiskStore(holoId);
+        if (diskHandle) {
+          ws = wasm.X64Workspace.boot_devcontainer_opfs_streamed(kernel, rootfsHandle, diskHandle);
+          bridged = false;
+          out && out.appendLine("holospace: booted the provisioned amd64 image on the x64 core (CC-44) — paged from OPFS");
+        } else {
+          try { rootfsHandle.close(); } catch {}
+        }
+      }
+    }
+    if (!ws && out) {
+      out.appendLine("holospace: an x64 holospace needs a provisioned image — Enter it from the Manager (with the router)");
+    }
+  } else if (arch === "aarch64") {
     // aarch64 holospace: boot the provisioned arm64 image on the AArch64 core,
     // paged from OPFS (CC-37) — a real arm64 devcontainer to a terminal. (The
     // AArch64 core's net/9p parity is the continued build, so this path drives
