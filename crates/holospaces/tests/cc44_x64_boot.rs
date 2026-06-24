@@ -496,3 +496,58 @@ RUN echo CC45-BUILD-RAN:$BUILT_BY\n";
     );
     assert_eq!(halt, Halt::Halted, "the build OS powered off cleanly");
 }
+
+/// The Dev Container **features** (`CC-25`) + **lifecycle** (`CC-22`) phases run on
+/// amd64: a `devcontainer.json` declares `containerEnv`, a feature, and lifecycle
+/// hooks; the parsed config's lifecycle `/init` installs the feature (its `install.sh`,
+/// injected at `/opt/holospaces/features/0/`, runs with the option as env) BEFORE the
+/// lifecycle hooks (spec order), all in the booted x86-64 OS over the stock amd64
+/// busybox base. Proves the full Dev Container spec surface — not just image/build —
+/// feeds the x86-64 boot (the ISA-agnostic CC-25/CC-22 pipelines, Law L4).
+#[test]
+#[ignore = "runs amd64 devcontainer features + lifecycle on x86-64 — CC-45 vv suite"]
+fn an_amd64_devcontainer_features_and_lifecycle_run_on_x64() {
+    use holospaces::assembly::{assemble_ext4_bootable, Layer};
+    use holospaces::boot::devcontainer;
+
+    let config: &[u8] = br#"{
+        "containerEnv": { "GREETING": "x64" },
+        "features": { "ghcr.io/holospaces/features/demo:1": { "version": "9" } },
+        "onCreateCommand": "echo CC45-ONCREATE",
+        "postCreateCommand": "echo CC45-POSTCREATE:$GREETING"
+    }"#;
+    let dc = devcontainer::parse(config).expect("parse the devcontainer.json");
+    assert_eq!(dc.features.len(), 1, "the feature is parsed");
+
+    // The feature artifact: install.sh echoes a marker using the (uppercased) option.
+    let install_sh: &[u8] = b"#!/bin/busybox sh\necho CC45-FEATURE-INSTALLED:$VERSION\n";
+    let feature_layer = tar_gz(&[("opt/holospaces/features/0/install.sh", install_sh)]);
+
+    let kernel = gunzip(&cc45_dir().join("linux/vmlinux.gz"));
+    let busybox = std::fs::read(cc45_dir().join("rootfs/layer.tar.gz")).expect("busybox layer");
+    let oci = "application/vnd.oci.image.layer.v1.tar+gzip";
+    let layers = [
+        Layer { media_type: oci, blob: &busybox },
+        Layer { media_type: oci, blob: &feature_layer },
+    ];
+    let init = dc.lifecycle_init();
+    let rootfs = assemble_ext4_bootable(&layers, &init, 64 * 1024 * 1024)
+        .expect("assemble the features+lifecycle amd64 rootfs");
+
+    let mut cpu = Cpu::boot_linux_disk(512 * 1024 * 1024, &kernel, rootfs, CC45_CMDLINE);
+    cpu.run(40_000_000_000);
+    let console = String::from_utf8_lossy(cpu.console());
+    eprintln!("---- amd64 features+lifecycle ----\n{console}\n---- end ----");
+    assert!(
+        console.contains("CC45-FEATURE-INSTALLED:9"),
+        "the feature's install.sh ran in the OS with its option as env (VERSION=9)"
+    );
+    assert!(
+        console.contains("CC45-ONCREATE") && console.contains("CC45-POSTCREATE:x64"),
+        "the lifecycle hooks ran in the OS with containerEnv in scope"
+    );
+    // Dev Container spec order: features install BEFORE the lifecycle commands.
+    let feat = console.find("CC45-FEATURE-INSTALLED").expect("feature ran");
+    let life = console.find("CC45-ONCREATE").expect("lifecycle ran");
+    assert!(feat < life, "features installed before the lifecycle hooks (spec order)");
+}
