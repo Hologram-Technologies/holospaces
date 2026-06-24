@@ -337,3 +337,94 @@ fn an_amd64_devcontainer_boots_paged_from_a_kappa_store() {
     );
     assert_eq!(halt, Halt::Halted, "powered off cleanly");
 }
+
+/// Build a minimal USTAR + gzip OCI layer blob from `(path, data)` entries. An empty
+/// `data` whose basename is prefixed `.wh.` is an OCI whiteout — the assembler
+/// deletes the matching lower-layer file (OCI image-spec "Layer", `CC-4`/`CC-20`).
+fn tar_gz(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    use flate2::{write::GzEncoder, Compression};
+    use std::io::Write as _;
+    let oct = |f: &mut [u8], v: u64| {
+        let s = format!("{:0w$o}", v, w = f.len() - 1);
+        f[..s.len()].copy_from_slice(s.as_bytes());
+    };
+    let mut tar = Vec::new();
+    for (path, data) in entries {
+        let mut hdr = [0u8; 512];
+        hdr[..path.len()].copy_from_slice(path.as_bytes());
+        oct(&mut hdr[100..108], 0o644); // mode
+        oct(&mut hdr[124..136], data.len() as u64); // size
+        hdr[156] = b'0'; // type: regular file
+        hdr[257..263].copy_from_slice(b"ustar\0");
+        hdr[263] = b'0';
+        hdr[264] = b'0';
+        hdr[148..156].fill(b' '); // checksum field spaces before summing
+        let sum: u32 = hdr.iter().map(|&b| u32::from(b)).sum();
+        oct(&mut hdr[148..155], u64::from(sum));
+        hdr[155] = b' ';
+        tar.extend_from_slice(&hdr);
+        tar.extend_from_slice(data);
+        let pad = data.len().div_ceil(512) * 512 - data.len();
+        tar.extend(std::iter::repeat_n(0u8, pad));
+    }
+    tar.extend([0u8; 1024]); // two zero blocks terminate the archive
+    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+    gz.write_all(&tar).unwrap();
+    gz.finish().unwrap()
+}
+
+/// An **arbitrary multi-layer** amd64 image (the DoD's "multi-layer real images")
+/// boots on the x86-64 core, with the OCI overlay — **whiteout**, **override**, and
+/// **add** — correctly applied across layers before the boot. Three layers stack:
+/// a lower layer with two files, the stock busybox layer in the middle (PID 1), and
+/// an upper layer that whiteouts one lower file, overrides the other, and adds a
+/// new one. PID 1 (the stock linux-amd64 busybox) inspects the merged rootfs and
+/// emits a single OK marker only if all three overlay rules held — proving the
+/// parametric assembler (`CC-4`/`CC-20`, Law L4) feeds the x86-64 boot for any image,
+/// not just the single-layer fixture.
+#[test]
+#[ignore = "boots a multi-layer amd64 image (whiteout/override/add) — run by the CC-45 vv suite"]
+fn an_amd64_multilayer_image_overlay_runs() {
+    use holospaces::assembly::{assemble_ext4_bootable, Layer};
+    let kernel = gunzip(&cc45_dir().join("linux/vmlinux.gz"));
+    let busybox = std::fs::read(cc45_dir().join("rootfs/layer.tar.gz")).expect("busybox layer");
+    // Lower layer: a file to be whiteout-removed + a file to be overridden.
+    let lower = tar_gz(&[("cc45-remove", b"FROM-L1"), ("cc45-keep", b"FROM-L1")]);
+    // Upper layer: whiteout cc45-remove, override cc45-keep, add cc45-added.
+    let upper = tar_gz(&[
+        (".wh.cc45-remove", b""),
+        ("cc45-keep", b"OVERRIDE-L3"),
+        ("cc45-added", b"ADDED-L3"),
+    ]);
+    let oci = "application/vnd.oci.image.layer.v1.tar+gzip";
+    let layers = [
+        Layer { media_type: oci, blob: &lower },
+        Layer { media_type: oci, blob: &busybox },
+        Layer { media_type: oci, blob: &upper },
+    ];
+    let init: &[u8] = b"#!/bin/busybox sh\n\
+/bin/busybox mkdir -p /proc\n\
+/bin/busybox mount -t proc proc /proc\n\
+echo CC45-DEVCONTAINER-UP\n\
+if [ ! -e /cc45-remove ] && \
+[ \"$(/bin/busybox cat /cc45-keep)\" = OVERRIDE-L3 ] && \
+[ \"$(/bin/busybox cat /cc45-added)\" = ADDED-L3 ]; then echo CC45-MULTILAYER-OK; \
+else echo CC45-MULTILAYER-FAIL; fi\n\
+/bin/busybox poweroff -f\n";
+    let rootfs = assemble_ext4_bootable(&layers, init, 64 * 1024 * 1024)
+        .expect("assemble the 3-layer amd64 image");
+    let mut cpu = Cpu::boot_linux_disk(512 * 1024 * 1024, &kernel, rootfs, CC45_CMDLINE);
+    let halt = cpu.run(40_000_000_000);
+    let console = String::from_utf8_lossy(cpu.console());
+    eprintln!("---- multi-layer amd64 devcontainer ----\n{console}\n---- end ----  (halt: {halt:?})");
+    assert!(
+        console.contains("CC45-DEVCONTAINER-UP"),
+        "the multi-layer amd64 image booted from its κ-disk rootfs"
+    );
+    assert!(
+        console.contains("CC45-MULTILAYER-OK"),
+        "the OCI overlay applied across layers (whiteout removed the lower file, the \
+         upper layer overrode + added files) before the x86-64 boot"
+    );
+    assert_eq!(halt, Halt::Halted, "the multi-layer devcontainer powered off cleanly");
+}
