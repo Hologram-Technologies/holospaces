@@ -84,6 +84,10 @@ struct Uart {
     /// CLEARED when the IIR is read — a one-shot per transition, not a level held
     /// while `ETBEI` is set. (A level THRE re-fires the serial ISR forever.)
     thre_pending: bool,
+    /// dev-only access counters: [THR-write, IER-write, IIR-read, LSR-read,
+    /// IRQ4-raise]. Used to diagnose the interrupt-driven-TX path (a livelock shows
+    /// up as one of these exploding relative to retired instructions).
+    dbg: [u64; 5],
 }
 
 /// The shared platform the core drives: the console and the substrate devices —
@@ -175,6 +179,7 @@ impl Sys {
                 fcr: 0,
                 divisor: 1,
                 thre_pending: false,
+                dbg: [0; 5],
             },
             virtio: None,
             virtio9p: None,
@@ -494,6 +499,10 @@ pub struct MmuStats {
     /// coherence re-walk firing) — high counts mean the kernel is upgrading page
     /// permissions without a flush our TLB sees, which the re-walk then repairs.
     pub tlb_revalidations: u64,
+    /// Page-table walks that filled a TLB entry (i.e. a software-TLB miss). If this
+    /// approaches the retired-instruction count, the working set is thrashing the
+    /// direct-mapped TLB and every access is paying a 4-level walk.
+    pub tlb_fills: u64,
 }
 
 /// The x86-64 long-mode integer core.
@@ -866,6 +875,7 @@ impl Cpu {
             } else {
                 match self.walk(vaddr) {
                     Ok((pa, w, u, lf)) => {
+                        self.mmu_stats.tlb_fills += 1;
                         self.tlb[set] = TlbEntry {
                             tag: page,
                             frame: pa & !0xfff,
@@ -1083,6 +1093,13 @@ impl Cpu {
     #[must_use]
     pub fn mmu_stats(&self) -> MmuStats {
         self.mmu_stats
+    }
+
+    /// dev-only UART access counters `[THR-write, IER-write, IIR-read, LSR-read,
+    /// IRQ4-raise]` — diagnoses the interrupt-driven console TX path.
+    #[must_use]
+    pub fn uart_dbg(&self) -> [u64; 5] {
+        self.sys.as_ref().map_or([0; 5], |s| s.uart.dbg)
     }
 
     /// `rip` (for tests / introspection).
@@ -1372,6 +1389,23 @@ impl Cpu {
             self.sys_tick();
             if self.sys.as_ref().is_some_and(|s| s.halted) {
                 return Halt::Halted;
+            }
+            // THRE is a LEVEL condition: while the TX-empty interrupt is enabled
+            // (ETBEI) and the holding register is empty (always — we emit instantly),
+            // a real 16550 keeps asserting IRQ4 so the driver is re-interrupted to
+            // send the NEXT FIFO batch. Without re-asserting, a write longer than the
+            // FIFO's `tx_loadsz` (16) deadlocks: the driver writes one FIFO-full,
+            // exits with data still queued, and waits for a drained-FIFO interrupt
+            // that a one-shot THRE never delivers (observed: console froze after
+            // exactly 16 chars). The driver clears ETBEI once its ring empties, so
+            // this cannot re-fire forever. `thre_pending` gates it to one in-flight
+            // interrupt at a time (re-armed after the driver reads the IIR).
+            if let Some(sys) = self.sys.as_mut() {
+                if sys.uart.ier & 0x02 != 0 && !sys.uart.thre_pending {
+                    sys.uart.thre_pending = true;
+                    sys.uart.dbg[4] += 1;
+                    sys.pic.raise(4);
+                }
             }
             self.take_pending_interrupt();
             #[cfg(feature = "cc44-trace")]
@@ -1700,6 +1734,7 @@ impl Cpu {
                 sys.uart.input.push(val);
             }
             0x3f8 => {
+                sys.uart.dbg[0] += 1;
                 sys.uart.output.push(val);
                 #[cfg(feature = "cc44-trace")]
                 {
@@ -1713,8 +1748,19 @@ impl Cpu {
                 // enabled, IER bit 1), signal it can send the next byte. COM1 =
                 // IRQ4. Without this an interrupt-driven userspace tty write blocks
                 // forever waiting to transmit (the idle<->init boot livelock).
-                if sys.uart.ier & 0x02 != 0 {
+                //
+                // COALESCE the THRE interrupt: raise IRQ4 only on the false→true
+                // transition of `thre_pending`, never on every byte. A real 16550
+                // raises THRE once when the FIFO drains, and the driver's
+                // `serial8250_tx_chars` loop — gated on our always-set LSR THRE —
+                // then writes a whole batch (`tx_loadsz` bytes) under that single
+                // interrupt. Pulsing IRQ4 per byte instead makes each character
+                // cost a full interrupt entry/IRET round-trip (~1000× slowdown:
+                // the boot crawls in `serial8250_tx_chars`). Once the kernel reads
+                // the IIR (clearing `thre_pending`), the next byte re-arms it.
+                if sys.uart.ier & 0x02 != 0 && !sys.uart.thre_pending {
                     sys.uart.thre_pending = true;
+                    sys.uart.dbg[4] += 1;
                     sys.pic.raise(4);
                 }
             }
@@ -1722,6 +1768,7 @@ impl Cpu {
                 sys.uart.divisor = (sys.uart.divisor & 0x00ff) | (u16::from(val) << 8);
             }
             0x3f9 => {
+                sys.uart.dbg[1] += 1;
                 sys.uart.ier = val;
                 // Enabling ETBEI (bit 1) with an empty THR (always — we emit at
                 // once) asserts the one-shot THRE interrupt; enabling ERBFI (bit 0)
@@ -1859,6 +1906,7 @@ impl Cpu {
                 0x3f9 if dlab => return (sys.uart.divisor >> 8) as u8, // DLM
                 0x3f9 => return sys.uart.ier,
                 0x3fa => {
+                    sys.uart.dbg[2] += 1;
                     // IIR: report the pending UART interrupt by priority — RX-data
                     // (id 0x04) when receive ints are enabled and a byte waits,
                     // else transmit-holding-empty (id 0x02) while THRE ints are
@@ -1881,6 +1929,7 @@ impl Cpu {
                 0x3fb => return sys.uart.lcr,
                 0x3fc => return sys.uart.mcr,
                 0x3fd => {
+                    sys.uart.dbg[3] += 1;
                     // Line Status Register: THR-empty (0x20) + transmitter-empty
                     // (0x40) always set; data-ready (0x01) when input is pending.
                     let dr = u8::from(sys.uart.in_cursor < sys.uart.input.len());
@@ -2640,17 +2689,21 @@ impl Cpu {
                 } else {
                     self.fetch(4) as i32 as i64
                 };
-                let a = sign_extend(self.load_rm(rm, size), size);
-                let r = a.wrapping_mul(imm) as u64;
+                let a = i128::from(sign_extend(self.load_rm(rm, size), size));
+                let full = a * i128::from(imm);
+                let r = full as u64;
                 self.store_rm(Rm::Reg(reg), size, r & Self::mask(size));
+                self.set_imul_flags(full, r, size);
             }
             0x6b => {
                 // IMUL r, r/m, imm8.
                 let (reg, rm) = self.modrm(rex);
                 let imm = self.fetch(1) as i8 as i64;
-                let a = sign_extend(self.load_rm(rm, size), size);
-                let r = a.wrapping_mul(imm) as u64;
+                let a = i128::from(sign_extend(self.load_rm(rm, size), size));
+                let full = a * i128::from(imm);
+                let r = full as u64;
                 self.store_rm(Rm::Reg(reg), size, r & Self::mask(size));
+                self.set_imul_flags(full, r, size);
             }
             0x86 => {
                 // XCHG r/m8, r8.
@@ -2991,9 +3044,14 @@ impl Cpu {
                         self.store_rm(Rm::Reg(reg), size, v & Self::mask(size));
                     }
                     0xaf => {
+                        // IMUL r, r/m (signed two-operand).
                         let (reg, rm) = self.modrm(rex);
-                        let (a, b) = (self.r[reg] & Self::mask(size), self.load_rm(rm, size));
-                        self.store_rm(Rm::Reg(reg), size, a.wrapping_mul(b));
+                        let a = i128::from(sign_extend(self.r[reg] & Self::mask(size), size));
+                        let b = i128::from(sign_extend(self.load_rm(rm, size), size));
+                        let full = a * b;
+                        let r = full as u64;
+                        self.store_rm(Rm::Reg(reg), size, r & Self::mask(size));
+                        self.set_imul_flags(full, r, size);
                     }
                     0x20 => {
                         // MOV r64, CRn (mod is ignored — rm is a register).
@@ -3823,29 +3881,50 @@ impl Cpu {
             match kind {
                 StringOp::Movs => {
                     let v = self.rd(self.r[RSI], osz);
+                    if self.fault.is_some() {
+                        break;
+                    }
                     self.wr(self.r[RDI], osz, v);
+                    if self.fault.is_some() {
+                        break;
+                    }
                     self.r[RSI] = self.r[RSI].wrapping_add(step as u64);
                     self.r[RDI] = self.r[RDI].wrapping_add(step as u64);
                 }
                 StringOp::Stos => {
                     self.wr(self.r[RDI], osz, self.r[RAX] & Self::mask(osz));
+                    if self.fault.is_some() {
+                        break;
+                    }
                     self.r[RDI] = self.r[RDI].wrapping_add(step as u64);
                 }
                 StringOp::Lods => {
                     let v = self.rd(self.r[RSI], osz);
+                    if self.fault.is_some() {
+                        break;
+                    }
                     self.store_rm(Rm::Reg(RAX), osz, v);
                     self.r[RSI] = self.r[RSI].wrapping_add(step as u64);
                 }
                 StringOp::Scas => {
                     let a = self.r[RAX] & Self::mask(osz);
                     let b = self.rd(self.r[RDI], osz);
+                    if self.fault.is_some() {
+                        break;
+                    }
                     let r = a.wrapping_sub(b);
                     self.flags_arith(a, b, r, osz, true);
                     self.r[RDI] = self.r[RDI].wrapping_add(step as u64);
                 }
                 StringOp::Cmps => {
                     let a = self.rd(self.r[RSI], osz);
+                    if self.fault.is_some() {
+                        break;
+                    }
                     let b = self.rd(self.r[RDI], osz);
+                    if self.fault.is_some() {
+                        break;
+                    }
                     let r = a.wrapping_sub(b);
                     self.flags_arith(a, b, r, osz, true);
                     self.r[RSI] = self.r[RSI].wrapping_add(step as u64);
@@ -3991,8 +4070,8 @@ impl Cpu {
                 // IMUL (signed): rdx:rax = rax * r/m.
                 let a = sign_extend(self.r[RAX] & m, size) as i128;
                 let b = sign_extend(self.load_rm(rm, size) & m, size) as i128;
-                let prod = (a * b) as u128;
-                self.store_mul_result(prod, size);
+                let prod = a * b;
+                self.store_imul_result(prod, size);
             }
             6 => {
                 // DIV (unsigned).
@@ -4004,6 +4083,13 @@ impl Cpu {
                 let dividend = self.dividend(size);
                 let q = dividend / u128::from(divisor);
                 let r = dividend % u128::from(divisor);
+                // #DE on quotient overflow — the quotient must fit the operand width
+                // (else AL/AX/EAX/RAX cannot hold it). The architecture faults here
+                // exactly as for divide-by-zero.
+                if q > u128::from(m) {
+                    self.raise_exception(0, 0, false);
+                    return Ok(());
+                }
                 self.store_div_result(q as u64, r as u64, size);
             }
             7 => {
@@ -4016,6 +4102,15 @@ impl Cpu {
                 let dividend = self.dividend_signed(size);
                 let q = dividend / i128::from(divisor);
                 let r = dividend % i128::from(divisor);
+                // #DE on signed quotient overflow (includes INT_MIN / -1): the
+                // quotient must fit `[-2^(n-1), 2^(n-1)-1]`.
+                let bits = u32::from(size) * 8;
+                let lo = -(1i128 << (bits - 1));
+                let hi = (1i128 << (bits - 1)) - 1;
+                if q < lo || q > hi {
+                    self.raise_exception(0, 0, false);
+                    return Ok(());
+                }
                 self.store_div_result(q as u64, r as u64, size);
             }
             _ => return Err(Halt::Undefined(start)),
@@ -4037,6 +4132,35 @@ impl Cpu {
         }
         let hi = prod >> (u32::from(size) * 8);
         let overflow = hi != 0;
+        self.set(flag::CF, overflow);
+        self.set(flag::OF, overflow);
+    }
+
+    /// One-operand `IMUL` (`RDX:RAX = RAX * r/m`, signed). CF=OF=1 iff the full
+    /// signed product does not fit the low operand width (i.e. the high half is not
+    /// merely the sign extension of the low half) — unlike unsigned `MUL`, which
+    /// keys overflow on a non-zero high half.
+    fn store_imul_result(&mut self, prod: i128, size: u8) {
+        let m = Self::mask(size);
+        let bits = u32::from(size) * 8;
+        let pu = prod as u128;
+        if size == 1 {
+            self.r[RAX] = (self.r[RAX] & !0xffff) | (pu as u64 & 0xffff);
+        } else {
+            self.store_rm(Rm::Reg(RAX), size, pu as u64 & m);
+            self.store_rm(Rm::Reg(RDX), size, (pu >> bits) as u64 & m);
+        }
+        let overflow = i128::from(sign_extend(pu as u64 & m, size)) != prod;
+        self.set(flag::CF, overflow);
+        self.set(flag::OF, overflow);
+    }
+
+    /// CF=OF for the two/three-operand `IMUL` forms: set iff the truncated result
+    /// (`result`, the low operand-width bits stored back) differs from the full
+    /// signed product `full` — i.e. the product overflowed the destination. The
+    /// other arithmetic flags are architecturally undefined and left unchanged.
+    fn set_imul_flags(&mut self, full: i128, result: u64, size: u8) {
+        let overflow = i128::from(sign_extend(result & Self::mask(size), size)) != full;
         self.set(flag::CF, overflow);
         self.set(flag::OF, overflow);
     }
