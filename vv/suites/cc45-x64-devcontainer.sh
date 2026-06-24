@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# CC-45 (TARGET) — An arbitrary amd64 devcontainer runs on x86-64 (build-capable;
-#                  full Dev Container / OCI spec)
+# CC-45 (SUITE) — An arbitrary amd64 devcontainer runs on x86-64 (build-capable;
+#                 full Dev Container / OCI spec)
 #
 # OPM process: SD5 Devcontainer Provisioning + SD2 Booting. The x86-64 analogue
 # of CC-37 (aarch64), broadened to the full Dev Container / OCI contract on a
@@ -18,8 +18,11 @@
 # Witnesses: crates/holospaces/tests/cc44_x64_boot.rs (the CC-45 tests).
 # Depends on: CC-44 (the x86-64 boot path).
 #
-# Status: TARGET — promoted to vv/suites/ once every section below is green for
-#   real. Expected RED (non-gating) until the fixture is committed.
+# Status: SUITE (LIVE) — every section below is green for real: the build-capable
+#   occupancy-index disk boots O(content), and the committed stock linux-amd64
+#   busybox fixture boots on the x86-64 core to CC45-DEVCONTAINER-UP /
+#   CC45-ARCH:x86_64 / CC45-COMPUTE:500500 and a clean poweroff, byte-matching the
+#   qemu-system-x86_64 differential oracle.
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
