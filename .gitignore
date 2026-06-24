@@ -34,3 +34,5 @@ boot-diag.log
 /boot-diag.log
 /btrace.log
 /boot*.log
+/.dev-boot.lock
+/dev-boot.out

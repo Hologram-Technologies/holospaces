@@ -29,8 +29,21 @@ fn main() {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(200);
-    let outp = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../boot-diag.log");
+    // Cycles per slice (millions). Smaller = finer resolution through a stall.
+    let per: u64 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100)
+        * 1_000_000;
+    // A PID-unique log so concurrent/leftover runs can never corrupt each other's
+    // output (a real hazard observed in this environment), plus a stable symlink
+    // `boot-diag.log` to the most recent run for convenience.
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let outp = dir.join(format!("boot-diag.{}.log", std::process::id()));
     let mut out = std::fs::File::create(&outp).unwrap();
+    let link = dir.join("boot-diag.log");
+    let _ = std::fs::remove_file(&link);
+    let _ = std::os::unix::fs::symlink(outp.file_name().unwrap(), &link);
     let kernel = gunzip(&art().join("linux/vmlinux.gz"));
     let init = std::fs::read(art().join("init.sh")).unwrap();
     let layer = std::fs::read(art().join("rootfs/layer.tar.gz")).unwrap();
@@ -50,21 +63,30 @@ fn main() {
     let mut cur = 0usize;
     let mut prev = cpu.mmu_stats();
     for s in 0..slices {
-        let h = cpu.run(100_000_000);
+        let h = cpu.run(per);
         let c = cpu.console();
         if c.len() > cur {
             out.write_all(&c[cur..]).unwrap();
             cur = c.len();
         }
         let st = cpu.mmu_stats();
+        let u = cpu.uart_dbg();
         writeln!(
             out,
-            "\n--- {}M cy {:.0}s prot=+{} nopage=+{} revalidate=+{} ---",
-            (s + 1) * 100,
+            "\n--- {}M cy {:.0}s prot=+{} nopage=+{} reval=+{} fills=+{} rip={:#x} \
+             uart[thr={} ier={} iir={} lsr={} irq={}] ---",
+            (s + 1) * per / 1_000_000,
             t0.elapsed().as_secs_f64(),
             st.protection_faults - prev.protection_faults,
             st.not_present_faults - prev.not_present_faults,
             st.tlb_revalidations - prev.tlb_revalidations,
+            st.tlb_fills - prev.tlb_fills,
+            cpu.rip(),
+            u[0],
+            u[1],
+            u[2],
+            u[3],
+            u[4],
         )
         .unwrap();
         prev = st;
