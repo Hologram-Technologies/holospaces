@@ -551,3 +551,42 @@ fn an_amd64_devcontainer_features_and_lifecycle_run_on_x64() {
     let life = console.find("CC45-ONCREATE").expect("lifecycle ran");
     assert!(feat < life, "features installed before the lifecycle hooks (spec order)");
 }
+
+/// **Dogfood**: holospaces parses + honours *this very workspace's* unmodified
+/// `.devcontainer/devcontainer.json` — an arbitrary, real Dev Container config (a
+/// Dockerfile build over an Ubuntu base, seven `ghcr.io` features, a postCreate
+/// command, customizations, mounts, `${localEnv}` substitution, JSONC comments +
+/// trailing commas). Proves the ingestion is parametric for real configs, not the
+/// synthetic fixtures (Law L4). The full toolchain build/boot needs network (offline
+/// CI) + native-exec for the heavy compiles (the interpreter wall, CC-48); this
+/// witnesses that holospaces understands its own config end of the contract.
+#[test]
+fn holospaces_parses_its_own_unmodified_devcontainer_config() {
+    use holospaces::boot::devcontainer;
+    // The repo's real config, relative to this crate (worktree root / .devcontainer).
+    let cfg_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.devcontainer/devcontainer.json");
+    let cfg = std::fs::read(&cfg_path).expect("read the workspace devcontainer.json");
+
+    let dc = devcontainer::parse(&cfg).expect("holospaces parses its own (JSONC) devcontainer.json");
+
+    // The build is a Dockerfile build (CC-26), honoured, not dropped.
+    assert!(
+        matches!(dc.image_source, devcontainer::ImageSource::Build(_)),
+        "the Dockerfile build directive is parsed as a Build source"
+    );
+    // All seven declared features are parsed (CC-25) — arbitrary ghcr.io refs.
+    assert!(
+        dc.features.len() >= 7,
+        "every declared feature is honoured ({} parsed)",
+        dc.features.len()
+    );
+    assert!(
+        dc.features.iter().any(|f| f.id.contains("claude-code")),
+        "the claude-code feature is among the parsed features"
+    );
+    // The lifecycle postCreateCommand runs the repo's post-create.sh (CC-22).
+    assert!(
+        dc.lifecycle.iter().any(|(_, cmd)| cmd.contains("post-create.sh")),
+        "the postCreateCommand (bash .devcontainer/post-create.sh) is honoured"
+    );
+}
