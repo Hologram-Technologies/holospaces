@@ -71,6 +71,13 @@ if [ -f "$CC45/cc45.sha256" ] && [ -f "$CC45/linux/vmlinux.gz" ] && [ -f "$CC45/
         --test cc44_x64_boot an_amd64_dockerfile_build_runs_on_x64 \
         -- --ignored --nocapture || exit 1
 
+    # The Dev Container FEATURES (CC-25) + LIFECYCLE (CC-22) phases on amd64: a
+    # devcontainer.json's feature install.sh + lifecycle hooks run in the x86-64 OS,
+    # in spec order (features before lifecycle).
+    cargo test --release --manifest-path "$ROOT/Cargo.toml" -p holospaces \
+        --test cc44_x64_boot an_amd64_devcontainer_features_and_lifecycle_run_on_x64 \
+        -- --ignored --nocapture || exit 1
+
     # The differential oracle: qemu-system-x86_64 booting the same kernel + rootfs
     # must run the same stock binary to the same markers.
     if command -v qemu-system-x86_64 >/dev/null 2>&1; then
