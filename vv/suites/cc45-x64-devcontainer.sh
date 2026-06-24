@@ -64,6 +64,25 @@ if [ -f "$CC45/cc45.sha256" ] && [ -f "$CC45/linux/vmlinux.gz" ] && [ -f "$CC45/
         --test cc44_x64_boot an_amd64_devcontainer_boots_paged_from_a_kappa_store \
         -- --ignored --nocapture || exit 1
 
+    # The BUILD-CAPABLE large disk, end to end: the stock amd64 rootfs assembled onto
+    # an 8 GiB disk and booted reading ONLY its occupied blocks (757 of the disk's
+    # 16.7M sectors) — the deployed browser path's occupancy boot, O(content).
+    cargo test --release --manifest-path "$ROOT/Cargo.toml" -p holospaces \
+        --test cc44_x64_boot an_amd64_devcontainer_boots_occupancy_streamed_from_a_large_disk \
+        -- --ignored --nocapture || exit 1
+
+    # e2fsck is the differential oracle for the 8 GiB ext4 GEOMETRY (66 block groups):
+    # a real fsck must find the multi-group image the assembler produces clean.
+    if command -v e2fsck >/dev/null 2>&1; then
+        _img="$(mktemp)"
+        cargo run --release --manifest-path "$ROOT/Cargo.toml" -p holospaces \
+            --example asm_fsck -- "$_img" $((8 * 1024 * 1024 * 1024)) || { rm -f "$_img"; exit 1; }
+        e2fsck -fn "$_img" \
+            || { echo "cc45-x64-devcontainer: e2fsck rejected the 8 GiB ext4 geometry" >&2; rm -f "$_img"; exit 1; }
+        rm -f "$_img"
+        echo "cc45-x64-devcontainer: 8 GiB build-capable disk — occupancy boot O(content) + e2fsck-clean geometry PASS"
+    fi
+
     # An ARBITRARY MULTI-LAYER image (the DoD's "multi-layer real images"): three
     # OCI layers stack with whiteout + override + add, and the merged amd64 rootfs
     # boots — proving the parametric assembler (CC-4/CC-20) feeds the x86-64 boot for
