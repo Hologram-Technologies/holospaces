@@ -953,15 +953,19 @@ export class DevcontainerImage {
         return ret[0];
     }
     /**
-     * Like [`assembleBootableIntoOpfs`](Self::assemble_bootable_into_opfs), but also
-     * records the rootfs's **occupancy** — the ascending block indices it actually
-     * wrote — into `occupancy_handle` as packed little-endian `u64`s. That sidecar
-     * lets [`X64Workspace::boot_devcontainer_opfs_streamed_occupancy`] page the disk
-     * **O(content)**: a multi-GiB build-capable devcontainer disk boots reading only
-     * its (few) occupied blocks, never its declared size — the deployed regime for a
-     * real developer's image, not a fixture-sized one. Byte-identical rootfs to the
-     * untracked assembler over the same layers (Law L1); the sidecar is the only
-     * addition. Returns the image length, as the untracked variant does.
+     * Like [`assembleBootableIntoOpfs`](Self::assemble_bootable_into_opfs), but
+     * **COMPACT + occupancy-tracked**: the non-zero blocks are written *contiguously*
+     * (the Nth emitted block at file offset `N·4096`, not at its disk offset), so the
+     * rootfs file is **O(content)** — a few MiB — no matter how large the declared
+     * disk. The `occupancy_handle` sidecar records the disk geometry and placement:
+     * an 8-byte little-endian `image_len` header, then the disk block index of each
+     * packed block (little-endian `u64`, in packed order). That is what lets the
+     * deployed disk be **arbitrarily large** in the browser: a sparse file truncated
+     * to the declared size would count its *logical* size against the origin's OPFS
+     * quota (a multi-GiB disk fails to stage), whereas the compact file costs only
+     * the image's content. [`X64Workspace::boot_devcontainer_opfs_streamed_occupancy`]
+     * reads it back, reconstructing the κ-disk O(content). Returns the image length
+     * (the declared disk the guest sees), as the untracked variant does.
      * @param {FileSystemSyncAccessHandle} rootfs_handle
      * @param {FileSystemSyncAccessHandle} occupancy_handle
      * @param {number} disk_bytes
