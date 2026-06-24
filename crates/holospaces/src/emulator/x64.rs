@@ -5295,7 +5295,12 @@ impl Cpu {
     fn sysret(&mut self) {
         let star = self.sys().msr.get(&MSR_STAR).copied().unwrap_or(0);
         self.rip = self.r[RCX];
-        self.rflags = (self.r[11] & 0x0024_4dd5) | 0x2;
+        // Restore RFLAGS from R11 (the value SYSCALL saved). The mask MUST keep IF
+        // (bit 9, 0x200): SYSRET restores the interrupt flag from R11 — dropping it
+        // left userspace running with interrupts permanently disabled after any
+        // syscall (no timer preemption, no device IRQs, until the next — impossible
+        // — interrupt), wedging the boot once a task needed to be woken.
+        self.rflags = (self.r[11] & 0x0024_4fd5) | 0x2;
         let ucs = (((star >> 48) & 0xffff) as u16).wrapping_add(16) | 3;
         self.seg[SegId::Cs as usize].selector = ucs;
         self.seg[SegId::Cs as usize].long = true;
