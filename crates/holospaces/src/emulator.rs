@@ -904,15 +904,18 @@ impl KappaBacking {
 
     /// The disk capacity in bytes — the **declared** size, independent of how many
     /// sectors are occupied (a sparse multi-GiB disk reports its full capacity).
-    fn len(&self) -> usize {
-        self.sector_count as usize * DISK_SECTOR
+    /// `u64`, not `usize`: a multi-GiB disk's byte capacity overflows a 32-bit
+    /// `usize` (wasm32), which would wrap the guest-visible capacity and the disk
+    /// addressing — the deployed browser peer runs build-capable disks > 4 GiB.
+    fn len(&self) -> u64 {
+        self.sector_count * DISK_SECTOR as u64
     }
 
     /// Read sector `i` (sparse → zeros) as a 512-byte block, through the bounded
     /// κ-keyed read cache so a repeated or dedup'd sector resolves without a store
     /// round-trip (Law L3: the store is the memory, this is the RAM cache).
-    fn read_sector(&self, i: usize) -> [u8; DISK_SECTOR] {
-        let Some(k) = self.index.get(&(i as u64)) else {
+    fn read_sector(&self, i: u64) -> [u8; DISK_SECTOR] {
+        let Some(k) = self.index.get(&i) else {
             return [0u8; DISK_SECTOR]; // sparse all-zero sector (absent ⇔ all-zero)
         };
         if let Some(hit) = self.read_cache.borrow().get(k) {
@@ -930,13 +933,14 @@ impl KappaBacking {
         out
     }
 
-    /// Read `buf.len()` bytes from byte offset `off` (spanning sectors).
-    fn read_into(&self, off: usize, buf: &mut [u8]) {
-        let mut done = 0;
+    /// Read `buf.len()` bytes from byte offset `off` (spanning sectors). `off` is
+    /// `u64` so a read past 4 GiB into a large disk is not truncated on wasm32.
+    fn read_into(&self, off: u64, buf: &mut [u8]) {
+        let mut done = 0usize;
         while done < buf.len() {
-            let pos = off + done;
-            let sector = self.read_sector(pos / DISK_SECTOR);
-            let so = pos % DISK_SECTOR;
+            let pos = off + done as u64;
+            let sector = self.read_sector(pos / DISK_SECTOR as u64);
+            let so = (pos % DISK_SECTOR as u64) as usize;
             let n = (DISK_SECTOR - so).min(buf.len() - done);
             buf[done..done + n].copy_from_slice(&sector[so..so + n]);
             done += n;
@@ -944,14 +948,15 @@ impl KappaBacking {
     }
 
     /// Write `data` at byte offset `off` (read-modify-write per affected sector,
-    /// re-content-addressing each touched sector through the store).
-    fn write_from(&mut self, off: usize, data: &[u8]) {
-        let mut done = 0;
+    /// re-content-addressing each touched sector through the store). `off` is `u64`
+    /// (see [`read_into`](Self::read_into)).
+    fn write_from(&mut self, off: u64, data: &[u8]) {
+        let mut done = 0usize;
         while done < data.len() {
-            let pos = off + done;
-            let si = pos / DISK_SECTOR;
+            let pos = off + done as u64;
+            let si = pos / DISK_SECTOR as u64;
             let mut sector = self.read_sector(si);
-            let so = pos % DISK_SECTOR;
+            let so = (pos % DISK_SECTOR as u64) as usize;
             let n = (DISK_SECTOR - so).min(data.len() - done);
             sector[so..so + n].copy_from_slice(&data[done..done + n]);
             match Self::store_sector(self.store.as_ref(), &sector) {
@@ -960,13 +965,13 @@ impl KappaBacking {
                     // immediate re-read is served without a store round-trip. Keys
                     // are content κ, so there is never a stale entry to invalidate.
                     self.read_cache.borrow_mut().insert(k, sector);
-                    self.index.insert(si as u64, k);
+                    self.index.insert(si, k);
                 }
                 // The write zeroed the sector — drop it from the index so the
                 // "absent ⇔ all-zero" invariant holds and the disk re-sparsifies
                 // (a `target/` cleaned in-guest reclaims its κ-store footprint).
                 None => {
-                    self.index.remove(&(si as u64));
+                    self.index.remove(&si);
                 }
             }
             done += n;
@@ -974,9 +979,10 @@ impl KappaBacking {
     }
 
     /// Reconstruct the full disk image — the self-contained snapshot of the disk
-    /// content (the live store dedups; the snapshot captures the bytes).
+    /// content (the live store dedups; the snapshot captures the bytes). A dense
+    /// buffer, so this is the native snapshot path, not the streamed boot.
     fn to_image(&self) -> Vec<u8> {
-        let mut image = vec![0u8; self.len()];
+        let mut image = vec![0u8; self.len() as usize];
         for (&i, k) in self.index.iter() {
             let bytes = self
                 .store
@@ -1058,7 +1064,7 @@ impl VirtioBlk {
 
     /// The disk capacity in 512-byte sectors (the `virtio_blk_config.capacity`).
     fn capacity_sectors(&self) -> u64 {
-        self.disk.len() as u64 / 512
+        self.disk.len() / 512
     }
 }
 
@@ -5261,7 +5267,7 @@ mod tests {
 
         // Reconstruction is byte-identical, and the disk is content-addressed.
         assert_eq!(disk.to_image(), image, "the κ-disk reconstructs its image");
-        assert_eq!(disk.len(), 3 * DISK_SECTOR);
+        assert_eq!(disk.len(), 3 * DISK_SECTOR as u64);
         assert!(
             !disk.index.contains_key(&1),
             "the all-zero sector is sparse (absent from the occupancy index)"
@@ -5275,7 +5281,7 @@ mod tests {
         // A partial-sector write (read-modify-write spanning the sector-1 boundary)
         // is read back faithfully.
         let patch = b"HOLOSPACES-KAPPA-DISK";
-        let off = DISK_SECTOR - 4; // straddles sectors 0 and 1
+        let off = DISK_SECTOR as u64 - 4; // straddles sectors 0 and 1
         disk.write_from(off, patch);
         let mut got = vec![0u8; patch.len()];
         disk.read_into(off, &mut got);
@@ -5347,7 +5353,7 @@ mod tests {
         // far end of the 1 TiB address space (no overflow in the sector math).
         for &i in &occupied_idx {
             assert_eq!(
-                disk.read_sector(i as usize),
+                disk.read_sector(i),
                 content(i),
                 "occupied sector {i} reads its content"
             );
@@ -5388,7 +5394,7 @@ mod tests {
         // First pass: every sector reads back its own content despite eviction.
         for s in 0..n {
             let mut got = [0u8; DISK_SECTOR];
-            disk.read_into(s * DISK_SECTOR, &mut got);
+            disk.read_into((s * DISK_SECTOR) as u64, &mut got);
             assert_eq!(
                 &got[..],
                 &image[s * DISK_SECTOR..(s + 1) * DISK_SECTOR],
@@ -5402,7 +5408,7 @@ mod tests {
         );
         // A hot re-read (now a cache hit) still returns the correct bytes.
         let mut got = [0u8; DISK_SECTOR];
-        disk.read_into((n - 1) * DISK_SECTOR, &mut got);
+        disk.read_into(((n - 1) * DISK_SECTOR) as u64, &mut got);
         assert_eq!(&got[..], &image[(n - 1) * DISK_SECTOR..n * DISK_SECTOR]);
     }
 
