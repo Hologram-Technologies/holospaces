@@ -55,6 +55,11 @@ cp "$ROOT/vv/artifacts/cc16/kernel/Image.gz" "$CRATE/web/devcontainer-net-kernel
 nmfdig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['manifests'][0]['digest'].split(':')[1])" "$ROOT/vv/artifacts/cc16/image/index.json")
 nldig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['layers'][0]['digest'].split(':')[1])" "$ROOT/vv/artifacts/cc16/image/blobs/sha256/$nmfdig")
 cp "$ROOT/vv/artifacts/cc16/image/blobs/sha256/$nldig" "$CRATE/web/devcontainer-net-layer.tar.gz"
+# The amd64 (x86-64) devcontainer (CC-45): the amd64 Linux kernel + the stock
+# linux/amd64 busybox layer, so the browser peer assembles the rootfs sparse into
+# OPFS and BOOTS it on the x86-64 system core via the shipped X64Workspace path.
+cp "$ROOT/vv/artifacts/cc45/linux/vmlinux.gz" "$CRATE/web/cc45-x64-kernel.gz"
+cp "$ROOT/vv/artifacts/cc45/rootfs/layer.tar.gz" "$CRATE/web/cc45-x64-layer.tar.gz"
 
 cd "$CRATE/web"
 # Install the declared browser-test dependencies (playwright, @vscode/test-web,
@@ -83,6 +88,9 @@ node terminal-test.mjs
 
 echo "==> running the streaming-assembly boot test in Chromium (CC-50: the rootfs streamed sparse straight into an OPFS file BOOTS to userspace via the shipped paged-κ-disk path — the deployed assembleIntoOpfs path, not a byte-identity substitute)"
 node cc50-streaming-boot-test.mjs
+
+echo "==> running the amd64 (x86-64) devcontainer boot test in Chromium (CC-45: a stock linux/amd64 devcontainer assembled sparse into OPFS BOOTS on the x86-64 system core via the shipped X64Workspace paged-κ-disk path — the deployed amd64 boot)"
+node cc45-x64-boot-test.mjs
 
 echo "==> running the DEPLOYED provision->boot test in Chromium (a registry image pulled via DevcontainerProvision, assembled SPARSE into OPFS via the deployed assembleIntoOpfs, and BOOTED to userspace — the exact deployed provisioning path no other witness exercised; the regression guard for 'the deploy can't boot a real image')"
 node provision-boot-test.mjs

@@ -258,26 +258,27 @@ impl DevcontainerProvision {
         let media_types: Vec<String> = image.layer_media_types().to_vec();
         let mut layer_idx = 0usize;
         let mut layer_err: Option<JsValue> = None;
-        let next_layer = || -> Result<Option<(String, Vec<u8>)>, holospaces::assembly::AssemblyError> {
-            if layer_idx >= layer_kappas.len() {
-                return Ok(None);
-            }
-            let i = layer_idx;
-            layer_idx += 1;
-            match self.store.get(&layer_kappas[i]) {
-                Ok(Some(bytes)) => Ok(Some((media_types[i].clone(), bytes.as_ref().to_vec()))),
-                Ok(None) => {
-                    layer_err = Some(JsValue::from_str(
-                        "an ingested layer is missing from the store",
-                    ));
-                    Ok(None)
+        let next_layer =
+            || -> Result<Option<(String, Vec<u8>)>, holospaces::assembly::AssemblyError> {
+                if layer_idx >= layer_kappas.len() {
+                    return Ok(None);
                 }
-                Err(e) => {
-                    layer_err = Some(js_err(e));
-                    Ok(None)
+                let i = layer_idx;
+                layer_idx += 1;
+                match self.store.get(&layer_kappas[i]) {
+                    Ok(Some(bytes)) => Ok(Some((media_types[i].clone(), bytes.as_ref().to_vec()))),
+                    Ok(None) => {
+                        layer_err = Some(JsValue::from_str(
+                            "an ingested layer is missing from the store",
+                        ));
+                        Ok(None)
+                    }
+                    Err(e) => {
+                        layer_err = Some(js_err(e));
+                        Ok(None)
+                    }
                 }
-            }
-        };
+            };
 
         // Stream the ext4 image block-by-block into the OPFS file. Only non-zero
         // blocks are written (the free space stays sparse), so the wasm heap holds
@@ -434,14 +435,15 @@ impl DevcontainerImage {
         // next), and stream the ext4 image block-by-block into the OPFS file —
         // never materializing the dense disk-sized image (Laws L3/L4).
         let mut layer_idx = 0usize;
-        let next_layer = || -> Result<Option<(String, Vec<u8>)>, holospaces::assembly::AssemblyError> {
-            if layer_idx >= self.layers.len() {
-                return Ok(None);
-            }
-            let (mt, b) = &self.layers[layer_idx];
-            layer_idx += 1;
-            Ok(Some((mt.clone(), b.clone())))
-        };
+        let next_layer =
+            || -> Result<Option<(String, Vec<u8>)>, holospaces::assembly::AssemblyError> {
+                if layer_idx >= self.layers.len() {
+                    return Ok(None);
+                }
+                let (mt, b) = &self.layers[layer_idx];
+                layer_idx += 1;
+                Ok(Some((mt.clone(), b.clone())))
+            };
 
         let mut io_err: Option<JsValue> = None;
         let geom = holospaces::assembly::stream_ext4_image_bootable_streamed_layers(
@@ -1850,7 +1852,9 @@ impl Aarch64Workspace {
     /// is not a `*_full` boot).
     #[must_use]
     pub fn egress_outbound(&self) -> Option<Vec<u8>> {
-        self.router.as_ref().and_then(net::RouterChannel::pop_outbound)
+        self.router
+            .as_ref()
+            .and_then(net::RouterChannel::pop_outbound)
     }
 
     /// Deliver an egress frame the router returned into the guest's network. A
@@ -1939,10 +1943,17 @@ impl X64Workspace {
             opts.set_at((i * 512) as f64);
             let _ = rootfs.read_with_u8_array_and_options(buf, &opts);
         };
+        // x86-64 has no device tree, so the virtio-mmio κ-disk is discovered from
+        // the command line (`virtio_mmio.device=<size>@<base>:<irq>` — the κ-disk's
+        // MMIO slot at 0xd000_0000, IRQ 11), exactly as the CC-45 boot witness. The
+        // aarch64 peer discovers the same device from its DTB instead, hence the
+        // shorter cmdline there. `random.trust_cpu=on` lets the RNG seed from RDRAND
+        // so early userspace doesn't block on entropy.
         let cpu = x64::Cpu::boot_linux_disk_streamed(
             512 * 1024 * 1024,
             kernel,
-            "console=ttyS0 root=/dev/vda rw init=/init",
+            "console=ttyS0 root=/dev/vda rw init=/init \
+             virtio_mmio.device=0x200@0xd0000000:11 random.trust_cpu=on",
             store,
             sector_count,
             read,
