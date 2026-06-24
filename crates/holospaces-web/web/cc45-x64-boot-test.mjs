@@ -42,28 +42,39 @@ self.onmessage = async () => {
 
     const root = await navigator.storage.getDirectory();
     const ROOTFS = "cc45-x64-rootfs.img";
+    const OCC = "cc45-x64-occ.idx";
     const PACK = "cc45-x64-disk.pack";
-    for (const n of [ROOTFS, PACK]) { try { await root.removeEntry(n); } catch {} }
-    const rootfsFile = await root.getFileHandle(ROOTFS, { create: true });
-    const rootfsHandle = await rootfsFile.createSyncAccessHandle();
+    for (const n of [ROOTFS, OCC, PACK]) { try { await root.removeEntry(n); } catch {} }
+    const rootfsHandle = await (await root.getFileHandle(ROOTFS, { create: true })).createSyncAccessHandle();
+    const occHandle = await (await root.getFileHandle(OCC, { create: true })).createSyncAccessHandle();
 
-    // Stream the bootable amd64 rootfs sparse into OPFS — a 512 MiB declared disk
-    // over a few-MiB busybox layer (the free space is a hole).
-    const DISK_BYTES = 512 * 1024 * 1024;
+    // An **8 GiB** declared disk — a real build-capable size — assembled SPARSE into
+    // OPFS, with the rootfs OCCUPANCY (the ascending indices of the blocks actually
+    // written) recorded into the sidecar. The free space is a hole; the occupancy is
+    // a few-thousand-entry list, not 8 GiB.
+    const DISK_BYTES = 8 * 1024 * 1024 * 1024;
     const img = new DevcontainerImage();
     img.add_layer("application/vnd.oci.image.layer.v1.tar+gzip", layer);
-    const imageLen = img.assembleBootableIntoOpfs(rootfsHandle, DISK_BYTES);
-    const onDiskLen = rootfsHandle.getSize();
+    const imageLen = img.assembleBootableIntoOpfsTracked(rootfsHandle, occHandle, DISK_BYTES);
+    const occBytes = occHandle.getSize();        // 8 bytes per occupied block
+    const occupiedBlocks = occBytes / 8;
 
     rootfsHandle.close();
+    occHandle.close();
     const rootfsRead = await (await root.getFileHandle(ROOTFS)).createSyncAccessHandle();
+    const occRead = await (await root.getFileHandle(OCC)).createSyncAccessHandle();
     const packHandle = await (await root.getFileHandle(PACK, { create: true })).createSyncAccessHandle();
 
-    // BOOT on the x86-64 core via the shipped paged-κ-disk path.
-    const ws = X64Workspace.boot_devcontainer_opfs_streamed(kernel, rootfsRead, packHandle);
+    // BOOT the 8 GiB disk **O(content)** on the x86-64 core: only the occupied blocks
+    // are paged from OPFS. An O(disk) boot would read 16.7M sectors and never finish
+    // in a browser — that this completes IS the proof it pages by content.
+    const ws = X64Workspace.bootDevcontainerOpfsStreamedOccupancy(kernel, rootfsRead, occRead, packHandle);
 
     let booted = false, mounted = false;
-    for (let i = 0; i < 6000; i++) {
+    // The interpreted x64 core boots in ~2-3B cycles; 2000 × 8M = 16B is generous
+    // headroom (disk size adds no boot cycles — proven natively), and bounds a stuck
+    // boot's failure time.
+    for (let i = 0; i < 2000; i++) {
       const halted = ws.run(8_000_000);
       const t = ws.terminal();
       mounted = mounted || t.includes("EXT4-fs") || t.includes("Mounted root");
@@ -73,7 +84,7 @@ self.onmessage = async () => {
     const tail = ws.terminal().split("\\n").slice(-12).join("\\n");
     try { rootfsRead.close(); } catch {}
     try { packHandle.close(); } catch {}
-    self.postMessage({ ok: true, imageLen, onDiskLen, diskBytes: DISK_BYTES, booted, mounted, tail });
+    self.postMessage({ ok: true, imageLen, occBytes, occupiedBlocks, diskBytes: DISK_BYTES, booted, mounted, tail });
   } catch (e) {
     self.postMessage({ ok: false, error: String(e && e.stack ? e.stack : e) });
   }
@@ -118,10 +129,13 @@ try {
     failed = true;
     console.error("CC45-X64-BOOT-TEST: worker failed —", r.error);
   } else {
-    check(r.imageLen >= r.diskBytes && r.onDiskLen === r.imageLen,
-      `the bootable amd64 rootfs streamed into OPFS (${r.imageLen} bytes for a ${r.diskBytes}-byte disk, sparse)`);
+    const totalBlocks = r.diskBytes / 4096;
+    check(r.imageLen >= r.diskBytes,
+      `the bootable amd64 rootfs spans the full ${(r.diskBytes / 1024 / 1024 / 1024)} GiB declared disk (${r.imageLen} bytes)`);
+    check(r.occupiedBlocks > 0 && r.occupiedBlocks < totalBlocks / 8,
+      `assembled SPARSE: ${r.occupiedBlocks} occupied blocks recorded, ≪ the ${totalBlocks} blocks of an 8 GiB disk (O(content))`);
     check(r.mounted, "a real amd64 Linux mounted the streamed-into-OPFS rootfs over virtio-blk — in the browser");
-    check(r.booted, "the amd64 devcontainer BOOTED to userspace on the x86-64 core via the shipped paged-κ-disk path");
+    check(r.booted, "the amd64 devcontainer BOOTED to userspace O(content) from an 8 GiB occupancy-paged disk on the x86-64 core");
     if (!r.booted) console.error("  console tail:\n" + r.tail);
   }
   console.log(failed

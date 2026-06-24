@@ -390,12 +390,18 @@
       // old window path assembled a dense 1 GiB Vec and OOM-trapped on a real
       // image. Sync access handles are worker-only, but the router transport is
       // window-only, so the window relays each layer fetch for the worker.
-      // 1 GiB sparse — historical parity (the deploy booted at this size before the
-      // dense-Vec OOM regression). Sparse, so it costs only the image's content, not
-      // a gigabyte allocation. (A larger build-capable disk awaits the occupancy-index
-      // boot path: today the κ-disk indexer reads every sector of the declared disk,
-      // so the size also bounds boot-setup time — tracked as the next refinement.)
-      const PROVISION_DISK_BYTES = 1024 * 1024 * 1024;
+      // The declared disk size, per architecture. Sparse, so it costs only the
+      // image's content, never the declared size. x86-64 boots the occupancy-paged
+      // κ-disk (CC-45) — only the blocks the provision wrote are read — so it pages
+      // O(content) and can declare a real, **build-capable** disk (room to apt-install
+      // and compile in-guest) with no boot-setup penalty. The other arches still page
+      // O(disk) at boot (their occupancy paths are their own issues), so they keep the
+      // conservative 1 GiB until then.
+      function provisionDiskBytes(arch) {
+        return arch === "x64"
+          ? 16 * 1024 * 1024 * 1024 // 16 GiB — build-capable, paged O(content)
+          : 1024 * 1024 * 1024; // 1 GiB — O(disk) boot, conservative
+      }
       async function provisionToOpfs(kappa, image, arch) {
         const worker = new Worker("./provision-worker.mjs", { type: "module" });
         try {
@@ -422,7 +428,7 @@
               }
             };
             worker.onerror = (e) => reject(new Error("provision worker error: " + (e.message || (e.filename + ":" + e.lineno))));
-            worker.postMessage({ type: "provision", image, arch, kappa, diskBytes: PROVISION_DISK_BYTES });
+            worker.postMessage({ type: "provision", image, arch, kappa, diskBytes: provisionDiskBytes(arch) });
           });
         } finally {
           worker.terminate();
