@@ -250,6 +250,32 @@ impl DevcontainerProvision {
         rootfs_handle: web_sys::FileSystemSyncAccessHandle,
         disk_bytes: f64,
     ) -> Result<f64, JsValue> {
+        self.assemble_into_opfs_inner(rootfs_handle, None, disk_bytes)
+    }
+
+    /// Like [`assembleIntoOpfs`](Self::assemble_into_opfs), but also records the
+    /// rootfs's **occupancy** — the ascending indices of the blocks it actually
+    /// wrote — into `occupancy_handle` as packed little-endian `u64`s. That sidecar
+    /// is what lets the deployed boot page an **arbitrarily large**, build-capable
+    /// devcontainer disk **O(content)**: only the (few) occupied blocks are read at
+    /// boot, never the declared size. The rootfs bytes are identical to the untracked
+    /// assembler over the same image (Law L1); the sidecar is the sole addition.
+    #[wasm_bindgen(js_name = assembleIntoOpfsTracked)]
+    pub fn assemble_into_opfs_tracked(
+        &self,
+        rootfs_handle: web_sys::FileSystemSyncAccessHandle,
+        occupancy_handle: web_sys::FileSystemSyncAccessHandle,
+        disk_bytes: f64,
+    ) -> Result<f64, JsValue> {
+        self.assemble_into_opfs_inner(rootfs_handle, Some(occupancy_handle), disk_bytes)
+    }
+
+    fn assemble_into_opfs_inner(
+        &self,
+        rootfs_handle: web_sys::FileSystemSyncAccessHandle,
+        occupancy_handle: Option<web_sys::FileSystemSyncAccessHandle>,
+        disk_bytes: f64,
+    ) -> Result<f64, JsValue> {
         let image = self.pull.ingest(&self.store).map_err(js_err)?;
         // Pull each layer blob out of the store one at a time, overlay it, and let
         // it drop before fetching the next — neither the whole layer stack nor the
@@ -284,6 +310,10 @@ impl DevcontainerProvision {
         // blocks are written (the free space stays sparse), so the wasm heap holds
         // the assembler's content working set, never the whole image.
         let mut io_err: Option<JsValue> = None;
+        let track = occupancy_handle.is_some();
+        // The occupancy: each emitted block's index, packed little-endian, ascending
+        // (built only when a sidecar was requested).
+        let mut occupancy: Vec<u8> = Vec::new();
         let geom = holospaces::assembly::stream_ext4_image_bootable_streamed_layers(
             next_layer,
             holospaces::machine::REAL_IMAGE_INIT,
@@ -291,6 +321,9 @@ impl DevcontainerProvision {
             |block_index, bytes| {
                 if io_err.is_some() {
                     return;
+                }
+                if track {
+                    occupancy.extend_from_slice(&block_index.to_le_bytes());
                 }
                 let opts = web_sys::FileSystemReadWriteOptions::new();
                 opts.set_at((block_index * bytes.len() as u64) as f64);
@@ -310,6 +343,13 @@ impl DevcontainerProvision {
         // Ensure the file spans the full image so the trailing sparse region reads
         // back as zeros (OPFS truncate grows with a hole).
         rootfs_handle.truncate_with_f64(image_len as f64)?;
+        // Persist the occupancy sidecar, if one was requested (overwriting any prior).
+        if let Some(occ) = occupancy_handle {
+            occ.truncate_with_f64(0.0)?;
+            let opts = web_sys::FileSystemReadWriteOptions::new();
+            opts.set_at(0.0);
+            occ.write_with_u8_array_and_options(&occupancy, &opts)?;
+        }
         Ok(image_len as f64)
     }
 }
@@ -469,6 +509,66 @@ impl DevcontainerImage {
         // Grow the file to span the full image so the trailing sparse region reads
         // back as zeros (OPFS truncate grows with a hole).
         rootfs_handle.truncate_with_f64(image_len as f64)?;
+        Ok(image_len as f64)
+    }
+
+    /// Like [`assembleBootableIntoOpfs`](Self::assemble_bootable_into_opfs), but also
+    /// records the rootfs's **occupancy** — the ascending block indices it actually
+    /// wrote — into `occupancy_handle` as packed little-endian `u64`s. That sidecar
+    /// lets [`X64Workspace::boot_devcontainer_opfs_streamed_occupancy`] page the disk
+    /// **O(content)**: a multi-GiB build-capable devcontainer disk boots reading only
+    /// its (few) occupied blocks, never its declared size — the deployed regime for a
+    /// real developer's image, not a fixture-sized one. Byte-identical rootfs to the
+    /// untracked assembler over the same layers (Law L1); the sidecar is the only
+    /// addition. Returns the image length, as the untracked variant does.
+    #[wasm_bindgen(js_name = assembleBootableIntoOpfsTracked)]
+    pub fn assemble_bootable_into_opfs_tracked(
+        &self,
+        rootfs_handle: web_sys::FileSystemSyncAccessHandle,
+        occupancy_handle: web_sys::FileSystemSyncAccessHandle,
+        disk_bytes: f64,
+    ) -> Result<f64, JsValue> {
+        let mut layer_idx = 0usize;
+        let next_layer =
+            || -> Result<Option<(String, Vec<u8>)>, holospaces::assembly::AssemblyError> {
+                if layer_idx >= self.layers.len() {
+                    return Ok(None);
+                }
+                let (mt, b) = &self.layers[layer_idx];
+                layer_idx += 1;
+                Ok(Some((mt.clone(), b.clone())))
+            };
+
+        let mut io_err: Option<JsValue> = None;
+        // The occupancy: each emitted block's index, packed little-endian, ascending.
+        let mut occupancy: Vec<u8> = Vec::new();
+        let geom = holospaces::assembly::stream_ext4_image_bootable_streamed_layers(
+            next_layer,
+            holospaces::machine::DEVCONTAINER_INIT,
+            disk_bytes as u64,
+            |block_index, bytes| {
+                if io_err.is_some() {
+                    return;
+                }
+                occupancy.extend_from_slice(&block_index.to_le_bytes());
+                let opts = web_sys::FileSystemReadWriteOptions::new();
+                opts.set_at((block_index * bytes.len() as u64) as f64);
+                if let Err(e) = rootfs_handle.write_with_u8_array_and_options(bytes, &opts) {
+                    io_err = Some(e);
+                }
+            },
+        )
+        .map_err(js_err)?;
+        if let Some(e) = io_err {
+            return Err(e);
+        }
+        let image_len = geom.image_len();
+        rootfs_handle.truncate_with_f64(image_len as f64)?;
+        // Persist the occupancy sidecar (overwrite any prior contents).
+        occupancy_handle.truncate_with_f64(0.0)?;
+        let opts = web_sys::FileSystemReadWriteOptions::new();
+        opts.set_at(0.0);
+        occupancy_handle.write_with_u8_array_and_options(&occupancy, &opts)?;
         Ok(image_len as f64)
     }
 }
@@ -1960,6 +2060,67 @@ impl X64Workspace {
         );
         // The κ-disk is fully ingested up front; release the rootfs's exclusive OPFS
         // lock so re-provisioning/removal isn't blocked and the handle doesn't leak.
+        rootfs_handle.close();
+        Ok(X64Workspace {
+            cpu,
+            halted: false,
+            console_cursor: 0,
+        })
+    }
+
+    /// Boot a provisioned amd64 image **O(content)** by occupancy — the deployed path
+    /// for an arbitrarily large, build-capable devcontainer disk. `occupancy_handle`
+    /// is the sidecar [`assembleBootableIntoOpfsTracked`](DevcontainerImage::assemble_bootable_into_opfs_tracked)
+    /// wrote (packed little-endian `u64` block indices); only those blocks are read
+    /// from `rootfs_handle` (each a 4 KiB block = 8 sectors), so a multi-GiB declared
+    /// disk pages in proportion to its **content**, never reading its holes. The
+    /// streamed-from-OPFS analogue of [`x64::Cpu::boot_linux_disk_occupancy_streamed`].
+    #[wasm_bindgen(js_name = bootDevcontainerOpfsStreamedOccupancy)]
+    pub fn boot_devcontainer_opfs_streamed_occupancy(
+        kernel: &[u8],
+        rootfs_handle: web_sys::FileSystemSyncAccessHandle,
+        occupancy_handle: web_sys::FileSystemSyncAccessHandle,
+        disk_handle: web_sys::FileSystemSyncAccessHandle,
+    ) -> Result<X64Workspace, JsValue> {
+        let store = Box::new(opfs_store::OpfsKappaStore::new(disk_handle));
+        let total = rootfs_handle.get_size().map_err(js_err)? as u64;
+        let sector_count = total.div_ceil(512);
+
+        // Read the occupancy sidecar: packed little-endian u64 block indices.
+        let occ_len = occupancy_handle.get_size().map_err(js_err)? as usize;
+        let mut occ_bytes = vec![0u8; occ_len];
+        let opts = web_sys::FileSystemReadWriteOptions::new();
+        opts.set_at(0.0);
+        occupancy_handle
+            .read_with_u8_array_and_options(&mut occ_bytes, &opts)
+            .map_err(js_err)?;
+        occupancy_handle.close();
+        let occupied_blocks: Vec<u64> = occ_bytes
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+
+        let rootfs = rootfs_handle.clone();
+        let read = move |i: u64, buf: &mut [u8]| {
+            let opts = web_sys::FileSystemReadWriteOptions::new();
+            opts.set_at((i * 512) as f64);
+            let _ = rootfs.read_with_u8_array_and_options(buf, &opts);
+        };
+        // 4 KiB ext4 blocks over 512-byte disk sectors → 8 sectors per block. Same
+        // cmdline as the streamed boot (x86-64 discovers the κ-disk from the cmdline,
+        // having no device tree).
+        const SECTORS_PER_BLOCK: u64 = 8;
+        let cpu = x64::Cpu::boot_linux_disk_occupancy_streamed(
+            512 * 1024 * 1024,
+            kernel,
+            "console=ttyS0 root=/dev/vda rw init=/init \
+             virtio_mmio.device=0x200@0xd0000000:11 random.trust_cpu=on",
+            store,
+            sector_count,
+            &occupied_blocks,
+            SECTORS_PER_BLOCK,
+            read,
+        );
         rootfs_handle.close();
         Ok(X64Workspace {
             cpu,
