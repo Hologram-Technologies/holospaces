@@ -245,34 +245,36 @@ fn blk_service_chain(mem: &mut GuestRam, dev: &mut VirtioBlk, head: u16) -> u32 
     const VIRTIO_BLK_S_IOERR: u8 = 1;
 
     let mut written = 0u32;
-    let mut disk_off = (sector * 512) as usize;
+    // u64: the disk byte offset spans the full declared disk, which is multi-GiB and
+    // overflows a 32-bit usize on wasm32 (the deployed browser peer).
+    let mut disk_off = sector * 512;
     let mut status = VIRTIO_BLK_S_OK;
     match req_type {
         VIRTIO_BLK_T_IN => {
             for (addr, len, _flags) in data {
                 let n = *len as usize;
-                if disk_off + n > dev.disk.len() {
+                if disk_off + n as u64 > dev.disk.len() {
                     status = VIRTIO_BLK_S_IOERR;
                     break;
                 }
                 let mut buf = vec![0u8; n];
                 dev.disk.read_into(disk_off, &mut buf);
                 mem.write_bytes(*addr, &buf);
-                disk_off += n;
+                disk_off += n as u64;
                 written += *len;
             }
         }
         VIRTIO_BLK_T_OUT => {
             for (addr, len, _flags) in data {
                 let n = *len as usize;
-                if disk_off + n > dev.disk.len() {
+                if disk_off + n as u64 > dev.disk.len() {
                     status = VIRTIO_BLK_S_IOERR;
                     break;
                 }
                 let mut buf = vec![0u8; n];
                 mem.read_bytes(*addr, &mut buf);
                 dev.disk.write_from(disk_off, &buf);
-                disk_off += n;
+                disk_off += n as u64;
             }
         }
         VIRTIO_BLK_T_GET_ID => {
