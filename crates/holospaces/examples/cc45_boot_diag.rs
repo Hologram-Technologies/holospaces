@@ -63,7 +63,28 @@ fn main() {
     let mut cur = 0usize;
     let mut prev = cpu.mmu_stats();
     for s in 0..slices {
-        let h = cpu.run(per);
+        // Run the slice in 64 sub-chunks, sampling RIP each, so a stuck slice
+        // reveals its loop: collect the distinct top RIPs + the IF flag.
+        let mut h = Halt::OutOfBudget;
+        let mut samples: std::collections::BTreeMap<u64, u32> = std::collections::BTreeMap::new();
+        let mut if_clear = 0u32;
+        for _ in 0..64 {
+            h = cpu.run(per / 64);
+            *samples.entry(cpu.rip() & !0xfff).or_default() += 1;
+            if cpu.rflags() & (1 << 9) == 0 {
+                if_clear += 1;
+            }
+            if !matches!(h, Halt::OutOfBudget) {
+                break;
+            }
+        }
+        let mut top: Vec<_> = samples.into_iter().collect();
+        top.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
+        let hot: Vec<String> = top
+            .iter()
+            .take(3)
+            .map(|(p, c)| format!("{p:#x}:{c}"))
+            .collect();
         let c = cpu.console();
         if c.len() > cur {
             out.write_all(&c[cur..]).unwrap();
@@ -89,6 +110,7 @@ fn main() {
             u[4],
         )
         .unwrap();
+        writeln!(out, "      hot_pages={hot:?} if_clear={if_clear}/64").unwrap();
         // Interrupt histogram (qemu -d int differential): every nonzero vector.
         let mut hist = String::from("      int[");
         for v in 0..=255u16 {
