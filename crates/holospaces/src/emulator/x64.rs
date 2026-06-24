@@ -141,6 +141,11 @@ struct Sys {
     /// registers a UP boot drives are modelled (`SVR`, `EOI`, the LVT timer, the
     /// timer initial/current count + divide).
     lapic: Lapic,
+    /// The I/O APIC (MMIO at `0xFEC0_0000`). Advertised via the ACPI MADT so Linux
+    /// takes the *symmetric I/O* path — device IRQs route through the redirection
+    /// table to the local APIC (not the legacy PIC), which lets the kernel run the
+    /// tickless LAPIC timer instead of storming the periodic PIT.
+    ioapic: Ioapic,
     /// The architected timestamp counter (`RDTSC`) — advanced in lockstep with the
     /// PIT so the kernel's delay loops and the TSC clocksource make progress.
     tsc: u64,
@@ -192,12 +197,64 @@ impl Sys {
             pic: Pic::new(),
             pit: Pit::new(),
             lapic: Lapic::new(),
+            ioapic: Ioapic::new(),
             tsc: 0,
             halted: false,
             rng: 0x9e37_79b9_7f4a_7c15,
             tdiv: 0,
             pci_addr: 0,
             dcache: vec![u64::MAX; DCACHE_LINES],
+        }
+    }
+
+    /// Assert an ISA IRQ line. Once Linux has programmed + unmasked the line's
+    /// I/O APIC redirection entry (symmetric I/O mode), deliver its configured
+    /// vector to the local APIC; until then (early boot, before `setup_IO_APIC`)
+    /// fall through to the legacy 8259 PIC. Because Linux masks the PIC at the same
+    /// time it unmasks the matching IOAPIC entry, a line is only ever deliverable
+    /// through one path. The PIT (ISA IRQ0) maps to GSI 2 per the MADT interrupt
+    /// source override; the old cascade IRQ2 swaps to GSI 0 (unused).
+    fn raise_irq(&mut self, irq: u8) {
+        let gsi = match irq {
+            0 => 2,
+            2 => 0,
+            n => n as usize,
+        };
+        if gsi < 24 {
+            let e = self.ioapic.redir[gsi];
+            if e & (1 << 16) == 0 {
+                // Unmasked: deliver this entry's vector to the local APIC.
+                let level = e & (1 << 15) != 0;
+                // A level line whose Remote IRR is still set (not yet EOI'd)
+                // coalesces — no second delivery, exactly as the 82093AA.
+                if level && e & (1 << 14) != 0 {
+                    return;
+                }
+                self.lapic.set_irr((e & 0xff) as u8);
+                if level {
+                    self.ioapic.redir[gsi] |= 1 << 14; // latch Remote IRR
+                }
+                return;
+            }
+        }
+        self.pic.raise(irq);
+    }
+
+    /// Acknowledge a local-APIC interrupt (write to the EOI register). Clears the
+    /// highest in-service vector, then — for level-triggered I/O APIC sources —
+    /// clears Remote IRR on every redirection entry carrying that vector, the
+    /// LAPIC↔IOAPIC EOI broadcast a real chipset performs. Edge sources carry no
+    /// Remote IRR, so this is a no-op for them.
+    fn lapic_eoi(&mut self) {
+        let v = Lapic::highest(&self.lapic.isr);
+        self.lapic.eoi();
+        if let Some(v) = v {
+            for e in &mut self.ioapic.redir {
+                if *e & ((1 << 15) | (1 << 14)) == ((1 << 15) | (1 << 14)) && (*e & 0xff) as u8 == v
+                {
+                    *e &= !(1 << 14);
+                }
+            }
         }
     }
 }
@@ -388,6 +445,73 @@ impl Lapic {
     fn eoi(&mut self) {
         if let Some(v) = Self::highest(&self.isr) {
             self.isr[(v >> 6) as usize] &= !(1u64 << (v & 63));
+        }
+    }
+}
+
+/// The I/O APIC (Intel 82093AA), MMIO at [`IOAPIC_BASE`]. A UP machine drives it
+/// through the indirect IOREGSEL/IOWIN window: the 24-entry redirection table maps
+/// each Global System Interrupt (GSI) to a destination vector, which we deliver to
+/// the local APIC. Linux discovers it via the MADT and switches to symmetric I/O
+/// mode — the path that arms the tickless LAPIC timer (no PIT storm).
+struct Ioapic {
+    /// IOAPIC ID (bits 27:24 of the ID register).
+    id: u32,
+    /// IOREGSEL latch — the indirect register index the next IOWIN access targets.
+    ioregsel: u32,
+    /// The 24 redirection-table entries (64-bit each). Reset masked (bit 16 set).
+    redir: [u64; 24],
+}
+
+impl Ioapic {
+    fn new() -> Self {
+        Ioapic {
+            id: 0,
+            ioregsel: 0,
+            // Every entry masked at reset (bit 16), as the 82093AA powers up.
+            redir: [1 << 16; 24],
+        }
+    }
+    /// Read the indirect register currently selected by IOREGSEL.
+    fn read(&self) -> u32 {
+        match self.ioregsel {
+            0x00 => (self.id & 0xf) << 24, // ID
+            // Version 0x20 in bits 7:0; "max redirection entry" = 23 (24 entries)
+            // in bits 23:16 — Linux reads this to size the GSI space (GSI 0-23).
+            0x01 => 0x0017_0020,
+            0x02 => (self.id & 0xf) << 24, // arbitration ID
+            i @ 0x10..=0x3f => {
+                let n = ((i - 0x10) / 2) as usize;
+                let e = self.redir[n];
+                // Delivery Status (bit 12) is read-only-0; the rest reads back.
+                let dword = if i & 1 == 0 {
+                    e as u32
+                } else {
+                    (e >> 32) as u32
+                };
+                if i & 1 == 0 {
+                    dword & !(1 << 12)
+                } else {
+                    dword
+                }
+            }
+            _ => 0,
+        }
+    }
+    /// Write the indirect register currently selected by IOREGSEL.
+    fn write(&mut self, val: u32) {
+        match self.ioregsel {
+            0x00 => self.id = (val >> 24) & 0xf,
+            i @ 0x10..=0x3f => {
+                let n = ((i - 0x10) / 2) as usize;
+                if i & 1 == 0 {
+                    self.redir[n] = (self.redir[n] & 0xffff_ffff_0000_0000) | u64::from(val);
+                } else {
+                    self.redir[n] =
+                        (self.redir[n] & 0x0000_0000_ffff_ffff) | (u64::from(val) << 32);
+                }
+            }
+            _ => {} // version / arbitration are read-only
         }
     }
 }
@@ -674,6 +798,9 @@ const TAA_NO: u64 = 1 << 8; // not vulnerable to TSX Async Abort
 // The local-APIC MMIO window (the architectural default base).
 const LAPIC_BASE: u64 = 0xFEE0_0000;
 const LAPIC_END: u64 = 0xFEE0_1000;
+/// The I/O APIC MMIO page (IOREGSEL at +0x00, IOWIN at +0x10).
+const IOAPIC_BASE: u64 = 0xFEC0_0000;
+const IOAPIC_END: u64 = 0xFEC0_1000;
 
 impl Cpu {
     /// A fresh core with `ram_bytes` of zeroed RAM and `rip`/`rsp` reset.
@@ -1076,7 +1203,7 @@ impl Cpu {
             sys.uart.input.extend_from_slice(bytes);
             // Raise the receive interrupt if the driver runs input interrupt-driven.
             if sys.uart.ier & 0x01 != 0 {
-                sys.pic.raise(4);
+                sys.raise_irq(4);
             }
         }
     }
@@ -1148,7 +1275,7 @@ impl Cpu {
             }
             sys.pit.counter = sys.pit.counter.saturating_sub(1);
             if sys.pit.counter == 0 {
-                sys.pic.raise(0);
+                sys.raise_irq(0);
                 if sys.pit.ch0_periodic {
                     sys.pit.counter = u32::from(sys.pit.reload);
                 } else {
@@ -1156,19 +1283,23 @@ impl Cpu {
                 }
             }
         }
-        if sys.lapic.enabled()
-            && sys.lapic.initial_count != 0
-            && sys.lapic.lvt_timer & (1 << 16) == 0
-        {
+        // The local-APIC timer counts down whenever it is armed (current_count !=
+        // 0), independent of the LVT mask — Linux calibrates it MASKED (arms a
+        // count, masks the LVT to suppress interrupts, then measures the decrement),
+        // so gating the counter on the mask made calibration read zero counts and
+        // print "APIC frequency too slow, disabling apic timer", forcing the PIT.
+        // The mask gates only interrupt DELIVERY. Reload on expiry only in periodic
+        // mode (bit 17); one-shot stays stopped until the kernel re-arms it (0x380),
+        // which is the tickless regime that replaces the periodic PIT tick.
+        if sys.lapic.enabled() && sys.lapic.current_count != 0 {
+            sys.lapic.current_count -= 1;
             if sys.lapic.current_count == 0 {
-                sys.lapic.current_count = sys.lapic.initial_count;
-            }
-            sys.lapic.current_count = sys.lapic.current_count.saturating_sub(1);
-            if sys.lapic.current_count == 0 {
+                if sys.lapic.lvt_timer & (1 << 16) == 0 {
+                    sys.lapic.set_irr((sys.lapic.lvt_timer & 0xff) as u8);
+                }
                 if sys.lapic.lvt_timer & (1 << 17) != 0 {
                     sys.lapic.current_count = sys.lapic.initial_count;
                 }
-                sys.lapic.set_irr((sys.lapic.lvt_timer & 0xff) as u8);
             }
         }
     }
@@ -1182,6 +1313,9 @@ impl Cpu {
         }
         if (LAPIC_BASE..LAPIC_END).contains(&pa) {
             return u64::from(self.lapic_read((pa - LAPIC_BASE) as u32));
+        }
+        if (IOAPIC_BASE..IOAPIC_END).contains(&pa) {
+            return u64::from(self.ioapic_read((pa - IOAPIC_BASE) as u32));
         }
         self.dcache_touch(pa);
         // Same-page accesses (the common case) map to contiguous physical bytes
@@ -1222,6 +1356,10 @@ impl Cpu {
         }
         if (LAPIC_BASE..LAPIC_END).contains(&pa) {
             self.lapic_write((pa - LAPIC_BASE) as u32, val as u32);
+            return;
+        }
+        if (IOAPIC_BASE..IOAPIC_END).contains(&pa) {
+            self.ioapic_write((pa - IOAPIC_BASE) as u32, val as u32);
             return;
         }
         self.dcache_touch(pa);
@@ -1416,7 +1554,7 @@ impl Cpu {
                 if sys.uart.ier & 0x02 != 0 && !sys.uart.thre_pending {
                     sys.uart.thre_pending = true;
                     sys.uart.dbg[4] += 1;
-                    sys.pic.raise(4);
+                    sys.raise_irq(4);
                 }
             }
             self.take_pending_interrupt();
@@ -1773,7 +1911,7 @@ impl Cpu {
                 if sys.uart.ier & 0x02 != 0 && !sys.uart.thre_pending {
                     sys.uart.thre_pending = true;
                     sys.uart.dbg[4] += 1;
-                    sys.pic.raise(4);
+                    sys.raise_irq(4);
                 }
             }
             0x3f9 if dlab => {
@@ -1790,7 +1928,7 @@ impl Cpu {
                     sys.uart.thre_pending = true;
                 }
                 if val & 0x02 != 0 || (val & 0x01 != 0 && dr) {
-                    sys.pic.raise(4);
+                    sys.raise_irq(4);
                 }
             }
             0x3fa => sys.uart.fcr = val, // FCR (write side of IIR/FCR)
@@ -2085,11 +2223,32 @@ impl Cpu {
 
     /// Write a local-APIC register. Drives the spurious-vector (enable), the LVT
     /// timer, the timer count/divide, the TPR, and `EOI` (offset `0xb0`).
+    /// IOREGSEL (`+0x00`) / IOWIN (`+0x10`) — the I/O APIC's indirect register
+    /// window (see [`Ioapic`]).
+    fn ioapic_read(&mut self, off: u32) -> u32 {
+        match off {
+            0x00 => self.sys().ioapic.ioregsel,
+            0x10 => self.sys().ioapic.read(),
+            _ => 0,
+        }
+    }
+    fn ioapic_write(&mut self, off: u32, val: u32) {
+        match off {
+            0x00 => self.sys_mut().ioapic.ioregsel = val & 0xff,
+            0x10 => self.sys_mut().ioapic.write(val),
+            _ => {}
+        }
+    }
+
     fn lapic_write(&mut self, off: u32, val: u32) {
+        // EOI must reach the I/O APIC (Remote IRR), so it can't borrow only `lapic`.
+        if off == 0x0b0 {
+            self.sys_mut().lapic_eoi();
+            return;
+        }
         let l = &mut self.sys_mut().lapic;
         match off {
             0x080 => l.tpr = val,
-            0x0b0 => l.eoi(), // EOI
             0x0f0 => l.svr = val,
             0x320 => {
                 l.lvt_timer = val;
@@ -2198,7 +2357,7 @@ impl Cpu {
         }
         self.sys_mut().virtio = Some(dev);
         if raise {
-            self.sys_mut().pic.raise(VIRTIO_BLK_IRQ);
+            self.sys_mut().raise_irq(VIRTIO_BLK_IRQ);
         }
     }
 
@@ -2216,7 +2375,7 @@ impl Cpu {
         }
         self.sys_mut().virtio9p = Some(dev);
         if raise {
-            self.sys_mut().pic.raise(VIRTIO_9P_IRQ);
+            self.sys_mut().raise_irq(VIRTIO_9P_IRQ);
         }
     }
 
@@ -2241,7 +2400,7 @@ impl Cpu {
         }
         self.sys_mut().virtionet = Some(dev);
         if raise {
-            self.sys_mut().pic.raise(VIRTIO_NET_IRQ);
+            self.sys_mut().raise_irq(VIRTIO_NET_IRQ);
         }
     }
 
@@ -2257,7 +2416,7 @@ impl Cpu {
         let raise = super::devbus::net_pump(&mut mem, &mut dev);
         self.sys_mut().virtionet = Some(dev);
         if raise {
-            self.sys_mut().pic.raise(VIRTIO_NET_IRQ);
+            self.sys_mut().raise_irq(VIRTIO_NET_IRQ);
         }
     }
 
@@ -3354,6 +3513,12 @@ struct RegSnapshot {
 // the kernel's 16 MiB load address, mirroring the firecracker/kvmtool loaders).
 const ZERO_PAGE: u64 = 0x7000; // struct boot_params (the "zero page")
 const CMDLINE_ADDR: u64 = 0x20000; // the kernel command line
+                                   // ACPI tables in the e820-reserved 0xF0000 block (16-byte-aligned RSDP).
+const RSDP_PHYS: u64 = 0x000F_0000;
+const RSDT_PHYS: u64 = 0x000F_0040;
+const MADT_PHYS: u64 = 0x000F_0080;
+const LAPIC_BASE_PHYS: u32 = 0xFEE0_0000;
+const IOAPIC_BASE_PHYS: u32 = 0xFEC0_0000;
 const BOOT_GDT: u64 = 0x500; // the boot GDT (3 flat descriptors)
 const BOOT_PML4: u64 = 0x9000; // the loader's identity page tables
 const BOOT_PDPT: u64 = 0xa000;
@@ -3468,6 +3633,8 @@ impl Cpu {
         cpu.ram[CMDLINE_ADDR as usize..CMDLINE_ADDR as usize + cl.len()].copy_from_slice(cl);
         cpu.ram[CMDLINE_ADDR as usize + cl.len()] = 0;
         cpu.build_boot_params(cmdline, ram_bytes as u64, disk.is_some());
+        // ACPI RSDP/RSDT/MADT so Linux uses the I/O APIC (symmetric I/O mode).
+        cpu.build_acpi_tables();
 
         // The boot GDT: a null descriptor, a 64-bit code segment (__BOOT_CS,
         // selector 0x10), and a flat data segment (__BOOT_DS, selector 0x18) —
@@ -3647,6 +3814,88 @@ impl Cpu {
             self.ram[off + 8..off + 16].copy_from_slice(&size.to_le_bytes());
             self.ram[off + 16..off + 20].copy_from_slice(&ty.to_le_bytes());
         }
+        // The RSDP physical address handed to the kernel via boot_params (0x070);
+        // built by `build_acpi_tables`. Without it (no BIOS to scan) Linux finds no
+        // MADT and falls back to virtual-wire/PIC mode.
+        self.ram[zp + 0x070..zp + 0x078].copy_from_slice(&RSDP_PHYS.to_le_bytes());
+    }
+
+    /// Write the ACPI tables (RSDP → RSDT → MADT) into low reserved memory so Linux
+    /// discovers the local + I/O APIC and takes the *symmetric I/O* interrupt path
+    /// (the tickless LAPIC-timer regime), instead of legacy virtual-wire/PIC mode.
+    /// The MADT advertises one enabled CPU, the I/O APIC at `0xFEC0_0000` with 24
+    /// GSIs, and the ISA IRQ0→GSI2 source override (the PIT pin the kernel's
+    /// `check_timer` expects). Tables live in the e820-reserved `0xF0000` block.
+    fn build_acpi_tables(&mut self) {
+        // 8-bit checksum: the byte that makes the sum of all `Length` bytes == 0.
+        fn checksum(t: &[u8]) -> u8 {
+            0u8.wrapping_sub(t.iter().fold(0u8, |a, &b| a.wrapping_add(b)))
+        }
+        const OEMID: &[u8; 6] = b"HOLOS\0";
+        const OEM_TABLE: &[u8; 8] = b"HOLOSPCS";
+
+        // Common 36-byte ACPI table header (signature, length back-filled, rev,
+        // checksum back-filled, OEM fields). Returns the header bytes.
+        let header = |sig: &[u8; 4], revision: u8| -> Vec<u8> {
+            let mut h = Vec::new();
+            h.extend_from_slice(sig);
+            h.extend_from_slice(&0u32.to_le_bytes()); // length (back-filled)
+            h.push(revision);
+            h.push(0); // checksum (back-filled)
+            h.extend_from_slice(OEMID);
+            h.extend_from_slice(OEM_TABLE);
+            h.extend_from_slice(&1u32.to_le_bytes()); // OEM revision
+            h.extend_from_slice(&0u32.to_le_bytes()); // creator id
+            h.extend_from_slice(&1u32.to_le_bytes()); // creator revision
+            h
+        };
+        let finalize = |t: &mut Vec<u8>| {
+            let len = t.len() as u32;
+            t[4..8].copy_from_slice(&len.to_le_bytes());
+            t[9] = 0;
+            t[9] = checksum(t);
+        };
+
+        // ── MADT (APIC) ──────────────────────────────────────────────────────
+        let mut madt = header(b"APIC", 4);
+        madt.extend_from_slice(&LAPIC_BASE_PHYS.to_le_bytes()); // local APIC addr
+        madt.extend_from_slice(&1u32.to_le_bytes()); // Flags: PCAT_COMPAT (8259 present)
+                                                     // Type 0 — Processor Local APIC (UID 0, APIC ID 0, enabled).
+        madt.extend_from_slice(&[0, 8, 0, 0]);
+        madt.extend_from_slice(&1u32.to_le_bytes());
+        // Type 1 — I/O APIC (ID 0, addr 0xFEC00000, GSI base 0).
+        madt.extend_from_slice(&[1, 12, 0, 0]);
+        madt.extend_from_slice(&IOAPIC_BASE_PHYS.to_le_bytes());
+        madt.extend_from_slice(&0u32.to_le_bytes());
+        // Type 2 — Interrupt Source Override: ISA IRQ0 → GSI 2, bus-conforming.
+        madt.extend_from_slice(&[2, 10, 0, 0]);
+        madt.extend_from_slice(&2u32.to_le_bytes());
+        madt.extend_from_slice(&0u16.to_le_bytes());
+        // Type 4 — Local APIC NMI: all CPUs (UID 0xFF), LINT1.
+        madt.extend_from_slice(&[4, 6, 0xff, 0, 0, 1]);
+        finalize(&mut madt);
+
+        // ── RSDT (one entry → MADT) ──────────────────────────────────────────
+        let mut rsdt = header(b"RSDT", 1);
+        rsdt.extend_from_slice(&(MADT_PHYS as u32).to_le_bytes());
+        finalize(&mut rsdt);
+
+        // ── RSDP (ACPI 1.0, 20 bytes) ────────────────────────────────────────
+        let mut rsdp = Vec::new();
+        rsdp.extend_from_slice(b"RSD PTR ");
+        rsdp.push(0); // checksum (back-filled)
+        rsdp.extend_from_slice(OEMID);
+        rsdp.push(0); // revision (ACPI 1.0)
+        rsdp.extend_from_slice(&(RSDT_PHYS as u32).to_le_bytes());
+        rsdp[8] = checksum(&rsdp);
+
+        let write = |ram: &mut [u8], at: u64, bytes: &[u8]| {
+            let a = at as usize;
+            ram[a..a + bytes.len()].copy_from_slice(bytes);
+        };
+        write(&mut self.ram, RSDP_PHYS, &rsdp);
+        write(&mut self.ram, RSDT_PHYS, &rsdt);
+        write(&mut self.ram, MADT_PHYS, &madt);
     }
 
     // ── platform timers + interrupt delivery (the long-mode boot path; #12) ────
@@ -3706,16 +3955,14 @@ impl Cpu {
                 sys.pit.counter
             })
         });
+        // Fast-forward to the local-APIC timer's deadline only when it is armed
+        // (current_count != 0) and will actually fire (LVT unmasked) — matching the
+        // run-loop counter, which now runs whenever armed and stops after a one-shot
+        // expiry until re-armed.
         let apic = (sys.lapic.enabled()
-            && sys.lapic.initial_count != 0
+            && sys.lapic.current_count != 0
             && sys.lapic.lvt_timer & (1 << 16) == 0)
-            .then(|| {
-                u64::from(if sys.lapic.current_count == 0 {
-                    sys.lapic.initial_count
-                } else {
-                    sys.lapic.current_count
-                })
-            });
+            .then(|| u64::from(sys.lapic.current_count));
         // No armed timer → nothing to fast-forward to; leave the CPU halted (the
         // run loop keeps pumping devices/network and an external IRQ still wakes
         // it), exactly as hardware idles until an interrupt.
@@ -3739,7 +3986,7 @@ impl Cpu {
         }
         if let Some(pt) = pit {
             if pt == ticks {
-                sys.pic.raise(0);
+                sys.raise_irq(0);
                 if sys.pit.ch0_periodic {
                     sys.pit.counter = u32::from(sys.pit.reload);
                 } else {
