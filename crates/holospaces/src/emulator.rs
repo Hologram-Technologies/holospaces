@@ -847,6 +847,52 @@ impl KappaBacking {
         }
     }
 
+    /// The occupancy-index boot path for a **streamed** medium (`CC-45`, deployed):
+    /// the rootfs is not resident — its occupied blocks are read on demand through
+    /// `read` (e.g. an OPFS file in the browser). `occupied_blocks` lists the block
+    /// indices the sparse assembler wrote (a block is `sectors_per_block` disk
+    /// sectors); each is read **once** into a reused buffer and split into sectors,
+    /// so the disk pages **O(content)** — a multi-GiB declared disk with a few
+    /// hundred MiB of content boots in proportion to its content, never reading the
+    /// holes and never materializing the whole image (one block buffer is reused).
+    /// This is the streaming union of [`from_sectors`](Self::from_sectors) (paged)
+    /// and [`from_occupancy`](Self::from_occupancy) (content-only) — the path a real
+    /// developer's large build-capable devcontainer needs in the browser.
+    fn from_occupancy_streamed<R: FnMut(u64, &mut [u8])>(
+        store: Box<dyn KappaStore>,
+        sector_count: u64,
+        occupied_blocks: &[u64],
+        sectors_per_block: u64,
+        mut read: R,
+    ) -> Self {
+        let mut index = BTreeMap::new();
+        let mut block = alloc::vec![0u8; (sectors_per_block as usize) * DISK_SECTOR];
+        for &b in occupied_blocks {
+            let base = b * sectors_per_block;
+            // Read the whole block at its first sector (the `read` callback offsets
+            // by `sector * DISK_SECTOR`), then content-address each non-zero sector.
+            read(base, &mut block);
+            for j in 0..sectors_per_block {
+                let sector_idx = base + j;
+                if sector_idx >= sector_count {
+                    break;
+                }
+                let off = (j as usize) * DISK_SECTOR;
+                let mut s = [0u8; DISK_SECTOR];
+                s.copy_from_slice(&block[off..off + DISK_SECTOR]);
+                if let Some(k) = Self::store_sector(store.as_ref(), &s) {
+                    index.insert(sector_idx, k);
+                }
+            }
+        }
+        KappaBacking {
+            store,
+            sector_count,
+            index,
+            read_cache: core::cell::RefCell::new(SectorCache::new()),
+        }
+    }
+
     /// Content-address a sector through the store (sparse all-zero → `None`).
     fn store_sector(store: &dyn KappaStore, sector: &[u8; DISK_SECTOR]) -> Option<KappaLabel71> {
         if sector.iter().all(|&b| b == 0) {
