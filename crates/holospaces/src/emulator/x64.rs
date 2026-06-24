@@ -3358,23 +3358,56 @@ impl Cpu {
                         let bit = u64::from(self.fetch(1) as u8);
                         self.bit_test(rm, size, bit, ((ext & 7).wrapping_sub(4) & 3) as u8);
                     }
-                    0xbc => {
-                        // BSF r, r/m — index of the lowest set bit; ZF if zero.
+                    0xb8 if rep == RepKind::Rep => {
+                        // POPCNT r, r/m (F3 0F B8) — population count. ZF=(src==0);
+                        // CF/OF/SF/AF/PF cleared.
                         let (reg, rm) = self.modrm(rex);
                         let v = self.load_rm(rm, size) & Self::mask(size);
+                        self.store_rm(Rm::Reg(reg), size, u64::from(v.count_ones()));
                         self.set(flag::ZF, v == 0);
-                        if v != 0 {
-                            self.store_rm(Rm::Reg(reg), size, u64::from(v.trailing_zeros()));
+                        for f in [flag::CF, flag::OF, flag::SF, flag::PF] {
+                            self.set(f, false);
+                        }
+                    }
+                    0xbc => {
+                        let (reg, rm) = self.modrm(rex);
+                        let v = self.load_rm(rm, size) & Self::mask(size);
+                        let bits = u32::from(size) * 8;
+                        if rep == RepKind::Rep {
+                            // TZCNT (F3 0F BC) — trailing zeros, = width if src==0.
+                            let r = if v == 0 { bits } else { v.trailing_zeros() };
+                            self.store_rm(Rm::Reg(reg), size, u64::from(r));
+                            self.set(flag::CF, v == 0);
+                            self.set(flag::ZF, r == 0);
+                        } else {
+                            // BSF r, r/m — index of the lowest set bit; ZF if zero.
+                            self.set(flag::ZF, v == 0);
+                            if v != 0 {
+                                self.store_rm(Rm::Reg(reg), size, u64::from(v.trailing_zeros()));
+                            }
                         }
                     }
                     0xbd => {
-                        // BSR r, r/m — index of the highest set bit.
                         let (reg, rm) = self.modrm(rex);
                         let v = self.load_rm(rm, size) & Self::mask(size);
-                        self.set(flag::ZF, v == 0);
-                        if v != 0 {
-                            let idx = 63 - v.leading_zeros();
-                            self.store_rm(Rm::Reg(reg), size, u64::from(idx));
+                        let bits = u32::from(size) * 8;
+                        if rep == RepKind::Rep {
+                            // LZCNT (F3 0F BD) — leading zeros within the width.
+                            let r = if v == 0 {
+                                bits
+                            } else {
+                                v.leading_zeros() - (64 - bits)
+                            };
+                            self.store_rm(Rm::Reg(reg), size, u64::from(r));
+                            self.set(flag::CF, v == 0);
+                            self.set(flag::ZF, r == 0);
+                        } else {
+                            // BSR r, r/m — index of the highest set bit.
+                            self.set(flag::ZF, v == 0);
+                            if v != 0 {
+                                let idx = 63 - v.leading_zeros();
+                                self.store_rm(Rm::Reg(reg), size, u64::from(idx));
+                            }
                         }
                     }
                     0xb0 => self.cmpxchg(rex, 1),
@@ -4337,10 +4370,21 @@ impl Cpu {
         } else {
             ((dst << cnt) | (src >> (bits - cnt))) & m
         };
+        // CF = the last bit shifted out of `dst`.
+        let cf = if right {
+            (dst >> (cnt - 1)) & 1
+        } else {
+            (dst >> (bits - cnt)) & 1
+        };
         self.store_rm(rm, size, res);
+        self.set(flag::CF, cf != 0);
         self.set(flag::ZF, res == 0);
         self.set(flag::SF, Self::sign(res, size));
         self.set(flag::PF, (res as u8).count_ones().is_multiple_of(2));
+        // OF (1-bit shifts only): set when the sign bit changed.
+        if cnt == 1 {
+            self.set(flag::OF, Self::sign(res, size) != Self::sign(dst, size));
+        }
     }
 
     /// Group 3 (`0xf6`/`0xf7`): `TEST`/`NOT`/`NEG`/`MUL`/`IMUL`/`DIV`/`IDIV`.
