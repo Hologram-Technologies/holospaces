@@ -52,6 +52,7 @@ pub enum Halt {
 mod flag {
     pub const CF: u64 = 1 << 0;
     pub const PF: u64 = 1 << 2;
+    pub const AF: u64 = 1 << 4;
     pub const ZF: u64 = 1 << 6;
     pub const SF: u64 = 1 << 7;
     pub const OF: u64 = 1 << 11;
@@ -1497,6 +1498,9 @@ impl Cpu {
         self.set(flag::ZF, r == 0);
         self.set(flag::SF, Self::sign(r, size));
         self.set(flag::PF, (r as u8).count_ones().is_multiple_of(2));
+        // AF (auxiliary carry) = carry/borrow into bit 4 = (a ^ b ^ result) bit 4,
+        // the same identity for add and subtract.
+        self.set(flag::AF, (a ^ b ^ res) & 0x10 != 0);
         if sub {
             self.set(flag::CF, (a & m) < (b & m));
             let of = (Self::sign(a, size) != Self::sign(b, size))
