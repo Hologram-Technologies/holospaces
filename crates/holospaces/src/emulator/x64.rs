@@ -3660,6 +3660,7 @@ impl Cpu {
     /// in proportion to its content, never reading the holes or holding the image.
     /// The streaming union of [`boot_linux_disk_streamed`](Self::boot_linux_disk_streamed)
     /// and [`boot_linux_disk_occupancy`](Self::boot_linux_disk_occupancy).
+    #[allow(clippy::too_many_arguments)] // the κ-disk's full descriptor: store, geometry, occupancy, medium
     pub fn boot_linux_disk_occupancy_streamed<R: FnMut(u64, &mut [u8])>(
         ram_bytes: usize,
         kernel: &[u8],
