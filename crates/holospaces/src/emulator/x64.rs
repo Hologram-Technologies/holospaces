@@ -2617,7 +2617,14 @@ impl Cpu {
         let mut rep = RepKind::None; // F3 (REP/REPE) / F2 (REPNE)
         self.cur_seg = None;
         self.rex_present = false;
-        loop {
+        // An x86 instruction is at most 15 bytes. Bounding the prefix scan is a
+        // hard correctness/robustness limit: without it, executing a region of
+        // repeated prefix bytes (e.g. a wild jump into garbage) spins this loop
+        // forever inside one step() — wedging the whole emulator with no interrupt
+        // or budget escape. Past the limit, stop consuming prefixes and let the
+        // opcode decode (which raises #UD on the over-long encoding, surfacing the
+        // problem) — exactly as a real CPU's #GP(0) on a >15-byte instruction.
+        for _ in 0..15 {
             let user = self.cpl == 3;
             let p = self.translate_acc(self.rip, false, user) as usize;
             let b = *self.ram.get(p).unwrap_or(&0);
