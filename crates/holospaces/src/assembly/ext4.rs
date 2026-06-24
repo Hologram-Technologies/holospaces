@@ -923,6 +923,11 @@ fn encode_inode(inode: &Inode, tree_blocks: Option<&Vec<(u64, Vec<u8>)>>) -> Vec
 
     put32(&mut b, 100, 0); // i_generation
     put32(&mut b, 108, (size >> 32) as u32); // i_size_high
+    // High 16 bits of uid/gid (l_i_uid_high / l_i_gid_high, linux2 osd2). Without
+    // these, an image whose files are owned by uid/gid ≥ 65536 (rootless/namespaced
+    // builds, e.g. 100000:100000) gets silently wrong ownership.
+    put16(&mut b, 120, (inode.uid >> 16) as u16);
+    put16(&mut b, 122, (inode.gid >> 16) as u16);
     put16(&mut b, 128, EXTRA_ISIZE);
     put32(&mut b, 144, inode.mtime); // i_crtime
     b

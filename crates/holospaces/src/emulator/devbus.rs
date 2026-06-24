@@ -226,6 +226,12 @@ fn blk_service_chain(mem: &mut GuestRam, dev: &mut VirtioBlk, head: u16) -> u32 
     if chain.is_empty() {
         return 0;
     }
+    // A well-formed request is header → data… → status (≥2 descriptors). A guest
+    // that posts a 1-descriptor chain would make `chain[1..0]` panic the whole VM;
+    // refuse it instead (a malformed-driver / malicious-guest robustness guard).
+    if chain.len() < 2 {
+        return 0;
+    }
     let (haddr, _, _) = chain[0];
     let req_type = mem.rd32(haddr);
     let sector = mem.rd64(haddr + 8);
