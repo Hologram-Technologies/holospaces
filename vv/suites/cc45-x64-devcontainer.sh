@@ -71,6 +71,13 @@ if [ -f "$CC45/cc45.sha256" ] && [ -f "$CC45/linux/vmlinux.gz" ] && [ -f "$CC45/
         --test cc44_x64_boot an_amd64_devcontainer_boots_occupancy_streamed_from_a_large_disk \
         -- --ignored --nocapture || exit 1
 
+    # The DEPLOYED init (the browser peer's bootDevcontainerOpfsStreamedOccupancy path)
+    # reaches its userspace marker O(content) from the same 8 GiB disk — the native
+    # mirror of the in-browser boot, fast and CI-reliable.
+    cargo test --release --manifest-path "$ROOT/Cargo.toml" -p holospaces \
+        --test cc44_x64_boot the_deployed_amd64_init_boots_occupancy_streamed_from_a_large_disk \
+        -- --ignored --nocapture || exit 1
+
     # e2fsck is the differential oracle for the 8 GiB ext4 GEOMETRY (66 block groups):
     # a real fsck must find the multi-group image the assembler produces clean.
     if command -v e2fsck >/dev/null 2>&1; then

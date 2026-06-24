@@ -716,3 +716,80 @@ fn an_amd64_devcontainer_boots_occupancy_streamed_from_a_large_disk() {
         "boot-setup reads track content, not the 8 GiB disk's 16.7M sectors ({reads} reads)"
     );
 }
+
+/// The **deployed** init boots O(content) from a large disk — the exact path the
+/// browser peer takes (`X64Workspace.bootDevcontainerOpfsStreamedOccupancy` →
+/// [`DEVCONTAINER_INIT`](holospaces::machine::DEVCONTAINER_INIT)), witnessed natively
+/// (~20s) so CI knows the deployed amd64 path reaches its userspace without waiting on
+/// the inherently slow in-browser boot. The stock amd64 rootfs is stream-assembled
+/// onto an 8 GiB disk with the deployed init injected, booted reading only its
+/// occupied blocks, and reaches the deployed marker — the mounts that need a host
+/// (devtmpfs/9p) degrade gracefully, as in the browser.
+#[test]
+#[ignore = "boots the deployed init O(content) from an 8 GiB disk — CC-45 vv suite"]
+fn the_deployed_amd64_init_boots_occupancy_streamed_from_a_large_disk() {
+    use holospaces::assembly::{stream_ext4_image_bootable, Layer};
+    use std::collections::BTreeMap;
+
+    let busybox = std::fs::read(cc45_dir().join("rootfs/layer.tar.gz")).expect("busybox layer");
+    let layers = [Layer {
+        media_type: "application/vnd.oci.image.layer.v1.tar+gzip",
+        blob: &busybox,
+    }];
+    const DISK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+    const SECTORS_PER_BLOCK: u64 = 8;
+
+    let mut sparse: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    let mut occupied_blocks: Vec<u64> = Vec::new();
+    let geom = stream_ext4_image_bootable(
+        &layers,
+        holospaces::machine::DEVCONTAINER_INIT,
+        DISK_BYTES,
+        |bi, bytes| {
+            occupied_blocks.push(bi);
+            sparse.insert(bi, bytes.to_vec());
+        },
+    )
+    .expect("stream-assemble the 8 GiB rootfs with the deployed init");
+
+    let sector_count = geom.image_len() as u64 / 512;
+    let read = |sector: u64, buf: &mut [u8]| {
+        let bi = sector / SECTORS_PER_BLOCK;
+        match sparse.get(&bi) {
+            Some(b) => buf[..b.len()].copy_from_slice(b),
+            None => buf.fill(0),
+        }
+    };
+    let kernel = gunzip(&cc45_dir().join("linux/vmlinux.gz"));
+    let mut cpu = Cpu::boot_linux_disk_occupancy_streamed(
+        512 * 1024 * 1024,
+        &kernel,
+        CC45_CMDLINE,
+        Box::new(MemKappaStore::new()),
+        sector_count,
+        &occupied_blocks,
+        SECTORS_PER_BLOCK,
+        read,
+    );
+
+    // The deployed init drops to an interactive shell (no poweroff), so run in slices
+    // and stop as soon as its marker prints.
+    let mut booted = false;
+    for _ in 0..20 {
+        cpu.run(1_000_000_000);
+        if String::from_utf8_lossy(cpu.console()).contains("holospace devcontainer ready") {
+            booted = true;
+            break;
+        }
+    }
+    let console = String::from_utf8_lossy(cpu.console());
+    eprintln!("---- deployed init, 8 GiB occupancy ----\n{console}\n---- end ----");
+    assert!(
+        console.contains("EXT4-fs (vda): mounted"),
+        "a real amd64 Linux mounted the occupancy-streamed rootfs over virtio-blk"
+    );
+    assert!(
+        booted,
+        "the deployed amd64 init reached 'holospace devcontainer ready' O(content) from the 8 GiB disk"
+    );
+}

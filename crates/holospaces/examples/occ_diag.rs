@@ -29,7 +29,16 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(40);
     let layer = std::fs::read(art.join("rootfs/layer.tar.gz")).unwrap();
-    let init = std::fs::read(art.join("init.sh")).unwrap();
+    // arg3 = "devinit" boots the DEPLOYED init (DEVCONTAINER_INIT, prints "holospace
+    // devcontainer ready") — the exact path the browser test takes; default = cc45
+    // init.sh (CC45-COMPUTE + poweroff).
+    let dev = std::env::args().nth(3).as_deref() == Some("devinit");
+    let cc45_init = std::fs::read(art.join("init.sh")).unwrap();
+    let init: &[u8] = if dev {
+        holospaces::machine::DEVCONTAINER_INIT
+    } else {
+        &cc45_init
+    };
     let layers = [Layer {
         media_type: "application/vnd.oci.image.layer.v1.tar+gzip",
         blob: &layer,
@@ -38,7 +47,7 @@ fn main() {
     let mut sparse: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
     let mut occ: Vec<u64> = Vec::new();
     let t0 = Instant::now();
-    let geom = stream_ext4_image_bootable(&layers, &init, disk, |bi, b| {
+    let geom = stream_ext4_image_bootable(&layers, init, disk, |bi, b| {
         occ.push(bi);
         sparse.insert(bi, b.to_vec());
     })
