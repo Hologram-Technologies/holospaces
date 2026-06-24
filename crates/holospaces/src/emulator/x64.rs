@@ -478,6 +478,24 @@ struct TlbEntry {
 /// Direct-mapped TLB sets, indexed by the virtual page number.
 const TLB_SETS: usize = 1024;
 
+/// MMU instrumentation for the x86-64 core — pure counters, no architected effect.
+/// Boot/perf diagnostics: a fault *storm* (a copy-on-write loop from a stale
+/// software-TLB entry, a demand-paging loop) is otherwise invisible — the boot is
+/// just "slow". These turn it into a number: compare against retired instructions
+/// (`Cpu::insns`) to see whether the core is making progress or thrashing the MMU.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct MmuStats {
+    /// `#PF` with P=1: a write to a read-only page, or a user access to a supervisor
+    /// page — copy-on-write, write-protect, and the user/supervisor boundary.
+    pub protection_faults: u64,
+    /// `#PF` with P=0: demand paging — a level of the walk was not-present.
+    pub not_present_faults: u64,
+    /// Software-TLB permission re-validations that resolved a stale denial (the
+    /// coherence re-walk firing) — high counts mean the kernel is upgrading page
+    /// permissions without a flush our TLB sees, which the re-walk then repairs.
+    pub tlb_revalidations: u64,
+}
+
 /// The x86-64 long-mode integer core.
 pub struct Cpu {
     /// The 16 general-purpose registers (`rax`,`rcx`,`rdx`,`rbx`,`rsp`,`rbp`,
@@ -491,6 +509,12 @@ pub struct Cpu {
     /// core has executed (informational; the x86-64 analogue of the RISC-V
     /// `INSTRET` CSR).
     insns: u64,
+    /// MMU instrumentation (counters only — no effect on the architected state).
+    /// Permanent boot/perf diagnostics: a fault *storm* (e.g. a copy-on-write loop
+    /// from a stale software-TLB entry, or a demand-paging loop) shows up as one of
+    /// these counters exploding relative to retired instructions — turning
+    /// "the boot is mysteriously slow" into a measured number, not a guess.
+    mmu_stats: MmuStats,
     /// Control registers: `cr0` (paging/protection), `cr2` (page-fault address),
     /// `cr3` (the PML4 physical base), `cr4` (PAE et al.).
     cr0: u64,
@@ -647,6 +671,7 @@ impl Cpu {
             rip: RAM_BASE,
             rflags: 0x2, // bit 1 is reserved-1
             insns: 0,
+            mmu_stats: MmuStats::default(),
             dr: [0; 8],
             xmm: [0; 16],
             cr0: 0,
@@ -855,6 +880,7 @@ impl Cpu {
                     }
                     Err(()) => {
                         // Not-present (P=0): the kernel's #PF handler maps the page.
+                        self.mmu_stats.not_present_faults += 1;
                         let error = (if write { PF_ERR_WRITE } else { 0 })
                             | (if user { PF_ERR_USER } else { 0 });
                         self.fault = Some(PageFault { addr: vaddr, error });
@@ -883,11 +909,13 @@ impl Cpu {
                         pgen: self.pcid_gen[pcid],
                     };
                     if !denied(w, u) {
+                        self.mmu_stats.tlb_revalidations += 1;
                         self.set_accessed_dirty(lf, write);
                         return (pa & !0xfff) | (vaddr & 0xfff);
                     }
                 }
             }
+            self.mmu_stats.protection_faults += 1;
             let error = PF_ERR_PRESENT
                 | (if write { PF_ERR_WRITE } else { 0 })
                 | (if user { PF_ERR_USER } else { 0 });
@@ -1048,6 +1076,13 @@ impl Cpu {
     #[must_use]
     pub fn rflags(&self) -> u64 {
         self.rflags
+    }
+
+    /// MMU instrumentation snapshot (protection / not-present faults, TLB
+    /// re-validations) — boot/perf diagnostics; see [`MmuStats`].
+    #[must_use]
+    pub fn mmu_stats(&self) -> MmuStats {
+        self.mmu_stats
     }
 
     /// `rip` (for tests / introspection).

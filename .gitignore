@@ -30,3 +30,7 @@ crates/holospaces-emulator/target/
 
 # The built Chrome extension upload zip (produced by scripts/build-extension.sh).
 crates/holospaces-web/extension/dist/
+boot-diag.log
+/boot-diag.log
+/btrace.log
+/boot*.log
