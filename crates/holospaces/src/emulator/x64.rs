@@ -4815,9 +4815,8 @@ impl Cpu {
             0x18..=0x1f => {
                 let _ = self.modrm(rex);
             }
-            // LFENCE/MFENCE/SFENCE/(L/ST)MXCSR/FXSAVE — group 15 (0F AE). The
-            // fences are no-ops here (a single in-order core); STMXCSR returns the
-            // default MXCSR; LDMXCSR/FXSAVE/FXRSTOR are accepted and ignored.
+            // Group 15 (0F AE): LFENCE/MFENCE/SFENCE (register form, no-ops on this
+            // in-order core), and the memory forms FXSAVE/FXRSTOR/LDMXCSR/STMXCSR.
             0xae => {
                 let modrm_peek = *self
                     .ram
@@ -4827,8 +4826,37 @@ impl Cpu {
                     let _ = self.modrm(rex); // fence (register form) — no-op
                 } else {
                     let (ext, rm) = self.modrm(rex);
-                    if ext & 7 == 3 {
-                        self.xmm_store_lo32(rm, 0x1f80); // STMXCSR (default MXCSR)
+                    let addr = self.rm_addr(rm).unwrap_or(0);
+                    match ext & 7 {
+                        0 => {
+                            // FXSAVE — write the 512-byte FPU/SSE save area. We model
+                            // the SSE state (16 XMM + MXCSR); the x87 region is a sane
+                            // default (this guest's userspace is SSE, not x87). Saving
+                            // the XMM state is REQUIRED: the kernel FXSAVE/FXRSTORs it
+                            // around a context switch, so without it a preempted SSE
+                            // task's XMM registers are silently corrupted.
+                            self.wr(addr, 8, 0x0000_0000_0000_037f); // FCW (+FSW/FTW=0)
+                            self.wr(addr + 24, 8, 0xffff_0000_0000_1f80); // MXCSR|MASK
+                            for i in 4..20u64 {
+                                self.wr(addr + i * 8, 8, 0); // x87 ST/MM region
+                            }
+                            for i in 0..16u64 {
+                                let x = self.xmm[i as usize];
+                                self.wr(addr + 160 + i * 16, 8, x as u64);
+                                self.wr(addr + 168 + i * 16, 8, (x >> 64) as u64);
+                            }
+                        }
+                        1 => {
+                            // FXRSTOR — reload the 16 XMM registers the kernel saved.
+                            for i in 0..16u64 {
+                                let lo = self.rd(addr + 160 + i * 16, 8);
+                                let hi = self.rd(addr + 168 + i * 16, 8);
+                                self.xmm[i as usize] = u128::from(lo) | (u128::from(hi) << 64);
+                            }
+                        }
+                        2 => {} // LDMXCSR — accepted (a fixed default MXCSR is modelled)
+                        3 => self.xmm_store_lo32(rm, 0x1f80), // STMXCSR
+                        _ => {} // fences (memory form)
                     }
                 }
             }
