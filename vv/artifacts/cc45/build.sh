@@ -51,7 +51,7 @@ cp linux/arch/x86/boot/bzImage        "$here/linux/bzImage"
 cp linux/.config                      "$here/linux/kernel.config"
 echo "kernel: vmlinux.gz $(stat -c%s "$here/linux/vmlinux.gz") bytes; bzImage $(stat -c%s "$here/linux/bzImage") bytes"
 
-echo "== [2/3] static busybox amd64 (the stock binary) =="
+echo "== [2/4] static busybox amd64 (the stock binary) =="
 BBVER=1.36.1
 wget -q "https://busybox.net/downloads/busybox-$BBVER.tar.bz2"
 tar xf "busybox-$BBVER.tar.bz2"
@@ -70,9 +70,29 @@ tar xf "busybox-$BBVER.tar.bz2"
 cp "busybox-$BBVER/busybox" "$here/rootfs/busybox"
 echo "busybox: $(stat -c%s "$here/rootfs/busybox") bytes  ($(file -b "$here/rootfs/busybox" | cut -d, -f1-2))"
 
-echo "== [3/3] OCI image layer (tar+gzip of /bin/busybox) =="
+echo "== [3/4] OCI image layer (tar+gzip of /bin/busybox) =="
 ldir="$(mktemp -d)"; mkdir -p "$ldir/bin"
 cp "$here/rootfs/busybox" "$ldir/bin/busybox"
 ( cd "$ldir" && tar --numeric-owner --owner=0 --group=0 --mtime='2026-05-31 00:00:00 UTC' --sort=name -cf - bin ) | gzip -9 -n > "$here/rootfs/layer.tar.gz"
-( cd "$here" && sha256sum linux/vmlinux.gz linux/bzImage linux/kernel.config rootfs/busybox rootfs/layer.tar.gz init.sh > cc45.sha256 )
+
+echo "== [4/4] static linux-amd64 TinyCC (the in-guest toolchain — build-capable) =="
+# A real, self-contained C compiler the guest runs to BUILD software in-image
+# (the decisive CC-45 acceptance: a toolchain compiles a program to a runnable
+# binary inside the devcontainer). Pinned TinyCC mob; statically linked so it runs
+# in the libc-free busybox rootfs. `make tcc` only (the cross/test targets are not
+# needed and some fail on a modern host — the `tcc` binary is the artifact).
+TCCREV=a338258d309c888bde96b2d1f206299231a54ddf # tcc mob, 0.9.28rc
+git clone https://repo.or.cz/tinycc.git tinycc >/dev/null 2>&1
+( cd tinycc
+  git checkout -q "$TCCREV"
+  ./configure --extra-ldflags="-static" >/dev/null 2>&1
+  make -j"$(nproc)" tcc >/dev/null 2>&1
+  strip tcc )
+mkdir -p "$here/build"
+cp "tinycc/tcc" "$here/build/tcc"
+echo "tcc: $(stat -c%s "$here/build/tcc") bytes  ($(file -b "$here/build/tcc" | cut -d, -f1-3))"
+# build/hello.c is a committed source (a freestanding program), not generated.
+
+( cd "$here" && sha256sum linux/vmlinux.gz linux/bzImage linux/kernel.config \
+    rootfs/busybox rootfs/layer.tar.gz init.sh build/tcc build/hello.c > cc45.sha256 )
 echo "DONE"

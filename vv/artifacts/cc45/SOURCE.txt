@@ -11,6 +11,8 @@ The differential oracle is qemu-system-x86_64 on the same kernel + rootfs.
 Pins
   Commit (linux v6.6): torvalds/linux tag v6.6
   busybox: 1.36.1 (https://busybox.net/downloads/busybox-1.36.1.tar.bz2)
+  TinyCC: mob commit a338258d309c888bde96b2d1f206299231a54ddf (0.9.28rc,
+    https://repo.or.cz/tinycc.git) — the in-guest toolchain, statically linked.
   Toolchain: native x86_64 gcc (the build host is amd64 — no cross compile).
 
 linux/vmlinux.gz, linux/bzImage
@@ -45,9 +47,21 @@ init.sh
   native_machine_halt → `hlt` → the emulator halts). The witness asserts these
   markers, and qemu-system-x86_64 produces them on the same rootfs.
 
+build/tcc, build/hello.c
+  The **in-guest toolchain** for the build-capable witness
+  (an_amd64_devcontainer_builds_a_program_in_guest): build/tcc is a static
+  linux-amd64 TinyCC (pinned above), the same kind of binary a real devcontainer
+  ships; build/hello.c is a freestanding program (its own _start, the write+exit
+  syscalls inline — no libc/headers, so the in-guest compile depends only on tcc).
+  The witness overlays this toolchain layer on the busybox base and PID 1 runs
+  `tcc -static -nostdlib /hello.c -o /hello` and then `/hello` — the guest both
+  COMPILES and RUNS code it built itself, on the x86-64 core. This is the decisive
+  acceptance criterion (a devcontainer you can actually build software in), not a
+  pre-built binary. hello.c is a committed source; build/tcc is built by build.sh.
+
 cc45.sha256
   Checksums of the committed artifacts.
 
 Reproduce: ./build.sh  (clones v6.6, builds the kernel + busybox, packs the
-layer). The qemu-system-x86_64 differential is run by
+layer, builds the static TinyCC). The qemu-system-x86_64 differential is run by
 vv/suites/cc45-x64-devcontainer.sh when qemu is present.

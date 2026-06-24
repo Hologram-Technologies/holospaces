@@ -663,7 +663,7 @@ fn an_amd64_devcontainer_boots_occupancy_streamed_from_a_large_disk() {
 
     let content: u64 = sparse.values().map(|v| v.len() as u64).sum();
     assert!(
-        geom.image_len() as u64 >= DISK_BYTES - BLOCK,
+        geom.image_len() >= DISK_BYTES - BLOCK,
         "the ext4 image spans the full 8 GiB declared disk"
     );
     assert!(
@@ -674,7 +674,7 @@ fn an_amd64_devcontainer_boots_occupancy_streamed_from_a_large_disk() {
     // Boot O(content): read ONLY the occupied blocks from the sparse medium. The
     // block device spans the IMAGE (image_len ≥ the declared disk, by its metadata),
     // exactly as the deployed path declares it from the provisioned file's size.
-    let sector_count = geom.image_len() as u64 / 512;
+    let sector_count = geom.image_len() / 512;
     let mut reads = 0u64;
     let read = |sector: u64, buf: &mut [u8]| {
         reads += 1;
@@ -752,7 +752,7 @@ fn the_deployed_amd64_init_boots_occupancy_streamed_from_a_large_disk() {
     )
     .expect("stream-assemble the 8 GiB rootfs with the deployed init");
 
-    let sector_count = geom.image_len() as u64 / 512;
+    let sector_count = geom.image_len() / 512;
     let read = |sector: u64, buf: &mut [u8]| {
         let bi = sector / SECTORS_PER_BLOCK;
         match sparse.get(&bi) {
@@ -791,5 +791,95 @@ fn the_deployed_amd64_init_boots_occupancy_streamed_from_a_large_disk() {
     assert!(
         booted,
         "the deployed amd64 init reached 'holospace devcontainer ready' O(content) from the 8 GiB disk"
+    );
+}
+
+/// Like [`tar_gz`], but each entry carries its own UNIX mode — so an executable
+/// (a compiler binary) lands in the image with the `+x` bits a real toolchain needs.
+fn tar_gz_x(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
+    use flate2::{write::GzEncoder, Compression};
+    use std::io::Write as _;
+    let oct = |f: &mut [u8], v: u64| {
+        let s = format!("{:0w$o}", v, w = f.len() - 1);
+        f[..s.len()].copy_from_slice(s.as_bytes());
+    };
+    let mut tar = Vec::new();
+    for (path, data, mode) in entries {
+        let mut hdr = [0u8; 512];
+        hdr[..path.len()].copy_from_slice(path.as_bytes());
+        oct(&mut hdr[100..108], u64::from(*mode));
+        oct(&mut hdr[124..136], data.len() as u64);
+        hdr[156] = b'0';
+        hdr[257..263].copy_from_slice(b"ustar\0");
+        hdr[263] = b'0';
+        hdr[264] = b'0';
+        hdr[148..156].fill(b' ');
+        let sum: u32 = hdr.iter().map(|&b| u32::from(b)).sum();
+        oct(&mut hdr[148..155], u64::from(sum));
+        hdr[155] = b' ';
+        tar.extend_from_slice(&hdr);
+        tar.extend_from_slice(data);
+        let pad = data.len().div_ceil(512) * 512 - data.len();
+        tar.extend(std::iter::repeat_n(0u8, pad));
+    }
+    tar.extend([0u8; 1024]);
+    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+    gz.write_all(&tar).unwrap();
+    gz.finish().unwrap()
+}
+
+/// **Build software in-guest** — the decisive CC-45 acceptance criterion: a real
+/// `linux/amd64` devcontainer with a toolchain (the static TinyCC) **compiles a real
+/// program inside the guest, then runs the binary it produced**. The stock busybox
+/// rootfs + a toolchain layer (the `linux-amd64` `tcc` + a freestanding source) boot
+/// on the x86-64 core; PID 1 runs `tcc /hello.c -o /hello` and then `/hello` — so the
+/// guest both *compiles* and *executes* code it built itself. The devcontainer is
+/// genuinely usable for development, not merely bootable.
+#[test]
+#[ignore = "compiles + runs a program in-guest (the build-in-guest workload) — CC-45 vv suite"]
+fn an_amd64_devcontainer_builds_a_program_in_guest() {
+    use holospaces::assembly::{assemble_ext4_bootable, Layer};
+
+    let busybox = std::fs::read(cc45_dir().join("rootfs/layer.tar.gz")).expect("busybox layer");
+    let tcc = std::fs::read(cc45_dir().join("build/tcc")).expect("static linux-amd64 tcc");
+    let hello = std::fs::read(cc45_dir().join("build/hello.c")).expect("freestanding source");
+    // A toolchain layer over the busybox base: the compiler (+x) and the source.
+    let tool_layer = tar_gz_x(&[
+        ("usr/local/bin/tcc", &tcc, 0o755),
+        ("hello.c", &hello, 0o644),
+    ]);
+    let layers = [
+        Layer {
+            media_type: "application/vnd.oci.image.layer.v1.tar+gzip",
+            blob: &busybox,
+        },
+        Layer {
+            media_type: "application/vnd.oci.image.layer.v1.tar+gzip",
+            blob: &tool_layer,
+        },
+    ];
+    // PID 1 compiles the source with the in-image toolchain, then RUNS the binary.
+    let init: &[u8] = b"#!/bin/busybox sh\n\
+        /bin/busybox mkdir -p /proc /tmp\n\
+        /bin/busybox mount -t proc proc /proc\n\
+        echo CC45-BUILD-START\n\
+        /usr/local/bin/tcc -static -nostdlib /hello.c -o /hello\n\
+        echo CC45-TCC-EXIT:$?\n\
+        /hello\n\
+        echo CC45-RAN-EXIT:$?\n\
+        /bin/busybox poweroff -f\n";
+    let rootfs = assemble_ext4_bootable(&layers, init, 256 * 1024 * 1024).unwrap();
+    let kernel = gunzip(&cc45_dir().join("linux/vmlinux.gz"));
+    let mut cpu = Cpu::boot_linux_disk(512 * 1024 * 1024, &kernel, rootfs, CC45_CMDLINE);
+    let halt = cpu.run(200_000_000_000);
+    let console = String::from_utf8_lossy(cpu.console());
+    eprintln!("---- build-in-guest ----\n{console}\n---- end ----  (halt: {halt:?})");
+    assert!(
+        console.contains("CC45-TCC-EXIT:0"),
+        "the in-guest toolchain (tcc) compiled the program successfully"
+    );
+    assert!(
+        console.contains("CC45-BUILT-IN-GUEST:42"),
+        "the guest RAN the binary it just built (the devcontainer is build-capable)"
     );
 }

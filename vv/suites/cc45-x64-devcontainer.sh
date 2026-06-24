@@ -78,6 +78,14 @@ if [ -f "$CC45/cc45.sha256" ] && [ -f "$CC45/linux/vmlinux.gz" ] && [ -f "$CC45/
         --test cc44_x64_boot the_deployed_amd64_init_boots_occupancy_streamed_from_a_large_disk \
         -- --ignored --nocapture || exit 1
 
+    # BUILD SOFTWARE IN-GUEST (the decisive acceptance criterion): a real amd64
+    # devcontainer with a toolchain (static TinyCC) compiles a program inside the
+    # guest and then RUNS the binary it built — genuinely usable for development,
+    # not merely bootable.
+    cargo test --release --manifest-path "$ROOT/Cargo.toml" -p holospaces \
+        --test cc44_x64_boot an_amd64_devcontainer_builds_a_program_in_guest \
+        -- --ignored --nocapture || exit 1
+
     # e2fsck is the differential oracle for the 8 GiB ext4 GEOMETRY (66 block groups):
     # a real fsck must find the multi-group image the assembler produces clean.
     if command -v e2fsck >/dev/null 2>&1; then
