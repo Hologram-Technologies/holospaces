@@ -953,6 +953,28 @@ export class DevcontainerImage {
         return ret[0];
     }
     /**
+     * Like [`assembleBootableIntoOpfs`](Self::assemble_bootable_into_opfs), but also
+     * records the rootfs's **occupancy** — the ascending block indices it actually
+     * wrote — into `occupancy_handle` as packed little-endian `u64`s. That sidecar
+     * lets [`X64Workspace::boot_devcontainer_opfs_streamed_occupancy`] page the disk
+     * **O(content)**: a multi-GiB build-capable devcontainer disk boots reading only
+     * its (few) occupied blocks, never its declared size — the deployed regime for a
+     * real developer's image, not a fixture-sized one. Byte-identical rootfs to the
+     * untracked assembler over the same layers (Law L1); the sidecar is the only
+     * addition. Returns the image length, as the untracked variant does.
+     * @param {FileSystemSyncAccessHandle} rootfs_handle
+     * @param {FileSystemSyncAccessHandle} occupancy_handle
+     * @param {number} disk_bytes
+     * @returns {number}
+     */
+    assembleBootableIntoOpfsTracked(rootfs_handle, occupancy_handle, disk_bytes) {
+        const ret = wasm.devcontainerimage_assembleBootableIntoOpfsTracked(this.__wbg_ptr, rootfs_handle, occupancy_handle, disk_bytes);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return ret[0];
+    }
+    /**
      * Assemble the layers into a **bootable, interactive, writable** root
      * filesystem on a `disk_bytes`-sized disk: the same overlay as
      * [`Self::assemble`], plus the persistent devcontainer
@@ -1053,6 +1075,26 @@ export class DevcontainerProvision {
      */
     assembleIntoOpfs(rootfs_handle, disk_bytes) {
         const ret = wasm.devcontainerprovision_assembleIntoOpfs(this.__wbg_ptr, rootfs_handle, disk_bytes);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return ret[0];
+    }
+    /**
+     * Like [`assembleIntoOpfs`](Self::assemble_into_opfs), but also records the
+     * rootfs's **occupancy** — the ascending indices of the blocks it actually
+     * wrote — into `occupancy_handle` as packed little-endian `u64`s. That sidecar
+     * is what lets the deployed boot page an **arbitrarily large**, build-capable
+     * devcontainer disk **O(content)**: only the (few) occupied blocks are read at
+     * boot, never the declared size. The rootfs bytes are identical to the untracked
+     * assembler over the same image (Law L1); the sidecar is the sole addition.
+     * @param {FileSystemSyncAccessHandle} rootfs_handle
+     * @param {FileSystemSyncAccessHandle} occupancy_handle
+     * @param {number} disk_bytes
+     * @returns {number}
+     */
+    assembleIntoOpfsTracked(rootfs_handle, occupancy_handle, disk_bytes) {
+        const ret = wasm.devcontainerprovision_assembleIntoOpfsTracked(this.__wbg_ptr, rootfs_handle, occupancy_handle, disk_bytes);
         if (ret[2]) {
             throw takeFromExternrefTable0(ret[1]);
         }
@@ -1977,6 +2019,29 @@ export class X64Workspace {
     free() {
         const ptr = this.__destroy_into_raw();
         wasm.__wbg_x64workspace_free(ptr, 0);
+    }
+    /**
+     * Boot a provisioned amd64 image **O(content)** by occupancy — the deployed path
+     * for an arbitrarily large, build-capable devcontainer disk. `occupancy_handle`
+     * is the sidecar [`assembleBootableIntoOpfsTracked`](DevcontainerImage::assemble_bootable_into_opfs_tracked)
+     * wrote (packed little-endian `u64` block indices); only those blocks are read
+     * from `rootfs_handle` (each a 4 KiB block = 8 sectors), so a multi-GiB declared
+     * disk pages in proportion to its **content**, never reading its holes. The
+     * streamed-from-OPFS analogue of [`x64::Cpu::boot_linux_disk_occupancy_streamed`].
+     * @param {Uint8Array} kernel
+     * @param {FileSystemSyncAccessHandle} rootfs_handle
+     * @param {FileSystemSyncAccessHandle} occupancy_handle
+     * @param {FileSystemSyncAccessHandle} disk_handle
+     * @returns {X64Workspace}
+     */
+    static bootDevcontainerOpfsStreamedOccupancy(kernel, rootfs_handle, occupancy_handle, disk_handle) {
+        const ptr0 = passArray8ToWasm0(kernel, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.x64workspace_bootDevcontainerOpfsStreamedOccupancy(ptr0, len0, rootfs_handle, occupancy_handle, disk_handle);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return X64Workspace.__wrap(ret[0]);
     }
     /**
      * Boot a provisioned amd64 image, **streaming** its κ-disk from OPFS (no full

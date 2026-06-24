@@ -65,19 +65,27 @@ self.onmessage = async (e) => {
     const dir = await root.getDirectoryHandle("provisioned", { create: true });
     // Replace any prior staging so a re-provision is clean.
     try { await dir.removeEntry(kappa); } catch {}
+    try { await dir.removeEntry(`${kappa}.occ`); } catch {}
     const fh = await dir.getFileHandle(kappa, { create: true });
     const handle = await fh.createSyncAccessHandle();
+    // The occupancy sidecar — the ascending indices of the blocks the assembler
+    // writes, so the boot pages an arbitrarily large declared disk O(content) (only
+    // the occupied blocks are read, never the holes). Co-located with the rootfs.
+    const occFh = await dir.getFileHandle(`${kappa}.occ`, { create: true });
+    const occHandle = await occFh.createSyncAccessHandle();
     let imageLen;
     try {
-      // Safety net for re-provisioning: assembleIntoOpfs writes only the non-zero
-      // blocks and truncates to the final length, so if removeEntry failed above and
-      // the file already exists, stale non-zero blocks from the old image (in regions
-      // the new image leaves sparse) would survive and corrupt the rootfs. Zero the
-      // file first so only this image's content is present.
+      // Safety net for re-provisioning: the assembler writes only the non-zero blocks
+      // and truncates to the final length, so if removeEntry failed above and the file
+      // already exists, stale non-zero blocks from the old image (in regions the new
+      // image leaves sparse) would survive and corrupt the rootfs. Zero the file first
+      // so only this image's content is present. assembleIntoOpfsTracked likewise
+      // overwrites the occupancy sidecar.
       handle.truncate(0);
-      imageLen = prov.assembleIntoOpfs(handle, diskBytes);
+      imageLen = prov.assembleIntoOpfsTracked(handle, occHandle, diskBytes);
     } finally {
       try { handle.close(); } catch {}
+      try { occHandle.close(); } catch {}
     }
     self.postMessage({ type: "done", imageLen });
   } catch (err) {

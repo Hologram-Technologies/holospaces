@@ -206,6 +206,23 @@ async function openProvisionedHandle(id) {
   }
 }
 
+// A synchronous read handle on the rootfs OCCUPANCY sidecar the tracked assembler
+// wrote (provisioned/<id>.occ — packed little-endian u64 block indices). It lets the
+// boot page an arbitrarily large, build-capable disk O(content): only the occupied
+// blocks are read, never the declared size. `null` if absent (a pre-occupancy
+// provision), in which case the caller falls back to the O(disk) streamed boot.
+async function openOccupancyHandle(id) {
+  const root = await opfsRoot();
+  if (!root || !id) return null;
+  try {
+    const dir = await root.getDirectoryHandle("provisioned", { create: false });
+    const fh = await dir.getFileHandle(`${id}.occ`, { create: false });
+    return await fh.createSyncAccessHandle();
+  } catch {
+    return null;
+  }
+}
+
 let persisting = false;
 async function saveSnapshot() {
   // Snapshot/resume is a riscv64 Workspace capability; the aarch64 terminal core
@@ -291,9 +308,18 @@ async function bootHolospace() {
       if (rootfsHandle) {
         const diskHandle = await openDiskStore(holoId);
         if (diskHandle) {
-          ws = wasm.X64Workspace.boot_devcontainer_opfs_streamed(kernel, rootfsHandle, diskHandle);
+          // PREFERRED: occupancy-paged — only the blocks the provision actually wrote
+          // are read, so an arbitrarily large build-capable disk boots O(content).
+          const occHandle = await openOccupancyHandle(holoId);
+          if (occHandle) {
+            ws = wasm.X64Workspace.bootDevcontainerOpfsStreamedOccupancy(kernel, rootfsHandle, occHandle, diskHandle);
+            out && out.appendLine("holospace: booted the provisioned amd64 image on the x64 core (CC-45) — O(content) occupancy-paged from OPFS");
+          } else {
+            // Fallback for a pre-occupancy provision: page every sector (O(disk)).
+            ws = wasm.X64Workspace.boot_devcontainer_opfs_streamed(kernel, rootfsHandle, diskHandle);
+            out && out.appendLine("holospace: booted the provisioned amd64 image on the x64 core (CC-44) — paged from OPFS");
+          }
           bridged = false;
-          out && out.appendLine("holospace: booted the provisioned amd64 image on the x64 core (CC-44) — paged from OPFS");
         } else {
           try { rootfsHandle.close(); } catch {}
         }
