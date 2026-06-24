@@ -89,6 +89,16 @@ fn main() {
             u[4],
         )
         .unwrap();
+        // Interrupt histogram (qemu -d int differential): every nonzero vector.
+        let mut hist = String::from("      int[");
+        for v in 0..=255u16 {
+            let c = cpu.int_count(v as u8);
+            if c > 0 {
+                hist.push_str(&format!("{v:02x}={c} "));
+            }
+        }
+        hist.push(']');
+        writeln!(out, "{hist}").unwrap();
         prev = st;
         out.flush().unwrap();
         if !matches!(h, Halt::OutOfBudget) {

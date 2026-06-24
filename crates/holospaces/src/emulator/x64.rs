@@ -518,6 +518,10 @@ pub struct Cpu {
     /// core has executed (informational; the x86-64 analogue of the RISC-V
     /// `INSTRET` CSR).
     insns: u64,
+    /// Delivered-interrupt histogram, indexed by vector — a dev differential
+    /// against qemu's `-d int` (e.g. v=0xec LAPIC timer, v=0x24 COM1/IRQ4, v=0x0e
+    /// `#PF`). A starved timer count means the scheduler is not ticking.
+    int_counts: Box<[u64; 256]>,
     /// MMU instrumentation (counters only — no effect on the architected state).
     /// Permanent boot/perf diagnostics: a fault *storm* (e.g. a copy-on-write loop
     /// from a stale software-TLB entry, or a demand-paging loop) shows up as one of
@@ -680,6 +684,7 @@ impl Cpu {
             rip: RAM_BASE,
             rflags: 0x2, // bit 1 is reserved-1
             insns: 0,
+            int_counts: Box::new([0; 256]),
             mmu_stats: MmuStats::default(),
             dr: [0; 8],
             xmm: [0; 16],
@@ -1100,6 +1105,13 @@ impl Cpu {
     #[must_use]
     pub fn uart_dbg(&self) -> [u64; 5] {
         self.sys.as_ref().map_or([0; 5], |s| s.uart.dbg)
+    }
+
+    /// Count of interrupts/exceptions delivered for a given IDT vector — a
+    /// differential against qemu's `-d int` histogram. See [`Cpu::int_counts`].
+    #[must_use]
+    pub fn int_count(&self, vector: u8) -> u64 {
+        self.int_counts[vector as usize]
     }
 
     /// `rip` (for tests / introspection).
@@ -3790,6 +3802,7 @@ impl Cpu {
     /// CS,RIP`, and the error code for the faults that carry one), switch to the
     /// gate's stack on a ring change, clear `IF`, and jump to the handler.
     fn deliver_interrupt(&mut self, vector: u8, error: u64, has_error: bool) {
+        self.int_counts[vector as usize] = self.int_counts[vector as usize].wrapping_add(1);
         let (idt_base, _) = self.sys().idtr;
         let desc = idt_base + u64::from(vector) * 16;
         let lo = self.rd_virt(desc, 8);
