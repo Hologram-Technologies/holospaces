@@ -622,6 +622,17 @@ const MSR_FS_BASE: u32 = 0xC000_0100;
 const MSR_GS_BASE: u32 = 0xC000_0101;
 const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
 const MSR_APIC_BASE: u32 = 0x1B;
+/// `IA32_ARCH_CAPABILITIES` — the read-only MSR reporting which speculative-execution
+/// vulnerability classes the CPU is immune to. A faithful, non-speculative emulator
+/// is immune to all of them; reporting that lets the kernel skip the mitigations
+/// (notably PTI), matching the qemu oracle.
+const MSR_IA32_ARCH_CAPABILITIES: u32 = 0x10A;
+const RDCL_NO: u64 = 1 << 0; // not vulnerable to Rogue Data Cache Load (Meltdown) → no PTI
+const IBRS_ALL: u64 = 1 << 1; // enhanced IBRS always on (no retpoline needed)
+const SSB_NO: u64 = 1 << 4; // not vulnerable to Speculative Store Bypass
+const MDS_NO: u64 = 1 << 5; // not vulnerable to Microarchitectural Data Sampling
+const IF_PSCHANGE_MC_NO: u64 = 1 << 6; // no instruction-fetch page-size-change MCE
+const TAA_NO: u64 = 1 << 8; // not vulnerable to TSX Async Abort
 
 // The local-APIC MMIO window (the architectural default base).
 const LAPIC_BASE: u64 = 0xFEE0_0000;
@@ -731,7 +742,12 @@ impl Cpu {
         u &= us(e3);
         if e3 & (1 << 7) != 0 {
             // 1 GiB page
-            return Ok(((e3 & 0x000f_ffff_c000_0000) | (vaddr & 0x3fff_ffff), w, u, a3));
+            return Ok((
+                (e3 & 0x000f_ffff_c000_0000) | (vaddr & 0x3fff_ffff),
+                w,
+                u,
+                a3,
+            ));
         }
         let a2 = next(e3) + idx(1);
         let e2 = ent(next(e3), idx(1));
@@ -4169,9 +4185,15 @@ impl Cpu {
                 // text_poke's poking-mm) need not flush the (software) TLB.
                 (0x0000_0600, 0, (1 << 30) | (1 << 17), 0x078b_fbff)
             }
-            // Leaf 7 sub-leaf 0: EBX bit 18 = RDSEED (the seeding RNG the
-            // kernel pairs with RDRAND).
-            7 => (0, 1 << 18, 0, 0),
+            // Leaf 7 sub-leaf 0: EBX bit 18 = RDSEED (the seeding RNG the kernel
+            // pairs with RDRAND). EDX bit 29 = ARCH_CAPABILITIES — the core exposes
+            // `IA32_ARCH_CAPABILITIES` (MSR 0x10A) so the kernel reads its truthful
+            // security properties: this deterministic emulator has no speculative
+            // execution, so it is immune to Meltdown/MDS/SSB/etc. and the kernel must
+            // not enable the (costly, and here un-needed) PTI/MDS mitigations — which
+            // also avoids the KPTI user-page-table W+X walk. Matches the qemu oracle,
+            // whose boot likewise runs without PTI.
+            7 => (0, 1 << 18, 0, 1 << 29),
             0x8000_0000 => (0x8000_0008, 0x6874_7541, 0x444d_4163, 0x6974_6e65),
             0x8000_0001 => {
                 // EDX: SYSCALL (bit 11), NX (bit 20), Long Mode (bit 29), …
@@ -4194,6 +4216,14 @@ impl Cpu {
             MSR_FS_BASE => self.seg[SegId::Fs as usize].base,
             MSR_GS_BASE => self.seg[SegId::Gs as usize].base,
             MSR_APIC_BASE => LAPIC_BASE | 0x900, // enabled, BSP
+            // IA32_ARCH_CAPABILITIES — the core's truthful security posture. With no
+            // speculative execution it is immune to the side-channel classes, so it
+            // reports RDCL_NO (Meltdown), IBRS_ALL, SSB_NO, MDS_NO, IF_PSCHANGE_MC_NO,
+            // TAA_NO, MMIO_STALE_DATA_NO, FB_CLEAR. RDCL_NO is what makes the kernel
+            // skip PTI (and so the KPTI user-page-table W+X walk).
+            MSR_IA32_ARCH_CAPABILITIES => {
+                RDCL_NO | IBRS_ALL | SSB_NO | MDS_NO | IF_PSCHANGE_MC_NO | TAA_NO
+            }
             _ => self.sys().msr.get(&ecx).copied().unwrap_or(0),
         }
     }
