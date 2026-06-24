@@ -746,7 +746,13 @@ impl TreeBuilder {
                 let id = self.next_id;
                 self.next_id += 1;
                 self.contents.insert(id, e.data);
-                self.file_ids.insert(e.path.clone(), id);
+                // Key by the NORMALIZED path: hardlink targets are resolved through
+                // `normalize` (below), and many real images (GNU tar / dpkg layers)
+                // store member names as `./usr/bin/foo` while a hardlink's target is
+                // `usr/bin/foo` (or vice versa). Keying the raw path here while
+                // looking up the normalized target would spuriously fail every such
+                // hardlink with "dangling hard link", breaking legitimate images.
+                self.file_ids.insert(normalize(&e.path)?, id);
                 DirEnt::File { meta, content: id }
             }
             tar::Kind::HardLink => {
@@ -755,7 +761,7 @@ impl TreeBuilder {
                 let id = self.file_ids.get(&target).copied().ok_or_else(|| {
                     AssemblyError::BadTar(alloc::format!("dangling hard link to {target}"))
                 })?;
-                self.file_ids.insert(e.path.clone(), id);
+                self.file_ids.insert(normalize(&e.path)?, id);
                 DirEnt::File { meta, content: id }
             }
             tar::Kind::Symlink => DirEnt::Symlink {
