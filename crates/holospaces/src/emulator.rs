@@ -5249,15 +5249,19 @@ mod tests {
     /// The **occupancy-index boot path** (`CC-45`, section B): a κ-disk declared
     /// at a *build-capable* multi-GiB size pages **only** its occupied sectors, so
     /// boot setup is O(content), not O(disk). This is the ceiling the deployed
-    /// Manager had to cap around; the test proves it is genuinely gone — an 8 GiB
-    /// disk (16.7M sectors) is constructed from a handful of occupied sectors
-    /// without ever allocating or touching a per-sector slot for the holes.
+    /// Manager had to cap around; the test proves it is genuinely gone and the
+    /// implementation is **completely parametric in the declared size, with no
+    /// hard-coded limit** — a *1 TiB* disk (2.1 *billion* sectors) is constructed
+    /// from a handful of occupied sectors without ever allocating or touching a
+    /// per-sector slot for the holes. (A dense `Vec<Option<κ>>` would be ~16 GB of
+    /// RAM and a 2.1-billion-iteration build; the sparse index holds one entry per
+    /// *occupied* sector, so cost tracks content, not capacity — any devcontainer,
+    /// any disk size.)
     #[test]
     fn occupancy_index_pages_only_content_for_a_multi_gib_disk() {
-        // An 8 GiB disk — far larger than the old dense-index ceiling. A dense
-        // `Vec<Option<κ>>` would be ~1.2 GB of RAM and a 16.7M-iteration build;
-        // the sparse occupancy index allocates one entry per *occupied* sector.
-        const DISK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+        // 1 TiB — orders of magnitude past any build-capable need, to demonstrate
+        // the size is a free parameter, not a baked-in ceiling.
+        const DISK_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
         let sector_count = DISK_BYTES / DISK_SECTOR as u64;
 
         // A sparse scattering of populated sectors — content near the start (a
@@ -5284,7 +5288,7 @@ mod tests {
         assert_eq!(
             disk.len() as u64,
             DISK_BYTES,
-            "the disk reports its declared 8 GiB"
+            "the disk reports its full declared 1 TiB capacity"
         );
         // …but only the occupied sectors are indexed — O(content), not O(disk).
         assert_eq!(
@@ -5294,7 +5298,7 @@ mod tests {
         );
 
         // Every occupied sector reads back its content, including the one at the
-        // far end of the 8 GiB address space (no overflow in the sector math).
+        // far end of the 1 TiB address space (no overflow in the sector math).
         for &i in &occupied_idx {
             assert_eq!(
                 disk.read_sector(i as usize),
