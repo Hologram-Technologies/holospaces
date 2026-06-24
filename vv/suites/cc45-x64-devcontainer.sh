@@ -65,6 +65,12 @@ if [ -f "$CC45/cc45.sha256" ] && [ -f "$CC45/linux/vmlinux.gz" ] && [ -f "$CC45/
         --test cc44_x64_boot an_amd64_multilayer_image_overlay_runs \
         -- --ignored --nocapture || exit 1
 
+    # The Dev Container BUILD phase (CC-26) on amd64: a Dockerfile (FROM/ENV/COPY/RUN)
+    # builds the rootfs and its RUN steps execute in the booted x86-64 OS.
+    cargo test --release --manifest-path "$ROOT/Cargo.toml" -p holospaces \
+        --test cc44_x64_boot an_amd64_dockerfile_build_runs_on_x64 \
+        -- --ignored --nocapture || exit 1
+
     # The differential oracle: qemu-system-x86_64 booting the same kernel + rootfs
     # must run the same stock binary to the same markers.
     if command -v qemu-system-x86_64 >/dev/null 2>&1; then

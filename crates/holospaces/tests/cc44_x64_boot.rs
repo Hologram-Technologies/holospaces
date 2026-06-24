@@ -428,3 +428,71 @@ else echo CC45-MULTILAYER-FAIL; fi\n\
     );
     assert_eq!(halt, Halt::Halted, "the multi-layer devcontainer powered off cleanly");
 }
+
+/// A **Dockerfile build** (`CC-26`) produces an amd64 rootfs whose `RUN` steps
+/// execute **in the booted x86-64 OS**: `FROM` the stock amd64 busybox, an `ENV` the
+/// `RUN` consumes, a `COPY` from the build context, and `RUN` steps that run real
+/// applets. The parsed Dockerfile's build `/init` (with the `ENV` in scope) boots on
+/// the x86-64 core and runs the steps — the COPY'd script executes and the `RUN`
+/// echo uses the `ENV` — then powers off. Proves the substrate-native Dev Container
+/// **build** phase feeds the x86-64 boot (Law L4, the ISA-agnostic `CC-26` pipeline).
+#[test]
+#[ignore = "builds an amd64 devcontainer from a Dockerfile + runs it on x86-64 — CC-45 vv suite"]
+fn an_amd64_dockerfile_build_runs_on_x64() {
+    use holospaces::assembly::{assemble_ext4_bootable, Layer};
+    use holospaces::dockerfile;
+    use std::collections::BTreeMap;
+
+    // No WORKDIR + explicit /bin/busybox: the fixture's busybox is the bare binary
+    // (no applet symlink farm), exactly the stock amd64 busybox the run-stage uses.
+    let dockerfile = "FROM holospaces/busybox:latest\n\
+ENV BUILT_BY=cc45\n\
+COPY setup.sh /usr/local/bin/setup.sh\n\
+RUN /bin/busybox sh /usr/local/bin/setup.sh\n\
+RUN echo CC45-BUILD-RAN:$BUILT_BY\n";
+    let setup_sh: &[u8] = b"#!/bin/busybox sh\necho CC45-SETUP-RAN\n";
+
+    let df = dockerfile::parse(dockerfile.as_bytes(), &BTreeMap::new()).expect("parse the Dockerfile");
+    assert_eq!(df.from, "holospaces/busybox:latest", "FROM resolved");
+
+    let kernel = gunzip(&cc45_dir().join("linux/vmlinux.gz"));
+    let busybox = std::fs::read(cc45_dir().join("rootfs/layer.tar.gz")).expect("busybox layer");
+    // The COPY directives → a synthetic layer at their destination paths.
+    let copy_files: Vec<(&str, &[u8])> = df
+        .copies()
+        .iter()
+        .map(|(src, dst)| {
+            assert_eq!(*src, "setup.sh", "COPY source from the build context");
+            (dst.trim_start_matches('/'), setup_sh)
+        })
+        .collect();
+    let copy_layer = tar_gz(&copy_files);
+    let oci = "application/vnd.oci.image.layer.v1.tar+gzip";
+    let layers = [
+        Layer { media_type: oci, blob: &busybox },
+        Layer { media_type: oci, blob: &copy_layer },
+    ];
+    // The build /init runs BUILD-START, the RUN steps, BUILD-DONE, then our poweroff
+    // tail (before the trailing reboot the build init appends).
+    let init = df.build_init(Some("/bin/busybox poweroff -f\n"));
+    let rootfs = assemble_ext4_bootable(&layers, &init, 64 * 1024 * 1024)
+        .expect("assemble the Dockerfile-built amd64 rootfs");
+
+    let mut cpu = Cpu::boot_linux_disk(512 * 1024 * 1024, &kernel, rootfs, CC45_CMDLINE);
+    let halt = cpu.run(40_000_000_000);
+    let console = String::from_utf8_lossy(cpu.console());
+    eprintln!("---- amd64 Dockerfile build ----\n{console}\n---- end ----  (halt: {halt:?})");
+    assert!(
+        console.contains("BUILD-START") && console.contains("BUILD-DONE"),
+        "the Dockerfile build /init ran its RUN sequence in the booted x86-64 OS"
+    );
+    assert!(
+        console.contains("CC45-SETUP-RAN"),
+        "the COPY'd setup.sh executed in the OS (RUN ran the copied script)"
+    );
+    assert!(
+        console.contains("CC45-BUILD-RAN:cc45"),
+        "the RUN echo consumed the Dockerfile ENV (BUILT_BY=cc45)"
+    );
+    assert_eq!(halt, Halt::Halted, "the build OS powered off cleanly");
+}
