@@ -1,0 +1,1 @@
+{"architecture":"amd64","config":{"Cmd":["/bin/busybox","sh"]},"os":"linux","rootfs":{"diff_ids":["sha256:b64c89bcafd73f2a402830dfe79ea0586a2c1a41125a53c55b574d1d1e1d5498"],"type":"layers"}}

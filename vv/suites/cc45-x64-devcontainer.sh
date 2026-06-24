@@ -86,6 +86,14 @@ if [ -f "$CC45/cc45.sha256" ] && [ -f "$CC45/linux/vmlinux.gz" ] && [ -f "$CC45/
         --test cc44_x64_boot an_amd64_devcontainer_builds_a_program_in_guest \
         -- --ignored --nocapture || exit 1
 
+    # An ARBITRARY REAL OCI image (the registry image-layout, blobs by digest)
+    # ingested through the PRODUCTION path (oci::ingest_image, every blob verified
+    # by re-derivation) for linux/amd64, then booted on x86-64 — the Codespaces
+    # `image:` → pull → boot resolution, end to end on amd64.
+    cargo test --release --manifest-path "$ROOT/Cargo.toml" -p holospaces \
+        --test cc44_x64_boot an_arbitrary_real_amd64_oci_image_boots_on_x64 \
+        -- --ignored --nocapture || exit 1
+
     # e2fsck is the differential oracle for the 8 GiB ext4 GEOMETRY (66 block groups):
     # a real fsck must find the multi-group image the assembler produces clean.
     if command -v e2fsck >/dev/null 2>&1; then

@@ -883,3 +883,68 @@ fn an_amd64_devcontainer_builds_a_program_in_guest() {
         "the guest RAN the binary it just built (the devcontainer is build-capable)"
     );
 }
+
+/// An **arbitrary, real OCI image** — the actual image-layout format a registry
+/// serves, every blob named by its `sha256` digest (which *is* a κ-label) — is
+/// **ingested by the production path** (`oci::ingest_image`, verifying every blob by
+/// re-derivation, Law L5) for `linux/amd64`, then assembled and **booted on the
+/// x86-64 core**. This is the Codespaces/Gitpod resolution path (`image:` →
+/// registry pull → boot) end to end on amd64, using the same ingester the deployed
+/// Manager's `DevcontainerProvision` drives — not a hand-fed fixture layer.
+#[test]
+#[ignore = "ingests a real amd64 OCI image-layout + boots it on x86-64 — CC-45 vv suite"]
+fn an_arbitrary_real_amd64_oci_image_boots_on_x64() {
+    use holospaces::assembly::{assemble_ext4_bootable, Layer};
+    use holospaces::emulator::Arch;
+    use holospaces::oci::ingest_image;
+
+    let img = cc45_dir().join("image");
+    let oci_layout = std::fs::read(img.join("oci-layout")).expect("oci-layout");
+    let index = std::fs::read(img.join("index.json")).expect("index.json");
+    let store: Box<dyn KappaStore> = Box::new(MemKappaStore::new());
+
+    // Pull the multi-platform index → the linux/amd64 manifest → config + layers,
+    // verifying each blob against its digest as it is content-addressed into the store.
+    let ingested = ingest_image(store.as_ref(), &oci_layout, &index, Arch::X64, |d| {
+        let hex = d.strip_prefix("sha256:")?;
+        std::fs::read(img.join("blobs/sha256").join(hex)).ok()
+    })
+    .expect("ingest the real amd64 OCI image (Law L5: every blob re-derived from its κ)");
+
+    // The layers are now κ-addressed; resolve their bytes + media types for assembly.
+    let owned: Vec<(String, Vec<u8>)> = ingested
+        .layers()
+        .iter()
+        .zip(ingested.layer_media_types())
+        .map(|(k, mt)| {
+            let bytes = store.get(k).unwrap().unwrap().as_ref().to_vec();
+            (mt.clone(), bytes)
+        })
+        .collect();
+    let layers: Vec<Layer> = owned
+        .iter()
+        .map(|(mt, b)| Layer {
+            media_type: mt,
+            blob: b,
+        })
+        .collect();
+
+    let init = std::fs::read(cc45_dir().join("init.sh")).expect("init");
+    let rootfs = assemble_ext4_bootable(&layers, &init, 64 * 1024 * 1024).unwrap();
+    let kernel = gunzip(&cc45_dir().join("linux/vmlinux.gz"));
+    let mut cpu = Cpu::boot_linux_disk(512 * 1024 * 1024, &kernel, rootfs, CC45_CMDLINE);
+    let halt = cpu.run(40_000_000_000);
+    let console = String::from_utf8_lossy(cpu.console());
+    eprintln!(
+        "---- real amd64 OCI image on x86-64 ----\n{console}\n---- end ----  (halt: {halt:?})"
+    );
+    assert!(
+        console.contains("CC45-ARCH:x86_64"),
+        "the registry-format amd64 image boots and identifies as x86_64"
+    );
+    assert!(
+        console.contains("CC45-COMPUTE:500500"),
+        "and runs the stock linux-amd64 busybox userspace"
+    );
+    assert_eq!(halt, Halt::Halted, "clean poweroff");
+}
