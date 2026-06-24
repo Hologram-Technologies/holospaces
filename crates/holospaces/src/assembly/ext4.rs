@@ -713,8 +713,21 @@ impl Geometry {
             let need = div_ceil(total, BLOCKS_PER_GROUP);
             if need <= groups {
                 let inodes_count = ipg * groups;
+                // Round a MULTI-group image up to whole block groups so the final
+                // group always spans its full metadata footprint (super/GDT/block+
+                // inode bitmaps/inode table). A short trailing group — `total` just
+                // past a group boundary — would otherwise place that metadata past
+                // the image end (an out-of-bounds write for any large, multi-group
+                // build-capable disk). The extra blocks are free, sparse data space.
+                // A single-group image keeps its exact size: its one (partial) group
+                // already contains its metadata.
+                let total_blocks = if groups > 1 {
+                    groups * BLOCKS_PER_GROUP
+                } else {
+                    total
+                };
                 return Geometry {
-                    total_blocks: total,
+                    total_blocks,
                     groups,
                     inodes_per_group: ipg,
                     inodes_count,

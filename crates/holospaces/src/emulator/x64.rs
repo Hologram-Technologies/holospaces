@@ -3652,6 +3652,39 @@ impl Cpu {
         )
     }
 
+    /// Boot by occupancy from a **streamed** medium — the deployed browser path for
+    /// an arbitrarily large devcontainer disk (`CC-45`). The κ-disk is declared at
+    /// `sector_count` sectors but paged **O(content)**: only the `occupied_blocks`
+    /// the sparse assembler wrote are read (each `sectors_per_block` sectors) through
+    /// the `read` callback (the OPFS file), so a multi-GiB build-capable disk boots
+    /// in proportion to its content, never reading the holes or holding the image.
+    /// The streaming union of [`boot_linux_disk_streamed`](Self::boot_linux_disk_streamed)
+    /// and [`boot_linux_disk_occupancy`](Self::boot_linux_disk_occupancy).
+    pub fn boot_linux_disk_occupancy_streamed<R: FnMut(u64, &mut [u8])>(
+        ram_bytes: usize,
+        kernel: &[u8],
+        cmdline: &str,
+        store: alloc::boxed::Box<dyn hologram_substrate_core::KappaStore>,
+        sector_count: u64,
+        occupied_blocks: &[u64],
+        sectors_per_block: u64,
+        read: R,
+    ) -> Self {
+        let backing = super::KappaBacking::from_occupancy_streamed(
+            store,
+            sector_count,
+            occupied_blocks,
+            sectors_per_block,
+            read,
+        );
+        Self::boot_linux_inner(
+            ram_bytes,
+            kernel,
+            cmdline,
+            Some(super::VirtioBlk::with_backing(backing)),
+        )
+    }
+
     fn boot_linux_inner(
         ram_bytes: usize,
         kernel: &[u8],

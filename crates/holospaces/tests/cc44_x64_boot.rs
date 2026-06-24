@@ -398,9 +398,18 @@ fn an_amd64_multilayer_image_overlay_runs() {
     ]);
     let oci = "application/vnd.oci.image.layer.v1.tar+gzip";
     let layers = [
-        Layer { media_type: oci, blob: &lower },
-        Layer { media_type: oci, blob: &busybox },
-        Layer { media_type: oci, blob: &upper },
+        Layer {
+            media_type: oci,
+            blob: &lower,
+        },
+        Layer {
+            media_type: oci,
+            blob: &busybox,
+        },
+        Layer {
+            media_type: oci,
+            blob: &upper,
+        },
     ];
     let init: &[u8] = b"#!/bin/busybox sh\n\
 /bin/busybox mkdir -p /proc\n\
@@ -416,7 +425,9 @@ else echo CC45-MULTILAYER-FAIL; fi\n\
     let mut cpu = Cpu::boot_linux_disk(512 * 1024 * 1024, &kernel, rootfs, CC45_CMDLINE);
     let halt = cpu.run(40_000_000_000);
     let console = String::from_utf8_lossy(cpu.console());
-    eprintln!("---- multi-layer amd64 devcontainer ----\n{console}\n---- end ----  (halt: {halt:?})");
+    eprintln!(
+        "---- multi-layer amd64 devcontainer ----\n{console}\n---- end ----  (halt: {halt:?})"
+    );
     assert!(
         console.contains("CC45-DEVCONTAINER-UP"),
         "the multi-layer amd64 image booted from its κ-disk rootfs"
@@ -426,7 +437,11 @@ else echo CC45-MULTILAYER-FAIL; fi\n\
         "the OCI overlay applied across layers (whiteout removed the lower file, the \
          upper layer overrode + added files) before the x86-64 boot"
     );
-    assert_eq!(halt, Halt::Halted, "the multi-layer devcontainer powered off cleanly");
+    assert_eq!(
+        halt,
+        Halt::Halted,
+        "the multi-layer devcontainer powered off cleanly"
+    );
 }
 
 /// A **Dockerfile build** (`CC-26`) produces an amd64 rootfs whose `RUN` steps
@@ -452,7 +467,8 @@ RUN /bin/busybox sh /usr/local/bin/setup.sh\n\
 RUN echo CC45-BUILD-RAN:$BUILT_BY\n";
     let setup_sh: &[u8] = b"#!/bin/busybox sh\necho CC45-SETUP-RAN\n";
 
-    let df = dockerfile::parse(dockerfile.as_bytes(), &BTreeMap::new()).expect("parse the Dockerfile");
+    let df =
+        dockerfile::parse(dockerfile.as_bytes(), &BTreeMap::new()).expect("parse the Dockerfile");
     assert_eq!(df.from, "holospaces/busybox:latest", "FROM resolved");
 
     let kernel = gunzip(&cc45_dir().join("linux/vmlinux.gz"));
@@ -469,8 +485,14 @@ RUN echo CC45-BUILD-RAN:$BUILT_BY\n";
     let copy_layer = tar_gz(&copy_files);
     let oci = "application/vnd.oci.image.layer.v1.tar+gzip";
     let layers = [
-        Layer { media_type: oci, blob: &busybox },
-        Layer { media_type: oci, blob: &copy_layer },
+        Layer {
+            media_type: oci,
+            blob: &busybox,
+        },
+        Layer {
+            media_type: oci,
+            blob: &copy_layer,
+        },
     ];
     // The build /init runs BUILD-START, the RUN steps, BUILD-DONE, then our poweroff
     // tail (before the trailing reboot the build init appends).
@@ -527,8 +549,14 @@ fn an_amd64_devcontainer_features_and_lifecycle_run_on_x64() {
     let busybox = std::fs::read(cc45_dir().join("rootfs/layer.tar.gz")).expect("busybox layer");
     let oci = "application/vnd.oci.image.layer.v1.tar+gzip";
     let layers = [
-        Layer { media_type: oci, blob: &busybox },
-        Layer { media_type: oci, blob: &feature_layer },
+        Layer {
+            media_type: oci,
+            blob: &busybox,
+        },
+        Layer {
+            media_type: oci,
+            blob: &feature_layer,
+        },
     ];
     let init = dc.lifecycle_init();
     let rootfs = assemble_ext4_bootable(&layers, &init, 64 * 1024 * 1024)
@@ -549,7 +577,10 @@ fn an_amd64_devcontainer_features_and_lifecycle_run_on_x64() {
     // Dev Container spec order: features install BEFORE the lifecycle commands.
     let feat = console.find("CC45-FEATURE-INSTALLED").expect("feature ran");
     let life = console.find("CC45-ONCREATE").expect("lifecycle ran");
-    assert!(feat < life, "features installed before the lifecycle hooks (spec order)");
+    assert!(
+        feat < life,
+        "features installed before the lifecycle hooks (spec order)"
+    );
 }
 
 /// **Dogfood**: holospaces parses + honours *this very workspace's* unmodified
@@ -564,10 +595,12 @@ fn an_amd64_devcontainer_features_and_lifecycle_run_on_x64() {
 fn holospaces_parses_its_own_unmodified_devcontainer_config() {
     use holospaces::boot::devcontainer;
     // The repo's real config, relative to this crate (worktree root / .devcontainer).
-    let cfg_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.devcontainer/devcontainer.json");
+    let cfg_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.devcontainer/devcontainer.json");
     let cfg = std::fs::read(&cfg_path).expect("read the workspace devcontainer.json");
 
-    let dc = devcontainer::parse(&cfg).expect("holospaces parses its own (JSONC) devcontainer.json");
+    let dc =
+        devcontainer::parse(&cfg).expect("holospaces parses its own (JSONC) devcontainer.json");
 
     // The build is a Dockerfile build (CC-26), honoured, not dropped.
     assert!(
@@ -586,7 +619,100 @@ fn holospaces_parses_its_own_unmodified_devcontainer_config() {
     );
     // The lifecycle postCreateCommand runs the repo's post-create.sh (CC-22).
     assert!(
-        dc.lifecycle.iter().any(|(_, cmd)| cmd.contains("post-create.sh")),
+        dc.lifecycle
+            .iter()
+            .any(|(_, cmd)| cmd.contains("post-create.sh")),
         "the postCreateCommand (bash .devcontainer/post-create.sh) is honoured"
+    );
+}
+
+/// A developer's **arbitrarily large build-capable** amd64 devcontainer boots
+/// **O(content)** through the streamed occupancy path — the deployed browser
+/// regime, witnessed natively. The stock busybox rootfs is stream-assembled onto an
+/// **8 GiB** declared disk (sparse: only the non-zero 4 KiB blocks are materialized),
+/// then booted by `boot_linux_disk_occupancy_streamed`, which reads **only** the
+/// occupied blocks from the (sparse) medium — exactly one read per occupied block,
+/// not the 16.7M sectors of the declared disk. Proves a multi-GiB disk pages in
+/// proportion to its content, never the holes (Laws L3/L4) — required to provision a
+/// real, large devcontainer, not a fixture-sized one.
+#[test]
+#[ignore = "boots an amd64 devcontainer occupancy-streamed from an 8 GiB disk — CC-45 vv suite"]
+fn an_amd64_devcontainer_boots_occupancy_streamed_from_a_large_disk() {
+    use holospaces::assembly::{stream_ext4_image_bootable, Layer};
+    use std::collections::BTreeMap;
+
+    let busybox = std::fs::read(cc45_dir().join("rootfs/layer.tar.gz")).expect("busybox layer");
+    let init = std::fs::read(cc45_dir().join("init.sh")).expect("cc45 init");
+    let layers = [Layer {
+        media_type: "application/vnd.oci.image.layer.v1.tar+gzip",
+        blob: &busybox,
+    }];
+
+    const DISK_BYTES: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB — a real build-capable disk
+    const BLOCK: u64 = 4096;
+    const SECTORS_PER_BLOCK: u64 = BLOCK / 512;
+
+    // Stream-assemble SPARSE: record each non-zero 4 KiB block (index + bytes).
+    let mut sparse: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    let mut occupied_blocks: Vec<u64> = Vec::new();
+    let geom = stream_ext4_image_bootable(&layers, &init, DISK_BYTES, |bi, bytes| {
+        occupied_blocks.push(bi);
+        sparse.insert(bi, bytes.to_vec());
+    })
+    .expect("stream-assemble the 8 GiB sparse rootfs");
+
+    let content: u64 = sparse.values().map(|v| v.len() as u64).sum();
+    assert!(
+        geom.image_len() as u64 >= DISK_BYTES - BLOCK,
+        "the ext4 image spans the full 8 GiB declared disk"
+    );
+    assert!(
+        content < 256 * 1024 * 1024,
+        "only content is materialized — sparse, not 8 GiB ({content} bytes for an 8 GiB disk)"
+    );
+
+    // Boot O(content): read ONLY the occupied blocks from the sparse medium. The
+    // block device spans the IMAGE (image_len ≥ the declared disk, by its metadata),
+    // exactly as the deployed path declares it from the provisioned file's size.
+    let sector_count = geom.image_len() as u64 / 512;
+    let mut reads = 0u64;
+    let read = |sector: u64, buf: &mut [u8]| {
+        reads += 1;
+        let bi = sector / SECTORS_PER_BLOCK;
+        match sparse.get(&bi) {
+            Some(b) => buf[..b.len()].copy_from_slice(b),
+            None => buf.fill(0), // a hole — never reached for an occupied block
+        }
+    };
+    let kernel = gunzip(&cc45_dir().join("linux/vmlinux.gz"));
+    let mut cpu = Cpu::boot_linux_disk_occupancy_streamed(
+        512 * 1024 * 1024,
+        &kernel,
+        CC45_CMDLINE,
+        Box::new(MemKappaStore::new()),
+        sector_count,
+        &occupied_blocks,
+        SECTORS_PER_BLOCK,
+        read,
+    );
+    let halt = cpu.run(40_000_000_000);
+    let console = String::from_utf8_lossy(cpu.console());
+    eprintln!(
+        "---- occupancy-streamed 8 GiB amd64 ----\n{console}\n---- end ----  (halt: {halt:?})"
+    );
+    assert!(
+        console.contains("CC45-COMPUTE:500500"),
+        "the amd64 devcontainer ran from the 8 GiB occupancy-streamed disk"
+    );
+    assert_eq!(halt, Halt::Halted, "clean poweroff");
+    // O(content): one read per occupied block, ≪ the disk's 16.7M sectors.
+    assert_eq!(
+        reads,
+        occupied_blocks.len() as u64,
+        "exactly one read per occupied block — O(content), not O(disk)"
+    );
+    assert!(
+        reads < 200_000,
+        "boot-setup reads track content, not the 8 GiB disk's 16.7M sectors ({reads} reads)"
     );
 }
