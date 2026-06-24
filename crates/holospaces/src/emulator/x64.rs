@@ -4267,15 +4267,30 @@ impl Cpu {
                 (r, (a >> (cnt - 1)) & 1)
             }
             2 | 3 => {
-                // RCL / RCR through CF — uncommon on the boot path; approximate
-                // with the corresponding rotate (the kernel does not depend on the
-                // carry-through for correctness here).
-                let r = if ext == 2 {
-                    ((a << cnt) | (a >> (bits - cnt))) & m
-                } else {
-                    ((a >> cnt) | (a << (bits - cnt))) & m
+                // RCL / RCR — a true rotate of `a` THROUGH CF, i.e. a (bits+1)-bit
+                // rotation (the carry is the extra bit). The count reduces mod
+                // (bits+1) (mod 9/17 for 8/16-bit; 32/64-bit counts are already < the
+                // width from the 5/6-bit mask above). Used by multi-precision
+                // carry propagation — the ROL/ROR approximation gave wrong results.
+                let width = bits + 1;
+                let n = match size {
+                    1 => cnt % 9,
+                    2 => cnt % 17,
+                    _ => cnt % width,
                 };
-                (r, r & 1)
+                if n == 0 {
+                    (a, u64::from(self.rflags & flag::CF != 0))
+                } else {
+                    let cf_in = u128::from(self.rflags & flag::CF != 0);
+                    let v = (cf_in << bits) | u128::from(a);
+                    let fm = (1u128 << width) - 1;
+                    let rot = if ext == 2 {
+                        (v.wrapping_shl(n) | v.wrapping_shr(width - n)) & fm
+                    } else {
+                        (v.wrapping_shr(n) | v.wrapping_shl(width - n)) & fm
+                    };
+                    ((rot as u64) & m, u64::from((rot >> bits) & 1 != 0))
+                }
             }
             _ => (a, 0),
         };
@@ -4286,6 +4301,23 @@ impl Cpu {
             self.set(flag::ZF, res == 0);
             self.set(flag::SF, Self::sign(res, size));
             self.set(flag::PF, (res as u8).count_ones().is_multiple_of(2));
+        }
+        // OF is architecturally defined only for a 1-bit shift/rotate (undefined,
+        // hence left unmodified, for counts > 1). It reflects whether the sign bit
+        // changed: for SHL/RCL/ROL it is msb(result) XOR CF-out; for SHR it is the
+        // original msb; for SAR it is 0; for ROR/RCR it is the XOR of the result's
+        // top two bits.
+        if cnt == 1 {
+            let msb = Self::sign(res, size);
+            let of = match ext {
+                4 | 6 => msb ^ (cf != 0),                        // SHL/SAL
+                5 => Self::sign(a, size),                        // SHR
+                7 => false,                                      // SAR
+                0 | 2 => msb ^ (cf != 0),                        // ROL / RCL
+                1 | 3 => msb ^ (((res >> (bits - 2)) & 1) != 0), // ROR / RCR
+                _ => false,
+            };
+            self.set(flag::OF, of);
         }
     }
 
