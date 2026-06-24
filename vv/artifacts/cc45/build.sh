@@ -70,12 +70,12 @@ tar xf "busybox-$BBVER.tar.bz2"
 cp "busybox-$BBVER/busybox" "$here/rootfs/busybox"
 echo "busybox: $(stat -c%s "$here/rootfs/busybox") bytes  ($(file -b "$here/rootfs/busybox" | cut -d, -f1-2))"
 
-echo "== [3/4] OCI image layer (tar+gzip of /bin/busybox) =="
+echo "== [3/5] OCI image layer (tar+gzip of /bin/busybox) =="
 ldir="$(mktemp -d)"; mkdir -p "$ldir/bin"
 cp "$here/rootfs/busybox" "$ldir/bin/busybox"
 ( cd "$ldir" && tar --numeric-owner --owner=0 --group=0 --mtime='2026-05-31 00:00:00 UTC' --sort=name -cf - bin ) | gzip -9 -n > "$here/rootfs/layer.tar.gz"
 
-echo "== [4/4] static linux-amd64 TinyCC (the in-guest toolchain — build-capable) =="
+echo "== [4/5] static linux-amd64 TinyCC (the in-guest toolchain — build-capable) =="
 # A real, self-contained C compiler the guest runs to BUILD software in-image
 # (the decisive CC-45 acceptance: a toolchain compiles a program to a runnable
 # binary inside the devcontainer). Pinned TinyCC mob; statically linked so it runs
@@ -93,6 +93,43 @@ cp "tinycc/tcc" "$here/build/tcc"
 echo "tcc: $(stat -c%s "$here/build/tcc") bytes  ($(file -b "$here/build/tcc" | cut -d, -f1-3))"
 # build/hello.c is a committed source (a freestanding program), not generated.
 
+echo "== [5/5] real linux/amd64 OCI image-layout (the registry format) =="
+# Wrap the busybox layer as a genuine OCI image-layout — every blob named by its
+# sha256 digest (== its κ-label) — so the witness ingests it through the production
+# `oci::ingest_image` path (the exact resolution the deployed Manager's
+# DevcontainerProvision drives) and boots it on x86-64. Built from the layer above.
+python3 - "$here" <<'PY'
+import json, hashlib, gzip, os, sys
+base = sys.argv[1]
+layer = open(f"{base}/rootfs/layer.tar.gz", "rb").read()
+ld = hashlib.sha256(layer).hexdigest()
+diff = hashlib.sha256(gzip.decompress(layer)).hexdigest()
+cfg = json.dumps({"architecture": "amd64", "os": "linux",
+                  "config": {"Cmd": ["/bin/busybox", "sh"]},
+                  "rootfs": {"type": "layers", "diff_ids": [f"sha256:{diff}"]}},
+                 separators=(",", ":"), sort_keys=True).encode()
+cd = hashlib.sha256(cfg).hexdigest()
+man = json.dumps({"schemaVersion": 2,
+                  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                  "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": f"sha256:{cd}", "size": len(cfg)},
+                  "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", "digest": f"sha256:{ld}", "size": len(layer)}]},
+                 separators=(",", ":"), sort_keys=True).encode()
+md = hashlib.sha256(man).hexdigest()
+idx = json.dumps({"schemaVersion": 2,
+                  "mediaType": "application/vnd.oci.image.index.v1+json",
+                  "manifests": [{"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": f"sha256:{md}", "size": len(man),
+                                 "platform": {"architecture": "amd64", "os": "linux"}}]},
+                 separators=(",", ":"), sort_keys=True).encode()
+img = f"{base}/image"
+os.makedirs(f"{img}/blobs/sha256", exist_ok=True)
+for dig, data in [(ld, layer), (cd, cfg), (md, man)]:
+    open(f"{img}/blobs/sha256/{dig}", "wb").write(data)
+open(f"{img}/index.json", "wb").write(idx)
+open(f"{img}/oci-layout", "wb").write(b'{"imageLayoutVersion":"1.0.0"}')
+print(f"OCI image: amd64, layer {ld[:12]}, manifest {md[:12]}")
+PY
+
 ( cd "$here" && sha256sum linux/vmlinux.gz linux/bzImage linux/kernel.config \
-    rootfs/busybox rootfs/layer.tar.gz init.sh build/tcc build/hello.c > cc45.sha256 )
+    rootfs/busybox rootfs/layer.tar.gz init.sh build/tcc build/hello.c \
+    image/oci-layout image/index.json image/blobs/sha256/* > cc45.sha256 )
 echo "DONE"
