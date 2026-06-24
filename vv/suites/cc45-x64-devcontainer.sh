@@ -15,14 +15,21 @@
 #   • a stock linux-amd64 busybox (vv/artifacts/cc45/rootfs/) — arbitrary
 #     linux-amd64 binaries run with no per-ISA workaround;
 #   • qemu-system-x86_64 as the differential oracle.
-# Witnesses: crates/holospaces/tests/cc44_x64_boot.rs (the CC-45 tests).
+# Witnesses: crates/holospaces/tests/cc44_x64_boot.rs (the CC-45 tests). The
+#   *deployed browser* path is witnessed by the browser job (scripts/browser-manager-
+#   test.sh → crates/holospaces-web/web/cc45-x64-boot-test.mjs): in Chromium, a stock
+#   linux/amd64 devcontainer is assembled sparse into an OPFS file and BOOTED on the
+#   x86-64 core via the shipped X64Workspace paged-κ-disk path.
 # Depends on: CC-44 (the x86-64 boot path).
 #
 # Status: SUITE (LIVE) — every section below is green for real: the build-capable
 #   occupancy-index disk boots O(content), and the committed stock linux-amd64
 #   busybox fixture boots on the x86-64 core to CC45-DEVCONTAINER-UP /
 #   CC45-ARCH:x86_64 / CC45-COMPUTE:500500 and a clean poweroff, byte-matching the
-#   qemu-system-x86_64 differential oracle.
+#   qemu-system-x86_64 differential oracle. The full Dev Container / OCI contract
+#   (multi-layer images, Dockerfile build, features + lifecycle, the dogfooded
+#   workspace config) is witnessed in cc44_x64_boot.rs; the deployed amd64 boot is
+#   witnessed in a real browser by the browser job.
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
