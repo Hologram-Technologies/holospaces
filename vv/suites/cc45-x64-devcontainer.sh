@@ -57,6 +57,14 @@ if [ -f "$CC45/cc45.sha256" ] && [ -f "$CC45/linux/vmlinux.gz" ] && [ -f "$CC45/
         --test cc44_x64_boot an_amd64_devcontainer_boots_paged_from_a_kappa_store \
         -- --ignored --nocapture || exit 1
 
+    # An ARBITRARY MULTI-LAYER image (the DoD's "multi-layer real images"): three
+    # OCI layers stack with whiteout + override + add, and the merged amd64 rootfs
+    # boots — proving the parametric assembler (CC-4/CC-20) feeds the x86-64 boot for
+    # any image, not just the single-layer fixture.
+    cargo test --release --manifest-path "$ROOT/Cargo.toml" -p holospaces \
+        --test cc44_x64_boot an_amd64_multilayer_image_overlay_runs \
+        -- --ignored --nocapture || exit 1
+
     # The differential oracle: qemu-system-x86_64 booting the same kernel + rootfs
     # must run the same stock binary to the same markers.
     if command -v qemu-system-x86_64 >/dev/null 2>&1; then
