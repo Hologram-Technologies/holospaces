@@ -5338,7 +5338,7 @@ mod tests {
 
         // The guest sees the full declared capacity…
         assert_eq!(
-            disk.len() as u64,
+            disk.len(),
             DISK_BYTES,
             "the disk reports its full declared 1 TiB capacity"
         );
