@@ -2929,16 +2929,16 @@ impl Cpu {
                 // Same settable mask as IRETQ below.
                 self.rflags = (self.pop() & 0x0024_4fd5) | 0x2;
             }
-            0xa4 => self.string_op(StringOp::Movs, 1, rep),
-            0xa5 => self.string_op(StringOp::Movs, size, rep),
-            0xa6 => self.string_op(StringOp::Cmps, 1, rep),
-            0xa7 => self.string_op(StringOp::Cmps, size, rep),
-            0xaa => self.string_op(StringOp::Stos, 1, rep),
-            0xab => self.string_op(StringOp::Stos, size, rep),
-            0xac => self.string_op(StringOp::Lods, 1, rep),
-            0xad => self.string_op(StringOp::Lods, size, rep),
-            0xae => self.string_op(StringOp::Scas, 1, rep),
-            0xaf => self.string_op(StringOp::Scas, size, rep),
+            0xa4 => self.string_op(StringOp::Movs, 1, rep, start),
+            0xa5 => self.string_op(StringOp::Movs, size, rep, start),
+            0xa6 => self.string_op(StringOp::Cmps, 1, rep, start),
+            0xa7 => self.string_op(StringOp::Cmps, size, rep, start),
+            0xaa => self.string_op(StringOp::Stos, 1, rep, start),
+            0xab => self.string_op(StringOp::Stos, size, rep, start),
+            0xac => self.string_op(StringOp::Lods, 1, rep, start),
+            0xad => self.string_op(StringOp::Lods, size, rep, start),
+            0xae => self.string_op(StringOp::Scas, 1, rep, start),
+            0xaf => self.string_op(StringOp::Scas, size, rep, start),
             0xc0 => {
                 let (ext, rm) = self.modrm(rex);
                 let cnt = self.fetch(1) as u8;
@@ -4130,14 +4130,28 @@ impl Cpu {
     /// Execute a string instruction (`MOVS`/`STOS`/`LODS`/`SCAS`/`CMPS`) of
     /// element size `osz`, honouring a `REP`/`REPE`/`REPNE` prefix and the
     /// direction flag. `RSI`/`RDI` advance by ±`osz`; `RCX` counts the repeats.
-    fn string_op(&mut self, kind: StringOp, osz: u8, rep: RepKind) {
+    fn string_op(&mut self, kind: StringOp, osz: u8, rep: RepKind, start: u64) {
         let step: i64 = if self.rflags & RFLAGS_DF != 0 {
             -i64::from(osz)
         } else {
             i64::from(osz)
         };
         let mut count = if rep == RepKind::None { 1 } else { self.r[RCX] };
+        // A `REP` is interruptible/restartable: the hardware checks for a pending
+        // interrupt between iterations, leaving RCX/RSI/RDI at the partial position
+        // with RIP on the prefix so it resumes. We bound the iterations executed per
+        // `step()` and, if the count is not exhausted, rewind RIP to `start` so the
+        // instruction re-executes — both yielding to interrupts/the run budget and
+        // preventing a pathologically large RCX from wedging the emulator in one step.
+        let budget: u64 = 1 << 16;
+        let mut done: u64 = 0;
         while count != 0 {
+            if rep != RepKind::None && done >= budget {
+                self.r[RCX] = count;
+                self.rip = start;
+                return;
+            }
+            done += 1;
             match kind {
                 StringOp::Movs => {
                     let v = self.rd(self.r[RSI], osz);
