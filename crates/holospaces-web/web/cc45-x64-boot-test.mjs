@@ -89,6 +89,8 @@ self.onmessage = async () => {
     const full = ws.terminal();
     const tail = full.slice(-1400);
     try { rootfsRead.close(); } catch {}
+    // boot closes occRead on success; close defensively in case it returned early.
+    try { occRead.close(); } catch {}
     try { packHandle.close(); } catch {}
     self.postMessage({ ok: true, imageLen, rootfsBytes, occBytes, occupiedBlocks, diskBytes: DISK_BYTES, booted, mounted, ranInit, panicked, termLen: full.length, tail });
   } catch (e) {

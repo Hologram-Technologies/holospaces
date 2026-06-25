@@ -51,21 +51,23 @@ BIN="$ROOT/target/release/examples/$EX"
 
 # (1) Force-fresh build. cargo clean is the only reliable invalidation here.
 echo "[dev-boot] force-clean rebuild of $EX (defeating stale-binary cache)…"
+build_start=$(date +%s)   # stamp BEFORE the build, so a fresh binary's mtime is ≥ this
 cargo clean --release -p holospaces 2>/dev/null
 if ! cargo build --release -q -p holospaces --example "$EX" 2>build.err; then
     grep -E "error" build.err | head -20; echo "BUILD FAILED"; exit 1
 fi
 rm -f build.err
-# Assert the binary is genuinely fresh (younger than this run's start).
+# Assert the binary is genuinely fresh: its mtime is at/after this run's build start, so
+# the rebuild produced it — not a leftover from a prior run, however recent that was.
 [ -x "$BIN" ] || { echo "missing $BIN after build"; exit 1; }
-bage=$(( $(date +%s) - $(stat -c %Y "$BIN") ))
-if [ "$bage" -gt 600 ]; then
-    echo "REFUSING TO RUN: $EX is ${bage}s old — the rebuild did not take. Aborting."
+bmtime=$(stat -c %Y "$BIN")
+if [ "$bmtime" -lt "$build_start" ]; then
+    echo "REFUSING TO RUN: $EX was not rebuilt during this run (mtime predates build start) — stale binary. Aborting."
     exit 2
 fi
 newest_src=$(find crates/holospaces/src crates/holospaces/examples -name '*.rs' -newer "$BIN" | head -1)
 [ -n "$newest_src" ] && { echo "REFUSING TO RUN: $newest_src is newer than the binary — stale build."; exit 2; }
-echo "[dev-boot] fresh binary (${bage}s old): $BIN"
+echo "[dev-boot] fresh binary (built $(( $(date +%s) - bmtime ))s ago, this run): $BIN"
 
 # (3) Kill any prior diag run and verify none remain before launching ours.
 for _ in 1 2 3 4 5; do

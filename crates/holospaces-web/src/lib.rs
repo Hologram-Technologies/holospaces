@@ -2130,10 +2130,36 @@ impl X64Workspace {
         let image_len = u64::from_le_bytes(occ_bytes[0..8].try_into().unwrap());
         // The block device must span the declared IMAGE, not the compact file.
         let sector_count = image_len / 512;
-        let occupied_blocks: Vec<u64> = occ_bytes[8..]
+        // VALIDATE the sidecar before trusting it: the payload after the header must be
+        // a whole number of 8-byte block indices, else `chunks_exact` would silently
+        // drop a truncated tail and desynchronize packed slots from block indices.
+        let payload = &occ_bytes[8..];
+        if !payload.len().is_multiple_of(8) {
+            return Err(JsValue::from_str(
+                "occupancy sidecar payload is not a whole number of 8-byte block indices (corrupt/truncated)",
+            ));
+        }
+        let occupied_blocks: Vec<u64> = payload
             .chunks_exact(8)
             .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
             .collect();
+        // Every named block must lie within the declared disk (a stray index would map
+        // to a sector outside the device).
+        let block_count = image_len.div_ceil(BLOCK_BYTES);
+        if occupied_blocks.iter().any(|&b| b >= block_count) {
+            return Err(JsValue::from_str(
+                "occupancy sidecar names a block outside the declared disk",
+            ));
+        }
+        // The compact rootfs file holds exactly one 4 KiB slot per occupied block; if it
+        // is shorter, a packed-slot read would run off the end and corrupt the boot.
+        let rootfs_size = rootfs_handle.get_size().map_err(js_err)? as u64;
+        let expected = occupied_blocks.len() as u64 * BLOCK_BYTES;
+        if rootfs_size < expected {
+            return Err(JsValue::from_str(
+                "compact rootfs file is smaller than the occupancy index implies (truncated)",
+            ));
+        }
 
         // The rootfs file is COMPACT — the Nth occupied block at file offset N·4096 —
         // so read it sequentially: from_occupancy_streamed visits the occupied blocks

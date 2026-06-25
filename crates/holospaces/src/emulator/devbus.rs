@@ -246,35 +246,48 @@ fn blk_service_chain(mem: &mut GuestRam, dev: &mut VirtioBlk, head: u16) -> u32 
 
     let mut written = 0u32;
     // u64: the disk byte offset spans the full declared disk, which is multi-GiB and
-    // overflows a 32-bit usize on wasm32 (the deployed browser peer).
-    let mut disk_off = sector * 512;
+    // overflows a 32-bit usize on wasm32 (the deployed browser peer). `sector` is
+    // GUEST-controlled, so the offset uses CHECKED arithmetic — a huge sector that
+    // would wrap u64 fails the request (IOERR) instead of aliasing a real offset.
+    let Some(mut disk_off) = sector.checked_mul(512) else {
+        mem.wr8(status_desc.0, VIRTIO_BLK_S_IOERR);
+        return 1; // just the status byte
+    };
     let mut status = VIRTIO_BLK_S_OK;
     match req_type {
         VIRTIO_BLK_T_IN => {
             for (addr, len, _flags) in data {
                 let n = *len as usize;
-                if disk_off + n as u64 > dev.disk.len() {
+                let Some(end) = disk_off.checked_add(n as u64) else {
+                    status = VIRTIO_BLK_S_IOERR;
+                    break;
+                };
+                if end > dev.disk.len() {
                     status = VIRTIO_BLK_S_IOERR;
                     break;
                 }
                 let mut buf = vec![0u8; n];
                 dev.disk.read_into(disk_off, &mut buf);
                 mem.write_bytes(*addr, &buf);
-                disk_off += n as u64;
+                disk_off = end;
                 written += *len;
             }
         }
         VIRTIO_BLK_T_OUT => {
             for (addr, len, _flags) in data {
                 let n = *len as usize;
-                if disk_off + n as u64 > dev.disk.len() {
+                let Some(end) = disk_off.checked_add(n as u64) else {
+                    status = VIRTIO_BLK_S_IOERR;
+                    break;
+                };
+                if end > dev.disk.len() {
                     status = VIRTIO_BLK_S_IOERR;
                     break;
                 }
                 let mut buf = vec![0u8; n];
                 mem.read_bytes(*addr, &mut buf);
                 dev.disk.write_from(disk_off, &buf);
-                disk_off += n as u64;
+                disk_off = end;
             }
         }
         VIRTIO_BLK_T_GET_ID => {

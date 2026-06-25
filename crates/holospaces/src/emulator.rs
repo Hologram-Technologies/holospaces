@@ -978,11 +978,16 @@ impl KappaBacking {
         }
     }
 
-    /// Reconstruct the full disk image — the self-contained snapshot of the disk
-    /// content (the live store dedups; the snapshot captures the bytes). A dense
-    /// buffer, so this is the native snapshot path, not the streamed boot.
+    /// Reconstruct the full **dense** disk image. Use only for a disk whose declared
+    /// size is the content size (the legacy image path); for a sparse/occupancy disk
+    /// (a multi-GiB declared capacity with little content) this would allocate the
+    /// whole capacity — prefer [`occupied`](Self::occupied) + a sparse snapshot.
+    /// `usize::try_from` so a >4 GiB disk on a 32-bit target (wasm32) fails LOUDLY
+    /// instead of truncating the length and corrupting the image.
     fn to_image(&self) -> Vec<u8> {
-        let mut image = vec![0u8; self.len() as usize];
+        let len = usize::try_from(self.len())
+            .expect("κ-disk: declared size exceeds usize — use the sparse snapshot path");
+        let mut image = vec![0u8; len];
         for (&i, k) in self.index.iter() {
             let bytes = self
                 .store
@@ -994,6 +999,30 @@ impl KappaBacking {
             image[i * DISK_SECTOR..(i + 1) * DISK_SECTOR].copy_from_slice(bytes.as_ref());
         }
         image
+    }
+
+    /// The disk's **occupancy** — its declared sector count and the `(index, bytes)`
+    /// of every populated sector — for a SPARSE snapshot bounded by content, not by
+    /// the declared capacity. The dual of [`from_occupancy`](Self::from_occupancy);
+    /// safe for a multi-GiB/TiB declared disk holding little content.
+    fn occupied(&self) -> (u64, Vec<(u64, [u8; DISK_SECTOR])>) {
+        let sectors = self.len() / DISK_SECTOR as u64;
+        let occ = self
+            .index
+            .iter()
+            .map(|(&i, k)| {
+                let bytes = self
+                    .store
+                    .get(k)
+                    .ok()
+                    .flatten()
+                    .expect("κ-disk: a sector's content resolves for its κ");
+                let mut s = [0u8; DISK_SECTOR];
+                s.copy_from_slice(bytes.as_ref());
+                (i, s)
+            })
+            .collect();
+        (sectors, occ)
     }
 }
 
@@ -2753,11 +2782,22 @@ impl Emulator {
                 out.extend_from_slice(&dev.last_avail.to_le_bytes());
                 out.extend_from_slice(&dev.interrupt_status.to_le_bytes());
                 out.push(u8::from(dev.irq_pending));
-                // The disk content (reconstructed from the κ-disk) — a self-
-                // contained snapshot so resume is faithful on any peer.
-                let image = dev.disk.to_image();
-                out.extend_from_slice(&(image.len() as u64).to_le_bytes());
-                out.extend_from_slice(&image);
+                // The disk content (reconstructed from the κ-disk) — a self-contained
+                // snapshot so resume is faithful on any peer. Encoded SPARSELY (declared
+                // sector count + only the occupied sectors), bounded by CONTENT not by
+                // the declared capacity — so a multi-GiB/TiB build-capable (occupancy)
+                // disk snapshots without materializing its full size (which would OOM,
+                // and would truncate the length on a 32-bit target). The sentinel
+                // `u64::MAX` in the legacy length slot tags the sparse form, so an older
+                // dense snapshot still restores.
+                let (sectors, occ) = dev.disk.occupied();
+                out.extend_from_slice(&u64::MAX.to_le_bytes()); // sparse-form sentinel
+                out.extend_from_slice(&sectors.to_le_bytes());
+                out.extend_from_slice(&(occ.len() as u64).to_le_bytes());
+                for (i, sector) in &occ {
+                    out.extend_from_slice(&i.to_le_bytes());
+                    out.extend_from_slice(sector);
+                }
             }
         }
         // The VirtIO 9P device: its transport state, the fid table, the mount
@@ -2862,10 +2902,33 @@ impl Emulator {
                 let last_avail = r.u16()?;
                 let interrupt_status = r.u32()?;
                 let irq_pending = r.u8()? != 0;
-                let disk_len = r.u64()? as usize;
-                // Rebuild the κ-disk by content-addressing the snapshot image back
-                // into a fresh store (the substrate; Law L3).
-                let disk = KappaBacking::from_image(r.bytes(disk_len)?);
+                // Rebuild the κ-disk by content-addressing the snapshot back into a
+                // fresh store (the substrate; Law L3). `u64::MAX` tags the SPARSE form
+                // (declared sector count + only the occupied sectors), bounded by
+                // content; any other value is a legacy DENSE image length. The sparse
+                // count `n` is validated implicitly — each `(idx, sector)` is read with
+                // `r.bytes`, so a corrupt/oversized `n` fails as `Truncated` rather than
+                // pre-allocating (no `with_capacity(n)` on attacker-controlled `n`).
+                let disk_tag = r.u64()?;
+                let disk = if disk_tag == u64::MAX {
+                    let sectors = r.u64()?;
+                    let n = r.u64()?;
+                    let mut occ: Vec<(u64, [u8; DISK_SECTOR])> = Vec::new();
+                    for _ in 0..n {
+                        let i = r.u64()?;
+                        if i >= sectors {
+                            return Err(SnapshotError::Malformed); // sector outside the disk
+                        }
+                        let mut s = [0u8; DISK_SECTOR];
+                        s.copy_from_slice(r.bytes(DISK_SECTOR)?);
+                        occ.push((i, s));
+                    }
+                    KappaBacking::from_occupancy(Box::new(MemKappaStore::new()), sectors, occ)
+                } else {
+                    let disk_len =
+                        usize::try_from(disk_tag).map_err(|_| SnapshotError::Malformed)?;
+                    KappaBacking::from_image(r.bytes(disk_len)?)
+                };
                 Some(VirtioBlk {
                     disk,
                     status,
@@ -5368,6 +5431,62 @@ mod tests {
         assert!(
             !disk.index.contains_key(&100),
             "a hole is never content-addressed"
+        );
+    }
+
+    #[test]
+    fn a_sparse_occupancy_disk_snapshots_bounded_by_content_not_capacity() {
+        // A multi-GiB build-capable disk holding little content. Its snapshot must be
+        // bounded by CONTENT (a handful of sectors), never the declared capacity: the
+        // dense `to_image()` would allocate the whole capacity (OOM on a large disk)
+        // and would lossily truncate the length on a 32-bit target (wasm32). The
+        // `occupied()` ⇄ `from_occupancy()` pair is that bounded snapshot path.
+        const DISK_BYTES: u64 = 64 * 1024 * 1024 * 1024; // 64 GiB declared
+        let sector_count = DISK_BYTES / DISK_SECTOR as u64;
+        let occupied_idx = [0u64, 7, 8192, sector_count - 1];
+        let content = |i: u64| -> [u8; DISK_SECTOR] {
+            let mut s = [0u8; DISK_SECTOR];
+            s[..8].copy_from_slice(&i.to_le_bytes());
+            s[DISK_SECTOR - 1] = 0xAB; // non-zero even for i==0 (all-zero ⇔ a hole)
+            s
+        };
+        let occ_in: Vec<(u64, [u8; DISK_SECTOR])> =
+            occupied_idx.iter().map(|&i| (i, content(i))).collect();
+        let disk =
+            KappaBacking::from_occupancy(Box::new(MemKappaStore::new()), sector_count, occ_in);
+
+        // The snapshot extent is the OCCUPANCY — content-bounded, not 64 GiB.
+        let (sectors, occ) = disk.occupied();
+        assert_eq!(
+            sectors, sector_count,
+            "the declared sector count is preserved"
+        );
+        assert_eq!(
+            occ.len(),
+            occupied_idx.len(),
+            "only occupied sectors are captured — O(content), so a 64 GiB disk's \
+             snapshot is a few sectors, not 64 GiB"
+        );
+
+        // Restore (the snapshot's inverse) reconstructs the disk: same declared
+        // capacity, same content, same holes.
+        let restored = KappaBacking::from_occupancy(Box::new(MemKappaStore::new()), sectors, occ);
+        assert_eq!(
+            restored.len(),
+            DISK_BYTES,
+            "the restored disk reports the full declared capacity"
+        );
+        for &i in &occupied_idx {
+            assert_eq!(
+                restored.read_sector(i),
+                content(i),
+                "occupied sector {i} survives the snapshot round-trip"
+            );
+        }
+        assert_eq!(
+            restored.read_sector(42),
+            [0u8; DISK_SECTOR],
+            "a hole restores as sparse zeros"
         );
     }
 
