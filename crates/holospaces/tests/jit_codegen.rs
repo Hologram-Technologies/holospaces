@@ -30,14 +30,31 @@ enum Op {
     Movr { d: u8, s: u8 },
     Bin { op: Bin, d: u8, a: u8, b: u8 },
     Shift { op: Sh, d: u8, a: u8, sh: u8 },
+    /// `d = [r[base] + disp]` (the SHA-512 `W[]` schedule on the stack).
+    Load { d: u8, base: u8, disp: i32 },
+    /// `[r[base] + disp] = s`.
+    Store { base: u8, disp: i32, s: u8 },
 }
 
+/// Guest RAM lives in the same wasm memory as the register file, after a page of
+/// headroom: regs at `r*8`, guest byte `A` at wasm offset `GUEST_BASE + A`.
+const GUEST_BASE: u64 = 0x1000;
+const GUEST_LEN: usize = 0x3000; // 3 pages of test guest RAM
+
 /// The reference oracle — the meaning of the IR, in plain Rust.
-fn interpret(block: &[Op], r: &mut [u64; NREG]) {
+fn interpret(block: &[Op], r: &mut [u64; NREG], ram: &mut [u8]) {
     for op in block {
         match *op {
             Op::Movi { d, imm } => r[d as usize] = imm,
             Op::Movr { d, s } => r[d as usize] = r[s as usize],
+            Op::Load { d, base, disp } => {
+                let a = r[base as usize].wrapping_add(disp as i64 as u64) as usize;
+                r[d as usize] = u64::from_le_bytes(ram[a..a + 8].try_into().unwrap());
+            }
+            Op::Store { base, disp, s } => {
+                let a = r[base as usize].wrapping_add(disp as i64 as u64) as usize;
+                ram[a..a + 8].copy_from_slice(&r[s as usize].to_le_bytes());
+            }
             Op::Bin { op, d, a, b } => {
                 let (a, b) = (r[a as usize], r[b as usize]);
                 r[d as usize] = match op {
@@ -153,6 +170,31 @@ fn compile(block: &[Op]) -> Vec<u8> {
                 });
                 setl(d, &mut code);
             }
+            // memory ops: wasm offset = (r[base] + disp) + GUEST_BASE, wrapped to i32
+            Op::Load { d, base, disp } => {
+                getl(base, &mut code);
+                code.push(0x42);
+                sleb(i64::from(disp), &mut code); // + disp
+                code.push(0x7c); // i64.add
+                code.push(0x42);
+                sleb(GUEST_BASE as i64, &mut code); // + GUEST_BASE
+                code.push(0x7c); // i64.add
+                code.push(0xa7); // i32.wrap_i64
+                code.extend([0x29, 0x03, 0x00]); // i64.load align=3
+                setl(d, &mut code);
+            }
+            Op::Store { base, disp, s } => {
+                getl(base, &mut code);
+                code.push(0x42);
+                sleb(i64::from(disp), &mut code);
+                code.push(0x7c);
+                code.push(0x42);
+                sleb(GUEST_BASE as i64, &mut code);
+                code.push(0x7c);
+                code.push(0xa7); // i32.wrap_i64 → addr on stack
+                getl(s, &mut code); // value to store
+                code.extend([0x37, 0x03, 0x00]); // i64.store align=3
+            }
         }
     }
     // exit: locals → regs
@@ -168,7 +210,7 @@ fn compile(block: &[Op]) -> Vec<u8> {
     let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
     section(1, vec![0x01, 0x60, 0x00, 0x00], &mut m); // type () -> ()
     section(3, vec![0x01, 0x00], &mut m); // func 0: type 0
-    section(5, vec![0x01, 0x00, 0x01], &mut m); // memory min 1
+    section(5, vec![0x01, 0x00, 0x04], &mut m); // memory min 4 pages (regs + guest RAM)
     let mut exp = vec![0x02];
     exp.extend([0x03, 0x6d, 0x65, 0x6d, 0x02, 0x00]); // "mem"
     exp.extend([0x03, 0x72, 0x75, 0x6e, 0x00, 0x00]); // "run"
@@ -181,8 +223,9 @@ fn compile(block: &[Op]) -> Vec<u8> {
     m
 }
 
-/// Run a compiled block over a register file via wasmtime; return the resulting regs.
-fn run_wasm(bytes: &[u8], regs: [u64; NREG]) -> [u64; NREG] {
+/// Run a compiled block via wasmtime over a register file (mem `0..128`) and guest RAM
+/// (mem `GUEST_BASE..`). `ram` is updated in place by any stores; returns the result regs.
+fn run_wasm(bytes: &[u8], regs: [u64; NREG], ram: &mut [u8]) -> [u64; NREG] {
     let engine = Engine::default();
     let module = Module::new(&engine, bytes).expect("emitted wasm is valid");
     let mut store = Store::new(&engine, ());
@@ -192,6 +235,7 @@ fn run_wasm(bytes: &[u8], regs: [u64; NREG]) -> [u64; NREG] {
     for (i, v) in regs.iter().enumerate() {
         mem.write(&mut store, i * 8, &v.to_le_bytes()).unwrap();
     }
+    mem.write(&mut store, GUEST_BASE as usize, ram).unwrap();
     run.call(&mut store, ()).expect("run");
     let mut out = [0u64; NREG];
     for (i, o) in out.iter_mut().enumerate() {
@@ -199,6 +243,7 @@ fn run_wasm(bytes: &[u8], regs: [u64; NREG]) -> [u64; NREG] {
         mem.read(&store, i * 8, &mut b).unwrap();
         *o = u64::from_le_bytes(b);
     }
+    mem.read(&store, GUEST_BASE as usize, ram).unwrap();
     out
 }
 
@@ -243,8 +288,9 @@ fn jit_codegen_is_bit_identical_to_the_interpreter() {
             *r = rng.next();
         }
         let mut want = regs;
-        interpret(&block, &mut want);
-        let got = run_wasm(&compile(&block), regs);
+        let mut ram = vec![0u8; GUEST_LEN];
+        interpret(&block, &mut want, &mut ram);
+        let got = run_wasm(&compile(&block), regs, &mut ram);
         assert_eq!(got, want, "JIT block result diverged from the interpreter");
     }
 }
@@ -271,8 +317,9 @@ fn jit_codegen_matches_on_a_sha512_shaped_block() {
     regs[1] = 0xbb67_ae85_84ca_a73b;
     regs[2] = 0x3c6e_f372_fe94_f82b;
     let mut want = regs;
-    interpret(&block, &mut want);
-    assert_eq!(run_wasm(&compile(&block), regs), want, "SHA-512-shaped block diverged");
+    let mut ram = vec![0u8; GUEST_LEN];
+    interpret(&block, &mut want, &mut ram);
+    assert_eq!(run_wasm(&compile(&block), regs, &mut ram), want, "SHA-512-shaped block diverged");
 }
 
 /// Minimal x86-64 decoder for the reg-reg ALU/mov subset (the SHA-512 compression
@@ -344,8 +391,57 @@ fn decoded_x86_runs_through_the_jit_and_matches() {
     regs[3] = 0x1111_1111_1111_1111; // rbx
     regs[2] = 0xffff_0000_ffff_0000; // rdx
     let mut want = regs;
-    interpret(&ir, &mut want);
+    let mut ram = vec![0u8; GUEST_LEN];
+    interpret(&ir, &mut want, &mut ram);
     // hand-check rcx (reg 1) and confirm the JIT (codegen→wasmtime) agrees end-to-end.
     assert_eq!(want[1], regs[0].wrapping_add(regs[3]) ^ regs[2]);
-    assert_eq!(run_wasm(&compile(&ir), regs), want, "real x86 bytes → decode → JIT diverged");
+    assert_eq!(run_wasm(&compile(&ir), regs, &mut ram), want, "real x86 bytes → decode → JIT diverged");
+}
+
+/// Memory ops differential: random blocks mixing reg-ALU with Load/Store through base
+/// pointers, interpret vs codegen→wasmtime over a shared guest RAM = bit-identical (regs
+/// AND RAM). This is the `W[]`-schedule shape — the JIT touching guest memory, not just
+/// registers, which is where the real (memory-bound) boot win lives.
+#[test]
+fn jit_memory_ops_are_bit_identical_to_the_interpreter() {
+    let mut rng = Rng(0xd1b5_4a32_d192_ed03);
+    // base pointers held in regs 12..16 — never written by the block, so they stay valid.
+    const BASE: [u8; 4] = [12, 13, 14, 15];
+    for _ in 0..300 {
+        let n = 1 + (rng.next() % 30);
+        let mut block = Vec::new();
+        for _ in 0..n {
+            let d = (rng.next() % 12) as u8; // dst regs 0..12 only (keep base ptrs intact)
+            let base = BASE[(rng.next() % 4) as usize];
+            let disp = (rng.next() % 0x600) as i32; // in-range offset
+            block.push(match rng.next() % 6 {
+                0 => Op::Movi { d, imm: rng.next() },
+                1 => Op::Bin { op: Bin::Add, d, a: rng.reg(), b: rng.reg() },
+                2 => Op::Bin { op: Bin::Xor, d, a: rng.reg(), b: rng.reg() },
+                3 => Op::Shift { op: Sh::Rotr, d, a: rng.reg(), sh: (rng.next() % 64) as u8 },
+                4 => Op::Load { d, base, disp },
+                _ => Op::Store { base, disp, s: rng.reg() },
+            });
+        }
+        // base pointers spaced so [base+disp, +8) stays inside the test RAM.
+        let mut regs = [0u64; NREG];
+        for r in regs[..12].iter_mut() {
+            *r = rng.next();
+        }
+        regs[12] = 0x0000;
+        regs[13] = 0x0800;
+        regs[14] = 0x1000;
+        regs[15] = 0x1800;
+        // random initial guest RAM
+        let mut ram0 = vec![0u8; GUEST_LEN];
+        for b in ram0.iter_mut() {
+            *b = (rng.next() & 0xff) as u8;
+        }
+        let (mut regs_i, mut ram_i) = (regs, ram0.clone());
+        interpret(&block, &mut regs_i, &mut ram_i);
+        let mut ram_w = ram0;
+        let regs_w = run_wasm(&compile(&block), regs, &mut ram_w);
+        assert_eq!(regs_w, regs_i, "memory-op block: regs diverged");
+        assert_eq!(ram_w, ram_i, "memory-op block: guest RAM diverged");
+    }
 }
