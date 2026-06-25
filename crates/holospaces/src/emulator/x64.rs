@@ -125,6 +125,29 @@ pub fn drain_exc_trace() -> Vec<String> {
     EXC_TRACE.with(|t| core::mem::take(&mut *t.borrow_mut()))
 }
 
+// JIT Rung 0 — a sampling hot-code profiler (std/dev only). `run()` samples `rip`'s
+// 4 KiB code page every 1024 instructions into a histogram; a few hot pages dominating
+// the samples = the JIT thesis (compile those once per planet, the rest is cold). Cheap:
+// one mask+compare per instruction, a map update 1/1024.
+#[cfg(feature = "std")]
+thread_local! {
+    static HOTPROF: core::cell::RefCell<std::collections::HashMap<u64, u64>> =
+        core::cell::RefCell::new(std::collections::HashMap::new());
+}
+#[cfg(feature = "std")]
+fn hotprof_sample(rip: u64) {
+    HOTPROF.with(|h| *h.borrow_mut().entry(rip & !0xfff).or_insert(0) += 1);
+}
+/// Drain the hot-code profile as `(code_page, sample_count)` sorted hottest-first.
+#[cfg(feature = "std")]
+#[must_use]
+pub fn drain_hotprof() -> Vec<(u64, u64)> {
+    let mut v: Vec<(u64, u64)> =
+        HOTPROF.with(|h| core::mem::take(&mut *h.borrow_mut()).into_iter().collect());
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v
+}
+
 struct Sys {
     uart: Uart,
     /// The `virtio-blk` κ-disk rootfs (`CC-7`), when a disk is attached. The
@@ -615,6 +638,12 @@ const RFLAGS_IF: u64 = 1 << 9;
 const CR4_PCIDE: u64 = 1 << 17;
 /// `RFLAGS.DF` — the direction flag (string-op increment/decrement).
 const RFLAGS_DF: u64 = 1 << 10;
+/// `RFLAGS.AC` — the alignment-check / SMAP access flag. The kernel's `stac`/`clac`
+/// bracket every `copy_to_user`/`get_user` with `AC=1`, so its page-fault handler can
+/// tell a legitimate user access (`regs->flags & AC`) from a stray kernel access to
+/// user memory: a `#PF` taken with `AC=0` on a user address is `page_fault_oops`
+/// (fatal). Modelling `AC` is required for a faulting `copy_to_user` to be recoverable.
+const RFLAGS_AC: u64 = 1 << 18;
 
 // The model-specific registers the long-mode boot path drives.
 const MSR_EFER: u32 = 0xC000_0080;
@@ -1237,6 +1266,11 @@ impl Cpu {
             // shared `devbus` pump the other cores drive from their run loops.
             if i & 0x3ff == 0 && self.sys.as_ref().is_some_and(|s| s.virtionet.is_some()) {
                 self.virtio_net_pump();
+            }
+            // JIT Rung 0: sample the executing code page (cheap, 1/1024 instructions).
+            #[cfg(feature = "std")]
+            if i & 0x3ff == 0 {
+                hotprof_sample(self.rip);
             }
             // Advance the platform timers (PIT + APIC timer + TSC) and latch a
             // tick when one expires, then deliver any pending interrupt through
@@ -3651,6 +3685,56 @@ impl Cpu {
         } else {
             i64::from(osz)
         };
+        // Bulk fast path — `clear_page` / small `__clear_user` (a top-2 hot operation on
+        // a real boot: rep stos zeroing a page). A forward `REP STOS` whose whole
+        // destination lies in one mapped RAM page is a single slice fill instead of N
+        // per-element writes. Byte-identical to the loop below, and TSC-identical: we
+        // replay the same per-cache-line dcache touches the per-element path would make
+        // (the modelled L1 jitter feeds the TSC → RDRAND → ASLR, so it must not drift).
+        // Falls through on anything subtle (DF=1, MMIO/device, cross-page, not-present).
+        if matches!(kind, StringOp::Stos) && rep != RepKind::None && self.rflags & RFLAGS_DF == 0 {
+            let count = self.r[RCX];
+            let len = count.wrapping_mul(u64::from(osz));
+            let dst = self.r[RDI];
+            if count != 0 && (dst & 0xfff) + len <= 0x1000 {
+                let user = self.cpl == 3;
+                let pa = self.translate_acc(dst, true, user);
+                let hi = pa.wrapping_add(len);
+                if self.fault.is_none()
+                    && !(VIRTIO_BLK_BASE..VIRTIO_NET_END).contains(&pa)
+                    && !(LAPIC_BASE..LAPIC_END).contains(&pa)
+                    && hi <= self.ram.len() as u64
+                {
+                    // Replay the per-element dcache touches (one miss per 64 B line) so the
+                    // TSC trajectory is bit-identical to the per-element loop.
+                    let mut line = pa & !0x3f;
+                    while line < hi {
+                        self.dcache_touch(line);
+                        line += 64;
+                    }
+                    let val = self.r[RAX] & Self::mask(osz);
+                    let o = (pa - RAM_BASE) as usize;
+                    let n = len as usize;
+                    if osz == 1 {
+                        self.ram[o..o + n].fill(val as u8);
+                    } else {
+                        let bytes = val.to_le_bytes();
+                        let mut p = o;
+                        let end = o + n;
+                        while p < end {
+                            self.ram[p..p + osz as usize].copy_from_slice(&bytes[..osz as usize]);
+                            p += osz as usize;
+                        }
+                    }
+                    self.r[RDI] = dst.wrapping_add(len);
+                    self.r[RCX] = 0;
+                    return;
+                }
+                // A `#PF` latched on the probe (not-present page): the per-element loop
+                // below sees `self.fault` on its first write and breaks, then `step`
+                // restarts the whole REP after the handler maps the page — unchanged.
+            }
+        }
         let mut count = if rep == RepKind::None { 1 } else { self.r[RCX] };
         while count != 0 {
             match kind {
@@ -4140,7 +4224,13 @@ impl Cpu {
                     self.r[RDX] = tsc >> 32;
                     self.r[RCX] = 0;
                 }
-                _ => {} // MONITOR/MWRC/etc. — no boot-path effect
+                // SMAP: CLAC clears the AC flag, STAC sets it. The kernel's user-access
+                // primitives (`copy_to_user`/`get_user`/…) wrap the access in `stac`/`clac`
+                // so a `#PF` taken mid-access carries `AC=1` and is recognised as a
+                // recoverable user fault rather than a fatal kernel access (`page_fault_oops`).
+                0xca => self.rflags &= !RFLAGS_AC, // CLAC
+                0xcb => self.rflags |= RFLAGS_AC,  // STAC
+                _ => {} // MONITOR/MWAIT/etc. — no boot-path effect
             }
             return Ok(());
         }
@@ -4449,6 +4539,71 @@ mod tests {
         // Full 8-byte copy is byte-perfect across the page split (2 in page 1, 6 in page 2).
         assert_eq!(&cpu.ram[0x7FFE..0x8000], &src[0..2], "page-1 half of the copy");
         assert_eq!(&cpu.ram[0x9000..0x9006], &src[2..8], "page-2 half of the copy");
+    }
+
+    #[test]
+    fn rep_stos_bulk_fast_path_fills_a_page_like_the_per_element_loop() {
+        // The `clear_page` hot path: a page-aligned 4 KiB `rep stosq` of zero. The bulk
+        // fast path must leave RAM + registers exactly as the per-element loop would.
+        // (Paging off → `translate_acc` is identity, so RDI is its own phys address.)
+        let mut cpu = Cpu::new(256 * 1024);
+        let dst = 0x10_000usize;
+        cpu.ram[dst..dst + 4096].fill(0xCD); // poison so a missed byte is visible
+        cpu.r[RDI] = dst as u64;
+        cpu.r[RCX] = 512; // 512 × 8 B = one 4 KiB page
+        cpu.r[RAX] = 0; // clear_page zeroes
+        cpu.rflags &= !RFLAGS_DF; // forward
+        cpu.string_op(StringOp::Stos, 8, RepKind::Rep);
+        assert_eq!(cpu.r[RCX], 0, "REP consumed the whole count");
+        assert_eq!(cpu.r[RDI], (dst + 4096) as u64, "RDI advanced by the byte length");
+        assert!(
+            cpu.ram[dst..dst + 4096].iter().all(|&b| b == 0),
+            "the whole page was zeroed (clear_page)"
+        );
+
+        // Byte-granular, non-zero fill (small `memset`/`__clear_user` shape).
+        cpu.ram[dst..dst + 4096].fill(0);
+        cpu.r[RDI] = dst as u64;
+        cpu.r[RCX] = 4096;
+        cpu.r[RAX] = 0xAB;
+        cpu.rflags &= !RFLAGS_DF;
+        cpu.string_op(StringOp::Stos, 1, RepKind::Rep);
+        assert_eq!(cpu.r[RDI], (dst + 4096) as u64);
+        assert!(
+            cpu.ram[dst..dst + 4096].iter().all(|&b| b == 0xAB),
+            "byte-granular fill covered the page"
+        );
+
+        // A partial fill that does NOT span the page must still be exact, and must not
+        // touch the byte just past the end.
+        cpu.ram[dst..dst + 4096].fill(0);
+        cpu.r[RDI] = dst as u64;
+        cpu.r[RCX] = 10;
+        cpu.r[RAX] = 0xFFFF_FFFF_FFFF_FFFF;
+        cpu.string_op(StringOp::Stos, 8, RepKind::Rep);
+        assert!(cpu.ram[dst..dst + 80].iter().all(|&b| b == 0xFF), "10 qwords filled");
+        assert_eq!(cpu.ram[dst + 80], 0, "the byte past the fill is untouched");
+    }
+
+    #[test]
+    fn stac_and_clac_drive_the_ac_flag() {
+        // SMAP: STAC sets RFLAGS.AC, CLAC clears it. The kernel's page-fault handler
+        // checks `regs->flags & AC` to tell a legitimate (stac-bracketed) faulting
+        // `copy_to_user` from a stray kernel access to user memory — the latter is
+        // `page_fault_oops`. Without modelling AC, a demand-paged `copy_to_user` during
+        // execve oopses and the kernel panics "Attempted to kill init" for certain ASLR
+        // layouts (the long-standing x86 boot blocker). This guards the fix.
+        let mut cpu = Cpu::new(64 * 1024);
+        cpu.ram[0..3].copy_from_slice(&[0x0f, 0x01, 0xcb]); // STAC
+        cpu.rip = 0;
+        cpu.rflags &= !RFLAGS_AC;
+        cpu.step().expect("STAC executes");
+        assert!(cpu.rflags & RFLAGS_AC != 0, "STAC set RFLAGS.AC");
+
+        cpu.ram[0..3].copy_from_slice(&[0x0f, 0x01, 0xca]); // CLAC
+        cpu.rip = 0;
+        cpu.step().expect("CLAC executes");
+        assert_eq!(cpu.rflags & RFLAGS_AC, 0, "CLAC cleared RFLAGS.AC");
     }
 
     #[test]

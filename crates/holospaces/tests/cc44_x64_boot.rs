@@ -133,6 +133,50 @@ fn smoke_amd64_linux_boots_to_userspace() {
     assert_eq!(halt, Halt::Halted, "PID 1 powered the machine off cleanly");
 }
 
+/// JIT Rung 0 — the thesis check. Boots real amd64 Linux to userspace while sampling
+/// the executing code page (1/1024 instructions), then reports how concentrated
+/// execution is. If a small set of code pages dominates the samples, the interpreter
+/// is spending its time in a few hot loops — exactly the work a κ-JIT compiles **once
+/// per planet** and reuses; the long cold tail is left interpreted. A flat profile
+/// would mean a JIT buys little — so this number decides whether the JIT is worth it.
+#[test]
+#[ignore = "JIT Rung 0 hot-code profile of a real amd64 boot (~release)"]
+fn jit_rung0_hot_code_profile() {
+    let kernel = vmlinux_elf();
+    let mut cpu = Cpu::boot_linux(
+        1024 * 1024 * 1024,
+        &kernel,
+        "earlyprintk=serial,ttyS0 console=ttyS0 random.trust_cpu=on",
+    );
+    let _ = cpu.run(40_000_000_000);
+    let prof = holospaces::emulator::x64::drain_hotprof();
+    let total: u64 = prof.iter().map(|(_, c)| c).sum();
+    assert!(total > 0, "the profiler collected samples");
+    eprintln!(
+        "\n==== JIT RUNG 0: hot-code profile ====\n{total} samples across {} distinct 4 KiB code pages",
+        prof.len()
+    );
+    let mut cum = 0u64;
+    for (rank, (page, count)) in prof.iter().take(20).enumerate() {
+        cum += *count;
+        eprintln!(
+            "  #{:<2} page={page:#014x}  {:>6} samples  {:>5.1}%   cum {:>5.1}%",
+            rank + 1,
+            count,
+            100.0 * *count as f64 / total as f64,
+            100.0 * cum as f64 / total as f64,
+        );
+    }
+    for topn in [4usize, 16, 64, 256] {
+        let s: u64 = prof.iter().take(topn).map(|(_, c)| c).sum();
+        eprintln!(
+            "  top-{topn:<3} pages = {:.1}% of execution",
+            100.0 * s as f64 / total as f64
+        );
+    }
+    eprintln!("==== end (JIT thesis holds if a small top-N covers most execution) ====\n");
+}
+
 /// The deployed Platform-Manager path: an x64 holospace selected from the
 /// architecture picker boots its provisioned amd64 image on the x86-64 core with
 /// the κ-disk **streamed** sector-by-sector from a [`KappaStore`] (no full image in
