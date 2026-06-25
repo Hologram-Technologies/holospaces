@@ -1236,7 +1236,8 @@ impl Cpu {
     }
 
     /// Count of interrupts/exceptions delivered for a given IDT vector — a
-    /// differential against qemu's `-d int` histogram. See [`Cpu::int_counts`].
+    /// differential against qemu's `-d int` histogram, read from the per-vector
+    /// `int_counts` table.
     #[must_use]
     pub fn int_count(&self, vector: u8) -> u64 {
         self.int_counts[vector as usize]
