@@ -583,14 +583,24 @@ fn an_amd64_devcontainer_features_and_lifecycle_run_on_x64() {
     );
 }
 
-/// **Dogfood**: holospaces parses + honours *this very workspace's* unmodified
-/// `.devcontainer/devcontainer.json` — an arbitrary, real Dev Container config (a
-/// Dockerfile build over an Ubuntu base, seven `ghcr.io` features, a postCreate
-/// command, customizations, mounts, `${localEnv}` substitution, JSONC comments +
-/// trailing commas). Proves the ingestion is parametric for real configs, not the
-/// synthetic fixtures (Law L4). The full toolchain build/boot needs network (offline
-/// CI) + native-exec for the heavy compiles (the interpreter wall, CC-48); this
-/// witnesses that holospaces understands its own config end of the contract.
+/// **Dogfood (config acceptance only)**: holospaces *parses* — accepts unmodified —
+/// *this very workspace's* `.devcontainer/devcontainer.json` (a Dockerfile build over
+/// an Ubuntu base, seven `ghcr.io` features, a postCreate command, customizations,
+/// mounts, `${localEnv}` substitution, JSONC comments + trailing commas). This proves
+/// the **parser** is parametric for a real config, not just the synthetic fixtures —
+/// nothing more.
+///
+/// It does **NOT** build the Dockerfile, install any feature, run the lifecycle, or
+/// boot the result. Building + booting *this* container end-to-end pulls an Ubuntu
+/// base + ~20 apt packages + rustup + 7 features over the network and executes those
+/// heavy installs in-guest — that needs the deployed egress extension (unavailable to
+/// the offline suite) and the native-exec tier for the heavy compiles (CC-48), and is
+/// **not** claimed here. The *general* capability this config exercises is witnessed
+/// separately on amd64 with offline content: the Dockerfile-build mechanism
+/// (`an_amd64_dockerfile_build_runs_on_x64`), feature install + lifecycle
+/// (`an_amd64_devcontainer_features_and_lifecycle_run_on_x64`), a real OCI image
+/// (`an_arbitrary_real_amd64_oci_image_boots_on_x64`), and compiling in-guest
+/// (`an_amd64_devcontainer_builds_a_program_in_guest`).
 #[test]
 fn holospaces_parses_its_own_unmodified_devcontainer_config() {
     use holospaces::boot::devcontainer;
@@ -602,27 +612,29 @@ fn holospaces_parses_its_own_unmodified_devcontainer_config() {
     let dc =
         devcontainer::parse(&cfg).expect("holospaces parses its own (JSONC) devcontainer.json");
 
-    // The build is a Dockerfile build (CC-26), honoured, not dropped.
+    // The build directive is parsed as a Dockerfile build source (CC-26) — parsed,
+    // not executed.
     assert!(
         matches!(dc.image_source, devcontainer::ImageSource::Build(_)),
         "the Dockerfile build directive is parsed as a Build source"
     );
-    // All seven declared features are parsed (CC-25) — arbitrary ghcr.io refs.
+    // All seven declared features are parsed (CC-25) — arbitrary ghcr.io refs, parsed
+    // (not installed).
     assert!(
         dc.features.len() >= 7,
-        "every declared feature is honoured ({} parsed)",
+        "every declared feature is parsed ({} parsed)",
         dc.features.len()
     );
     assert!(
         dc.features.iter().any(|f| f.id.contains("claude-code")),
         "the claude-code feature is among the parsed features"
     );
-    // The lifecycle postCreateCommand runs the repo's post-create.sh (CC-22).
+    // The lifecycle postCreateCommand is parsed (CC-22) — parsed, not run.
     assert!(
         dc.lifecycle
             .iter()
             .any(|(_, cmd)| cmd.contains("post-create.sh")),
-        "the postCreateCommand (bash .devcontainer/post-create.sh) is honoured"
+        "the postCreateCommand (bash .devcontainer/post-create.sh) is parsed"
     );
 }
 
