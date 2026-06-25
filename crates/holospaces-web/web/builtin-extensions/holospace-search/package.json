@@ -1,0 +1,15 @@
+{
+  "name": "holospace-search",
+  "displayName": "Holospace Search",
+  "description": "Find-in-files + search & replace over the holospace's virtio-9p workspace (CC-52) — File + Text search providers running as native browser-peer exec over CC-15, never the emulated guest.",
+  "version": "0.0.1",
+  "publisher": "holospaces",
+  "engines": { "vscode": "^1.75.0" },
+  "browser": "./extension.js",
+  "capabilities": {
+    "virtualWorkspaces": true,
+    "untrustedWorkspaces": { "supported": true }
+  },
+  "enabledApiProposals": ["fileSearchProvider", "textSearchProvider"],
+  "activationEvents": ["onStartupFinished"]
+}
