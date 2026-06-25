@@ -212,6 +212,30 @@ impl Cpu {
         self.ram[o..o + len].to_vec()
     }
 
+    // ── simple-framebuffer (the graphical scanout) ───────────────────────────
+    // A passive RGBA framebuffer reserved at the TOP of guest RAM. The guest's `simpledrm` driver —
+    // pointed at `fb_phys_base()` by a `simple-framebuffer` device-tree node — writes pixels here;
+    // the host reads them out for the κ render stack (super-res + tile-κ + render-memo). There is NO
+    // per-frame device logic: the framebuffer is just owned RAM the guest draws into. (virtio-gpu is
+    // the later phase for dynamic resolution + acceleration.)
+    /// Framebuffer width in pixels (the `simple-framebuffer` scanout).
+    pub const FB_W: usize = 1280;
+    /// Framebuffer height in pixels.
+    pub const FB_H: usize = 800;
+    /// Framebuffer byte length (`FB_W * FB_H * 4`, RGBA8888).
+    pub const FB_SIZE: usize = Self::FB_W * Self::FB_H * 4;
+
+    /// Guest-physical base of the framebuffer — what the `simple-framebuffer` DT node advertises.
+    #[must_use]
+    pub fn fb_phys_base(&self) -> u64 { self.base + (self.ram.len().saturating_sub(Self::FB_SIZE)) as u64 }
+
+    /// Read the framebuffer scanout (RGBA, `FB_W`×`FB_H`) — the surface the κ render stack projects.
+    #[must_use]
+    pub fn read_framebuffer(&self) -> Vec<u8> { let s = self.ram.len().saturating_sub(Self::FB_SIZE); self.ram[s..].to_vec() }
+
+    /// Write the framebuffer region (a host-side push, or the smoke test in lieu of a graphical kernel).
+    pub fn write_framebuffer(&mut self, bytes: &[u8]) { let s = self.ram.len().saturating_sub(Self::FB_SIZE); let n = bytes.len().min(self.ram.len() - s); self.ram[s..s + n].copy_from_slice(&bytes[..n]); }
+
     /// **V&V hook** (`CC-46`): the guest-physical base of this machine's first
     /// `virtio-9p` MMIO slot, and the workspace mount tag — so a witness drives
     /// the device at the same address the AArch64 `virt` device tree advertises.
@@ -3640,7 +3664,7 @@ impl Cpu {
     /// [`Cpu::run`] (a `PSCI SYSTEM_OFF` returns [`Halt::Exit`]).
     #[must_use]
     pub fn boot_linux(ram_bytes: usize, kernel: &[u8], bootargs: &str) -> Self {
-        Self::boot_linux_inner(ram_bytes, kernel, bootargs, None, None, None)
+        Self::boot_linux_inner(ram_bytes, kernel, bootargs, None, None, None, false)
     }
 
     /// Boot like [`Cpu::boot_linux`], additionally attaching a **`virtio-blk`
@@ -3663,6 +3687,7 @@ impl Cpu {
             Some(super::VirtioBlk::new(rootfs)),
             None,
             None,
+            false,
         )
     }
 
@@ -3680,6 +3705,7 @@ impl Cpu {
         store: alloc::boxed::Box<dyn hologram_substrate_core::KappaStore>,
         sector_count: u64,
         read: R,
+        has_fb: bool,
     ) -> Self {
         let backing = super::KappaBacking::from_sectors(store, sector_count, read);
         Self::boot_linux_inner(
@@ -3689,6 +3715,7 @@ impl Cpu {
             Some(super::VirtioBlk::with_backing(backing)),
             None,
             None,
+            has_fb,
         )
     }
 
@@ -3723,6 +3750,7 @@ impl Cpu {
             Some(super::VirtioBlk::new(rootfs)),
             Some(super::Virtio9p::new(fs, super::WORKSPACE_TAG)),
             Some(super::VirtioNet::new(egress, ingress)),
+            false,
         )
     }
 
@@ -3733,6 +3761,7 @@ impl Cpu {
         disk: Option<super::VirtioBlk>,
         virtio9p: Option<super::Virtio9p>,
         virtionet: Option<super::VirtioNet>,
+        has_fb: bool,
     ) -> Self {
         let mut cpu = Cpu::new(RAM_BASE, ram_bytes);
         // Load the kernel image at text_offset above the base of RAM.
@@ -3752,6 +3781,7 @@ impl Cpu {
             has_blk,
             has_9p,
             has_net,
+            has_fb,
         );
         let dtb_off = DTB_OFFSET as usize;
         let dn = dtb.len().min(cpu.ram.len() - dtb_off);
@@ -4892,6 +4922,7 @@ fn arm64_virt_dtb(
     has_blk: bool,
     has_9p: bool,
     has_net: bool,
+    has_fb: bool,
 ) -> Vec<u8> {
     const PH_GIC: u32 = 1;
     const PH_CLK: u32 = 2;
@@ -4950,9 +4981,18 @@ fn arm64_virt_dtb(
     f.prop_empty("always-on");
     f.end_node();
 
+    // When a graphical kernel is booting, carve the simple-framebuffer region off
+    // the TOP of usable RAM so the kernel's allocator never hands those pages out
+    // (they're the scanout the host reads). Non-graphical boots advertise full RAM —
+    // a byte-identical /memory to the witnessed boots.
+    let mem_size = if has_fb {
+        ram_size.saturating_sub(Cpu::FB_SIZE as u64)
+    } else {
+        ram_size
+    };
     f.begin_node(&alloc::format!("memory@{ram_base:x}"));
     f.prop_str("device_type", "memory");
-    f.prop_reg(ram_base, ram_size);
+    f.prop_reg(ram_base, mem_size);
     f.end_node();
 
     // The GICv2: distributor + CPU interface.
@@ -5024,6 +5064,26 @@ fn arm64_virt_dtb(
         f.prop_str("compatible", "virtio,mmio");
         f.prop_reg(VIRTIO_NET_BASE, VIRTIO_NET_END - VIRTIO_NET_BASE);
         f.prop_cells("interrupts", &[0, INTID_VIRTIO_NET - SPI_BASE_INTID, 4]);
+        f.end_node();
+    }
+
+    // The passive `simple-framebuffer` (the graphical scanout) — a fixed RGBA region
+    // reserved at the TOP of guest RAM (carved out of /memory above). The guest's
+    // `simpledrm` driver binds this node and renders the console/desktop here; the
+    // host reads it via `read_framebuffer()` into the κ render stack. No MMIO, no
+    // per-frame logic — just owned RAM. Emitted only for a graphical kernel so every
+    // non-graphical (witnessed) boot keeps a byte-identical devicetree.
+    if has_fb {
+        let fb_base = ram_base + ram_size - Cpu::FB_SIZE as u64;
+        f.begin_node(&alloc::format!("framebuffer@{fb_base:x}"));
+        f.prop_str("compatible", "simple-framebuffer");
+        f.prop_reg(fb_base, Cpu::FB_SIZE as u64);
+        f.prop_u32("width", Cpu::FB_W as u32);
+        f.prop_u32("height", Cpu::FB_H as u32);
+        f.prop_u32("stride", (Cpu::FB_W * 4) as u32);
+        // memory byte order R,G,B,A → the simplefb word `a8b8g8r8`; the host reads it
+        // back as RGBA directly (swizzle in the render bridge if a guest uses BGRA).
+        f.prop_str("format", "a8b8g8r8");
         f.end_node();
     }
 
@@ -5171,6 +5231,28 @@ impl Fdt {
 #[allow(clippy::identity_op, clippy::too_many_arguments)]
 mod tests {
     use super::*;
+
+    // The graphical `simple-framebuffer` device-tree node (the guest half of the
+    // framebuffer device). `has_fb=true` emits a `simple-framebuffer` node at the top
+    // of RAM (carved out of /memory) so a graphical kernel's `simpledrm` binds it;
+    // `has_fb=false` is byte-for-byte the witnessed non-graphical boot — no fb node.
+    #[test]
+    fn simple_framebuffer_dtb_node() {
+        let base = 0x4000_0000u64;
+        let size = 512 * 1024 * 1024u64;
+        let with = arm64_virt_dtb(base, size, "console=ttyAMA0", true, false, false, true);
+        let without = arm64_virt_dtb(base, size, "console=ttyAMA0", true, false, false, false);
+        let has = |blob: &[u8], needle: &[u8]| blob.windows(needle.len()).any(|w| w == needle);
+
+        // the graphical blob carries the binding, the node, and our RGBA-order format
+        assert!(has(&with, b"simple-framebuffer"), "fb compatible missing");
+        assert!(has(&with, b"framebuffer@"), "fb node name missing");
+        assert!(has(&with, b"a8b8g8r8"), "fb format missing");
+        // the non-graphical blob is the witnessed shape — no framebuffer leaks in
+        assert!(!has(&without, b"simple-framebuffer"), "fb leaked into non-graphical boot");
+        assert!(!has(&without, b"framebuffer@"), "fb name leaked into non-graphical boot");
+        assert!(with.len() > without.len(), "fb node added no bytes");
+    }
 
     // ── A64 instruction encoders (the Arm-ARM fixed-field layouts) ──────────
     // Hand-encoding lets a battery assert against the Arm-ARM-defined final

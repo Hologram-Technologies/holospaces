@@ -1,0 +1,75 @@
+<!doctype html>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>rung 2 — real graphical kernel → fbcon → κ render</title>
+<style>
+  html,body{margin:0;height:100%;background:#05080d;color:#cfe0f5;font-family:ui-monospace,Menlo,Consolas,monospace}
+  #wrap{display:flex;flex-direction:column;height:100%}
+  #hud{padding:8px 12px;font-size:12.5px;line-height:1.6;background:#070b12;border-bottom:1px solid #16202e}
+  #hud b{color:#7fd1b9} .ok{color:#7fe0a3} .bad{color:#ff8a8a} .k{color:#8a93a6}
+  #main{flex:1;min-height:0;display:flex}
+  #stage{position:relative;flex:1;min-height:0;background:#000}
+  #out{position:absolute;inset:0;width:100%;height:100%;display:block}
+  #serial{width:42%;max-width:560px;margin:0;padding:8px 10px;overflow:auto;white-space:pre-wrap;font-size:11px;color:#9fb0c8;background:#04060a;border-left:1px solid #16202e}
+</style>
+<div id="wrap">
+  <div id="hud">
+    <div>rung 2 · the <b>real graphical aarch64 kernel</b> (DRM_SIMPLEDRM + fbcon) boots over a κ-disk; its console renders onto the emulator's simple-framebuffer → κ super-res.</div>
+    <div id="phase" class="k">starting worker …</div>
+    <div id="signals" class="k">— </div>
+    <div id="verdict" class="k"></div>
+  </div>
+  <div id="main">
+    <div id="stage"><canvas id="out"></canvas></div>
+    <pre id="serial">(serial console)</pre>
+  </div>
+</div>
+<script type="module">
+import { KappaSurface } from "/holospaces-alpine-P0/kappa-engine/holo-surface.js";
+const $ = id => document.getElementById(id);
+let surf = null;
+
+// Capture the LITERAL guest framebuffer (memory order R,G,B,A == ImageData RGBA) as a
+// PNG — independent of WebGPU, so the witness holds even on a headless GPU-less browser.
+const raw2d = document.createElement("canvas");
+function capturePng(buf, W, H) {
+  raw2d.width = W; raw2d.height = H;
+  const ctx = raw2d.getContext("2d");
+  ctx.putImageData(new ImageData(new Uint8ClampedArray(buf.slice(0)), W, H), 0, 0);
+  window.__rung2png = raw2d.toDataURL("image/png");
+}
+async function render(buf, W, H) {
+  capturePng(buf, W, H);
+  const bytes = new Uint8Array(buf);
+  if (!surf) surf = await new KappaSurface($("out"), { sharpen: 0.7 }).init();
+  surf.present({ width: W, height: H, bytes });
+  if (surf.comp.device?.queue?.onSubmittedWorkDone) await surf.comp.device.queue.onSubmittedWorkDone();
+}
+
+const w = new Worker("/_vendor/holowhat/vendor/holospaces/crates/holospaces-web/web/fb-rung2-boot-worker.mjs", { type: "module" });
+window.__rung2 = { phase: "starting" };
+
+w.onmessage = async (e) => {
+  const m = e.data;
+  window.__rung2 = { ...window.__rung2, ...m, fb: undefined };   // keep state, don't stash the big buffer
+  $("phase").textContent = (m.done ? "✓ " : "· ") + (m.phase || "");
+  if (m.iter != null) {
+    $("signals").innerHTML =
+      `iter <b>${m.iter}</b> · drm-probe <b class="${m.drm?'ok':'k'}">${m.drm?'yes':'…'}</b>` +
+      ` · fbcon-bound <b class="${m.fbcon?'ok':'k'}">${m.fbcon?'yes':'…'}</b>` +
+      ` · framebuffer pixels <b class="${m.fbNonZero?'ok':'k'}">${(m.pixels||0).toLocaleString()}</b>` +
+      ` · ${m.W}×${m.H}`;
+  }
+  if (m.serialTail) $("serial").textContent = m.serialTail;
+  if (m.fb) { try { await render(m.fb, m.W, m.H); } catch (err) { console.error(err); } }
+  if (m.done) {
+    const pass = m.fbcon && m.fbNonZero !== false && (m.pixels || 0) > 0;
+    $("verdict").className = pass ? "ok" : "bad";
+    $("verdict").textContent = pass
+      ? `RUNG 2 PASS — the graphical kernel bound fbcon to the simple-framebuffer; its console rendered ${(m.pixels||0).toLocaleString()} live pixels, projected through κ super-res. The terminal is now a picture.`
+      : `RUNG 2 incomplete — drm=${m.drm} fbcon=${m.fbcon} pixels=${m.pixels}. See serial log.`;
+    window.__rung2.pass = pass;
+  }
+  if (m.phase === "error") { $("verdict").className = "bad"; $("verdict").textContent = "ERROR: " + m.error; window.__rung2.pass = false; }
+};
+w.postMessage({ go: true, nonce: (crypto.randomUUID ? crypto.randomUUID() : String(Date.now())) });
+</script>

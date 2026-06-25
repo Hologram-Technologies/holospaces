@@ -30,3 +30,11 @@ crates/holospaces-emulator/target/
 
 # The built Chrome extension upload zip (produced by scripts/build-extension.sh).
 crates/holospaces-web/extension/dist/
+
+# large emulator fixtures (kernels/rootfs) — provided out-of-band, not in git
+crates/holospaces-web/web/alpine-*-layer.tar.gz
+crates/holospaces-web/web/alpine-aarch64-cage-layer.tar.gz
+crates/holospaces-web/web/graphical-aarch64-kernel.gz
+crates/holospaces-web/web/x64-kernel.gz
+vv/artifacts/cc45/alpine/alpine-minirootfs.tar.gz
+vv/artifacts/cc45/alpine/init

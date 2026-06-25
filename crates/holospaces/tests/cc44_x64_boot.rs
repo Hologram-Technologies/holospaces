@@ -95,6 +95,44 @@ fn an_amd64_linux_kernel_boots_to_userspace() {
     );
 }
 
+/// Fast, ungated **smoke proof** — the "run it yourself" keystone. A plain
+/// `cargo test` (no `--ignored`, no `vv/heavy`, no Docker, no live qemu) boots a
+/// real, unmodified upstream Linux 6.6 amd64 to userspace and asserts PID 1's
+/// marker. Self-contained: the kernel ELF is committed (`vv/artifacts/cc44/linux/
+/// vmlinux.gz`) and the only assertion is the guest's own userspace print, so the
+/// proof needs nothing but the crate. ~18s of CPU emulation — the price of "a
+/// stranger can watch real Linux boot in one command".
+///
+/// The heavier proofs stay `#[ignore]`'d above/below: the full qemu-differential
+/// oracle line-match, the streamed κ-disk path, and the Docker dogfood.
+///
+/// Determinism: the core's RDRAND is seeded from the TSC, which is a function of
+/// (deterministic) execution, so this boot takes the same known-good ASLR layout
+/// every run. (A layout-dependent execve fault exists for *certain* ASLR layouts —
+/// see `hologram-execve-stack-fault-native-repro` — but the native default layout
+/// is not one of them; this smoke test does not paper over that bug, it simply
+/// doesn't hit it.)
+#[test]
+fn smoke_amd64_linux_boots_to_userspace() {
+    let kernel = vmlinux_elf();
+    let mut cpu = Cpu::boot_linux(
+        1024 * 1024 * 1024,
+        &kernel,
+        "earlyprintk=serial,ttyS0 console=ttyS0 random.trust_cpu=on",
+    );
+    let halt = cpu.run(40_000_000_000);
+    let console = String::from_utf8_lossy(cpu.console());
+    assert!(
+        console.contains("Run /init as init process"),
+        "the kernel handed control to PID 1\n---- guest console ----\n{console}"
+    );
+    assert!(
+        console.contains("HOLOSPACES-LINUX-USERSPACE-OK"),
+        "PID 1 reached userspace and printed its marker\n---- guest console ----\n{console}"
+    );
+    assert_eq!(halt, Halt::Halted, "PID 1 powered the machine off cleanly");
+}
+
 /// The deployed Platform-Manager path: an x64 holospace selected from the
 /// architecture picker boots its provisioned amd64 image on the x86-64 core with
 /// the κ-disk **streamed** sector-by-sector from a [`KappaStore`] (no full image in

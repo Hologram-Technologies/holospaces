@@ -1,0 +1,69 @@
+<!doctype html>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>rung 3 — a Wayland compositor (cage) on the κ framebuffer</title>
+<style>
+  html,body{margin:0;height:100%;background:#05080d;color:#cfe0f5;font-family:ui-monospace,Menlo,Consolas,monospace}
+  #wrap{display:flex;flex-direction:column;height:100%}
+  #hud{padding:8px 12px;font-size:12.5px;line-height:1.6;background:#070b12;border-bottom:1px solid #16202e}
+  #hud b{color:#7fd1b9} .ok{color:#7fe0a3} .bad{color:#ff8a8a} .k{color:#8a93a6}
+  #main{flex:1;min-height:0;display:flex}
+  #stage{position:relative;flex:1;min-height:0;background:#000}
+  #out{position:absolute;inset:0;width:100%;height:100%;display:block}
+  #serial{width:44%;max-width:600px;margin:0;padding:8px 10px;overflow:auto;white-space:pre-wrap;font-size:11px;color:#9fb0c8;background:#04060a;border-left:1px solid #16202e}
+</style>
+<div id="wrap">
+  <div id="hud">
+    <div>rung 3 · a real <b>Wayland compositor (cage)</b> + terminal (foot) drives the emulator's simple-framebuffer over wlroots DRM + pixman — a GUI session, no GPU in the guest.</div>
+    <div id="phase" class="k">starting worker …</div>
+    <div id="signals" class="k">— </div>
+    <div id="verdict" class="k"></div>
+  </div>
+  <div id="main">
+    <div id="stage"><canvas id="out"></canvas></div>
+    <pre id="serial">(serial console)</pre>
+  </div>
+</div>
+<script type="module">
+import { KappaSurface } from "/holospaces-alpine-P0/kappa-engine/holo-surface.js";
+const $ = id => document.getElementById(id);
+let surf = null;
+const raw2d = document.createElement("canvas");
+function capturePng(buf, W, H) {
+  raw2d.width = W; raw2d.height = H;
+  raw2d.getContext("2d").putImageData(new ImageData(new Uint8ClampedArray(buf.slice(0)), W, H), 0, 0);
+  window.__rung3png = raw2d.toDataURL("image/png");
+}
+async function render(buf, W, H) {
+  capturePng(buf, W, H);
+  if (!surf) surf = await new KappaSurface($("out"), { sharpen: 0.7 }).init();
+  surf.present({ width: W, height: H, bytes: new Uint8Array(buf) });
+  if (surf.comp.device?.queue?.onSubmittedWorkDone) await surf.comp.device.queue.onSubmittedWorkDone();
+}
+
+const w = new Worker("/_vendor/holowhat/vendor/holospaces/crates/holospaces-web/web/fb-rung3-boot-worker.mjs", { type: "module" });
+window.__rung3 = { phase: "starting" };
+w.onmessage = async (e) => {
+  const m = e.data;
+  window.__rung3 = { ...window.__rung3, ...m, fb: undefined };
+  $("phase").textContent = (m.done ? "✓ " : "· ") + (m.phase || "");
+  if (m.iter != null) {
+    $("signals").innerHTML =
+      `iter <b>${m.iter}</b> · /dev/dri <b class="${m.dri?'ok':'k'}">${m.dri?'yes':'…'}</b>` +
+      ` · wlroots/DRM <b class="${m.wlr?'ok':'k'}">${m.wlr?'yes':'…'}</b>` +
+      ` · session <b class="${m.cage?'ok':'k'}">${m.cage?'up':'…'}</b>` +
+      ` · fb pixels <b class="${m.pixels?'ok':'k'}">${(m.pixels||0).toLocaleString()}</b>`;
+  }
+  if (m.serialTail) $("serial").textContent = m.serialTail;
+  if (m.fb) { try { await render(m.fb, m.W, m.H); } catch (err) { console.error("render:", err.message); } }
+  if (m.done) {
+    const pass = m.cage && m.wlr && (m.pixels || 0) > 0;
+    $("verdict").className = pass ? "ok" : "bad";
+    $("verdict").textContent = pass
+      ? `RUNG 3 PASS — a Wayland compositor session ran on the κ framebuffer (${(m.pixels||0).toLocaleString()} pixels). A real GUI, not just a console.`
+      : `RUNG 3 incomplete — dri=${m.dri} wlr=${m.wlr} session=${m.cage} pixels=${m.pixels}. See serial.`;
+    window.__rung3.pass = pass;
+  }
+  if (m.phase === "error") { $("verdict").className = "bad"; $("verdict").textContent = "ERROR: " + m.error; window.__rung3.pass = false; }
+};
+w.postMessage({ go: true, nonce: (crypto.randomUUID ? crypto.randomUUID() : String(Date.now())) });
+</script>

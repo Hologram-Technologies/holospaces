@@ -96,6 +96,35 @@ struct Uart {
 #[cfg(feature = "cc44-trace")]
 static TP_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+// Dev instrumentation (std builds only — host tests + the wasm browser peer; the
+// bare-metal no_std build excludes it entirely). A bounded ring of the most recent
+// guest CPU-exception deliveries (vectors < 32), pushed in `deliver_interrupt`.
+// Fires only on exceptions (rare vs. instructions/IRQs), so the cost is negligible.
+// Used to post-mortem the x64 wasm demand-paging divergence (the execve user-stack
+// `#PF` that kills init in the browser but not natively). Drained, newline-joined,
+// via `X64Workspace::exc_trace`.
+#[cfg(feature = "std")]
+thread_local! {
+    static EXC_TRACE: core::cell::RefCell<Vec<String>> = const { core::cell::RefCell::new(Vec::new()) };
+}
+#[cfg(feature = "std")]
+fn exc_trace_push(line: String) {
+    EXC_TRACE.with(|t| {
+        let mut v = t.borrow_mut();
+        v.push(line);
+        let n = v.len();
+        if n > 1024 {
+            v.drain(0..n - 1024);
+        }
+    });
+}
+/// Drain the dev exception-trace ring (most recent guest CPU exceptions).
+#[cfg(feature = "std")]
+#[must_use]
+pub fn drain_exc_trace() -> Vec<String> {
+    EXC_TRACE.with(|t| core::mem::take(&mut *t.borrow_mut()))
+}
+
 struct Sys {
     uart: Uart,
     /// The `virtio-blk` κ-disk rootfs (`CC-7`), when a disk is attached. The
@@ -1246,6 +1275,8 @@ impl Cpu {
                     self.r[RSP],
                 );
             }
+            // Dev: while the #PF handler trace is armed, log each rip it runs (so the
+            // fatal execve fault's path can be diffed against a good fault's).
             match self.step() {
                 Ok(()) => self.insns = self.insns.wrapping_add(1),
                 Err(h) => return h,
@@ -3526,6 +3557,20 @@ impl Cpu {
         let hi = self.rd_virt(desc + 8, 8);
         let off = (lo & 0xffff) | ((lo >> 32) & 0xffff_0000) | ((hi & 0xffff_ffff) << 32);
         let ist = (lo >> 32) & 0x7;
+        // Dev instrumentation: record CPU exceptions (< 32) into the bounded ring so a
+        // wasm post-mortem can see the fault sequence — repeated identical `cr2` on
+        // vector 14 = a non-progressing demand-paging loop (a stale translation across
+        // the fault); a single `cr2` then a different fault = the handler took -EFAULT.
+        #[cfg(feature = "std")]
+        if vector < 32 {
+            exc_trace_push(format!(
+                "V={vector} err={error:#x} rip={:#x} cr2={:#x} handler={off:#x} cpl={} rsp={:#x}",
+                self.rip,
+                self.cr2,
+                self.cpl,
+                self.r[RSP],
+            ));
+        }
         // dev-only (`cc44-trace`): log CPU-exception vectors (< 32) as they vector
         // through the IDT — the fault type + faulting RIP + CR2 + target handler.
         // External IRQs (≥ 32) are omitted: they fire thousands of times per boot.
@@ -3639,6 +3684,15 @@ impl Cpu {
                     self.r[RSI] = self.r[RSI].wrapping_add(step as u64);
                     self.r[RDI] = self.r[RDI].wrapping_add(step as u64);
                 }
+            }
+            // A `#PF` latched on this element's access (a demand-paged destination —
+            // the kernel's `copy_to_user`/`__clear_user` on a not-present user page):
+            // stop here so `step` discards the partial effects and restarts the whole
+            // `REP` after the handler maps the page (x86 string ops are restartable).
+            // Without this the loop spins the remaining `RCX` against the benign phys-0
+            // scratch — wasted work, and a needless re-clobber of phys 0 every fault.
+            if self.fault.is_some() {
+                break;
             }
             if rep != RepKind::None {
                 count -= 1;
@@ -4317,6 +4371,84 @@ mod tests {
             0x100,
             "rdmsr read EFER back into eax"
         );
+    }
+
+    /// A `REP MOVSB` whose destination crosses into a not-present page (exactly the
+    /// kernel's `copy_to_user` of argv/envp onto a freshly demand-paged user stack at
+    /// `execve` — the fault that blocked the x64 browser boot). The string op must
+    /// fault on the boundary byte, let `step` restore the pre-instruction registers
+    /// and set `CR2`, and — once the page is mapped — restart and complete the copy
+    /// byte-perfect. The fault must also *stop the REP* (not spin the remaining count
+    /// against the phys-0 scratch): the single faulting element writes phys 0 once.
+    #[test]
+    fn rep_movsb_faults_on_a_page_boundary_then_restarts_and_completes() {
+        let mut cpu = Cpu::new(64 * 1024);
+        let put = |cpu: &mut Cpu, at: usize, e: u64| {
+            cpu.ram[at..at + 8].copy_from_slice(&e.to_le_bytes());
+        };
+        // 4-level tables at 0x1000/0x2000/0x3000; the PT at 0x4000 maps VA→PA identity
+        // for the frames we use, EXCEPT VA 0x8000 (destination's second page) is absent.
+        put(&mut cpu, 0x1000, 0x2000 | 0b11); // PML4[0] → PDPT  (present|write)
+        put(&mut cpu, 0x2000, 0x3000 | 0b11); // PDPT[0] → PD
+        put(&mut cpu, 0x3000, 0x4000 | 0b11); // PD[0]   → PT
+        let map = |cpu: &mut Cpu, va: u64, pa: u64| {
+            put(cpu, 0x4000 + ((va >> 12) as usize) * 8, pa | 0b11);
+        };
+        map(&mut cpu, 0x5000, 0x5000); // code
+        map(&mut cpu, 0x6000, 0x6000); // source page
+        map(&mut cpu, 0x7000, 0x7000); // destination page 1 (present)
+        // VA 0x8000 (destination page 2) deliberately left not-present.
+        cpu.cr3 = 0x1000;
+        cpu.cr4 = 1 << 5; // PAE
+        cpu.efer = 1 << 8; // LME
+        cpu.cr0 = 1 << 31; // PG
+
+        // Eight distinct, non-zero source bytes so a stray phys-0 scratch is visible.
+        let src: [u8; 8] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        cpu.ram[0x6000..0x6008].copy_from_slice(&src);
+        // A sentinel at phys 0 — clobbered at most once (the faulting element) with the
+        // fix; clobbered repeatedly (ending in src[7]) without it.
+        cpu.ram[0] = 0xAB;
+
+        // Code: `rep movsb` (F3 A4) then `hlt`.
+        cpu.ram[0x5000..0x5003].copy_from_slice(&[0xF3, 0xA4, 0xF4]);
+        cpu.rip = 0x5000;
+        cpu.r[RCX] = 8;
+        cpu.r[RSI] = 0x6000;
+        cpu.r[RDI] = 0x7FFE; // 2 bytes fit in page 1, then crosses into absent 0x8000
+        cpu.rflags &= !RFLAGS_DF; // forward
+
+        // One step decodes + executes the `rep movsb`; it faults on the 3rd byte.
+        cpu.step().expect("rep movsb step should not halt the core");
+
+        assert_eq!(cpu.cr2, 0x8000, "CR2 = first byte in the not-present page");
+        assert_eq!(cpu.rip, 0x5000, "RIP rolled back to the faulting instruction");
+        assert_eq!(cpu.r[RCX], 8, "RCX restored (the REP restarts whole)");
+        assert_eq!(cpu.r[RSI], 0x6000, "RSI restored");
+        assert_eq!(cpu.r[RDI], 0x7FFE, "RDI restored");
+        // The two bytes that fit in the present page were really written.
+        assert_eq!(cpu.ram[0x7FFE], 0x11, "byte 0 landed in the present page");
+        assert_eq!(cpu.ram[0x7FFF], 0x22, "byte 1 landed in the present page");
+        // The REP stopped at the fault: phys 0 holds the *single* faulting element
+        // (src[2]=0x33), not src[7] (which a spin-to-zero loop would leave).
+        assert_eq!(
+            cpu.ram[0], 0x33,
+            "the faulting element wrote the phys-0 scratch exactly once (REP stopped)"
+        );
+
+        // The kernel's #PF handler maps the page; the instruction restarts and finishes.
+        map(&mut cpu, 0x8000, 0x9000); // page 2 → frame 0x9000 (present)
+        cpu.flush_tlb();
+        cpu.fault = None;
+        for _ in 0..4 {
+            if matches!(cpu.run(1), Halt::Halted) {
+                break;
+            }
+        }
+        assert_eq!(cpu.r[RCX], 0, "the REP ran to completion after the page was mapped");
+        // Full 8-byte copy is byte-perfect across the page split (2 in page 1, 6 in page 2).
+        assert_eq!(&cpu.ram[0x7FFE..0x8000], &src[0..2], "page-1 half of the copy");
+        assert_eq!(&cpu.ram[0x9000..0x9006], &src[2..8], "page-2 half of the copy");
     }
 
     #[test]

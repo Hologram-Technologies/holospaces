@@ -469,6 +469,52 @@ impl DevcontainerImage {
         rootfs_handle.truncate_with_f64(image_len as f64)?;
         Ok(image_len as f64)
     }
+
+    /// Like [`assembleBootableIntoOpfs`](Self::assemble_bootable_into_opfs) but with a
+    /// **caller-supplied `/init`** (UTF-8 script bytes) instead of the fixed
+    /// [`DEVCONTAINER_INIT`](holospaces::machine::DEVCONTAINER_INIT) — so a provisioned
+    /// image can launch its own session (e.g. a Wayland compositor on the framebuffer)
+    /// as PID 1. Same streamed, sparse, byte-reproducible serialization otherwise.
+    #[wasm_bindgen(js_name = assembleBootableWithInitIntoOpfs)]
+    pub fn assemble_bootable_with_init_into_opfs(
+        &self,
+        rootfs_handle: web_sys::FileSystemSyncAccessHandle,
+        disk_bytes: f64,
+        init: &[u8],
+    ) -> Result<f64, JsValue> {
+        let mut layer_idx = 0usize;
+        let next_layer = || -> Result<Option<(String, Vec<u8>)>, holospaces::assembly::AssemblyError> {
+            if layer_idx >= self.layers.len() {
+                return Ok(None);
+            }
+            let (mt, b) = &self.layers[layer_idx];
+            layer_idx += 1;
+            Ok(Some((mt.clone(), b.clone())))
+        };
+        let mut io_err: Option<JsValue> = None;
+        let geom = holospaces::assembly::stream_ext4_image_bootable_streamed_layers(
+            next_layer,
+            init,
+            disk_bytes as u64,
+            |block_index, bytes| {
+                if io_err.is_some() {
+                    return;
+                }
+                let opts = web_sys::FileSystemReadWriteOptions::new();
+                opts.set_at((block_index * bytes.len() as u64) as f64);
+                if let Err(e) = rootfs_handle.write_with_u8_array_and_options(bytes, &opts) {
+                    io_err = Some(e);
+                }
+            },
+        )
+        .map_err(js_err)?;
+        if let Some(e) = io_err {
+            return Err(e);
+        }
+        let image_len = geom.image_len();
+        rootfs_handle.truncate_with_f64(image_len as f64)?;
+        Ok(image_len as f64)
+    }
 }
 
 impl Default for DevcontainerImage {
@@ -1718,6 +1764,59 @@ pub struct Aarch64Workspace {
 
 #[wasm_bindgen]
 impl Aarch64Workspace {
+    /// Test-only: a bare workspace with RAM allocated but **no boot** — exercises the
+    /// passive `simple-framebuffer` source→sink path (`fb_write`/`framebuffer`/
+    /// `framebuffer_base`) end-to-end through the real wasm accessors, without the full
+    /// graphical-kernel boot. The framebuffer is the top `FB_SIZE` bytes of guest RAM.
+    pub fn new_fb_harness(ram_mb: u32) -> Aarch64Workspace {
+        let cpu = aarch64::Cpu::new(0x4000_0000, (ram_mb as usize) * 1024 * 1024);
+        Aarch64Workspace {
+            cpu,
+            halted: true,
+            console_cursor: 0,
+            router: None,
+        }
+    }
+
+    /// Boot a provisioned arm64 image **with the graphical framebuffer enabled** —
+    /// identical to [`boot_devcontainer_opfs_streamed`](Aarch64Workspace::boot_devcontainer_opfs_streamed)
+    /// but the devicetree carries a `simple-framebuffer` node (carved from the top of
+    /// RAM) and the cmdline adds `console=tty0`, so a graphical kernel's `simpledrm` +
+    /// `fbcon` render the console onto the framebuffer the κ render stack reads via
+    /// [`framebuffer`](Aarch64Workspace::framebuffer). Requires a kernel built with
+    /// `CONFIG_DRM_SIMPLEDRM` (the Hologram graphical kernel).
+    pub fn boot_devcontainer_opfs_streamed_graphical(
+        kernel: &[u8],
+        rootfs_handle: web_sys::FileSystemSyncAccessHandle,
+        disk_handle: web_sys::FileSystemSyncAccessHandle,
+    ) -> Result<Aarch64Workspace, JsValue> {
+        let store = Box::new(opfs_store::OpfsKappaStore::new(disk_handle));
+        let total = rootfs_handle.get_size().map_err(js_err)? as u64;
+        let sector_count = total.div_ceil(512);
+        let rootfs = rootfs_handle.clone();
+        let read = move |i: u64, buf: &mut [u8]| {
+            let opts = web_sys::FileSystemReadWriteOptions::new();
+            opts.set_at((i * 512) as f64);
+            let _ = rootfs.read_with_u8_array_and_options(buf, &opts);
+        };
+        let cpu = aarch64::Cpu::boot_linux_disk_streamed(
+            512 * 1024 * 1024,
+            kernel,
+            "console=ttyAMA0 console=tty0 root=/dev/vda rw init=/init",
+            store,
+            sector_count,
+            read,
+            true,
+        );
+        rootfs_handle.close();
+        Ok(Aarch64Workspace {
+            cpu,
+            halted: false,
+            console_cursor: 0,
+            router: None,
+        })
+    }
+
     /// Boot a provisioned arm64 image, **streaming** its κ-disk from OPFS (no full
     /// image in RAM): `rootfs_handle` is the provisioned rootfs (read
     /// sector-by-sector into the OPFS-backed store on `disk_handle`). Drive with
@@ -1744,6 +1843,7 @@ impl Aarch64Workspace {
             store,
             sector_count,
             read,
+            false,
         );
         // The κ-disk is fully ingested up front; release the rootfs's exclusive OPFS
         // lock so re-provisioning/removal isn't blocked and the handle doesn't leak.
@@ -1786,6 +1886,7 @@ impl Aarch64Workspace {
             store,
             sector_count,
             read,
+            false,
         );
         // The κ-disk is fully ingested up front; release the rootfs's exclusive OPFS
         // lock so re-provisioning/removal isn't blocked and the handle doesn't leak.
@@ -1835,6 +1936,24 @@ impl Aarch64Workspace {
     pub fn feed_input(&mut self, bytes: &[u8]) {
         self.cpu.feed_console(bytes);
     }
+
+    /// The guest's framebuffer scanout (RGBA bytes) — the surface the κ render stack super-res-projects
+    /// (`KappaSurface.present({width,height,bytes})`). Cheap: a slice of guest RAM the guest draws into.
+    #[must_use]
+    pub fn framebuffer(&self) -> Vec<u8> { self.cpu.read_framebuffer() }
+
+    /// `[width, height, stride_bytes, format]` (format 0 = RGBA8888).
+    #[must_use]
+    pub fn framebuffer_dims(&self) -> Vec<u32> {
+        vec![aarch64::Cpu::FB_W as u32, aarch64::Cpu::FB_H as u32, (aarch64::Cpu::FB_W * 4) as u32, 0]
+    }
+
+    /// Guest-physical base of the framebuffer (what a `simple-framebuffer` DT node advertises).
+    #[must_use]
+    pub fn framebuffer_base(&self) -> f64 { self.cpu.fb_phys_base() as f64 }
+
+    /// Push pixels into the framebuffer region (a host-side draw / the smoke test before a graphical kernel).
+    pub fn fb_write(&mut self, bytes: &[u8]) { self.cpu.write_framebuffer(bytes); }
 
     /// Whether the machine has powered off.
     #[wasm_bindgen(getter)]
@@ -1957,6 +2076,43 @@ impl X64Workspace {
         })
     }
 
+    /// Boot the **CC-44 kernel** (embedded initramfs) over a streamed OPFS κ-disk —
+    /// the initramfs PID 1 reaches userspace and the `virtio-blk` κ-disk is probed
+    /// (capacity + sector reads through the paged backing). Identical plumbing to
+    /// [`boot_devcontainer_opfs_streamed`](X64Workspace::boot_devcontainer_opfs_streamed)
+    /// but with CC-44's boot posture (initramfs root, the disk attached not mounted),
+    /// so the x64 core + streamed κ-disk are witnessed in the browser without a
+    /// disk-root `/init`. The host analogue is the passing CC-44 streamed-κ-disk test.
+    pub fn boot_linux_initramfs_streamed(
+        kernel: &[u8],
+        rootfs_handle: web_sys::FileSystemSyncAccessHandle,
+        disk_handle: web_sys::FileSystemSyncAccessHandle,
+    ) -> Result<X64Workspace, JsValue> {
+        let store = Box::new(opfs_store::OpfsKappaStore::new(disk_handle));
+        let total = rootfs_handle.get_size().map_err(js_err)? as u64;
+        let sector_count = total.div_ceil(512);
+        let rootfs = rootfs_handle.clone();
+        let read = move |i: u64, buf: &mut [u8]| {
+            let opts = web_sys::FileSystemReadWriteOptions::new();
+            opts.set_at((i * 512) as f64);
+            let _ = rootfs.read_with_u8_array_and_options(buf, &opts);
+        };
+        let cpu = x64::Cpu::boot_linux_disk_streamed(
+            512 * 1024 * 1024,
+            kernel,
+            "earlyprintk=serial,ttyS0 console=ttyS0 random.trust_cpu=on",
+            store,
+            sector_count,
+            read,
+        );
+        rootfs_handle.close();
+        Ok(X64Workspace {
+            cpu,
+            halted: false,
+            console_cursor: 0,
+        })
+    }
+
     /// Run a chunk of guest execution; returns `true` once the machine halts.
     pub fn run(&mut self, budget: f64) -> bool {
         if self.halted {
@@ -1994,5 +2150,13 @@ impl X64Workspace {
     #[must_use]
     pub fn halted(&self) -> bool {
         self.halted
+    }
+
+    /// Dev: drain the guest CPU-exception trace (vectors < 32), newline-joined,
+    /// most recent last — a post-mortem of the demand-paging divergence that kills
+    /// init on the wasm x64 boot. Empty unless exceptions were recorded.
+    #[must_use]
+    pub fn exc_trace(&self) -> String {
+        x64::drain_exc_trace().join("\n")
     }
 }

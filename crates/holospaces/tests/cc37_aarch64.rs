@@ -116,6 +116,7 @@ fn an_arm64_devcontainer_boots_paged_from_a_kappa_store() {
         Box::new(MemKappaStore::new()),
         sector_count,
         read,
+        false,
     );
     let halt = cpu.run(40_000_000_000);
     let console = String::from_utf8_lossy(cpu.console());
