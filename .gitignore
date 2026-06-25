@@ -38,3 +38,4 @@ boot-diag.log
 /boot*.log
 /.dev-boot.lock
 /dev-boot.out
+crates/holospaces-web/web/scm-test-failure.png
