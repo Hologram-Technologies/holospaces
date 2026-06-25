@@ -21,16 +21,21 @@ set -uo pipefail
 ROOT="${1:?usage: build-wasm-peer.sh <repo-root>}"
 WASM="$ROOT/crates/holospaces-web/web/pkg/holospaces_web_bg.wasm"
 
-for attempt in 1 2 3; do
+attempts=3
+for attempt in $(seq 1 "$attempts"); do
     if ( cd "$ROOT/crates/holospaces-web" \
             && wasm-pack build --release --target web --out-dir web/pkg ) \
         && [ -f "$WASM" ]; then
         exit 0
     fi
-    echo "build-wasm-peer: wasm-pack build attempt $attempt/3 failed (transient wasm-opt hiccup); retrying…" >&2
-    rm -f "$WASM" 2>/dev/null
-    sleep 3
+    # Only announce + back off when another attempt remains; the final failure
+    # falls through to the error below without an extra "retrying" line or sleep.
+    if [ "$attempt" -lt "$attempts" ]; then
+        echo "build-wasm-peer: wasm-pack build attempt $attempt/$attempts failed (transient wasm-opt hiccup); retrying…" >&2
+        rm -f "$WASM" 2>/dev/null
+        sleep 3
+    fi
 done
 
-echo "build-wasm-peer: wasm-pack build failed after 3 attempts" >&2
+echo "build-wasm-peer: wasm-pack build failed after $attempts attempts" >&2
 exit 1

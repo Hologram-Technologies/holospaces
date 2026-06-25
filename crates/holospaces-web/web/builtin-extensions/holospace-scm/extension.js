@@ -629,18 +629,32 @@ function activate(context) {
     setMarker(`$(repo) HOLOSPACE-SCM-REMOTE=${remote}`, `Remote ${remote} → ${url}`);
   });
 
-  // Watch the working tree (not `.git` internals) and refresh on change.
-  const watcher = vscode.workspace.createFileSystemWatcher("holospace:/**/*");
-  context.subscriptions.push(watcher);
+  // Watch the WORKING TREE and refresh on change — but NOT the `.git` object
+  // store. The broad `holospace:/**/*` glob also fires for `.git/**`, and the
+  // FileSystemProvider emits a change for every write the Git engine makes there
+  // (a commit/push writes hundreds of objects via `vscode.workspace.fs`), so an
+  // unfiltered watcher would refresh-storm during our own operations. We instead
+  // ignore `.git/**` here and watch the few git STATE files (HEAD / index /
+  // refs) separately, so a ref change still refreshes the view without the
+  // object-write storm.
   let debounce = null;
-  const onChange = () => {
+  const queueRefresh = () => {
     if (debounce) clearTimeout(debounce);
     debounce = setTimeout(() => refresh(), 400);
   };
-  watcher.onDidChange(onChange);
-  watcher.onDidCreate(onChange);
-  watcher.onDidDelete(onChange);
-  context.subscriptions.push(vscode.workspace.onDidSaveTextDocument(onChange));
+  const isGitInternal = (uri) => /(?:^|\/)\.git\//.test(uri.path);
+  const treeWatcher = vscode.workspace.createFileSystemWatcher("holospace:/**/*");
+  context.subscriptions.push(treeWatcher);
+  const onTreeChange = (uri) => { if (!isGitInternal(uri)) queueRefresh(); };
+  treeWatcher.onDidChange(onTreeChange);
+  treeWatcher.onDidCreate(onTreeChange);
+  treeWatcher.onDidDelete(onTreeChange);
+  const gitStateWatcher = vscode.workspace.createFileSystemWatcher("holospace:/**/.git/{HEAD,index,refs/**}");
+  context.subscriptions.push(gitStateWatcher);
+  gitStateWatcher.onDidChange(queueRefresh);
+  gitStateWatcher.onDidCreate(queueRefresh);
+  gitStateWatcher.onDidDelete(queueRefresh);
+  context.subscriptions.push(vscode.workspace.onDidSaveTextDocument(queueRefresh));
 
   // Bring-up: load the κ-verified engine, then reflect the real repository.
   setMarker("$(sync~spin) holospace Source Control — starting…");

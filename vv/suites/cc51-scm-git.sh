@@ -39,13 +39,14 @@ VENDOR="$WEB/builtin-extensions/holospace-scm/vendor/isomorphic-git"
 
 # (1) Host witness — the nested-path 9p workspace API at CC-15 parity with the
 # guest tree (a real-OS boot; the substrate primitive the Git engine builds on).
-if command -v cargo >/dev/null 2>&1; then
-    cargo test --release --manifest-path "$ROOT/Cargo.toml" -p holospaces \
-        --test cc51_nested_workspace -- --ignored --nocapture \
-        the_host_and_os_share_a_nested_workspace_tree_over_virtio_9p || exit 1
-else
-    echo "cc51-scm-git: SKIP host witness — cargo absent"
-fi
+# The host witness is a REQUIRED part of CC-51's gate: if cargo is absent we
+# cannot run it, so SKIP the whole suite (exit 127) rather than continue and
+# report a partial green from the deployed witness alone (no false green).
+command -v cargo >/dev/null 2>&1 \
+    || { echo "cc51-scm-git: SKIP — cargo absent (the host witness cannot run; refusing a partial green)"; exit 127; }
+cargo test --release --manifest-path "$ROOT/Cargo.toml" -p holospaces \
+    --test cc51_nested_workspace -- --ignored --nocapture \
+    the_host_and_os_share_a_nested_workspace_tree_over_virtio_9p || exit 1
 
 # (2) Deployed witness — the SCM provider in the real workbench (Chromium).
 command -v node >/dev/null 2>&1 || { echo "cc51-scm-git: SKIP deployed witness — node absent"; exit 127; }
