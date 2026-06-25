@@ -365,6 +365,7 @@ impl Source {
                 // the default RISC-V target.
                 let arch = match payload.get(cur).copied() {
                     Some(1) => crate::Arch::Aarch64,
+                    Some(2) => crate::Arch::X64,
                     _ => crate::Arch::Riscv64,
                 };
                 Ok(Source::Devcontainer {
@@ -592,17 +593,32 @@ mod tests {
         };
         let rv = dc(crate::Arch::Riscv64);
         let arm = dc(crate::Arch::Aarch64);
-        // Same everything but the arch ⇒ a different holospace κ (immutable ISA).
+        let x64 = dc(crate::Arch::X64);
+        // Same everything but the arch ⇒ a different holospace κ (immutable ISA) —
+        // for every supported ISA, pairwise distinct.
+        let krv = Holospace::compose(rv.clone(), caps()).kappa();
+        let karm = Holospace::compose(arm.clone(), caps()).kappa();
+        let kx64 = Holospace::compose(x64.clone(), caps()).kappa();
         assert_ne!(
-            Holospace::compose(rv.clone(), caps()).kappa(),
-            Holospace::compose(arm.clone(), caps()).kappa(),
-            "the guest architecture is part of the holospace identity (Law L1)"
+            krv, karm,
+            "the guest architecture is part of the identity (Law L1)"
         );
+        assert_ne!(karm, kx64, "x86-64 is a distinct identity from arm64");
+        assert_ne!(krv, kx64, "x86-64 is a distinct identity from riscv64");
         assert_eq!(rv.arch(), crate::Arch::Riscv64);
         assert_eq!(arm.arch(), crate::Arch::Aarch64);
-        // The selection round-trips through the source payload (encode → decode).
-        let decoded = Source::decode_payload(&arm.encode_payload()).unwrap();
-        assert_eq!(decoded.arch(), crate::Arch::Aarch64);
+        assert_eq!(x64.arch(), crate::Arch::X64);
+        // The selection round-trips through the source payload (encode → decode) —
+        // EVERY arch, including x86-64 (a regression guard: the X64 byte must not
+        // silently decode back as the default RISC-V).
+        for src in [&rv, &arm, &x64] {
+            let decoded = Source::decode_payload(&src.encode_payload()).unwrap();
+            assert_eq!(
+                decoded.arch(),
+                src.arch(),
+                "the architecture survives the payload round-trip"
+            );
+        }
         // The same arch is reproducible (QS1 still holds within an architecture).
         assert_eq!(
             Holospace::compose(arm.clone(), caps()).kappa(),

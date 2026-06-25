@@ -12,9 +12,15 @@
 //! the container environment and `WORKDIR` the working directory. The result is
 //! the built rootfs — no Docker daemon, just the emulator and the substrate.
 //!
-//! This parses the common instruction subset a devcontainer Dockerfile uses
-//! (`FROM`, `ARG`, `ENV`, `RUN`, `COPY`/`ADD`, `WORKDIR`). Unsupported
-//! instructions are an explicit error (never silently dropped).
+//! This parses the instruction set a devcontainer Dockerfile uses. `FROM`, `ARG`,
+//! `ENV`, `RUN`, `COPY`/`ADD`, `WORKDIR` shape the built rootfs. `SHELL` selects the
+//! `RUN` interpreter, `USER` records the runtime user, and `ENTRYPOINT`/`CMD` are
+//! retained as the image's default process (the default boot command when the Dev
+//! Container lifecycle supplies no override). `LABEL`/`EXPOSE`/`VOLUME`/`MAINTAINER`/
+//! `ONBUILD`/`STOPSIGNAL`/`HEALTHCHECK` are pure image/registry metadata with no
+//! effect on a rootfs — accepted and ignored *by design* (there is nothing in a
+//! rootfs to apply them to), not silently dropped. Any other instruction is an
+//! explicit [`DockerfileError::Unsupported`] error.
 
 #[cfg(not(feature = "std"))]
 #[allow(unused_imports)]
@@ -41,6 +47,20 @@ pub struct Dockerfile {
     pub env: BTreeMap<String, String>,
     /// The build steps in file order: `RUN` shell lines and `COPY`/`ADD` directives.
     pub steps: Vec<Step>,
+    /// `SHELL` — the interpreter for shell-form `RUN` (default busybox `sh`). When
+    /// set it is applied to every `RUN` in [`build_init`](Dockerfile::build_init).
+    pub shell: Option<String>,
+    /// `USER` — the image's declared user. The offline rootfs build runs `RUN` as
+    /// root (standard image-build behaviour); this records the user the runtime layer
+    /// (the Dev Container `remoteUser`) drops to. Retained, not dropped.
+    pub user: Option<String>,
+    /// `ENTRYPOINT` — the image's default entrypoint. Retained; the Dev Container
+    /// lifecycle's `overrideCommand` supersedes it at runtime (spec), but it becomes
+    /// the default boot process when no override tail is given (see `build_init`).
+    pub entrypoint: Option<String>,
+    /// `CMD` — the image's default command (args to the entrypoint, or the command
+    /// itself). Retained; same runtime semantics as `entrypoint`.
+    pub cmd: Option<String>,
 }
 
 /// One ordered build step.
@@ -98,6 +118,10 @@ pub fn parse(
     let mut workdir = None;
     let mut env: BTreeMap<String, String> = BTreeMap::new();
     let mut steps = Vec::new();
+    let mut shell: Option<String> = None;
+    let mut user: Option<String> = None;
+    let mut entrypoint: Option<String> = None;
+    let mut cmd: Option<String> = None;
     // Variables in scope for substitution: ARG defaults overridden by build_args,
     // plus ENVs as they are declared.
     let mut vars: BTreeMap<String, String> = BTreeMap::new();
@@ -159,10 +183,24 @@ pub fn parse(
                     dst: substitute(&dst, &vars),
                 });
             }
-            // Instructions that do not affect the built rootfs in this model are
-            // accepted as no-ops (they are metadata for a Docker daemon).
-            "LABEL" | "EXPOSE" | "VOLUME" | "USER" | "SHELL" | "MAINTAINER" | "ONBUILD"
-            | "STOPSIGNAL" | "HEALTHCHECK" | "CMD" | "ENTRYPOINT" => {}
+            // SHELL — the interpreter for subsequent shell-form RUN. Applied in
+            // build_init (the default is busybox sh). Honoured, not dropped.
+            "SHELL" => shell = Some(exec_to_shell(rest)),
+            // USER — the image's declared runtime user (substituted for ${ARG}s like
+            // the repo's `USER ${USERNAME}`). The offline build runs RUN as root
+            // (standard image-build behaviour); this is the user the runtime layer
+            // (Dev Container remoteUser) adopts. Retained, not dropped.
+            "USER" => user = Some(substitute(rest.trim(), &vars)),
+            // ENTRYPOINT / CMD — the image's default process. Retained; the Dev
+            // Container lifecycle's overrideCommand supersedes it at runtime (spec),
+            // and it becomes the default boot process when build_init gets no tail.
+            "ENTRYPOINT" => entrypoint = Some(exec_to_shell(rest)),
+            "CMD" => cmd = Some(exec_to_shell(rest)),
+            // Pure image/registry metadata with NO effect on a built rootfs (there is
+            // nothing in a rootfs for them to change): accepted and ignored by design,
+            // not silently dropped — the build assembles a rootfs, not a Docker daemon.
+            "LABEL" | "EXPOSE" | "VOLUME" | "MAINTAINER" | "ONBUILD" | "STOPSIGNAL"
+            | "HEALTHCHECK" => {}
             other => return Err(DockerfileError::Unsupported(other.to_owned())),
         }
     }
@@ -172,6 +210,10 @@ pub fn parse(
         workdir,
         env,
         steps,
+        shell,
+        user,
+        entrypoint,
+        cmd,
     })
 }
 
@@ -186,6 +228,20 @@ impl Dockerfile {
                 Step::Copy { .. } => None,
             })
             .collect()
+    }
+
+    /// The image's default process — `ENTRYPOINT` then `CMD` joined, per Docker
+    /// semantics — or `None` if neither is declared. Used by
+    /// [`build_init`](Dockerfile::build_init) as the boot default when no override
+    /// command is supplied.
+    #[must_use]
+    pub fn default_command(&self) -> Option<String> {
+        match (&self.entrypoint, &self.cmd) {
+            (Some(e), Some(c)) => Some(format!("{e} {c}")),
+            (Some(e), None) => Some(e.clone()),
+            (None, Some(c)) => Some(c.clone()),
+            (None, None) => None,
+        }
     }
 
     /// The build-phase `/init` the Boot Orchestrator injects to *run the build in
@@ -214,14 +270,37 @@ impl Dockerfile {
             s.push_str(wd);
             s.push_str("'\n");
         }
+        if let Some(u) = &self.user {
+            // The image's declared runtime user. The build's RUN steps run as root
+            // (standard image build); record it for visibility (the runtime layer's
+            // remoteUser adopts it).
+            s.push_str("export DOCKERFILE_USER='");
+            s.push_str(u);
+            s.push_str("'\n");
+        }
         s.push_str("echo BUILD-START\n");
         for line in self.run_lines() {
-            s.push_str(line);
+            // SHELL, if declared, is the interpreter for the shell-form RUN; else the
+            // build's busybox sh runs the line directly.
+            if let Some(sh) = &self.shell {
+                s.push_str(sh);
+                s.push_str(" '");
+                s.push_str(&line.replace('\'', "'\\''"));
+                s.push('\'');
+            } else {
+                s.push_str(line);
+            }
             s.push('\n');
         }
         s.push_str("echo BUILD-DONE\n");
         if let Some(t) = tail {
             s.push_str(t);
+        } else if let Some(default_cmd) = self.default_command() {
+            // No override tail: the image's own ENTRYPOINT + CMD is the default
+            // process (Docker semantics; a Dev Container overrideCommand would have
+            // supplied a tail instead).
+            s.push_str(&default_cmd);
+            s.push('\n');
         }
         s.push_str("busybox reboot -f\n");
         s.into_bytes()
@@ -468,5 +547,56 @@ mod tests {
             r,
             Err(DockerfileError::Unsupported("FROBNICATE".to_owned()))
         );
+    }
+
+    #[test]
+    fn shell_user_entrypoint_cmd_are_retained_and_applied_not_dropped() {
+        let df = parse(
+            b"FROM base\n\
+              ARG USERNAME=vscode\n\
+              SHELL [\"/bin/bash\", \"-c\"]\n\
+              USER ${USERNAME}\n\
+              RUN echo hi\n\
+              ENTRYPOINT [\"/usr/bin/myapp\"]\n\
+              CMD [\"--serve\"]\n",
+            &BTreeMap::new(),
+        )
+        .expect("parse");
+        // Each instruction is RETAINED (not dropped to a no-op).
+        assert_eq!(df.shell.as_deref(), Some("/bin/bash -c"));
+        assert_eq!(df.user.as_deref(), Some("vscode")); // ${USERNAME} substituted
+        assert_eq!(df.entrypoint.as_deref(), Some("/usr/bin/myapp"));
+        assert_eq!(df.cmd.as_deref(), Some("--serve"));
+        assert_eq!(
+            df.default_command().as_deref(),
+            Some("/usr/bin/myapp --serve")
+        );
+        // And APPLIED in the generated init: SHELL wraps RUN, USER is exported, and
+        // the ENTRYPOINT+CMD is the default process when no override tail is given.
+        let init = String::from_utf8(df.build_init(None)).unwrap();
+        assert!(
+            init.contains("/bin/bash -c 'echo hi'"),
+            "SHELL wraps the RUN line"
+        );
+        assert!(
+            init.contains("DOCKERFILE_USER='vscode'"),
+            "USER is recorded"
+        );
+        assert!(
+            init.contains("/usr/bin/myapp --serve"),
+            "ENTRYPOINT+CMD is the default boot process"
+        );
+    }
+
+    #[test]
+    fn pure_metadata_instructions_are_accepted_not_an_error() {
+        // LABEL/EXPOSE/VOLUME/... have no rootfs effect — accepted, not Unsupported,
+        // and they do not alter the build steps.
+        let df = parse(
+            b"FROM base\nLABEL a=b\nEXPOSE 8000\nVOLUME /data\nHEALTHCHECK NONE\nRUN echo ok\n",
+            &BTreeMap::new(),
+        )
+        .expect("metadata instructions are accepted");
+        assert_eq!(df.run_lines(), vec!["echo ok"]);
     }
 }
