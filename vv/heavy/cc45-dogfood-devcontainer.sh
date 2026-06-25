@@ -9,9 +9,18 @@
 # then runs the binary it built (DOGFOOD-GCC-BUILT:42).
 #
 # The rootfs is multi-GiB, so it is NOT a committed fixture — it is built here. Needs
-# docker + node (GitHub `ubuntu-latest` has both) + network for the base/features.
-# Status: SUITE (LIVE) — builds the actual devcontainer and validates a real in-guest
-#   compile; no fixture, no stub, no skip.
+# docker + node + network for the base/features, AND ~24 GiB RAM (a full Ubuntu+gcc
+# boot holds the κ-disk content + the guest's copy-on-write sectors in memory).
+#
+# Status: HEAVY (ON-DEMAND) — this lives in vv/heavy/, NOT vv/suites/, so the per-push
+#   V&V gate does NOT run it: the build is ~30 min and the boot needs ~24 GiB RAM,
+#   which OOMs the free 16 GiB CI runner. It is a REAL, reproducible validation (no
+#   fixture, no stub, no skip) — run it on a machine with the RAM:
+#       bash vv/heavy/cc45-dogfood-devcontainer.sh
+#   The per-push gate proves #13's build-capability with the FAST in-guest witnesses
+#   (the cc45 suite: a static TinyCC compiles + runs a program in-guest; a real OCI
+#   image boots; the Dockerfile/features pipelines feed the boot). THIS suite is the
+#   full-fat dogfood — the actual repo devcontainer + the real gcc 13.3.
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -28,6 +37,16 @@ cleanup() {
     rm -f "$ROOTFS" 2>/dev/null || true
 }
 trap cleanup EXIT
+
+# A 4.4 GB devcontainer image + a 4.2 GB rootfs export + a transient ext4 image need
+# headroom; on a CI runner reclaim the large preinstalled toolchains we don't use
+# (best-effort, only what's present). Harmless locally (the dirs usually don't exist).
+if [ -n "${CI:-}" ]; then
+    for d in /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+             /opt/hostedtoolcache/CodeQL /usr/local/.ghcup; do
+        [ -d "$d" ] && sudo rm -rf "$d" 2>/dev/null || true
+    done
+fi
 
 echo "== [1/3] build THIS repo's devcontainer, unmodified (Dev Container CLI) =="
 # Exactly the Codespaces/Gitpod resolution: the Dockerfile + every ghcr feature.

@@ -15,7 +15,6 @@
 use hologram_store_mem::MemKappaStore;
 use holospaces::assembly::{stream_ext4_image_bootable, Layer};
 use holospaces::emulator::x64::{Cpu, Halt};
-use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -113,24 +112,34 @@ fn holospaces_builds_in_its_own_real_devcontainer() {
         },
     ];
 
-    // Assemble the (multi-GiB) rootfs onto a build-capable disk, sparse, recording
-    // occupancy; boot it O(content) — the same κ-disk path the deployed peer uses.
+    // Assemble the (multi-GiB) rootfs onto a build-capable disk, streaming the image
+    // to a SPARSE temp FILE (not an in-RAM map) — recording only the occupied block
+    // indices (a few MiB) — then boot it O(content), paging the occupied blocks back
+    // from the file. This is exactly the deployed peer's path (it pages from an OPFS
+    // file), and it keeps the witness's peak RAM bounded so it fits a 16 GiB CI runner
+    // (the rootfs never sits in memory twice).
+    use std::io::{Seek, SeekFrom, Write};
     const DISK: u64 = 16 * 1024 * 1024 * 1024;
-    let mut sparse: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    let img_path = std::env::temp_dir().join(format!("cc45-dogfood-{}.img", std::process::id()));
     let mut occ: Vec<u64> = Vec::new();
-    let geom = stream_ext4_image_bootable(&layers, DOGFOOD_INIT, DISK, |bi, b| {
-        occ.push(bi);
-        sparse.insert(bi, b.to_vec());
-    })
-    .expect("assemble the real devcontainer rootfs into a bootable ext4");
-    let image_len = geom.image_len();
+    let image_len = {
+        let mut f = std::fs::File::create(&img_path).expect("create the temp ext4 image");
+        let geom = stream_ext4_image_bootable(&layers, DOGFOOD_INIT, DISK, |bi, b| {
+            occ.push(bi);
+            f.seek(SeekFrom::Start(bi * 4096)).unwrap();
+            f.write_all(b).unwrap();
+        })
+        .expect("assemble the real devcontainer rootfs into a bootable ext4");
+        let il = geom.image_len();
+        f.set_len(il).unwrap(); // the trailing sparse region reads back as zeros
+        il
+    };
 
+    // Page occupied blocks back from the file on demand (the deployed κ-disk pattern).
+    let mut rf = std::fs::File::open(&img_path).expect("reopen the temp ext4 image");
     let read = |sector: u64, buf: &mut [u8]| {
-        let bi = sector / 8;
-        match sparse.get(&bi) {
-            Some(b) => buf[..b.len()].copy_from_slice(b),
-            None => buf.fill(0),
-        }
+        rf.seek(SeekFrom::Start(sector * 512)).unwrap();
+        let _ = rf.read(buf);
     };
     let kernel = gunzip(&cc45_dir().join("linux/vmlinux.gz"));
     let mut cpu = Cpu::boot_linux_disk_occupancy_streamed(
@@ -144,6 +153,9 @@ fn holospaces_builds_in_its_own_real_devcontainer() {
         8,
         read,
     );
+    // The occupied blocks are now content-addressed in the κ-store; the temp file has
+    // served its purpose — remove it so it doesn't hold disk during the boot.
+    let _ = std::fs::remove_file(&img_path);
 
     // Run in slices; stop as soon as the guest finishes (or halts).
     let mut halted = false;
