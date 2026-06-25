@@ -1909,6 +1909,18 @@ export class Workspace {
         return ret !== 0;
     }
     /**
+     * Delete a file or directory subtree at a nested path (`unlink`/`rmdir`).
+     * `true` if it existed.
+     * @param {string} path
+     * @returns {boolean}
+     */
+    ws_delete_path(path) {
+        const ptr0 = passStringToWasm0(path, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.workspace_ws_delete_path(this.__wbg_ptr, ptr0, len0);
+        return ret !== 0;
+    }
+    /**
      * The shared workspace's directory listing — a JSON array of
      * `{ name, dir, size }` over the running holospace's `virtio-9p` workspace
      * (the workbench `FileSystemProvider.readDirectory`).
@@ -1927,6 +1939,23 @@ export class Workspace {
         }
     }
     /**
+     * List a directory by nested path — a JSON array `[{name,dir,size}]` in name
+     * order, or `null` if the path is absent or not a directory.
+     * @param {string} path
+     * @returns {string | undefined}
+     */
+    ws_list_path(path) {
+        const ptr0 = passStringToWasm0(path, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.workspace_ws_list_path(this.__wbg_ptr, ptr0, len0);
+        let v2;
+        if (ret[0] !== 0) {
+            v2 = getStringFromWasm0(ret[0], ret[1]).slice();
+            wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        }
+        return v2;
+    }
+    /**
      * Create a folder in the shared workspace (the workbench
      * `FileSystemProvider.createDirectory`).
      * @param {string} name
@@ -1935,6 +1964,15 @@ export class Workspace {
         const ptr0 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
         wasm.workspace_ws_mkdir(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * `mkdir -p` at a nested path in the shared workspace.
+     * @param {string} path
+     */
+    ws_mkdir_path(path) {
+        const ptr0 = passStringToWasm0(path, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.workspace_ws_mkdir_path(this.__wbg_ptr, ptr0, len0);
     }
     /**
      * Read a file from the shared workspace (the workbench
@@ -1947,6 +1985,23 @@ export class Workspace {
         const ptr0 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
         const ret = wasm.workspace_ws_read(this.__wbg_ptr, ptr0, len0);
+        let v2;
+        if (ret[0] !== 0) {
+            v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+            wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        }
+        return v2;
+    }
+    /**
+     * Read a file by nested path (e.g. `.git/HEAD`, `src/main.rs`) from the
+     * shared workspace. `undefined` if absent or a directory.
+     * @param {string} path
+     * @returns {Uint8Array | undefined}
+     */
+    ws_read_path(path) {
+        const ptr0 = passStringToWasm0(path, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.workspace_ws_read_path(this.__wbg_ptr, ptr0, len0);
         let v2;
         if (ret[0] !== 0) {
             v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
@@ -1970,6 +2025,38 @@ export class Workspace {
         return ret !== 0;
     }
     /**
+     * Rename a nested path (creating the destination's parents). `true` if the
+     * source existed.
+     * @param {string} from
+     * @param {string} to
+     * @returns {boolean}
+     */
+    ws_rename_path(from, to) {
+        const ptr0 = passStringToWasm0(from, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(to, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.workspace_ws_rename_path(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+        return ret !== 0;
+    }
+    /**
+     * Stat a nested path — a JSON object `{dir,size}`, or `null` if absent. The
+     * Git engine's `stat`/`lstat` over the workspace FS.
+     * @param {string} path
+     * @returns {string | undefined}
+     */
+    ws_stat_path(path) {
+        const ptr0 = passStringToWasm0(path, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.workspace_ws_stat_path(this.__wbg_ptr, ptr0, len0);
+        let v2;
+        if (ret[0] !== 0) {
+            v2 = getStringFromWasm0(ret[0], ret[1]).slice();
+            wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        }
+        return v2;
+    }
+    /**
      * Write a file into the shared workspace (the workbench
      * `FileSystemProvider.writeFile`) — the editor saving the *same content* the
      * OS reads over `virtio-9p` (one content, Law L1). Returns the content's κ
@@ -1987,6 +2074,30 @@ export class Workspace {
             const ptr1 = passArray8ToWasm0(content, wasm.__wbindgen_malloc);
             const len1 = WASM_VECTOR_LEN;
             const ret = wasm.workspace_ws_write(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+            deferred3_0 = ret[0];
+            deferred3_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+        }
+    }
+    /**
+     * Write a file at a nested path, creating parent directories — the editor /
+     * the Git engine saving the *same content* the OS reads over `virtio-9p`
+     * (Law L1). Returns the content's κ (its identity).
+     * @param {string} path
+     * @param {Uint8Array} content
+     * @returns {string}
+     */
+    ws_write_path(path, content) {
+        let deferred3_0;
+        let deferred3_1;
+        try {
+            const ptr0 = passStringToWasm0(path, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passArray8ToWasm0(content, wasm.__wbindgen_malloc);
+            const len1 = WASM_VECTOR_LEN;
+            const ret = wasm.workspace_ws_write_path(this.__wbg_ptr, ptr0, len0, ptr1, len1);
             deferred3_0 = ret[0];
             deferred3_1 = ret[1];
             return getStringFromWasm0(ret[0], ret[1]);
