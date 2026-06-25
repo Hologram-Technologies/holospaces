@@ -1782,6 +1782,67 @@ impl Workspace {
         self.machine.workspace_mkdir(name);
     }
 
+    // ── Nested-path workspace API (`CC-15` parity with the guest tree, `CC-51`) ──
+    // The flat `ws_*` above address only the share root; these address the full
+    // nested tree (a `.git` object store, `src/…` sources) the guest reads over
+    // `virtio-9p` — one content, Law L1. The workbench file explorer and the
+    // Source Control provider's Git engine (native browser-peer exec, the `CC-48`
+    // discipline) drive a real repository through these.
+
+    /// Read a file by nested path (e.g. `.git/HEAD`, `src/main.rs`) from the
+    /// shared workspace. `undefined` if absent or a directory.
+    #[must_use]
+    pub fn ws_read_path(&self, path: &str) -> Option<Vec<u8>> {
+        self.machine.workspace_file_path(path).map(<[u8]>::to_vec)
+    }
+
+    /// Write a file at a nested path, creating parent directories — the editor /
+    /// the Git engine saving the *same content* the OS reads over `virtio-9p`
+    /// (Law L1). Returns the content's κ (its identity).
+    pub fn ws_write_path(&mut self, path: &str, content: &[u8]) -> String {
+        self.machine.workspace_write_path(path, content);
+        address(content).as_str().to_owned()
+    }
+
+    /// List a directory by nested path — a JSON array `[{name,dir,size}]` in name
+    /// order, or `null` if the path is absent or not a directory.
+    #[must_use]
+    pub fn ws_list_path(&self, path: &str) -> Option<String> {
+        self.machine.workspace_list_path(path).map(|entries| {
+            let arr: Vec<serde_json::Value> = entries
+                .into_iter()
+                .map(|(name, dir, size)| serde_json::json!({ "name": name, "dir": dir, "size": size }))
+                .collect();
+            serde_json::Value::Array(arr).to_string()
+        })
+    }
+
+    /// Stat a nested path — a JSON object `{dir,size}`, or `null` if absent. The
+    /// Git engine's `stat`/`lstat` over the workspace FS.
+    #[must_use]
+    pub fn ws_stat_path(&self, path: &str) -> Option<String> {
+        self.machine
+            .workspace_stat_path(path)
+            .map(|(dir, size)| serde_json::json!({ "dir": dir, "size": size }).to_string())
+    }
+
+    /// `mkdir -p` at a nested path in the shared workspace.
+    pub fn ws_mkdir_path(&mut self, path: &str) {
+        self.machine.workspace_mkdir_path(path);
+    }
+
+    /// Delete a file or directory subtree at a nested path (`unlink`/`rmdir`).
+    /// `true` if it existed.
+    pub fn ws_delete_path(&mut self, path: &str) -> bool {
+        self.machine.workspace_delete_path(path)
+    }
+
+    /// Rename a nested path (creating the destination's parents). `true` if the
+    /// source existed.
+    pub fn ws_rename_path(&mut self, from: &str, to: &str) -> bool {
+        self.machine.workspace_rename_path(from, to)
+    }
+
     /// **Apply a configuration** the control plane published (ADR-018; `CC-28`):
     /// decode the κ-addressed [`Configuration`] bytes (resolved + verified over
     /// the substrate by the caller, Law L5) and enact its live directives on the

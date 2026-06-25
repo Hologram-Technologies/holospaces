@@ -1503,6 +1503,180 @@ mod ninep {
                 .children
                 .insert(name.into(), id);
         }
+
+        // ── Nested-path API (`CC-15` parity with the guest's `Twalk`/`Tcreate`) ──
+        //
+        // The flat helpers above operate only on the root directory; a real
+        // repository (a `.git` object tree, `src/…` sources) is *nested*. These
+        // walk the same inode tree the guest's 9P server walks (by `children`
+        // name), so a tree the host writes here is the *same content* the guest
+        // reads over `virtio-9p`, and vice-versa (one content, Law L1) — the
+        // substrate primitive the Source Control provider (`CC-51`) builds on.
+        // Paths are POSIX, relative to the share root; empty and `.` components
+        // are ignored.
+
+        /// Split a path into its non-empty, non-`.` components.
+        fn split_components(path: &str) -> impl Iterator<Item = &str> {
+            path.split('/').filter(|c| !c.is_empty() && *c != ".")
+        }
+
+        /// The parent-directory path and final component of `path`
+        /// (`("a/b", "c")` for `a/b/c`; `("", "c")` for `c`). `None` final
+        /// component for an empty path.
+        fn split_parent(path: &str) -> (&str, Option<&str>) {
+            let trimmed = path.trim_end_matches('/');
+            match trimmed.rfind('/') {
+                Some(i) => {
+                    let last = &trimmed[i + 1..];
+                    (&trimmed[..i], (!last.is_empty()).then_some(last))
+                }
+                None => ("", (!trimmed.is_empty()).then_some(trimmed)),
+            }
+        }
+
+        /// Resolve a path to its inode id, walking from the root. `None` if any
+        /// component is missing or a non-final component is not a directory.
+        fn resolve_path(&self, path: &str) -> Option<u64> {
+            let mut id = 1u64;
+            for comp in Self::split_components(path) {
+                let node = self.inodes.get(&id)?;
+                if !node.is_dir {
+                    return None;
+                }
+                id = *node.children.get(comp)?;
+            }
+            Some(id)
+        }
+
+        /// Ensure the directory at `path` exists, creating every parent (`mkdir
+        /// -p`). A non-directory occupying a path component is replaced by a
+        /// directory (the caller is creating a tree). Returns the directory id.
+        fn ensure_dir(&mut self, path: &str) -> u64 {
+            let mut id = 1u64;
+            for comp in Self::split_components(path) {
+                let existing = self
+                    .inodes
+                    .get(&id)
+                    .and_then(|n| n.children.get(comp))
+                    .copied();
+                id = match existing {
+                    Some(child) if self.inodes.get(&child).is_some_and(|n| n.is_dir) => child,
+                    other => {
+                        if let Some(child) = other {
+                            self.free_subtree(child);
+                        }
+                        let nid = self.alloc(true, S_IFDIR | 0o755);
+                        self.inodes.get_mut(&id).unwrap().children.insert(comp.into(), nid);
+                        nid
+                    }
+                };
+            }
+            id
+        }
+
+        /// Read a file by nested path. `None` if absent or a directory.
+        pub fn read_path(&self, path: &str) -> Option<&[u8]> {
+            let id = self.resolve_path(path)?;
+            let n = self.inodes.get(&id)?;
+            (!n.is_dir).then_some(n.data.as_slice())
+        }
+
+        /// Stat a path: `(is_dir, size)`. `None` if absent.
+        pub fn stat_path(&self, path: &str) -> Option<(bool, usize)> {
+            let id = self.resolve_path(path)?;
+            let n = self.inodes.get(&id)?;
+            Some((n.is_dir, n.data.len()))
+        }
+
+        /// List a directory by nested path — `(name, is_dir, size)` per entry,
+        /// in name order. `None` if the path is absent or not a directory.
+        pub fn list_path(&self, path: &str) -> Option<Vec<(String, bool, usize)>> {
+            let id = self.resolve_path(path)?;
+            let node = self.inodes.get(&id)?;
+            if !node.is_dir {
+                return None;
+            }
+            let mut out = Vec::new();
+            for (name, &cid) in &node.children {
+                if let Some(c) = self.inodes.get(&cid) {
+                    out.push((name.clone(), c.is_dir, c.data.len()));
+                }
+            }
+            Some(out)
+        }
+
+        /// Write a file at a nested path, creating parent directories (`mkdir
+        /// -p` + write). A directory occupying the target name is replaced by the
+        /// file.
+        pub fn write_path(&mut self, path: &str, data: &[u8]) {
+            let (dir, Some(file)) = Self::split_parent(path) else {
+                return;
+            };
+            let parent = self.ensure_dir(dir);
+            let existing = self
+                .inodes
+                .get(&parent)
+                .and_then(|n| n.children.get(file))
+                .copied();
+            match existing {
+                Some(cid) if self.inodes.get(&cid).is_some_and(|n| !n.is_dir) => {
+                    self.inodes.get_mut(&cid).unwrap().data = data.to_vec();
+                }
+                other => {
+                    if let Some(cid) = other {
+                        self.free_subtree(cid);
+                    }
+                    let nid = self.alloc(false, S_IFREG | 0o644);
+                    self.inodes.get_mut(&nid).unwrap().data = data.to_vec();
+                    self.inodes.get_mut(&parent).unwrap().children.insert(file.into(), nid);
+                }
+            }
+        }
+
+        /// `mkdir -p` at a nested path.
+        pub fn make_dir_path(&mut self, path: &str) {
+            self.ensure_dir(path);
+        }
+
+        /// Delete a file or directory subtree at a nested path. `true` if it
+        /// existed.
+        pub fn delete_path(&mut self, path: &str) -> bool {
+            let (dir, Some(file)) = Self::split_parent(path) else {
+                return false;
+            };
+            let Some(parent) = self.resolve_path(dir) else {
+                return false;
+            };
+            let Some(cid) = self.inodes.get_mut(&parent).and_then(|n| n.children.remove(file)) else {
+                return false;
+            };
+            self.free_subtree(cid);
+            true
+        }
+
+        /// Rename a nested path, creating the destination's parent directories.
+        /// `true` if the source existed; a displaced destination subtree is freed.
+        pub fn rename_path(&mut self, from: &str, to: &str) -> bool {
+            let (fdir, Some(fname)) = Self::split_parent(from) else {
+                return false;
+            };
+            let Some(fparent) = self.resolve_path(fdir) else {
+                return false;
+            };
+            let Some(id) = self.inodes.get_mut(&fparent).and_then(|n| n.children.remove(fname)) else {
+                return false;
+            };
+            let (tdir, Some(tname)) = Self::split_parent(to) else {
+                return false;
+            };
+            let tparent = self.ensure_dir(tdir);
+            if let Some(displaced) =
+                self.inodes.get_mut(&tparent).unwrap().children.insert(tname.into(), id)
+            {
+                self.free_subtree(displaced);
+            }
+            true
+        }
     }
 
     /// A little-endian cursor over a 9P message body.
@@ -2221,6 +2395,65 @@ impl Emulator {
         if let Some(d) = self.virtio9p.as_mut() {
             d.fs.make_dir(name);
         }
+    }
+
+    // ── Nested-path workspace API (`CC-15` parity with the guest tree) ──
+    // The flat methods above address only the share root; these address the full
+    // nested tree (a `.git` object store, `src/…` sources) the guest sees over
+    // `virtio-9p` — one content, Law L1. The Source Control provider (`CC-51`)
+    // and the workbench file explorer drive these over the wasm peer.
+
+    /// Read a file by nested path from the shared workspace. `None` if no 9P
+    /// device is attached, or the path is absent or a directory.
+    #[must_use]
+    pub fn workspace_file_path(&self, path: &str) -> Option<&[u8]> {
+        self.virtio9p.as_ref().and_then(|d| d.fs.read_path(path))
+    }
+
+    /// Stat a nested path: `(is_dir, size)`. `None` if absent / no workspace.
+    #[must_use]
+    pub fn workspace_stat_path(&self, path: &str) -> Option<(bool, usize)> {
+        self.virtio9p.as_ref().and_then(|d| d.fs.stat_path(path))
+    }
+
+    /// List a directory by nested path — `(name, is_dir, size)`. `None` if the
+    /// path is absent or not a directory (an empty share lists the root as
+    /// `Some(vec![])`).
+    #[must_use]
+    pub fn workspace_list_path(&self, path: &str) -> Option<Vec<(alloc::string::String, bool, usize)>> {
+        self.virtio9p.as_ref().and_then(|d| d.fs.list_path(path))
+    }
+
+    /// Write a file at a nested path, creating parent directories. No-op if no
+    /// workspace is attached.
+    pub fn workspace_write_path(&mut self, path: &str, data: &[u8]) {
+        if let Some(d) = self.virtio9p.as_mut() {
+            d.fs.write_path(path, data);
+        }
+    }
+
+    /// `mkdir -p` at a nested path in the shared workspace.
+    pub fn workspace_mkdir_path(&mut self, path: &str) {
+        if let Some(d) = self.virtio9p.as_mut() {
+            d.fs.make_dir_path(path);
+        }
+    }
+
+    /// Delete a file or directory subtree at a nested path. `true` if it existed.
+    pub fn workspace_delete_path(&mut self, path: &str) -> bool {
+        self.virtio9p
+            .as_mut()
+            .map(|d| d.fs.delete_path(path))
+            .unwrap_or(false)
+    }
+
+    /// Rename a nested path (creating the destination's parents). `true` if the
+    /// source existed.
+    pub fn workspace_rename_path(&mut self, from: &str, to: &str) -> bool {
+        self.virtio9p
+            .as_mut()
+            .map(|d| d.fs.rename_path(from, to))
+            .unwrap_or(false)
     }
 
     /// Attach a root filesystem disk to the machine's VirtIO block device — the
