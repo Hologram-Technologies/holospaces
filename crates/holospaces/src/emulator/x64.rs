@@ -2806,7 +2806,18 @@ impl Cpu {
                 let rel = self.fetch(4) as i32 as i64;
                 let ret = self.rip;
                 self.push(ret);
-                self.rip = self.rip.wrapping_add(rel as u64);
+                let target = self.rip.wrapping_add(rel as u64);
+                // Retpoline fast path. `call __x86_indirect_thunk_rXX` is the Spectre-v2
+                // mitigation for an indirect `call *rXX`; with no speculation (this is an
+                // emulator) it is *exactly* `call *rXX`. It is the #1 hot block on a real
+                // boot (~13% of block entries) — recognise the thunk body and jump straight
+                // to the register, skipping ~5 interpreted instructions per indirect call.
+                // `push(ret)` above already supplied the outer return address; the thunk's
+                // own push/mov/ret net to zero on rsp, so this is byte‑accurate.
+                self.rip = match self.retpoline_reg(target) {
+                    Some(reg) => self.r[reg],
+                    None => target,
+                };
             }
             0xe9 => {
                 let rel = self.fetch(4) as i32 as i64;
@@ -3730,6 +3741,34 @@ impl Cpu {
     /// Execute a string instruction (`MOVS`/`STOS`/`LODS`/`SCAS`/`CMPS`) of
     /// element size `osz`, honouring a `REP`/`REPE`/`REPNE` prefix and the
     /// direction flag. `RSI`/`RDI` advance by ±`osz`; `RCX` counts the repeats.
+    /// If `target` is an `__x86_indirect_thunk_rXX` retpoline (the Spectre‑v2 indirect‑
+    /// call thunk), return the register `XX` it dispatches through. The body is fixed:
+    /// `e8 01 00 00 00` (call +6) · `cc` (int3) · `48|4c 89 <modrm> 24`
+    /// (`mov %rXX,(%rsp)`) · `e9` (jmp `__x86_return_thunk`). Matched by content (not a
+    /// hardcoded address), so it is kernel‑version‑agnostic. Non‑faulting peek: an
+    /// unmapped/garbage target simply doesn't match and the call proceeds normally.
+    #[inline]
+    fn retpoline_reg(&self, target: u64) -> Option<usize> {
+        let b = |off: u64| *self.ram.get(self.translate(target.wrapping_add(off)) as usize).unwrap_or(&0);
+        if b(0) == 0xe8
+            && b(1) == 0x01
+            && b(2) == 0
+            && b(3) == 0
+            && b(4) == 0
+            && b(5) == 0xcc
+            && (b(6) | 0x04) == 0x4c // REX.W (0x48) or REX.WR (0x4c)
+            && b(7) == 0x89
+            && (b(8) & 0xc7) == 0x04 // mov reg,(rsp): mod=00, rm=100 (SIB follows)
+            && b(9) == 0x24 // SIB: base=rsp, index=none
+            && b(10) == 0xe9
+        {
+            // base reg from ModRM.reg, extended by REX.R (bit 2 of the REX byte).
+            Some(((b(8) >> 3) & 7) as usize | usize::from(b(6) & 0x04 != 0) << 3)
+        } else {
+            None
+        }
+    }
+
     fn string_op(&mut self, kind: StringOp, osz: u8, rep: RepKind) {
         let step: i64 = if self.rflags & RFLAGS_DF != 0 {
             -i64::from(osz)
@@ -4719,6 +4758,38 @@ mod tests {
             assert_eq!(cpu.ram[dst + i], cpu.ram[src + i], "byte {i} copied");
         }
         assert_eq!(cpu.ram[dst + 13], 0xEE, "the byte past the copy is untouched");
+    }
+
+    #[test]
+    fn call_to_a_retpoline_thunk_fast_paths_to_the_register() {
+        let mut cpu = Cpu::new(64 * 1024); // paging off → identity translate
+        // `__x86_indirect_thunk_rax` body at 0x6000: call +6; int3; mov %rax,(%rsp); jmp …
+        cpu.ram[0x6000..0x600b]
+            .copy_from_slice(&[0xe8, 0x01, 0, 0, 0, 0xcc, 0x48, 0x89, 0x04, 0x24, 0xe9]);
+        // `call 0x6000` at 0x5000 (E8 rel32).
+        let rel = (0x6000i64 - 0x5005) as i32;
+        cpu.ram[0x5000] = 0xe8;
+        cpu.ram[0x5001..0x5005].copy_from_slice(&rel.to_le_bytes());
+        cpu.rip = 0x5000;
+        cpu.r[RAX] = 0x7000; // the indirect target
+        cpu.r[RSP] = 0x4000;
+        cpu.step().expect("the call executes");
+        assert_eq!(cpu.rip, 0x7000, "fast-pathed straight to RAX (== call *rax), skipping the thunk");
+        assert_eq!(cpu.r[RSP], 0x3ff8, "the outer return address was pushed (rsp -= 8)");
+        assert_eq!(
+            u64::from_le_bytes(cpu.ram[0x3ff8..0x4000].try_into().unwrap()),
+            0x5005,
+            "the pushed value is the return address (the instruction after the call)"
+        );
+
+        // A normal call (target is NOT a retpoline) jumps to the target unchanged.
+        cpu.ram[0x8000] = 0x90; // nop — not a thunk body
+        let rel2 = (0x8000i64 - 0x5005) as i32;
+        cpu.ram[0x5001..0x5005].copy_from_slice(&rel2.to_le_bytes());
+        cpu.rip = 0x5000;
+        cpu.r[RSP] = 0x4000;
+        cpu.step().expect("the second call executes");
+        assert_eq!(cpu.rip, 0x8000, "a non-retpoline call jumps to its target normally");
     }
 
     #[test]
