@@ -5147,10 +5147,13 @@ impl Cpu {
                 } else {
                     f64::from_bits(self.xmm_load_rm_lo(rm, 8))
                 };
+                // libm (not the std f64 methods) so the core stays no_std — the same
+                // float foundation the riscv/aarch64 FPU emulation uses. rint rounds
+                // to nearest, ties-to-even (the default SSE rounding mode).
                 let r = if op2 == 0x2c {
-                    v.trunc()
+                    libm::trunc(v)
                 } else {
-                    v.round_ties_even()
+                    libm::rint(v)
                 };
                 self.r[reg] = if rex & 0x8 != 0 {
                     r as i64 as u64
@@ -5203,7 +5206,7 @@ impl Cpu {
                                 b
                             }
                         }
-                        _ => b.sqrt(),
+                        _ => libm::sqrt(b), // 0x51 SQRT — libm keeps the core no_std
                     }
                 };
                 let f32op = |op: u8, a: f32, b: f32| -> f32 {
@@ -5226,7 +5229,7 @@ impl Cpu {
                                 b
                             }
                         }
-                        _ => b.sqrt(),
+                        _ => libm::sqrtf(b), // 0x51 SQRT (single)
                     }
                 };
                 let dst = self.xmm[reg];
@@ -5288,7 +5291,7 @@ impl Cpu {
                 for l in 0..4u32 {
                     if p66 || f3 {
                         let f = f32::from_bits((src >> (l * 32)) as u32);
-                        let i = (if f3 { f.trunc() } else { f.round_ties_even() }) as i32 as u32;
+                        let i = (if f3 { libm::truncf(f) } else { libm::rintf(f) }) as i32 as u32;
                         out |= u128::from(i) << (l * 32);
                     } else {
                         let i = (src >> (l * 32)) as u32 as i32;
