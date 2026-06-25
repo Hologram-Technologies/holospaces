@@ -189,6 +189,30 @@ pub fn drain_blockprof() -> (u64, Vec<(u64, u64)>) {
     (entries, v)
 }
 
+// A runtime toggle for the interpreter fast paths (string-op bulk copies, retpoline
+// skip). On by default; the micro-benchmark turns it off to measure each fast path's
+// speedup cleanly (a synthetic, ASLR-independent workload — unlike a whole boot).
+#[cfg(feature = "std")]
+thread_local! {
+    static FASTPATH_ON: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
+}
+/// Enable/disable the interpreter fast paths (for benchmarking; on in production).
+#[cfg(feature = "std")]
+pub fn set_fastpaths(on: bool) {
+    FASTPATH_ON.with(|c| c.set(on));
+}
+#[inline(always)]
+fn fastpaths_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        FASTPATH_ON.with(core::cell::Cell::get)
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 struct Sys {
     uart: Uart,
     /// The `virtio-blk` κ-disk rootfs (`CC-7`), when a disk is attached. The
@@ -2814,9 +2838,9 @@ impl Cpu {
                 // to the register, skipping ~5 interpreted instructions per indirect call.
                 // `push(ret)` above already supplied the outer return address; the thunk's
                 // own push/mov/ret net to zero on rsp, so this is byte‑accurate.
-                self.rip = match self.retpoline_reg(target) {
-                    Some(reg) => self.r[reg],
-                    None => target,
+                self.rip = match (fastpaths_on(), self.retpoline_reg(target)) {
+                    (true, Some(reg)) => self.r[reg],
+                    _ => target,
                 };
             }
             0xe9 => {
@@ -3782,7 +3806,11 @@ impl Cpu {
         // replay the same per-cache-line dcache touches the per-element path would make
         // (the modelled L1 jitter feeds the TSC → RDRAND → ASLR, so it must not drift).
         // Falls through on anything subtle (DF=1, MMIO/device, cross-page, not-present).
-        if matches!(kind, StringOp::Stos) && rep != RepKind::None && self.rflags & RFLAGS_DF == 0 {
+        if fastpaths_on()
+            && matches!(kind, StringOp::Stos)
+            && rep != RepKind::None
+            && self.rflags & RFLAGS_DF == 0
+        {
             let count = self.r[RCX];
             let len = count.wrapping_mul(u64::from(osz));
             let dst = self.r[RDI];
@@ -3832,7 +3860,11 @@ impl Cpu {
         // TSC-identical: we replay the per-element interleaved (src-read, dst-write)
         // dcache touches the loop would make. Falls through on overlap, page-cross,
         // MMIO, DF=1, or a `#PF`.
-        if matches!(kind, StringOp::Movs) && rep != RepKind::None && self.rflags & RFLAGS_DF == 0 {
+        if fastpaths_on()
+            && matches!(kind, StringOp::Movs)
+            && rep != RepKind::None
+            && self.rflags & RFLAGS_DF == 0
+        {
             let count = self.r[RCX];
             let len = count.wrapping_mul(u64::from(osz));
             let (src, dst) = (self.r[RSI], self.r[RDI]);
@@ -4790,6 +4822,55 @@ mod tests {
         cpu.r[RSP] = 0x4000;
         cpu.step().expect("the second call executes");
         assert_eq!(cpu.rip, 0x8000, "a non-retpoline call jumps to its target normally");
+    }
+
+    /// Micro-benchmark: the bulk string-op fast paths vs the per-element interpreter,
+    /// on a synthetic (ASLR-independent) workload — a clean speedup number for the two
+    /// hottest *instruction-heavy* ops (each moves a 4 KiB page per call).
+    #[test]
+    #[ignore = "micro-benchmark (timing) — run explicitly with --nocapture"]
+    fn bench_string_op_fast_paths() {
+        use std::time::Instant;
+        let mut cpu = Cpu::new(1 << 20); // 1 MiB, paging off (identity translate)
+        const N: u32 = 200_000;
+        let stos = |cpu: &mut Cpu| {
+            for _ in 0..N {
+                cpu.r[RDI] = 0x10000;
+                cpu.r[RCX] = 512; // 512 qwords = one 4 KiB page (clear_page)
+                cpu.r[RAX] = 0;
+                cpu.rflags &= !RFLAGS_DF;
+                cpu.string_op(StringOp::Stos, 8, RepKind::Rep);
+            }
+        };
+        let movs = |cpu: &mut Cpu| {
+            for _ in 0..N {
+                cpu.r[RSI] = 0x10000;
+                cpu.r[RDI] = 0x20000;
+                cpu.r[RCX] = 512;
+                cpu.rflags &= !RFLAGS_DF;
+                cpu.string_op(StringOp::Movs, 8, RepKind::Rep);
+            }
+        };
+        for (name, bench) in [
+            ("rep stosq (clear_page)", &stos as &dyn Fn(&mut Cpu)),
+            ("rep movsq (copy_user)", &movs),
+        ] {
+            set_fastpaths(true);
+            bench(&mut cpu); // warm
+            let t0 = Instant::now();
+            bench(&mut cpu);
+            let on = t0.elapsed();
+            set_fastpaths(false);
+            bench(&mut cpu); // warm
+            let t1 = Instant::now();
+            bench(&mut cpu);
+            let off = t1.elapsed();
+            set_fastpaths(true);
+            eprintln!(
+                "  {name}: fast {on:>10.2?}  vs interpret {off:>10.2?}  = {:.1}x  ({N} × 4 KiB)",
+                off.as_secs_f64() / on.as_secs_f64()
+            );
+        }
     }
 
     #[test]
