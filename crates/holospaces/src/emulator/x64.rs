@@ -5094,22 +5094,208 @@ impl Cpu {
                     unpckh_dwords(self.xmm[reg], s)
                 };
             }
-            // Packed bitwise logicals — 128-bit, identical result for the PS/PD/int
-            // forms (the 66 prefix only selects the assembler mnemonic). Pervasive in
-            // compiled code + glibc: `xorps %xmm,%xmm` zeros a register, PXOR/POR/PAND
-            // appear throughout string/float routines. dst OP= r/m128.
+            // Packed-FLOAT bitwise logicals — 128-bit (the 66 prefix only selects the
+            // PS/PD mnemonic; the result is identical). `xorps %xmm,%xmm` (register
+            // zeroing) is pervasive in compiled code + glibc. The packed-INT forms
+            // (PAND/PANDN/POR/PXOR, DB/DF/EB/EF) are handled by `sse_bin` below.
             //   54 ANDPS/ANDPD · 55 ANDNPS/ANDNPD · 56 ORPS/ORPD · 57 XORPS/XORPD
-            //   DB PAND · DF PANDN · EB POR · EF PXOR
-            0x54 | 0x55 | 0x56 | 0x57 | 0xdb | 0xdf | 0xeb | 0xef => {
+            0x54..=0x57 => {
                 let (reg, rm) = self.modrm(rex);
                 let a = self.xmm[reg];
                 let b = self.xmm_load_rm(rm);
                 self.xmm[reg] = match op2 {
-                    0x54 | 0xdb => a & b,  // AND
-                    0x55 | 0xdf => !a & b, // ANDN (note: (NOT dst) AND src)
-                    0x56 | 0xeb => a | b,  // OR
-                    _ => a ^ b,            // 0x57 | 0xef — XOR
+                    0x54 => a & b,  // ANDPS
+                    0x55 => !a & b, // ANDNPS — (NOT dst) AND src
+                    0x56 => a | b,  // ORPS
+                    _ => a ^ b,     // 0x57 XORPS
                 };
+            }
+            // ── SSE/SSE2 scalar + packed floating point ─────────────────────────
+            // Prefix selects the form: F2 = scalar double, F3 = scalar single, 66 =
+            // packed double (2 lanes), none = packed single (4 lanes). gcc/cc1 and
+            // glibc use these throughout; a real in-guest compile traps without them.
+            //
+            // CVTSI2SD/SS — integer r/m (32/64 by REX.W) → scalar float, low lane.
+            0x2a => {
+                let (reg, rm) = self.modrm(rex);
+                let bits: u128 = if rex & 0x8 != 0 {
+                    let i = self.load_rm(rm, 8) as i64;
+                    if f3 {
+                        u128::from((i as f32).to_bits())
+                    } else {
+                        u128::from((i as f64).to_bits())
+                    }
+                } else {
+                    let i = self.load_rm(rm, 4) as u32 as i32;
+                    if f3 {
+                        u128::from((i as f32).to_bits())
+                    } else {
+                        u128::from((i as f64).to_bits())
+                    }
+                };
+                if f3 {
+                    self.xmm[reg] = (self.xmm[reg] & !0xffff_ffffu128) | bits;
+                } else {
+                    self.xmm[reg] = (self.xmm[reg] & !u128::from(u64::MAX)) | bits;
+                }
+            }
+            // CVTTSD2SI/SS (truncate) · CVTSD2SI/SS (round) — scalar float → GPR int.
+            0x2c | 0x2d => {
+                let (reg, rm) = self.modrm(rex);
+                let v = if f3 {
+                    f64::from(f32::from_bits(self.xmm_load_rm_lo(rm, 4) as u32))
+                } else {
+                    f64::from_bits(self.xmm_load_rm_lo(rm, 8))
+                };
+                let r = if op2 == 0x2c {
+                    v.trunc()
+                } else {
+                    v.round_ties_even()
+                };
+                self.r[reg] = if rex & 0x8 != 0 {
+                    r as i64 as u64
+                } else {
+                    (r as i32 as u64) & 0xffff_ffff
+                };
+            }
+            // UCOMISD/SS · COMISD/SS — compare low lanes → EFLAGS (ZF/PF/CF).
+            0x2e | 0x2f => {
+                let (reg, rm) = self.modrm(rex);
+                let (a, b) = if p66 {
+                    (
+                        f64::from_bits(self.xmm[reg] as u64),
+                        f64::from_bits(self.xmm_load_rm_lo(rm, 8)),
+                    )
+                } else {
+                    (
+                        f64::from(f32::from_bits(self.xmm[reg] as u32)),
+                        f64::from(f32::from_bits(self.xmm_load_rm_lo(rm, 4) as u32)),
+                    )
+                };
+                self.set(flag::OF, false);
+                self.set(flag::SF, false);
+                self.set(flag::AF, false);
+                let unordered = a.is_nan() || b.is_nan();
+                self.set(flag::ZF, unordered || a == b);
+                self.set(flag::PF, unordered);
+                self.set(flag::CF, unordered || a < b);
+            }
+            // SQRT · ADD · MUL · SUB · MIN · DIV · MAX — scalar or packed.
+            0x51 | 0x58 | 0x59 | 0x5c | 0x5d | 0x5e | 0x5f => {
+                let (reg, rm) = self.modrm(rex);
+                let f64op = |op: u8, a: f64, b: f64| -> f64 {
+                    match op {
+                        0x58 => a + b,
+                        0x59 => a * b,
+                        0x5c => a - b,
+                        0x5e => a / b,
+                        0x5d => {
+                            if a < b {
+                                a
+                            } else {
+                                b
+                            }
+                        }
+                        0x5f => {
+                            if a > b {
+                                a
+                            } else {
+                                b
+                            }
+                        }
+                        _ => b.sqrt(),
+                    }
+                };
+                let f32op = |op: u8, a: f32, b: f32| -> f32 {
+                    match op {
+                        0x58 => a + b,
+                        0x59 => a * b,
+                        0x5c => a - b,
+                        0x5e => a / b,
+                        0x5d => {
+                            if a < b {
+                                a
+                            } else {
+                                b
+                            }
+                        }
+                        0x5f => {
+                            if a > b {
+                                a
+                            } else {
+                                b
+                            }
+                        }
+                        _ => b.sqrt(),
+                    }
+                };
+                let dst = self.xmm[reg];
+                if f2 {
+                    let b = f64::from_bits(self.xmm_load_rm_lo(rm, 8));
+                    let r = f64op(op2, f64::from_bits(dst as u64), b);
+                    self.xmm[reg] = (dst & !u128::from(u64::MAX)) | u128::from(r.to_bits());
+                } else if f3 {
+                    let b = f32::from_bits(self.xmm_load_rm_lo(rm, 4) as u32);
+                    let r = f32op(op2, f32::from_bits(dst as u32), b);
+                    self.xmm[reg] = (dst & !0xffff_ffffu128) | u128::from(r.to_bits());
+                } else if p66 {
+                    let src = self.xmm_load_rm(rm);
+                    let mut out = 0u128;
+                    for l in 0..2 {
+                        let a = f64::from_bits((dst >> (l * 64)) as u64);
+                        let b = f64::from_bits((src >> (l * 64)) as u64);
+                        out |= u128::from(f64op(op2, a, b).to_bits()) << (l * 64);
+                    }
+                    self.xmm[reg] = out;
+                } else {
+                    let src = self.xmm_load_rm(rm);
+                    let mut out = 0u128;
+                    for l in 0..4 {
+                        let a = f32::from_bits((dst >> (l * 32)) as u32);
+                        let b = f32::from_bits((src >> (l * 32)) as u32);
+                        out |= u128::from(f32op(op2, a, b).to_bits()) << (l * 32);
+                    }
+                    self.xmm[reg] = out;
+                }
+            }
+            // CVTSS2SD/CVTSD2SS (scalar) · CVTPS2PD/CVTPD2PS (packed) — float precision.
+            0x5a => {
+                let (reg, rm) = self.modrm(rex);
+                if f2 {
+                    let v = f64::from_bits(self.xmm_load_rm_lo(rm, 8)) as f32;
+                    self.xmm[reg] = (self.xmm[reg] & !0xffff_ffffu128) | u128::from(v.to_bits());
+                } else if f3 {
+                    let v = f64::from(f32::from_bits(self.xmm_load_rm_lo(rm, 4) as u32));
+                    self.xmm[reg] =
+                        (self.xmm[reg] & !u128::from(u64::MAX)) | u128::from(v.to_bits());
+                } else if p66 {
+                    let src = self.xmm_load_rm(rm);
+                    let lo = (f64::from_bits(src as u64) as f32).to_bits();
+                    let hi = (f64::from_bits((src >> 64) as u64) as f32).to_bits();
+                    self.xmm[reg] = u128::from(lo) | (u128::from(hi) << 32);
+                } else {
+                    let src = self.xmm_load_rm_lo(rm, 8);
+                    let lo = f64::from(f32::from_bits(src as u32)).to_bits();
+                    let hi = f64::from(f32::from_bits((src >> 32) as u32)).to_bits();
+                    self.xmm[reg] = u128::from(lo) | (u128::from(hi) << 64);
+                }
+            }
+            // CVTDQ2PS (none) · CVTPS2DQ (66, round) · CVTTPS2DQ (F3, truncate).
+            0x5b => {
+                let (reg, rm) = self.modrm(rex);
+                let src = self.xmm_load_rm(rm);
+                let mut out = 0u128;
+                for l in 0..4u32 {
+                    if p66 || f3 {
+                        let f = f32::from_bits((src >> (l * 32)) as u32);
+                        let i = (if f3 { f.trunc() } else { f.round_ties_even() }) as i32 as u32;
+                        out |= u128::from(i) << (l * 32);
+                    } else {
+                        let i = (src >> (l * 32)) as u32 as i32;
+                        out |= u128::from((i as f32).to_bits()) << (l * 32);
+                    }
+                }
+                self.xmm[reg] = out;
             }
             // MOVAPS/MOVAPD — reg ← r/m (128, alignment not enforced).
             0x28 => {
@@ -5287,6 +5473,38 @@ impl Cpu {
             0xd9 => self.sse_packed_w(rex, |a, b| a.saturating_sub(b)),
             // PMULLW (low 16 of the product).
             0xd5 => self.sse_packed_w(rex, |a, b| a.wrapping_mul(b)),
+            // PMULHW/PMULHUW — high 16 of the signed/unsigned word product.
+            0xe5 => self.sse_packed_w(rex, |a, b| {
+                (((a as i16 as i32) * (b as i16 as i32)) >> 16) as u16
+            }),
+            0xe4 => self.sse_packed_w(rex, |a, b| ((u32::from(a) * u32::from(b)) >> 16) as u16),
+            // PMULUDQ — unsigned 32×32→64 of the low dword of each 64-bit lane.
+            0xf4 => self.sse_packed_q(rex, |a, b| (a & 0xffff_ffff) * (b & 0xffff_ffff)),
+            // PAVGB/PAVGW — rounded unsigned average.
+            0xe0 => self.sse_packed_b(rex, |a, b| ((u16::from(a) + u16::from(b) + 1) >> 1) as u8),
+            0xe3 => self.sse_packed_w(rex, |a, b| ((u32::from(a) + u32::from(b) + 1) >> 1) as u16),
+            // Saturating signed add/sub (bytes + words).
+            0xec => self.sse_packed_b(rex, |a, b| (a as i8).saturating_add(b as i8) as u8),
+            0xed => self.sse_packed_w(rex, |a, b| (a as i16).saturating_add(b as i16) as u16),
+            0xe8 => self.sse_packed_b(rex, |a, b| (a as i8).saturating_sub(b as i8) as u8),
+            0xe9 => self.sse_packed_w(rex, |a, b| (a as i16).saturating_sub(b as i16) as u16),
+            // PMADDWD — signed word multiply, adjacent pairs summed into dwords.
+            0xf5 => {
+                let (reg, rm) = self.modrm(rex);
+                let a = to_words(self.xmm[reg]);
+                let b = to_words(self.xmm_load_rm(rm));
+                let mut o = [0u32; 4];
+                for i in 0..4 {
+                    let p0 = i32::from(a[2 * i] as i16) * i32::from(b[2 * i] as i16);
+                    let p1 = i32::from(a[2 * i + 1] as i16) * i32::from(b[2 * i + 1] as i16);
+                    o[i] = p0.wrapping_add(p1) as u32;
+                }
+                let mut v = 0u128;
+                for (i, &word) in o.iter().enumerate() {
+                    v |= u128::from(word) << (i * 32);
+                }
+                self.xmm[reg] = v;
+            }
             // PUNPCKL/H BW/WD/DQ/QDQ.
             0x60 => self.sse_unpack(rex, Unpack::LoB),
             0x61 => self.sse_unpack(rex, Unpack::LoW),
