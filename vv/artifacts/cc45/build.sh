@@ -20,7 +20,7 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 work="$(mktemp -d)"; cd "$work"
 
-echo "== [1/3] cc45 amd64 kernel (no initramfs, virtio-blk root) =="
+echo "== [1/5] cc45 amd64 kernel (no initramfs, virtio-blk root) =="
 git clone --depth 1 --branch v6.6 https://github.com/torvalds/linux.git linux >/dev/null 2>&1
 ( cd linux
   export ARCH=x86_64
@@ -51,7 +51,7 @@ cp linux/arch/x86/boot/bzImage        "$here/linux/bzImage"
 cp linux/.config                      "$here/linux/kernel.config"
 echo "kernel: vmlinux.gz $(stat -c%s "$here/linux/vmlinux.gz") bytes; bzImage $(stat -c%s "$here/linux/bzImage") bytes"
 
-echo "== [2/4] static busybox amd64 (the stock binary) =="
+echo "== [2/5] static busybox amd64 (the stock binary) =="
 BBVER=1.36.1
 wget -q "https://busybox.net/downloads/busybox-$BBVER.tar.bz2"
 tar xf "busybox-$BBVER.tar.bz2"
