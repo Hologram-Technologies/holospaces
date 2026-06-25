@@ -953,6 +953,32 @@ export class DevcontainerImage {
         return ret[0];
     }
     /**
+     * Like [`assembleBootableIntoOpfs`](Self::assemble_bootable_into_opfs), but
+     * **COMPACT + occupancy-tracked**: the non-zero blocks are written *contiguously*
+     * (the Nth emitted block at file offset `N·4096`, not at its disk offset), so the
+     * rootfs file is **O(content)** — a few MiB — no matter how large the declared
+     * disk. The `occupancy_handle` sidecar records the disk geometry and placement:
+     * an 8-byte little-endian `image_len` header, then the disk block index of each
+     * packed block (little-endian `u64`, in packed order). That is what lets the
+     * deployed disk be **arbitrarily large** in the browser: a sparse file truncated
+     * to the declared size would count its *logical* size against the origin's OPFS
+     * quota (a multi-GiB disk fails to stage), whereas the compact file costs only
+     * the image's content. [`X64Workspace::boot_devcontainer_opfs_streamed_occupancy`]
+     * reads it back, reconstructing the κ-disk O(content). Returns the image length
+     * (the declared disk the guest sees), as the untracked variant does.
+     * @param {FileSystemSyncAccessHandle} rootfs_handle
+     * @param {FileSystemSyncAccessHandle} occupancy_handle
+     * @param {number} disk_bytes
+     * @returns {number}
+     */
+    assembleBootableIntoOpfsTracked(rootfs_handle, occupancy_handle, disk_bytes) {
+        const ret = wasm.devcontainerimage_assembleBootableIntoOpfsTracked(this.__wbg_ptr, rootfs_handle, occupancy_handle, disk_bytes);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return ret[0];
+    }
+    /**
      * Assemble the layers into a **bootable, interactive, writable** root
      * filesystem on a `disk_bytes`-sized disk: the same overlay as
      * [`Self::assemble`], plus the persistent devcontainer
@@ -1053,6 +1079,26 @@ export class DevcontainerProvision {
      */
     assembleIntoOpfs(rootfs_handle, disk_bytes) {
         const ret = wasm.devcontainerprovision_assembleIntoOpfs(this.__wbg_ptr, rootfs_handle, disk_bytes);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return ret[0];
+    }
+    /**
+     * Like [`assembleIntoOpfs`](Self::assemble_into_opfs), but also records the
+     * rootfs's **occupancy** — the ascending indices of the blocks it actually
+     * wrote — into `occupancy_handle` as packed little-endian `u64`s. That sidecar
+     * is what lets the deployed boot page an **arbitrarily large**, build-capable
+     * devcontainer disk **O(content)**: only the (few) occupied blocks are read at
+     * boot, never the declared size. The rootfs bytes are identical to the untracked
+     * assembler over the same image (Law L1); the sidecar is the sole addition.
+     * @param {FileSystemSyncAccessHandle} rootfs_handle
+     * @param {FileSystemSyncAccessHandle} occupancy_handle
+     * @param {number} disk_bytes
+     * @returns {number}
+     */
+    assembleIntoOpfsTracked(rootfs_handle, occupancy_handle, disk_bytes) {
+        const ret = wasm.devcontainerprovision_assembleIntoOpfsTracked(this.__wbg_ptr, rootfs_handle, occupancy_handle, disk_bytes);
         if (ret[2]) {
             throw takeFromExternrefTable0(ret[1]);
         }
@@ -1979,6 +2025,29 @@ export class X64Workspace {
         wasm.__wbg_x64workspace_free(ptr, 0);
     }
     /**
+     * Boot a provisioned amd64 image **O(content)** by occupancy — the deployed path
+     * for an arbitrarily large, build-capable devcontainer disk. `occupancy_handle`
+     * is the sidecar [`assembleBootableIntoOpfsTracked`](DevcontainerImage::assemble_bootable_into_opfs_tracked)
+     * wrote (packed little-endian `u64` block indices); only those blocks are read
+     * from `rootfs_handle` (each a 4 KiB block = 8 sectors), so a multi-GiB declared
+     * disk pages in proportion to its **content**, never reading its holes. The
+     * streamed-from-OPFS analogue of [`x64::Cpu::boot_linux_disk_occupancy_streamed`].
+     * @param {Uint8Array} kernel
+     * @param {FileSystemSyncAccessHandle} rootfs_handle
+     * @param {FileSystemSyncAccessHandle} occupancy_handle
+     * @param {FileSystemSyncAccessHandle} disk_handle
+     * @returns {X64Workspace}
+     */
+    static bootDevcontainerOpfsStreamedOccupancy(kernel, rootfs_handle, occupancy_handle, disk_handle) {
+        const ptr0 = passArray8ToWasm0(kernel, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.x64workspace_bootDevcontainerOpfsStreamedOccupancy(ptr0, len0, rootfs_handle, occupancy_handle, disk_handle);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return X64Workspace.__wrap(ret[0]);
+    }
+    /**
      * Boot a provisioned amd64 image, **streaming** its κ-disk from OPFS (no full
      * image in RAM): `rootfs_handle` is the provisioned rootfs (read
      * sector-by-sector into the OPFS-backed store on `disk_handle`). Drive with
@@ -2448,7 +2517,7 @@ function __wbg_get_imports() {
             return ret;
         }, arguments); },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 12, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 14, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h4aecbb93981a4764);
             return ret;
         },
@@ -2458,17 +2527,17 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 12, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 14, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h4aecbb93981a4764_2);
             return ret;
         },
         __wbindgen_cast_0000000000000004: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCDataChannelEvent")], shim_idx: 12, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCDataChannelEvent")], shim_idx: 14, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h4aecbb93981a4764_3);
             return ret;
         },
         __wbindgen_cast_0000000000000005: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCPeerConnectionIceEvent")], shim_idx: 12, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCPeerConnectionIceEvent")], shim_idx: 14, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h4aecbb93981a4764_4);
             return ret;
         },
