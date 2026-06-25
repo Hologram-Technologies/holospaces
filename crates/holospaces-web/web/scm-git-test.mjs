@@ -57,13 +57,13 @@ const { chromium } = await import("playwright");
 try { await stat(distDir); await stat(twDir); }
 catch { execSync(`npm install --no-save ${WORKBENCH_PIN} ${BOOTSTRAP}`, { cwd: DIR, stdio: "ignore" }); }
 
-function ociLayerDigest(imageDir) {
-  const blob = (d) => JSON.parse(execSync(`cat ${path.join(imageDir, "blobs/sha256", d.split(":")[1])}`).toString());
-  const index = JSON.parse(execSync(`cat ${path.join(imageDir, "index.json")}`).toString());
-  const manifest = blob(index.manifests[0].digest);
+async function ociLayerDigest(imageDir) {
+  const blob = async (d) => JSON.parse(await readFile(path.join(imageDir, "blobs/sha256", d.split(":")[1]), "utf8"));
+  const index = JSON.parse(await readFile(path.join(imageDir, "index.json"), "utf8"));
+  const manifest = await blob(index.manifests[0].digest);
   return manifest.layers[0].digest.split(":")[1];
 }
-const cc18Layer = ociLayerDigest(path.join(cc18, "image"));
+const cc18Layer = await ociLayerDigest(path.join(cc18, "image"));
 
 const html = await composeWorkbenchHtml({ distDir, twDir, baseUrl: "." });
 
