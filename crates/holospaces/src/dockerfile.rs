@@ -20,7 +20,7 @@
 //! `ONBUILD`/`STOPSIGNAL`/`HEALTHCHECK` are pure image/registry metadata with no
 //! effect on a rootfs — accepted and ignored *by design* (there is nothing in a
 //! rootfs to apply them to), not silently dropped. Any other instruction is an
-//! explicit [`DockerfileError::Unsupported`] error.
+//! explicit `DockerfileError::Unsupported` error.
 
 #[cfg(not(feature = "std"))]
 #[allow(unused_imports)]
