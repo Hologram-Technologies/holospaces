@@ -1566,7 +1566,11 @@ mod ninep {
                             self.free_subtree(child);
                         }
                         let nid = self.alloc(true, S_IFDIR | 0o755);
-                        self.inodes.get_mut(&id).unwrap().children.insert(comp.into(), nid);
+                        self.inodes
+                            .get_mut(&id)
+                            .unwrap()
+                            .children
+                            .insert(comp.into(), nid);
                         nid
                     }
                 };
@@ -1628,7 +1632,11 @@ mod ninep {
                     }
                     let nid = self.alloc(false, S_IFREG | 0o644);
                     self.inodes.get_mut(&nid).unwrap().data = data.to_vec();
-                    self.inodes.get_mut(&parent).unwrap().children.insert(file.into(), nid);
+                    self.inodes
+                        .get_mut(&parent)
+                        .unwrap()
+                        .children
+                        .insert(file.into(), nid);
                 }
             }
         }
@@ -1647,7 +1655,11 @@ mod ninep {
             let Some(parent) = self.resolve_path(dir) else {
                 return false;
             };
-            let Some(cid) = self.inodes.get_mut(&parent).and_then(|n| n.children.remove(file)) else {
+            let Some(cid) = self
+                .inodes
+                .get_mut(&parent)
+                .and_then(|n| n.children.remove(file))
+            else {
                 return false;
             };
             self.free_subtree(cid);
@@ -1663,15 +1675,23 @@ mod ninep {
             let Some(fparent) = self.resolve_path(fdir) else {
                 return false;
             };
-            let Some(id) = self.inodes.get_mut(&fparent).and_then(|n| n.children.remove(fname)) else {
+            let Some(id) = self
+                .inodes
+                .get_mut(&fparent)
+                .and_then(|n| n.children.remove(fname))
+            else {
                 return false;
             };
             let (tdir, Some(tname)) = Self::split_parent(to) else {
                 return false;
             };
             let tparent = self.ensure_dir(tdir);
-            if let Some(displaced) =
-                self.inodes.get_mut(&tparent).unwrap().children.insert(tname.into(), id)
+            if let Some(displaced) = self
+                .inodes
+                .get_mut(&tparent)
+                .unwrap()
+                .children
+                .insert(tname.into(), id)
             {
                 self.free_subtree(displaced);
             }
@@ -2420,7 +2440,10 @@ impl Emulator {
     /// path is absent or not a directory (an empty share lists the root as
     /// `Some(vec![])`).
     #[must_use]
-    pub fn workspace_list_path(&self, path: &str) -> Option<Vec<(alloc::string::String, bool, usize)>> {
+    pub fn workspace_list_path(
+        &self,
+        path: &str,
+    ) -> Option<Vec<(alloc::string::String, bool, usize)>> {
         self.virtio9p.as_ref().and_then(|d| d.fs.list_path(path))
     }
 

@@ -140,9 +140,13 @@ fn the_host_and_os_share_a_nested_workspace_tree_over_virtio_9p() {
         "the host reads back the NESTED file the OS wrote over 9p (guest → host, L1)",
     );
     // The host can also enumerate the guest-created nested directory.
-    let listing = emu.workspace_list_path("src/deep").expect("list the nested dir");
+    let listing = emu
+        .workspace_list_path("src/deep")
+        .expect("list the nested dir");
     assert!(
-        listing.iter().any(|(name, dir, _)| name == "from-guest.txt" && !*dir),
+        listing
+            .iter()
+            .any(|(name, dir, _)| name == "from-guest.txt" && !*dir),
         "the host lists the guest-created nested directory; got {listing:?}",
     );
 }

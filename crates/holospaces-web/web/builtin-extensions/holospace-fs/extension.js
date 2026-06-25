@@ -426,16 +426,20 @@ async function bootHolospace() {
 // ── FileSystemProvider over the virtio-9p workspace (CC-15) ─────────────────
 const { FileType, FileSystemError, EventEmitter } = vscode;
 
+// The workspace-relative POSIX path of a `holospace://…/workspace/<path>` URI —
+// the share-relative path the nested 9p API addresses (`.git/HEAD`,
+// `src/main.rs`). Already nested (only the `workspace/` prefix is stripped).
 function nameOf(uri) {
   const p = uri.path.replace(/^\/+/, "");
   return p.replace(/^workspace\/?/, "");
 }
 
-// Whether the booted core exposes the virtio-9p workspace. The riscv64 Workspace
-// does; the aarch64 terminal core does not yet (its workspace is empty until 9p
-// parity lands) — the editor then reflects the real, empty state, never fakes it.
+// Whether the booted core exposes the virtio-9p workspace with the nested-path
+// API (`CC-15`/`CC-51`). The riscv64 Workspace does; the aarch64 / x86-64
+// terminal cores do not yet (their workspace is empty until 9p parity lands) —
+// the editor then reflects the real, empty state, never fakes it.
 function has9p() {
-  return ws && typeof ws.ws_read === "function";
+  return ws && typeof ws.ws_read_path === "function";
 }
 
 class HolospaceFS {
@@ -453,48 +457,58 @@ class HolospaceFS {
       return { type: FileType.Directory, ctime: 0, mtime: 0, size: 0 };
     }
     if (!has9p()) throw FileSystemError.FileNotFound(uri);
-    const bytes = ws.ws_read(name);
-    if (bytes == null) throw FileSystemError.FileNotFound(uri);
-    return { type: FileType.File, ctime: 0, mtime: Date.now(), size: bytes.length };
+    const s = ws.ws_stat_path(name);
+    if (s == null) throw FileSystemError.FileNotFound(uri);
+    const { dir, size } = JSON.parse(s);
+    return {
+      type: dir ? FileType.Directory : FileType.File,
+      ctime: 0,
+      mtime: Date.now(),
+      size,
+    };
   }
-  async readDirectory() {
+  // Read a directory by its full nested path — so the explorer shows the real
+  // repository tree (`src/…`, the `.git` directory), not only the root.
+  async readDirectory(uri) {
     await readyPromise;
-    if (!has9p()) return []; // the aarch64 core has no 9p workspace yet
-    const list = JSON.parse(ws.ws_list());
-    return list.map((e) => [e.name, e.dir ? FileType.Directory : FileType.File]);
+    if (!has9p()) return []; // a core without the 9p workspace yet
+    const json = ws.ws_list_path(nameOf(uri));
+    if (json == null) return [];
+    return JSON.parse(json).map((e) => [e.name, e.dir ? FileType.Directory : FileType.File]);
   }
   async readFile(uri) {
     await readyPromise;
     if (!has9p()) throw FileSystemError.FileNotFound(uri);
-    const bytes = ws.ws_read(nameOf(uri));
+    const bytes = ws.ws_read_path(nameOf(uri));
     if (bytes == null) throw FileSystemError.FileNotFound(uri);
     return bytes;
   }
   async writeFile(uri, content) {
     await readyPromise;
     if (!has9p()) throw FileSystemError.NoPermissions(uri);
-    ws.ws_write(nameOf(uri), content);
+    ws.ws_write_path(nameOf(uri), content);
     this._emitter.fire([{ type: vscode.FileChangeType.Changed, uri }]);
   }
   // The mutating operations are the host-side duals of the 9P backend's
-  // Tmkdir / Tunlinkat / Trenameat — the editor changing the *same* workspace
-  // content the running OS sees over virtio-9p (one content, Law L1).
+  // Tmkdir / Tunlinkat / Trenameat — the editor (and the Source Control Git
+  // engine) changing the *same* nested workspace content the running OS sees
+  // over virtio-9p (one content, Law L1).
   async createDirectory(uri) {
     await readyPromise;
     if (!has9p()) throw FileSystemError.NoPermissions(uri);
-    ws.ws_mkdir(nameOf(uri));
+    ws.ws_mkdir_path(nameOf(uri));
     this._emitter.fire([{ type: vscode.FileChangeType.Created, uri }]);
   }
   async delete(uri) {
     await readyPromise;
     if (!has9p()) throw FileSystemError.FileNotFound(uri);
-    if (!ws.ws_delete(nameOf(uri))) throw FileSystemError.FileNotFound(uri);
+    if (!ws.ws_delete_path(nameOf(uri))) throw FileSystemError.FileNotFound(uri);
     this._emitter.fire([{ type: vscode.FileChangeType.Deleted, uri }]);
   }
   async rename(oldUri, newUri) {
     await readyPromise;
     if (!has9p()) throw FileSystemError.FileNotFound(oldUri);
-    if (!ws.ws_rename(nameOf(oldUri), nameOf(newUri))) {
+    if (!ws.ws_rename_path(nameOf(oldUri), nameOf(newUri))) {
       throw FileSystemError.FileNotFound(oldUri);
     }
     this._emitter.fire([
