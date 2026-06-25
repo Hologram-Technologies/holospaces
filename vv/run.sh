@@ -110,7 +110,7 @@ all_cc="CC-1 CC-2 CC-3 CC-4 CC-5 CC-6 CC-7 CC-8 CC-9 CC-10 CC-11 CC-12 CC-13 CC-
 # Targets (arc42 ch.10 rows marked "target — not yet live"): unfinished work with
 # a behavioral spec in vv/targets/ but not yet a live component. Reported, never gated.
 # (CC-44/45/46/48/49/50/51 were promoted to live — their suites are in vv/suites/ and gated.)
-target_cc="CC-47 CC-52"
+target_cc="CC-47"
 pending=""
 for cc in $all_cc; do
     cc_key="${cc//-/}"        # CC-1 -> CC1

@@ -1,0 +1,23 @@
+ignore — the `.gitignore` matcher the holospace-search Text/File search providers
+use to honour VS Code's `useIgnoreFiles` (CC-52). A faithful, widely-used
+implementation of gitignore-spec pattern matching (anchoring, negation `!`,
+directory-only `/`, `**`), so an arbitrary devcontainer's `.gitignore` is
+respected exactly.
+
+Imported external artifact, κ-pinned (Law L5 at the import boundary): the
+extension re-derives the bundle to its sha256 before it runs (see
+holospace-search/extension.js `IGNORE_PIN`), and the V&V suite checks SHA256SUMS.
+
+  version:  ignore@5.3.1  (npm; https://github.com/kaelzhang/node-ignore)
+  license:  MIT
+
+File (the package's single self-contained CommonJS entry, no dependencies):
+
+  index.cjs   the matcher  (npm: ignore/index.js — `.cjs` so Node treats it as
+              CommonJS under the web dir's "type": "module", and the browser
+              loads it by fetch + evaluate)
+
+Reproduce:
+  npm pack ignore@5.3.1     # or: npm install ignore@5.3.1
+  cp node_modules/ignore/index.js   index.cjs
+  sha256sum index.cjs               # must match SHA256SUMS
