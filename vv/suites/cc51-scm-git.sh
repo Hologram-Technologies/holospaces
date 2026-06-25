@@ -55,7 +55,7 @@ command -v wasm-pack >/dev/null 2>&1 || { echo "cc51-scm-git: SKIP deployed witn
 # provider drives over 9p) so the witness runs against the product, not a stale
 # bundle.
 if [ ! -f "$WEB/pkg/holospaces_web_bg.wasm" ]; then
-    ( cd "$ROOT/crates/holospaces-web" && wasm-pack build --release --target web --out-dir web/pkg ) || exit 1
+    "$ROOT/vv/lib/build-wasm-peer.sh" "$ROOT" || exit 1
 fi
 ( cd "$WEB" && node scm-git-test.mjs ) || exit 1
 exit 0

@@ -23,7 +23,7 @@ WEB="$ROOT/crates/holospaces-web/web"
 if ! command -v node >/dev/null 2>&1; then echo "cc17-workbench-holospace: SKIP — node unavailable" >&2; exit 127; fi
 # The wasm peer the holospace-fs extension boots in the workbench's extension host.
 if [ ! -f "$WEB/pkg/holospaces_web_bg.wasm" ]; then
-  ( cd "$ROOT/crates/holospaces-web" && wasm-pack build --release --target web --out-dir web/pkg ) || exit 1
+  "$ROOT/vv/lib/build-wasm-peer.sh" "$ROOT" || exit 1
 fi
 # A real witness installs its prerequisites — it does not skip.
 [ -d "$WEB/node_modules/playwright" ] || ( cd "$WEB" && npm install playwright >/dev/null 2>&1 )
