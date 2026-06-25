@@ -148,6 +148,47 @@ pub fn drain_hotprof() -> Vec<(u64, u64)> {
     v
 }
 
+// JIT Rung 2 — block discovery (std/dev only, OFF by default so the shipping run loop
+// pays nothing). When armed (`set_blockprof`), `run()` detects a control transfer cheaply
+// — the next `rip` is not the sequential fall-through (within x86's 15 B max insn length)
+// — and samples the *target* (= a basic-block entry = a JIT compilation unit) 1/64, plus
+// tracks total block entries + instructions so the test can report the hot blocks to
+// compile and the average block length.
+#[cfg(feature = "std")]
+thread_local! {
+    static BLOCKPROF: core::cell::RefCell<std::collections::HashMap<u64, u64>> =
+        core::cell::RefCell::new(std::collections::HashMap::new());
+    static BLOCKPROF_ON: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    static BLOCK_ENTRIES: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+/// Arm/disarm JIT Rung-2 block profiling (off in production; the test turns it on).
+#[cfg(feature = "std")]
+pub fn set_blockprof(on: bool) {
+    BLOCKPROF_ON.with(|c| c.set(on));
+}
+#[cfg(feature = "std")]
+#[inline]
+fn blockprof_entry(target: u64) {
+    let n = BLOCK_ENTRIES.with(|c| {
+        let v = c.get() + 1;
+        c.set(v);
+        v
+    });
+    if n & 0x3f == 0 {
+        BLOCKPROF.with(|h| *h.borrow_mut().entry(target).or_insert(0) += 1);
+    }
+}
+/// Drain the Rung-2 block profile: `(block_entries, sorted (block_start, sample_count))`.
+#[cfg(feature = "std")]
+#[must_use]
+pub fn drain_blockprof() -> (u64, Vec<(u64, u64)>) {
+    let entries = BLOCK_ENTRIES.with(|c| c.replace(0));
+    let mut v: Vec<(u64, u64)> =
+        BLOCKPROF.with(|h| core::mem::take(&mut *h.borrow_mut()).into_iter().collect());
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    (entries, v)
+}
+
 struct Sys {
     uart: Uart,
     /// The `virtio-blk` κ-disk rootfs (`CC-7`), when a disk is attached. The
@@ -1309,11 +1350,21 @@ impl Cpu {
                     self.r[RSP],
                 );
             }
-            // Dev: while the #PF handler trace is armed, log each rip it runs (so the
-            // fatal execve fault's path can be diffed against a good fault's).
+            // JIT Rung 2 (off by default): remember rip to detect a control transfer.
+            #[cfg(feature = "std")]
+            let rip0 = self.rip;
             match self.step() {
                 Ok(()) => self.insns = self.insns.wrapping_add(1),
                 Err(h) => return h,
+            }
+            // A non-sequential rip (backward, or > 15 B ahead) means the instruction
+            // branched/returned/faulted — the new rip is a basic-block entry.
+            #[cfg(feature = "std")]
+            if BLOCKPROF_ON.with(core::cell::Cell::get) {
+                let r = self.rip;
+                if r < rip0 || r > rip0.wrapping_add(15) {
+                    blockprof_entry(r);
+                }
             }
             #[cfg(feature = "cc44-trace")]
             if self.rip < 0x1000 && prev_rip >= 0x1000 {

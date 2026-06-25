@@ -177,6 +177,51 @@ fn jit_rung0_hot_code_profile() {
     eprintln!("==== end (JIT thesis holds if a small top-N covers most execution) ====\n");
 }
 
+/// JIT Rung 2 — block discovery. Boots while detecting basic-block entries (a
+/// non-sequential `rip` = a branch/return/fault target). Reports the hottest block
+/// starts (the JIT's compilation units), how concentrated they are, and the average
+/// block length — the data that scopes Rung 3's codegen (how big the blocks are, how
+/// few cover most execution).
+#[test]
+#[ignore = "JIT Rung 2 hot-block profile of a real amd64 boot (~release)"]
+fn jit_rung2_hot_block_profile() {
+    holospaces::emulator::x64::set_blockprof(true);
+    let kernel = vmlinux_elf();
+    let mut cpu = Cpu::boot_linux(
+        1024 * 1024 * 1024,
+        &kernel,
+        "earlyprintk=serial,ttyS0 console=ttyS0 random.trust_cpu=on",
+    );
+    let _ = cpu.run(40_000_000_000);
+    let insns = cpu.insns();
+    let (entries, blocks) = holospaces::emulator::x64::drain_blockprof();
+    holospaces::emulator::x64::set_blockprof(false);
+    assert!(entries > 0 && !blocks.is_empty(), "block profiler collected data");
+    let samples: u64 = blocks.iter().map(|(_, c)| c).sum();
+    eprintln!(
+        "\n==== JIT RUNG 2: hot-block profile ====\n{insns} instructions · {entries} block entries · \
+         avg block length {:.1} insns · {} distinct blocks sampled",
+        insns as f64 / entries as f64,
+        blocks.len(),
+    );
+    let mut cum = 0u64;
+    for (rank, (start, count)) in blocks.iter().take(20).enumerate() {
+        cum += *count;
+        eprintln!(
+            "  #{:<2} block={start:#014x}  {:>6} samples  {:>5.1}%   cum {:>5.1}%",
+            rank + 1,
+            count,
+            100.0 * *count as f64 / samples as f64,
+            100.0 * cum as f64 / samples as f64,
+        );
+    }
+    for topn in [16usize, 64, 256, 1024] {
+        let s: u64 = blocks.iter().take(topn).map(|(_, c)| c).sum();
+        eprintln!("  top-{topn:<4} blocks = {:.1}% of block entries", 100.0 * s as f64 / samples as f64);
+    }
+    eprintln!("==== end (these block starts are Rung 3's compilation units) ====\n");
+}
+
 /// The deployed Platform-Manager path: an x64 holospace selected from the
 /// architecture picker boots its provisioned amd64 image on the x86-64 core with
 /// the κ-disk **streamed** sector-by-sector from a [`KappaStore`] (no full image in
