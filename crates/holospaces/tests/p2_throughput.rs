@@ -11,8 +11,8 @@
 //! ```
 //!
 //! (Release only — a debug build runs the interpreter ~10× slower and is not a
-//! meaningful throughput figure.) MIPS is machine-dependent; the *ratio* between
-//! a TLB-on and TLB-off build is the portable signal.
+//! meaningful throughput figure.) MIPS is machine-dependent; the recorded number
+//! is for tracking, and the only gate this test asserts is a catastrophe floor.
 
 use holospaces::emulator::{Emulator, Halt};
 use std::io::Read;
@@ -30,6 +30,11 @@ fn cc9_linux_dir() -> PathBuf {
         .expect("the CC-9 Linux artifact directory")
 }
 
+/// Informational probe (`#[ignore]`d): boots the pinned RISC-V Linux kernel to a
+/// clean userspace power-off and **prints** the throughput figures (wall-clock,
+/// instruction count, MIPS — the proxy for the TLB-on/off speedup). The only
+/// assertion is a *catastrophe floor* (`mips > 1.0`) guarding against a gross
+/// regression; the printed MIPS / speedup ratio is recorded, not asserted.
 #[test]
 #[ignore = "informational throughput probe; run explicitly in --release"]
 fn emulator_boots_real_linux_throughput() {

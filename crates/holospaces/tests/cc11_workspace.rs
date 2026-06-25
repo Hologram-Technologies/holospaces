@@ -32,54 +32,60 @@ fn cc9_linux_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vv/artifacts/cc9/linux")
 }
 
-/// The workspace's **Editor / FS** surface: the operator opens the environment's
-/// content by κ (read, verified by re-derivation — Law L5), and an edit is a
-/// canonical event whose content κ has advanced (Law L1); the new content is
-/// content-addressed in the substrate (`CC-3` store, `CC-1` hashes). No boot
-/// required — a fast cargo-tier witness.
+/// `Intent` values — including `Intent::Edit` — are content-addressed in the
+/// κ-store: content put under a κ reads back and re-derives to its address (Laws
+/// L1/L5), an edit's content carries a fresh κ that equals the content's address
+/// and differs from the prior version's, and two identical `Intent::Edit` values
+/// share one κ (Laws L1/L2). This is a bare `MemKappaStore` witness of the
+/// content-addressing identities (`CC-3` store, `CC-1` hashes) — there is no
+/// `Workspace`, no editor, and no running environment. No boot required — a fast
+/// cargo-tier witness.
 #[test]
-fn the_workspace_editor_reads_and_edits_environment_content_by_kappa() {
+fn intent_edits_are_content_addressed_in_the_store() {
     let store = MemKappaStore::new();
 
-    // The environment content (the running holospace's filesystem holds files as
-    // κ-addressed content — `CC-7` κ-disk). The editor opens one by κ.
+    // Content put under a κ reads back by that κ and re-derives to it (L5). This
+    // exercises the store's content-addressing directly (no editor, no holospace).
     let original = b"hello from the devcontainer\n".to_vec();
     let file_k = store.put("blake3", &original).unwrap();
     let opened = store
         .get(&file_k)
         .unwrap()
-        .expect("the editor reads content by κ");
+        .expect("content reads back by κ");
     let opened = &opened[..];
     assert_eq!(
         opened,
         &original[..],
-        "the editor reads the environment content by κ"
+        "content read back by κ equals what was put"
     );
     assert!(
         verify(opened, &file_k).unwrap(),
         "the content re-derives to its κ (Law L5)"
     );
 
-    // An edit: a canonical event; the FS view advances to the new content's κ.
+    // An edit: an `Intent::Edit` value carrying new content with its own κ.
     let edited = b"hello from the EDITED devcontainer\n".to_vec();
     let intent = Intent::Edit {
         path: String::from("/work/readme.txt"),
         content: edited.clone(),
     };
     let new_k = intent.content_kappa().expect("an edit carries new content");
-    assert_ne!(new_k, file_k, "the edit advanced the file's κ (Law L1)");
+    assert_ne!(
+        new_k, file_k,
+        "the edited content has a different κ (Law L1)"
+    );
     assert_eq!(
         new_k,
         address(&edited),
-        "the editor's content κ is the content's address"
+        "the intent's content κ is the content's address"
     );
 
-    // Publishing the edit: the new content is content-addressed in the substrate;
-    // it reads back by κ (Law L5), and the old content is still its own identity.
+    // The edited content is content-addressed in the store: it reads back by κ
+    // (Law L5), and the old content keeps its own identity.
     let put_k = store.put("blake3", &edited).unwrap();
     assert_eq!(
         put_k, new_k,
-        "the substrate address is the editor's content κ"
+        "the store address equals the intent's content κ"
     );
     assert_eq!(
         &store.get(&new_k).unwrap().unwrap()[..],

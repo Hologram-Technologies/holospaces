@@ -7,9 +7,9 @@
 //! * the **OCI image specification** (https://github.com/opencontainers/image-spec):
 //!   a real OCI image-layout produced by **BuildKit** (`vv/artifacts/cc10/image`,
 //!   provenance in `SOURCE.txt`) is walked — index → manifest → config + layers —
-//!   and every blob is verified by re-derivation against its OCI `sha256` digest
-//!   (the registry's content address *is* a κ-label; Law L5). A **forged** blob
-//!   is refused.
+//!   every stored blob re-derives to its store κ (blake3), and the manifest
+//!   additionally re-derives to its OCI `sha256` digest (the registry's content
+//!   address *is* a κ-label; Law L5). A **forged** blob is refused.
 //! * the **Dev Container specification** (https://containers.dev): the repository's
 //!   `devcontainer.json` is validated (`CC-4`) and bound to the ingested image
 //!   into a reproducible source identity — the same source yields the same κ on
@@ -48,9 +48,10 @@ fn ingest(store: &MemKappaStore) -> Result<IngestedImage, OciError> {
     )
 }
 
-/// The real OCI image ingests: every blob is verified by re-derivation against
-/// its OCI digest (Law L5), and the manifest/config/layers are κ-addressed in the
-/// store. (CC-10, the OCI authority.)
+/// The real OCI image ingests: every stored blob re-derives to its store κ
+/// (blake3), and the manifest additionally re-derives to its OCI `sha256` digest
+/// (Law L5); the manifest/config/layers are κ-addressed in the store. (CC-10, the
+/// OCI authority.)
 #[test]
 fn a_real_oci_image_ingests_as_verified_kappa_content() {
     let store = MemKappaStore::new();

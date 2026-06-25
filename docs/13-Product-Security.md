@@ -117,7 +117,7 @@ bound to its operator (it cannot be forged for another).
 Content is addressable — hence perceivable — only via its κ; a peer cannot
 enumerate or fabricate content it was not given the κ for. *Enforced by* the
 content-addressed store (an unknown κ is absent). *Witness:*
-`sec_confidentiality_content_is_reachable_only_by_its_kappa`. This — together with
+`an_absent_kappa_resolves_to_none`. This — together with
 content-blind intermediaries (`SEC-7`) — **meets confidentiality for the deployed
 architecture**, and the reason is structural, not a deferral: holospaces has **no
 server** (ADR-001/Law L4), so no *untrusted party* ever holds perceivable content.
@@ -260,7 +260,7 @@ than a bolted-on check. A change that weakened any property would fail the gate.
 | SEC-2 | Authority (attenuation only) | `sec_authority_capabilities_only_attenuate_never_escalate` | `CC-40` |
 | SEC-3 | Cost / dedup (one κ, network-wide) | `sec_cost_identical_content_deduplicates`, `sec_cost_content_has_one_identity_on_every_peer` | `CC-40` |
 | SEC-4 | Identity (self-sovereign) | `sec_identity_is_self_sovereign_and_unforgeable` | `CC-40` |
-| SEC-5 | Confidentiality (κ-as-capability) | `sec_confidentiality_content_is_reachable_only_by_its_kappa` | `CC-40` |
+| SEC-5 | Confidentiality (κ-as-capability) | `an_absent_kappa_resolves_to_none` | `CC-40` |
 | SEC-6 | Reference resolution (verified vs κ) | `sec_reference_resolution_verifies_against_the_kappa_on_its_axis` | `CC-40` |
 | SEC-7 | Egress boundary (content-blind) | `the_egress_forwards_opaque_content_without_perceiving_it` | `CC-39` |
 | SEC-8 | Resource bounds (DoS resistance) | `forged_huge_ref_count_errors_without_ballooning`, `forged_huge_directive_count_errors_without_ballooning`, `twrite_with_mismatched_count_errors_not_panics`, `twrite_at_huge_offset_is_quota_rejected`, `the_connection_table_is_bounded`, `from_guest_backpressure_shrinks_the_advertised_window`, `read_cache_is_bounded_and_never_corrupts_reads`, `streamed_layers_overlay_is_identical_to_all_at_once` | Rust quality gate (lib tests) |

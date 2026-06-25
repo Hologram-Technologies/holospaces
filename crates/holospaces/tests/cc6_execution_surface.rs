@@ -8,10 +8,14 @@
 //! * the [WebAssembly](https://webassembly.org) specification — the userland is
 //!   spec-valid and binds only the substrate host ABI (`surface::validate_userland`);
 //! * the [hologram](https://github.com/Hologram-Technologies/hologram)
-//!   `ContainerRuntime` contract — the userland boots, suspends to a κ snapshot,
-//!   resumes, and migrates on a real `Runtime`, over **both** the native
-//!   `WasmtimeEngine` (JIT) and the `wasmi` `BareMetalEngine` interpreter (the
-//!   browser + bare-metal `ContainerEngine`), yielding the same κ on each (Q6).
+//!   `ContainerRuntime` contract — for a trivial (no-op) userland, the real
+//!   `Runtime` drives the lifecycle state machine (boot → suspend → κ-snapshot →
+//!   resume → adopt-on-peer-B), over **both** the native `WasmtimeEngine` (JIT)
+//!   and the `wasmi` `BareMetalEngine` interpreter (the browser + bare-metal
+//!   `ContainerEngine`), each producing a content-addressed `blake3:` snapshot
+//!   label and yielding the same provisioning κ (Q6). These tests exercise the
+//!   lifecycle transitions and snapshot labelling only; they do not assert any
+//!   observable computation or post-resume state continuity.
 //!
 //! This is the resolved RT1 surface: a κ-addressed userland over the host ABI,
 //! not a located OCI image (Laws L1/L2/L4).
@@ -26,9 +30,10 @@ use holospaces::surface::{self, SurfaceError};
 use holospaces::wasm::WasmError;
 use holospaces::Source;
 
-/// A real recompiled userland: general/system code that presents the full
-/// container ABI and imports nothing outside the `hologram` host surface, so the
-/// real Wasmtime engine can instantiate, suspend, and resume it.
+/// A trivial (no-op) userland: every entry point returns `(i32.const 0)`. It
+/// presents the full container ABI and imports nothing outside the `hologram`
+/// host surface, so the real engines can instantiate, suspend, and resume it —
+/// but it computes nothing observable.
 const USERLAND_WAT: &str = r#"
 (module
   (memory (export "memory") 1)
@@ -117,11 +122,15 @@ fn surface_validator_enforces_the_contract() {
     );
 }
 
-/// A validated userland boots, suspends to a κ snapshot, resumes, and migrates
-/// on the **real** substrate runtime — the resolved RT1 execution surface.
-/// (CC-6, runtime-contract authority.)
+/// For a trivial (no-op) κ-addressed userland, the **real** substrate runtime
+/// drives the lifecycle state machine (boot → suspend → κ-snapshot → resume →
+/// adopt-on-peer-B) over the native Wasmtime engine. Each suspend yields a
+/// content-addressed `blake3:` snapshot label. This asserts the lifecycle
+/// transitions and snapshot labelling only — it does NOT assert any observable
+/// computation, nor any post-resume state continuity distinguishing an adopted
+/// run from a fresh boot. (CC-6, runtime-contract authority.)
 #[test]
-fn a_recompiled_userland_runs_on_the_real_substrate() {
+fn the_lifecycle_state_machine_drives_on_the_real_runtime() {
     pollster::block_on(async {
         let module = wat::parse_str(USERLAND_WAT).unwrap();
         surface::validate_userland(&module).expect("surface-valid");
@@ -133,21 +142,30 @@ fn a_recompiled_userland_runs_on_the_real_substrate() {
             .expect("provision userland into store");
         assert_eq!(holospace.source(), &Source::Userland { entry: code });
 
-        // It boots and runs on the real Wasmtime-backed runtime.
+        // The lifecycle drives on the real Wasmtime-backed runtime: boot reaches
+        // the Running phase (no observable compute is asserted).
         let runtime_a = Runtime::new(WasmtimeEngine::new(), store_a);
         let mut a = Session::provision(&runtime_a, holospace.clone());
-        a.boot().await.expect("real spawn of the userland");
+        a.boot()
+            .await
+            .expect("boot transitions on the real runtime");
         assert_eq!(a.phase(), Phase::Running);
 
-        // Suspend → a real κ snapshot; resume from it.
-        let snapshot = a.suspend().await.expect("real suspend");
-        assert!(snapshot.as_str().starts_with("blake3:"));
-        a.resume().await.expect("real resume");
+        // Suspend → a content-addressed `blake3:` snapshot label; resume returns
+        // to Running (no post-resume state continuity is asserted).
+        let snapshot = a.suspend().await.expect("suspend transition");
+        assert!(
+            snapshot.as_str().starts_with("blake3:"),
+            "the snapshot is a content-addressed blake3: label"
+        );
+        a.resume().await.expect("resume transition");
         assert_eq!(a.phase(), Phase::Running);
-        let snapshot = a.suspend().await.expect("re-suspend");
+        let snapshot = a.suspend().await.expect("re-suspend transition");
 
-        // Migrate (QS2): ship the reachable bytes to instance B, resume there —
-        // because the userland and its state are content, nothing else transfers.
+        // Adopt on peer B (QS2): ship the reachable bytes to instance B and drive
+        // resume there. Because the userland and its snapshot label are content,
+        // nothing else transfers; this asserts the adopt → resume transition only,
+        // not that B continues A's state.
         let store_b = MemKappaStore::new();
         for k in runtime_a.store().iterate() {
             let v = runtime_a.store().get(&k).unwrap().unwrap();
@@ -155,20 +173,23 @@ fn a_recompiled_userland_runs_on_the_real_substrate() {
         }
         let runtime_b = Runtime::new(WasmtimeEngine::new(), store_b);
         let mut b = Session::adopt(&runtime_b, holospace, snapshot);
-        b.resume().await.expect("resume the migrated userland on B");
+        b.resume().await.expect("adopt-on-peer-B resume transition");
         assert_eq!(b.phase(), Phase::Running);
-        b.terminate().await.expect("terminate");
+        b.terminate().await.expect("terminate transition");
     });
 }
 
-/// The **same** userland κ boots on a *different* environment engine: the
-/// `wasmi` interpreter `ContainerEngine` (`hologram-runtime-bare`) — the engine
-/// the browser and bare-metal peers run (it is `no_std` + pure-Rust, so it
-/// compiles to wasm32 and to bare-metal where a JIT cannot). This witnesses Q6
-/// (the same holospace κ boots on any peer) across heterogeneous engines, not
-/// just the native Wasmtime one. (CC-6, cross-environment execution surface.)
+/// The **same** userland κ provisions identically on a *different* environment
+/// engine — the `wasmi` interpreter `ContainerEngine` (`hologram-runtime-bare`),
+/// the engine the browser and bare-metal peers run (it is `no_std` + pure-Rust,
+/// so it compiles to wasm32 and to bare-metal where a JIT cannot) — and the
+/// lifecycle then drives on it. The provisioning κ is identical across engines,
+/// witnessing Q6 (the same holospace κ on any peer) across heterogeneous
+/// engines, not just the native Wasmtime one. For the trivial (no-op) module the
+/// lifecycle transitions and `blake3:` snapshot labelling are asserted only — no
+/// observable computation. (CC-6, cross-environment execution surface.)
 #[test]
-fn a_userland_boots_on_the_interpreter_engine() {
+fn the_lifecycle_drives_on_the_interpreter_engine() {
     pollster::block_on(async {
         let module = wat::parse_str(USERLAND_WAT).unwrap();
         surface::validate_userland(&module).expect("surface-valid");
@@ -185,17 +206,23 @@ fn a_userland_boots_on_the_interpreter_engine() {
         let native = provision(&native_store, Source::Userland { entry: code }, caps()).unwrap();
         assert_eq!(holospace.kappa(), native.kappa(), "same κ on any peer (Q6)");
 
-        // Boot, suspend, resume, terminate on the interpreter engine — the real
-        // browser/bare-metal execution surface, no JIT, no host.
+        // The lifecycle drives on the interpreter engine — the real
+        // browser/bare-metal execution surface, no JIT, no host — through
+        // boot → suspend → resume → terminate (no observable compute asserted).
         let runtime = Runtime::new(BareMetalEngine::new(), store);
         let mut s = Session::provision(&runtime, holospace);
-        s.boot().await.expect("interpreter spawn of the userland");
+        s.boot()
+            .await
+            .expect("boot transition on the interpreter engine");
         assert_eq!(s.phase(), Phase::Running);
-        let snapshot = s.suspend().await.expect("interpreter suspend");
-        assert!(snapshot.as_str().starts_with("blake3:"));
-        s.resume().await.expect("interpreter resume");
+        let snapshot = s.suspend().await.expect("suspend transition (interpreter)");
+        assert!(
+            snapshot.as_str().starts_with("blake3:"),
+            "the snapshot is a content-addressed blake3: label"
+        );
+        s.resume().await.expect("resume transition (interpreter)");
         assert_eq!(s.phase(), Phase::Running);
-        s.terminate().await.expect("terminate");
+        s.terminate().await.expect("terminate transition");
     });
 }
 

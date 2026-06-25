@@ -153,9 +153,9 @@ mod tests {
         assert_eq!(hs.container_manifest().code, entry);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn host_namespace_matches_the_substrate_host_surface() {
-        #[cfg(feature = "std")]
         assert_eq!(HOST_NAMESPACE, crate::wasm::SUBSTRATE_HOST_MODULE);
     }
 }

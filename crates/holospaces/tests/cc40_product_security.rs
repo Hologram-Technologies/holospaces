@@ -190,27 +190,28 @@ fn sec_identity_is_self_sovereign_and_unforgeable() {
     );
 }
 
-// ── SEC-5 Confidentiality: the κ is the capability to perceive content ────────
-// Content is addressable — hence perceivable — only via its κ. A peer holding a
-// store cannot enumerate or fabricate content it was not given the κ for; an
-// unknown κ is simply absent. (The deeper frame-relative perception — content
-// meaningful only in the observer's base-frame — is the UOR/substrate layer this
-// builds on; here the enforced, holospaces-observable property is κ-as-capability.)
+// ── SEC-5 Confidentiality: the κ addresses content ───────────────────────────
+// Content is addressed by its κ: `get(κ)` resolves the content, and a κ the store
+// was never given resolves to nothing. (This layer's store also exposes
+// `iterate()`, so it does not by itself enforce "no enumeration"; real
+// confidentiality is the UOR/substrate layer this builds on — frame-relative
+// perception, content meaningful only in the observer's base-frame. What is
+// asserted here is just the addressing property: present κ → Some, absent κ → None.)
 #[test]
-fn sec_confidentiality_content_is_reachable_only_by_its_kappa() {
+fn an_absent_kappa_resolves_to_none() {
     let store = MemKappaStore::new();
-    let secret = b"content only the holder of its kappa can address";
+    let secret = b"content addressed by its kappa";
     let kappa = store.put("blake3", secret).unwrap();
 
     assert!(
         store.get(&kappa).unwrap().is_some(),
-        "the κ-holder perceives the content"
+        "a present κ resolves to its content"
     );
-    // Without the κ, the content is not reachable — a guessed/unknown κ is absent.
+    // A κ the store was never given resolves to nothing.
     let unknown = address(b"a kappa no one was given");
     assert!(
         store.get(&unknown).unwrap().is_none(),
-        "content is unreachable without its κ (no enumeration, no fabrication)"
+        "an unknown κ is absent"
     );
 }
 
