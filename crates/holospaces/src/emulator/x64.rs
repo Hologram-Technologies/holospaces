@@ -742,6 +742,7 @@ const PF_ERR_USER: u64 = 1 << 2;
 const RAX: usize = 0;
 const RCX: usize = 1;
 const RDX: usize = 2;
+const RBX: usize = 3;
 const RSP: usize = 4;
 const RBP: usize = 5;
 const RSI: usize = 6;
@@ -1247,6 +1248,15 @@ impl Cpu {
     #[must_use]
     pub fn rip(&self) -> u64 {
         self.rip
+    }
+
+    /// Read `n` bytes of guest virtual memory — a debug peek (e.g. to dump the bytes
+    /// of a faulting instruction during emulator bring-up).
+    #[must_use]
+    pub fn peek(&self, vaddr: u64, n: usize) -> Vec<u8> {
+        (0..n as u64)
+            .map(|i| self.rd_virt(vaddr + i, 1) as u8)
+            .collect()
     }
 
     /// Retired guest-instruction count — a monotonic tally of executed
@@ -3296,11 +3306,13 @@ impl Cpu {
                         self.r[RAX] = tsc & 0xffff_ffff;
                         self.r[RDX] = tsc >> 32;
                     }
-                    0x09 | 0x0e | 0x18..=0x1f | 0x77 | 0xae => {
-                        // WBINVD/FEMMS/NOP(prefetch/hint)/EMMS/fences+fxsave — no
-                        // architectural effect the integer boot path observes.
-                        // 0x18..0x1f take a ModRM; 0xae usually does too.
-                        if matches!(op2, 0x18..=0x1f | 0xae) {
+                    0x09 | 0x0d | 0x0e | 0x18..=0x1f | 0x77 | 0xae => {
+                        // WBINVD/PREFETCHW/FEMMS/NOP(prefetch/hint)/EMMS/fences+fxsave
+                        // — no architectural effect the integer boot path observes.
+                        // 0x0d (PREFETCHW — the kernel patches SLUB's prefetcht0 to it
+                        // for the write-prefetch of the freelist) and 0x18..0x1f take a
+                        // ModRM; 0xae usually does too.
+                        if matches!(op2, 0x0d | 0x18..=0x1f | 0xae) {
                             let _ = self.modrm(rex);
                         }
                     }
@@ -4657,7 +4669,7 @@ impl Cpu {
             let lo = self.rd(addr, 8);
             let hi = self.rd(addr + 8, 8);
             if lo == self.r[RAX] && hi == self.r[RDX] {
-                self.wr(addr, 8, self.r[1]); // RBX
+                self.wr(addr, 8, self.r[RBX]); // RBX:RCX swapped in (RBX = low)
                 self.wr(addr + 8, 8, self.r[RCX]);
                 self.set(flag::ZF, true);
             } else {
@@ -4669,7 +4681,7 @@ impl Cpu {
             let lo = self.rd(addr, 4);
             let hi = self.rd(addr + 4, 4);
             if lo == (self.r[RAX] & 0xffff_ffff) && hi == (self.r[RDX] & 0xffff_ffff) {
-                self.wr(addr, 4, self.r[1] & 0xffff_ffff);
+                self.wr(addr, 4, self.r[RBX] & 0xffff_ffff); // ECX:EBX swapped in (EBX = low)
                 self.wr(addr + 4, 4, self.r[RCX] & 0xffff_ffff);
                 self.set(flag::ZF, true);
             } else {
@@ -4738,7 +4750,13 @@ impl Cpu {
                 // deterministic TSC entropy source). ECX bit 17 = PCID, so the
                 // kernel tags address spaces and `CR3` switches (its ASID reuse and
                 // text_poke's poking-mm) need not flush the (software) TLB.
-                (0x0000_0600, 0, (1 << 30) | (1 << 17), 0x078b_fbff)
+                //
+                // EBX[15:8] = CLFLUSH line size in 8-byte units. The kernel computes
+                // `x86_clflush_size = field * 8` and steps a range by it in
+                // `clflush_cache_range` (cpa_flush / set_memory_*); a zero there makes
+                // that loop never advance — an infinite hang. Report 8 (→ the 64-byte
+                // line every x86-64 has). The CLFSH feature is advertised in EDX b19.
+                (0x0000_0600, 0x0000_0800, (1 << 30) | (1 << 17), 0x078b_fbff)
             }
             // Leaf 7 sub-leaf 0: EBX bit 18 = RDSEED (the seeding RNG the kernel
             // pairs with RDRAND). EDX bit 29 = ARCH_CAPABILITIES — the core exposes
@@ -4759,7 +4777,7 @@ impl Cpu {
             _ => (0, 0, 0, 0),
         };
         self.r[RAX] = u64::from(a);
-        self.r[1] = u64::from(b); // RBX
+        self.r[RBX] = u64::from(b); // EBX — register index 3, NOT 1 (which is RCX)
         self.r[RCX] = u64::from(c);
         self.r[RDX] = u64::from(d);
     }
@@ -5074,6 +5092,23 @@ impl Cpu {
                     unpckh_qwords(self.xmm[reg], s)
                 } else {
                     unpckh_dwords(self.xmm[reg], s)
+                };
+            }
+            // Packed bitwise logicals — 128-bit, identical result for the PS/PD/int
+            // forms (the 66 prefix only selects the assembler mnemonic). Pervasive in
+            // compiled code + glibc: `xorps %xmm,%xmm` zeros a register, PXOR/POR/PAND
+            // appear throughout string/float routines. dst OP= r/m128.
+            //   54 ANDPS/ANDPD · 55 ANDNPS/ANDNPD · 56 ORPS/ORPD · 57 XORPS/XORPD
+            //   DB PAND · DF PANDN · EB POR · EF PXOR
+            0x54 | 0x55 | 0x56 | 0x57 | 0xdb | 0xdf | 0xeb | 0xef => {
+                let (reg, rm) = self.modrm(rex);
+                let a = self.xmm[reg];
+                let b = self.xmm_load_rm(rm);
+                self.xmm[reg] = match op2 {
+                    0x54 | 0xdb => a & b,  // AND
+                    0x55 | 0xdf => !a & b, // ANDN (note: (NOT dst) AND src)
+                    0x56 | 0xeb => a | b,  // OR
+                    _ => a ^ b,            // 0x57 | 0xef — XOR
                 };
             }
             // MOVAPS/MOVAPD — reg ← r/m (128, alignment not enforced).
