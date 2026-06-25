@@ -30,16 +30,36 @@ enum Op {
     Movr { d: u8, s: u8 },
     Bin { op: Bin, d: u8, a: u8, b: u8 },
     Shift { op: Sh, d: u8, a: u8, sh: u8 },
-    /// `d = [r[base] + disp]` (the SHA-512 `W[]` schedule on the stack).
-    Load { d: u8, base: u8, disp: i32 },
-    /// `[r[base] + disp] = s`.
-    Store { base: u8, disp: i32, s: u8 },
+    /// `d = [base + idx<<scale + disp]` — full x86 effective address (SHA-512's `W[]`
+    /// stack load and `K[]` SIB-indexed table load).
+    Load { d: u8, base: u8, idx: u8, scale: u8, disp: i32 },
+    /// `[base + idx<<scale + disp] = s`.
+    Store { base: u8, idx: u8, scale: u8, disp: i32, s: u8 },
+    /// `d = d op [base + idx<<scale + disp]` — ALU op with a memory source operand
+    /// (`add reg, [mem]`), the round's `+W[t]` / `+K[t]`.
+    LoadOp { op: Bin, d: u8, base: u8, idx: u8, scale: u8, disp: i32 },
 }
+
+/// Address-mode sentinels: no base register / no index register.
+const NO_REG: u8 = 0xff;
 
 /// Guest RAM lives in the same wasm memory as the register file, after a page of
 /// headroom: regs at `r*8`, guest byte `A` at wasm offset `GUEST_BASE + A`.
 const GUEST_BASE: u64 = 0x1000;
 const GUEST_LEN: usize = 0x3000; // 3 pages of test guest RAM
+
+/// Effective address `base + idx<<scale + disp` (sentinels skipped) — the meaning shared
+/// by the interpreter and (mirrored in wasm) the codegen.
+fn eff_addr(r: &[u64; NREG], base: u8, idx: u8, scale: u8, disp: i32) -> usize {
+    let mut a = disp as i64 as u64;
+    if base != NO_REG {
+        a = a.wrapping_add(r[base as usize]);
+    }
+    if idx != NO_REG {
+        a = a.wrapping_add(r[idx as usize] << scale);
+    }
+    a as usize
+}
 
 /// The reference oracle — the meaning of the IR, in plain Rust.
 fn interpret(block: &[Op], r: &mut [u64; NREG], ram: &mut [u8]) {
@@ -47,13 +67,25 @@ fn interpret(block: &[Op], r: &mut [u64; NREG], ram: &mut [u8]) {
         match *op {
             Op::Movi { d, imm } => r[d as usize] = imm,
             Op::Movr { d, s } => r[d as usize] = r[s as usize],
-            Op::Load { d, base, disp } => {
-                let a = r[base as usize].wrapping_add(disp as i64 as u64) as usize;
+            Op::Load { d, base, idx, scale, disp } => {
+                let a = eff_addr(r, base, idx, scale, disp);
                 r[d as usize] = u64::from_le_bytes(ram[a..a + 8].try_into().unwrap());
             }
-            Op::Store { base, disp, s } => {
-                let a = r[base as usize].wrapping_add(disp as i64 as u64) as usize;
+            Op::Store { base, idx, scale, disp, s } => {
+                let a = eff_addr(r, base, idx, scale, disp);
                 ram[a..a + 8].copy_from_slice(&r[s as usize].to_le_bytes());
+            }
+            Op::LoadOp { op, d, base, idx, scale, disp } => {
+                let a = eff_addr(r, base, idx, scale, disp);
+                let m = u64::from_le_bytes(ram[a..a + 8].try_into().unwrap());
+                let dv = r[d as usize];
+                r[d as usize] = match op {
+                    Bin::Add => dv.wrapping_add(m),
+                    Bin::Sub => dv.wrapping_sub(m),
+                    Bin::Xor => dv ^ m,
+                    Bin::And => dv & m,
+                    Bin::Or => dv | m,
+                };
             }
             Op::Bin { op, d, a, b } => {
                 let (a, b) = (r[a as usize], r[b as usize]);
@@ -130,6 +162,29 @@ fn compile(block: &[Op]) -> Vec<u8> {
         sleb((r * 8) as i64, c); // i32.const addr
         c.extend([0x29, 0x03, 0x00]); // i64.load align=3 off=0
     };
+    // emit the i32 wasm offset for an effective address `base + idx<<scale + disp`,
+    // mirroring `eff_addr` then adding GUEST_BASE and wrapping to i32. Captures nothing.
+    let emit_addr = |base: u8, idx: u8, scale: u8, disp: i32, c: &mut Vec<u8>| {
+        c.push(0x42);
+        sleb(i64::from(disp), c); // i64.const disp
+        if base != NO_REG {
+            c.push(0x20);
+            uleb(u64::from(base), c); // local.get base
+            c.push(0x7c); // i64.add
+        }
+        if idx != NO_REG {
+            c.push(0x20);
+            uleb(u64::from(idx), c); // local.get idx
+            c.push(0x42);
+            sleb(i64::from(scale), c); // i64.const scale
+            c.push(0x86); // i64.shl
+            c.push(0x7c); // i64.add
+        }
+        c.push(0x42);
+        sleb(GUEST_BASE as i64, c); // + GUEST_BASE
+        c.push(0x7c); // i64.add
+        c.push(0xa7); // i32.wrap_i64
+    };
     // entry: regs → locals
     for r in 0..NREG {
         load_mem(r, &mut code);
@@ -170,30 +225,29 @@ fn compile(block: &[Op]) -> Vec<u8> {
                 });
                 setl(d, &mut code);
             }
-            // memory ops: wasm offset = (r[base] + disp) + GUEST_BASE, wrapped to i32
-            Op::Load { d, base, disp } => {
-                getl(base, &mut code);
-                code.push(0x42);
-                sleb(i64::from(disp), &mut code); // + disp
-                code.push(0x7c); // i64.add
-                code.push(0x42);
-                sleb(GUEST_BASE as i64, &mut code); // + GUEST_BASE
-                code.push(0x7c); // i64.add
-                code.push(0xa7); // i32.wrap_i64
+            // memory ops: emit_addr leaves the i32 wasm offset on the stack
+            Op::Load { d, base, idx, scale, disp } => {
+                emit_addr(base, idx, scale, disp, &mut code);
                 code.extend([0x29, 0x03, 0x00]); // i64.load align=3
                 setl(d, &mut code);
             }
-            Op::Store { base, disp, s } => {
-                getl(base, &mut code);
-                code.push(0x42);
-                sleb(i64::from(disp), &mut code);
-                code.push(0x7c);
-                code.push(0x42);
-                sleb(GUEST_BASE as i64, &mut code);
-                code.push(0x7c);
-                code.push(0xa7); // i32.wrap_i64 → addr on stack
-                getl(s, &mut code); // value to store
+            Op::Store { base, idx, scale, disp, s } => {
+                emit_addr(base, idx, scale, disp, &mut code); // addr
+                getl(s, &mut code); // value
                 code.extend([0x37, 0x03, 0x00]); // i64.store align=3
+            }
+            Op::LoadOp { op, d, base, idx, scale, disp } => {
+                getl(d, &mut code); // current d on stack
+                emit_addr(base, idx, scale, disp, &mut code);
+                code.extend([0x29, 0x03, 0x00]); // i64.load → mem value
+                code.push(match op {
+                    Bin::Add => 0x7c,
+                    Bin::Sub => 0x7d,
+                    Bin::Xor => 0x85,
+                    Bin::And => 0x83,
+                    Bin::Or => 0x84,
+                });
+                setl(d, &mut code);
             }
         }
     }
@@ -322,40 +376,112 @@ fn jit_codegen_matches_on_a_sha512_shaped_block() {
     assert_eq!(run_wasm(&compile(&block), regs, &mut ram), want, "SHA-512-shaped block diverged");
 }
 
-/// Minimal x86-64 decoder for the reg-reg ALU/mov subset (the SHA-512 compression
-/// core): optional REX, opcode, ModRM (mod=3). Maps to the IR; **bails** (stops) on any
-/// memory form or unknown opcode — exactly the JIT's "bail to the interpreter" discipline.
-/// The full transform also needs the stack/table loads (Load/Store IR) — the next slab.
-fn decode_x86(mut b: &[u8]) -> Vec<Op> {
-    let mut out = Vec::new();
-    while b.len() >= 2 {
-        let mut rex = 0u8;
-        if b[0] & 0xf0 == 0x40 {
-            rex = b[0];
-            b = &b[1..];
+/// Decode an x86-64 memory operand (ModRM mod≠3): the ModRM r/m field, an optional SIB
+/// byte, and disp8/disp32 → `(base, idx, scale, disp)` using `NO_REG` sentinels. `p` points
+/// at the ModRM byte; returns the address mode and the position past the displacement.
+/// Bails (`None`) on RIP-relative (needs the instruction address) or truncated input.
+fn decode_mem(bytes: &[u8], p0: usize, rex: u8, mod_: u8, modrm: u8) -> Option<((u8, u8, u8, i32), usize)> {
+    let mut p = p0 + 1; // past ModRM
+    let rexb = if rex & 0x01 != 0 { 8u8 } else { 0 }; // REX.B → base / r-m high bit
+    let rexx = if rex & 0x02 != 0 { 8u8 } else { 0 }; // REX.X → index high bit
+    let rm_low = modrm & 7;
+    let (mut base, mut idx, mut scale) = (NO_REG, NO_REG, 0u8);
+    let mut disp32_no_base = false;
+    if rm_low == 4 {
+        // SIB byte
+        let sib = *bytes.get(p)?;
+        p += 1;
+        scale = sib >> 6;
+        let index = (sib >> 3) & 7;
+        if index != 4 || rexx != 0 {
+            idx = index | rexx; // index==0b100 w/o REX.X means "no index"
         }
-        if b.len() < 2 {
+        let base_low = sib & 7;
+        if base_low == 5 && mod_ == 0 {
+            disp32_no_base = true; // base absent, disp32 follows
+        } else {
+            base = base_low | rexb;
+        }
+    } else if rm_low == 5 && mod_ == 0 {
+        return None; // RIP-relative — needs the instruction address; bail
+    } else {
+        base = rm_low | rexb;
+    }
+    let disp: i32 = if mod_ == 1 {
+        let d = *bytes.get(p)? as i8 as i32;
+        p += 1;
+        d
+    } else if mod_ == 2 || disp32_no_base {
+        let s = bytes.get(p..p + 4)?;
+        p += 4;
+        i32::from_le_bytes([s[0], s[1], s[2], s[3]])
+    } else {
+        0
+    };
+    Some(((base, idx, scale, disp), p))
+}
+
+/// x86-64 decoder for the SHA-512 compression subset: reg-reg ALU/mov (ModRM mod=3) AND
+/// memory-operand forms (`mov reg,[mem]`, `mov [mem],reg`, `add/or/and/sub/xor reg,[mem]`)
+/// with full base+index*scale+disp addressing. **Bails** (stops) on anything else — the
+/// JIT's "interpret what I don't model" discipline.
+fn decode_x86(bytes: &[u8]) -> Vec<Op> {
+    let mut out = Vec::new();
+    let mut p = 0;
+    while p < bytes.len() {
+        let mut rex = 0u8;
+        if bytes[p] & 0xf0 == 0x40 {
+            rex = bytes[p];
+            p += 1;
+        }
+        if p + 1 >= bytes.len() {
             break;
         }
-        let (opcode, modrm) = (b[0], b[1]);
-        if modrm >> 6 != 3 {
-            break; // memory form — outside this subset
+        let opcode = bytes[p];
+        let modrm = bytes[p + 1];
+        let mod_ = modrm >> 6;
+        let reg = ((modrm >> 3) & 7) | if rex & 0x04 != 0 { 8 } else { 0 }; // REX.R
+        if mod_ == 3 {
+            // reg-reg: `op r/m, r` (dst=r/m) or `op r, r/m` (dst=reg) / mov both ways
+            let rm = (modrm & 7) | if rex & 0x01 != 0 { 8 } else { 0 };
+            let dst_rm = |op| Op::Bin { op, d: rm, a: rm, b: reg };
+            let dst_reg = |op| Op::Bin { op, d: reg, a: reg, b: rm };
+            let op = match opcode {
+                0x01 => dst_rm(Bin::Add),
+                0x09 => dst_rm(Bin::Or),
+                0x21 => dst_rm(Bin::And),
+                0x29 => dst_rm(Bin::Sub),
+                0x31 => dst_rm(Bin::Xor),
+                0x89 => Op::Movr { d: rm, s: reg }, // mov r/m, r
+                0x03 => dst_reg(Bin::Add),
+                0x0b => dst_reg(Bin::Or),
+                0x23 => dst_reg(Bin::And),
+                0x2b => dst_reg(Bin::Sub),
+                0x33 => dst_reg(Bin::Xor),
+                0x8b => Op::Movr { d: reg, s: rm }, // mov r, r/m
+                _ => break,
+            };
+            out.push(op);
+            p += 2;
+        } else {
+            let ((base, idx, scale, disp), np) = match decode_mem(bytes, p + 1, rex, mod_, modrm) {
+                Some(x) => x,
+                None => break,
+            };
+            let loadop = |op| Op::LoadOp { op, d: reg, base, idx, scale, disp };
+            let op = match opcode {
+                0x8b => Op::Load { d: reg, base, idx, scale, disp }, // mov reg, [mem]
+                0x89 => Op::Store { base, idx, scale, disp, s: reg }, // mov [mem], reg
+                0x03 => loadop(Bin::Add),
+                0x0b => loadop(Bin::Or),
+                0x23 => loadop(Bin::And),
+                0x2b => loadop(Bin::Sub),
+                0x33 => loadop(Bin::Xor),
+                _ => break,
+            };
+            out.push(op);
+            p = np;
         }
-        let ext = |bit: u8| if rex & bit != 0 { 8u8 } else { 0 };
-        let reg = ((modrm >> 3) & 7) | ext(0x04); // REX.R
-        let rm = (modrm & 7) | ext(0x01); // REX.B
-        let bin = |op| Op::Bin { op, d: rm, a: rm, b: reg }; // `op r/m, r` → r/m op= r
-        let op = match opcode {
-            0x01 => bin(Bin::Add),
-            0x09 => bin(Bin::Or),
-            0x21 => bin(Bin::And),
-            0x29 => bin(Bin::Sub),
-            0x31 => bin(Bin::Xor),
-            0x89 => Op::Movr { d: rm, s: reg }, // mov r/m, r
-            _ => break,
-        };
-        out.push(op);
-        b = &b[2..];
     }
     out
 }
@@ -405,33 +531,38 @@ fn decoded_x86_runs_through_the_jit_and_matches() {
 #[test]
 fn jit_memory_ops_are_bit_identical_to_the_interpreter() {
     let mut rng = Rng(0xd1b5_4a32_d192_ed03);
-    // base pointers held in regs 12..16 — never written by the block, so they stay valid.
+    // reg 11 = SIB index, regs 12..16 = base pointers — never written by the block.
     const BASE: [u8; 4] = [12, 13, 14, 15];
     for _ in 0..300 {
         let n = 1 + (rng.next() % 30);
         let mut block = Vec::new();
         for _ in 0..n {
-            let d = (rng.next() % 12) as u8; // dst regs 0..12 only (keep base ptrs intact)
+            let d = (rng.next() % 11) as u8; // dst regs 0..11 only (keep base/index intact)
             let base = BASE[(rng.next() % 4) as usize];
-            let disp = (rng.next() % 0x600) as i32; // in-range offset
-            block.push(match rng.next() % 6 {
+            let scale = (rng.next() % 4) as u8; // 1,2,4,8
+            let idx = if rng.next() & 1 == 0 { NO_REG } else { 11 }; // exercise both SIB & plain
+            let disp = (rng.next() % 0x400) as i32; // in-range offset
+            block.push(match rng.next() % 8 {
                 0 => Op::Movi { d, imm: rng.next() },
                 1 => Op::Bin { op: Bin::Add, d, a: rng.reg(), b: rng.reg() },
                 2 => Op::Bin { op: Bin::Xor, d, a: rng.reg(), b: rng.reg() },
                 3 => Op::Shift { op: Sh::Rotr, d, a: rng.reg(), sh: (rng.next() % 64) as u8 },
-                4 => Op::Load { d, base, disp },
-                _ => Op::Store { base, disp, s: rng.reg() },
+                4 => Op::Load { d, base, idx, scale, disp },
+                5 => Op::Store { base, idx, scale, disp, s: rng.reg() },
+                6 => Op::LoadOp { op: Bin::Add, d, base, idx, scale, disp },
+                _ => Op::LoadOp { op: Bin::Xor, d, base, idx, scale, disp },
             });
         }
-        // base pointers spaced so [base+disp, +8) stays inside the test RAM.
+        // base/index spaced so [addr, +8) stays inside the test RAM (max ≈ 0x1700).
         let mut regs = [0u64; NREG];
-        for r in regs[..12].iter_mut() {
+        for r in regs[..11].iter_mut() {
             *r = rng.next();
         }
+        regs[11] = 0x20; // index value (small; idx<<scale ≤ 0x100)
         regs[12] = 0x0000;
-        regs[13] = 0x0800;
-        regs[14] = 0x1000;
-        regs[15] = 0x1800;
+        regs[13] = 0x0600;
+        regs[14] = 0x0c00;
+        regs[15] = 0x1200;
         // random initial guest RAM
         let mut ram0 = vec![0u8; GUEST_LEN];
         for b in ram0.iter_mut() {
@@ -444,4 +575,50 @@ fn jit_memory_ops_are_bit_identical_to_the_interpreter() {
         assert_eq!(regs_w, regs_i, "memory-op block: regs diverged");
         assert_eq!(ram_w, ram_i, "memory-op block: guest RAM diverged");
     }
+}
+
+#[test]
+fn decoder_handles_x86_memory_forms() {
+    // mov rax, [rsp+0x10]  (48 8b 44 24 10): rsp forces a SIB, disp8
+    assert_eq!(
+        decode_x86(&[0x48, 0x8b, 0x44, 0x24, 0x10]),
+        vec![Op::Load { d: 0, base: 4, idx: NO_REG, scale: 0, disp: 0x10 }]
+    );
+    // mov [rsp+0x8], rbx  (48 89 5c 24 08)
+    assert_eq!(
+        decode_x86(&[0x48, 0x89, 0x5c, 0x24, 0x08]),
+        vec![Op::Store { base: 4, idx: NO_REG, scale: 0, disp: 8, s: 3 }]
+    );
+    // add r15, [r13*8 + 0x100]  (4e 03 3c ed 00 01 00 00): SIB no-base table load — the
+    // K[] round-constant shape (index=r13 via REX.X, scale=8, disp32, no base register)
+    assert_eq!(
+        decode_x86(&[0x4e, 0x03, 0x3c, 0xed, 0x00, 0x01, 0x00, 0x00]),
+        vec![Op::LoadOp { op: Bin::Add, d: 15, base: NO_REG, idx: 13, scale: 3, disp: 0x100 }]
+    );
+}
+
+#[test]
+fn decoded_x86_memory_block_runs_through_the_jit() {
+    // mov rax,[rsp+0x10] ; add rax,[rsp+0x20] ; mov [rsp+0x100],rax  (the W[] shape:
+    // load two schedule words, sum, store back) — decoded from real bytes, run end-to-end.
+    let bytes = [
+        0x48, 0x8b, 0x44, 0x24, 0x10, // mov rax, [rsp+0x10]
+        0x48, 0x03, 0x44, 0x24, 0x20, // add rax, [rsp+0x20]
+        0x48, 0x89, 0x84, 0x24, 0x00, 0x01, 0x00, 0x00, // mov [rsp+0x100], rax (disp32)
+    ];
+    let ir = decode_x86(&bytes);
+    assert_eq!(ir.len(), 3, "all three memory instructions decoded");
+    let mut regs = [0u64; NREG];
+    regs[4] = 0; // rsp → guest RAM base 0
+    let mut ram0 = vec![0u8; GUEST_LEN];
+    ram0[0x10..0x18].copy_from_slice(&0x1111_2222_3333_4444u64.to_le_bytes());
+    ram0[0x20..0x28].copy_from_slice(&0x0000_0000_0001_0001u64.to_le_bytes());
+    let (mut regs_i, mut ram_i) = (regs, ram0.clone());
+    interpret(&ir, &mut regs_i, &mut ram_i);
+    let mut ram_w = ram0;
+    let regs_w = run_wasm(&compile(&ir), regs, &mut ram_w);
+    assert_eq!(regs_w, regs_i, "decoded memory block: regs diverged");
+    assert_eq!(ram_w, ram_i, "decoded memory block: guest RAM diverged");
+    let stored = u64::from_le_bytes(ram_i[0x100..0x108].try_into().unwrap());
+    assert_eq!(stored, 0x1111_2222_3333_4444u64.wrapping_add(0x0001_0001), "summed-and-stored");
 }
