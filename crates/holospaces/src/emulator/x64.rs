@@ -3735,6 +3735,55 @@ impl Cpu {
                 // restarts the whole REP after the handler maps the page — unchanged.
             }
         }
+        // Bulk fast path — `copy_user` (the other top-hot op: rep movs). A forward
+        // `REP MOVS` whose source and destination each lie within one mapped RAM page,
+        // physically NON-OVERLAPPING, is a single slice copy instead of N read+write
+        // pairs. Byte-identical (non-overlap → forward copy == `copy_within`) and
+        // TSC-identical: we replay the per-element interleaved (src-read, dst-write)
+        // dcache touches the loop would make. Falls through on overlap, page-cross,
+        // MMIO, DF=1, or a `#PF`.
+        if matches!(kind, StringOp::Movs) && rep != RepKind::None && self.rflags & RFLAGS_DF == 0 {
+            let count = self.r[RCX];
+            let len = count.wrapping_mul(u64::from(osz));
+            let (src, dst) = (self.r[RSI], self.r[RDI]);
+            if count != 0 && (src & 0xfff) + len <= 0x1000 && (dst & 0xfff) + len <= 0x1000 {
+                let user = self.cpl == 3;
+                let spa = self.translate_acc(src, false, user);
+                let dpa = if self.fault.is_none() {
+                    self.translate_acc(dst, true, user)
+                } else {
+                    0
+                };
+                let (shi, dhi) = (spa.wrapping_add(len), dpa.wrapping_add(len));
+                let ram_ok = |lo: u64, hi: u64, ram: u64| {
+                    !(VIRTIO_BLK_BASE..VIRTIO_NET_END).contains(&lo)
+                        && !(LAPIC_BASE..LAPIC_END).contains(&lo)
+                        && hi <= ram
+                };
+                let ramlen = self.ram.len() as u64;
+                if self.fault.is_none()
+                    && ram_ok(spa, shi, ramlen)
+                    && ram_ok(dpa, dhi, ramlen)
+                    && (dhi <= spa || shi <= dpa)
+                // physically non-overlapping
+                {
+                    let osz64 = u64::from(osz);
+                    for i in 0..count {
+                        self.dcache_touch(spa + i * osz64);
+                        self.dcache_touch(dpa + i * osz64);
+                    }
+                    let (soff, doff, n) =
+                        ((spa - RAM_BASE) as usize, (dpa - RAM_BASE) as usize, len as usize);
+                    self.ram.copy_within(soff..soff + n, doff);
+                    self.r[RSI] = src.wrapping_add(len);
+                    self.r[RDI] = dst.wrapping_add(len);
+                    self.r[RCX] = 0;
+                    return;
+                }
+                // A `#PF` latched on the probe: fall through; the per-element loop sees
+                // it on the first access and breaks, then `step` restarts the REP.
+            }
+        }
         let mut count = if rep == RepKind::None { 1 } else { self.r[RCX] };
         while count != 0 {
             match kind {
@@ -4583,6 +4632,42 @@ mod tests {
         cpu.string_op(StringOp::Stos, 8, RepKind::Rep);
         assert!(cpu.ram[dst..dst + 80].iter().all(|&b| b == 0xFF), "10 qwords filled");
         assert_eq!(cpu.ram[dst + 80], 0, "the byte past the fill is untouched");
+    }
+
+    #[test]
+    fn rep_movs_bulk_fast_path_copies_like_the_per_element_loop() {
+        // The `copy_user` hot path: a forward `rep movsq` of non-overlapping, single-page
+        // src/dst. The bulk slice copy must leave RAM + registers exactly as the
+        // per-element loop would. (Paging off → identity translate.)
+        let mut cpu = Cpu::new(256 * 1024);
+        let (src, dst) = (0x10_000usize, 0x20_000usize); // non-overlapping, distinct pages
+        for i in 0..4096 {
+            cpu.ram[src + i] = (i as u8).wrapping_mul(7).wrapping_add(1);
+        }
+        cpu.ram[dst..dst + 4096].fill(0);
+        cpu.r[RSI] = src as u64;
+        cpu.r[RDI] = dst as u64;
+        cpu.r[RCX] = 512; // 512 × 8 B = 4 KiB
+        cpu.rflags &= !RFLAGS_DF;
+        cpu.string_op(StringOp::Movs, 8, RepKind::Rep);
+        assert_eq!(cpu.r[RCX], 0, "REP consumed the whole count");
+        assert_eq!(cpu.r[RSI], (src + 4096) as u64, "RSI advanced");
+        assert_eq!(cpu.r[RDI], (dst + 4096) as u64, "RDI advanced");
+        let (a, b) = cpu.ram.split_at(0x18_000);
+        assert_eq!(&a[src..src + 4096], &b[0x8000..0x8000 + 4096], "dst == src after copy");
+
+        // A partial, byte-granular copy that does not span the page, and leaves the
+        // byte just past the end untouched.
+        cpu.ram[dst..dst + 4096].fill(0xEE);
+        cpu.r[RSI] = src as u64;
+        cpu.r[RDI] = dst as u64;
+        cpu.r[RCX] = 13;
+        cpu.string_op(StringOp::Movs, 1, RepKind::Rep);
+        assert_eq!(cpu.r[RDI], (dst + 13) as u64);
+        for i in 0..13 {
+            assert_eq!(cpu.ram[dst + i], cpu.ram[src + i], "byte {i} copied");
+        }
+        assert_eq!(cpu.ram[dst + 13], 0xEE, "the byte past the copy is untouched");
     }
 
     #[test]

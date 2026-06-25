@@ -38,3 +38,4 @@ crates/holospaces-web/web/graphical-aarch64-kernel.gz
 crates/holospaces-web/web/x64-kernel.gz
 vv/artifacts/cc45/alpine/alpine-minirootfs.tar.gz
 vv/artifacts/cc45/alpine/init
+crates/holospaces-web/web/x64-diskroot-kernel.gz
