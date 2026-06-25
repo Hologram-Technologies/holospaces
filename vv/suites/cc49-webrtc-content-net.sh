@@ -43,7 +43,7 @@ if [ ! -f "$WEB/pkg/holospaces_web_bg.wasm" ] || \
    ! grep -q "WebRtcLink" "$WEB/pkg/holospaces_web.js" 2>/dev/null || \
    ! grep -q "cn_pump" "$WEB/pkg/holospaces_web.js" 2>/dev/null || \
    ! grep -q "cn_discover" "$WEB/pkg/holospaces_web.js" 2>/dev/null; then
-  ( cd "$ROOT/crates/holospaces-web" && wasm-pack build --release --target web --out-dir web/pkg ) || exit 1
+  "$ROOT/vv/lib/build-wasm-peer.sh" "$ROOT" || exit 1
 fi
 # A real witness installs its prerequisites — it does not skip.
 [ -d "$WEB/node_modules/playwright" ] || ( cd "$WEB" && npm install playwright >/dev/null 2>&1 )

@@ -69,7 +69,7 @@ if [ -f "$WITNESS" ] \
     # Build the wasm peer (carries the substrate-native ext-host runtime) so the
     # witness always runs against the product, not a stale bundle.
     if [ ! -f "$WEB/pkg/holospaces_web_bg.wasm" ]; then
-        ( cd "$ROOT/crates/holospaces-web" && wasm-pack build --release --target web --out-dir web/pkg ) || exit 1
+        "$ROOT/vv/lib/build-wasm-peer.sh" "$ROOT" || exit 1
     fi
     ( cd "$WEB" && node ext-host-test.mjs ) || exit 1
     exit 0
