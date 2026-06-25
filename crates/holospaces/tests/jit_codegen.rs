@@ -10,7 +10,7 @@ use wasmtime::{Engine, Instance, Module, Store};
 
 const NREG: usize = 16;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Bin {
     Add,
     Sub,
@@ -18,15 +18,16 @@ enum Bin {
     And,
     Or,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Sh {
     ShrU,
     Shl,
     Rotr,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Op {
     Movi { d: u8, imm: u64 },
+    Movr { d: u8, s: u8 },
     Bin { op: Bin, d: u8, a: u8, b: u8 },
     Shift { op: Sh, d: u8, a: u8, sh: u8 },
 }
@@ -36,6 +37,7 @@ fn interpret(block: &[Op], r: &mut [u64; NREG]) {
     for op in block {
         match *op {
             Op::Movi { d, imm } => r[d as usize] = imm,
+            Op::Movr { d, s } => r[d as usize] = r[s as usize],
             Op::Bin { op, d, a, b } => {
                 let (a, b) = (r[a as usize], r[b as usize]);
                 r[d as usize] = match op {
@@ -122,6 +124,10 @@ fn compile(block: &[Op]) -> Vec<u8> {
             Op::Movi { d, imm } => {
                 code.push(0x42);
                 sleb(imm as i64, &mut code); // i64.const
+                setl(d, &mut code);
+            }
+            Op::Movr { d, s } => {
+                getl(s, &mut code);
                 setl(d, &mut code);
             }
             Op::Bin { op, d, a, b } => {
@@ -267,4 +273,79 @@ fn jit_codegen_matches_on_a_sha512_shaped_block() {
     let mut want = regs;
     interpret(&block, &mut want);
     assert_eq!(run_wasm(&compile(&block), regs), want, "SHA-512-shaped block diverged");
+}
+
+/// Minimal x86-64 decoder for the reg-reg ALU/mov subset (the SHA-512 compression
+/// core): optional REX, opcode, ModRM (mod=3). Maps to the IR; **bails** (stops) on any
+/// memory form or unknown opcode — exactly the JIT's "bail to the interpreter" discipline.
+/// The full transform also needs the stack/table loads (Load/Store IR) — the next slab.
+fn decode_x86(mut b: &[u8]) -> Vec<Op> {
+    let mut out = Vec::new();
+    while b.len() >= 2 {
+        let mut rex = 0u8;
+        if b[0] & 0xf0 == 0x40 {
+            rex = b[0];
+            b = &b[1..];
+        }
+        if b.len() < 2 {
+            break;
+        }
+        let (opcode, modrm) = (b[0], b[1]);
+        if modrm >> 6 != 3 {
+            break; // memory form — outside this subset
+        }
+        let ext = |bit: u8| if rex & bit != 0 { 8u8 } else { 0 };
+        let reg = ((modrm >> 3) & 7) | ext(0x04); // REX.R
+        let rm = (modrm & 7) | ext(0x01); // REX.B
+        let bin = |op| Op::Bin { op, d: rm, a: rm, b: reg }; // `op r/m, r` → r/m op= r
+        let op = match opcode {
+            0x01 => bin(Bin::Add),
+            0x09 => bin(Bin::Or),
+            0x21 => bin(Bin::And),
+            0x29 => bin(Bin::Sub),
+            0x31 => bin(Bin::Xor),
+            0x89 => Op::Movr { d: rm, s: reg }, // mov r/m, r
+            _ => break,
+        };
+        out.push(op);
+        b = &b[2..];
+    }
+    out
+}
+
+#[test]
+fn x86_decoder_maps_reg_reg_alu_to_the_ir() {
+    // add rax,rbx (48 01 d8): r/m=rax(0) += reg=rbx(3)
+    assert_eq!(decode_x86(&[0x48, 0x01, 0xd8]), vec![Op::Bin { op: Bin::Add, d: 0, a: 0, b: 3 }]);
+    // xor r9,r9 (4d 31 c9): REX.WRB → reg & rm both +8
+    assert_eq!(decode_x86(&[0x4d, 0x31, 0xc9]), vec![Op::Bin { op: Bin::Xor, d: 9, a: 9, b: 9 }]);
+    // and rcx,rdx (48 21 d1)
+    assert_eq!(decode_x86(&[0x48, 0x21, 0xd1]), vec![Op::Bin { op: Bin::And, d: 1, a: 1, b: 2 }]);
+    // mov rbx,rax (48 89 c3): rbx(3) = rax(0)
+    assert_eq!(decode_x86(&[0x48, 0x89, 0xc3]), vec![Op::Movr { d: 3, s: 0 }]);
+    // a two-instruction sequence
+    assert_eq!(
+        decode_x86(&[0x48, 0x01, 0xd8, 0x48, 0x31, 0xc8]),
+        vec![Op::Bin { op: Bin::Add, d: 0, a: 0, b: 3 }, Op::Bin { op: Bin::Xor, d: 0, a: 0, b: 1 }]
+    );
+}
+
+#[test]
+fn decoded_x86_runs_through_the_jit_and_matches() {
+    // mov rcx,rax ; add rcx,rbx ; xor rcx,rdx  → rcx = (rax + rbx) ^ rdx
+    let bytes = [
+        0x48, 0x89, 0xc1, // mov rcx, rax
+        0x48, 0x01, 0xd9, // add rcx, rbx
+        0x48, 0x31, 0xd1, // xor rcx, rdx
+    ];
+    let ir = decode_x86(&bytes);
+    let mut regs = [0u64; NREG];
+    regs[0] = 0x0102_0304_0506_0708; // rax
+    regs[3] = 0x1111_1111_1111_1111; // rbx
+    regs[2] = 0xffff_0000_ffff_0000; // rdx
+    let mut want = regs;
+    interpret(&ir, &mut want);
+    // hand-check rcx (reg 1) and confirm the JIT (codegen→wasmtime) agrees end-to-end.
+    assert_eq!(want[1], regs[0].wrapping_add(regs[3]) ^ regs[2]);
+    assert_eq!(run_wasm(&compile(&ir), regs), want, "real x86 bytes → decode → JIT diverged");
 }
