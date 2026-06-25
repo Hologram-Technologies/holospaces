@@ -119,10 +119,11 @@ fn build_rootfs(store: &MemKappaStore) -> (dockerfile::Dockerfile, Vec<u8>) {
     (df, rootfs)
 }
 
-/// (1) The Dockerfile is parsed and *honoured*: the build `/init` runs the `RUN`
-/// steps with the `ENV` in scope, the `COPY` source is injected into the rootfs at
-/// its destination, and `FROM` is the pulled base — verified against the `ext4`
-/// format by e2fsprogs.
+/// (1) The Dockerfile is parsed and the build `/init` is **generated** to run the
+/// `RUN` steps with the `ENV` in scope, the `COPY` source is **staged** in the
+/// rootfs at its destination, and `FROM` is the pulled base — the `ext4` is
+/// verified against the format by e2fsprogs. The actual `RUN` *execution* is
+/// witnessed by the emulator boot tests below, not here.
 #[test]
 fn the_dockerfile_build_is_assembled() {
     let store = MemKappaStore::new();
@@ -136,11 +137,11 @@ fn the_dockerfile_build_is_assembled() {
     assert!(init.contains("cd '/workspace'"), "WORKDIR entered: {init}");
     assert!(
         init.contains("busybox sh /usr/local/bin/setup.sh"),
-        "the COPY'd script runs: {init}"
+        "the init is wired to run the COPY'd script: {init}"
     );
     assert!(
         init.contains("echo BUILD-RAN:$BUILT_BY"),
-        "the RUN uses the ENV: {init}"
+        "the init exports the ENV for the RUN: {init}"
     );
 
     if !have("e2fsck") || !have("debugfs") {
@@ -170,7 +171,7 @@ fn the_dockerfile_build_is_assembled() {
     let _ = std::fs::remove_file(&img);
     assert!(
         String::from_utf8_lossy(&o).contains("SETUP-RAN"),
-        "the COPY source from the build context is in the rootfs (the RUN will execute it)"
+        "the COPY source from the build context is staged in the rootfs for the RUN"
     );
 }
 

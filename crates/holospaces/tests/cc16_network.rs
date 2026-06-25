@@ -105,7 +105,7 @@ fn the_os_reaches_the_internet_through_the_userspace_nat() {
 
     assert!(
         console.contains("IP-Config: Complete") || console.contains("NET-CONNECTED"),
-        "the OS configured its interface via DHCP over virtio-net; console:\n{console}"
+        "the OS brought up its network interface (DHCP IP-Config or the NAT-connected marker); console:\n{console}"
     );
     assert!(
         console.contains("NET-CONNECTED"),

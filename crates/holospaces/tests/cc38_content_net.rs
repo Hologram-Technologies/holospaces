@@ -52,12 +52,13 @@ fn a_browser_peer_fetches_content_from_a_bare_metal_peer() {
     let got = drive_fetch(&browser, &bare, &kappa)
         .expect("the browser peer fetched the content from the bare-metal peer");
     assert_eq!(&got[..], &content[..], "the fetched bytes are the content");
-    // Verify-on-receipt (SPINE-4 / Law L5): the bytes re-derive to the κ that was
-    // requested — a forging responder would be rejected inside BareNetSync.
+    // The returned bytes re-derive to the requested κ (Law L5): the right content
+    // came back. (Verify-on-receipt *enforcement* — rejecting a forging responder
+    // — is the sibling `a_forging_responder_is_rejected`.)
     assert_eq!(
         address(&got[..]),
         kappa,
-        "the fetched content re-derives to the requested κ"
+        "the fetched bytes are the requested content (hash matches)"
     );
 
     // A κ that neither peer holds resolves to nothing — no forging, no false

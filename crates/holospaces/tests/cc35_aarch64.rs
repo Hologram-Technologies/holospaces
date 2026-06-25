@@ -41,8 +41,9 @@ fn the_a64_data_processing_battery_passes() {
     assert_eq!(status, 0, "arith battery exit status");
 }
 
-/// The load/store battery: the full addressing-mode + extension family round
-/// trips through memory correctly.
+/// The load/store battery: its cases round-trip through memory correctly (the
+/// "full addressing-mode + extension family" is the fixture's scope; this test
+/// runs the fixture and asserts its `PASS` verdict).
 #[test]
 fn the_a64_load_store_battery_passes() {
     let (console, status) = run_battery(MEMORY);

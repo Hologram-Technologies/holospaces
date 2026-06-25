@@ -461,8 +461,11 @@ fn check_9p_workspace<C: Mmio>(mut cpu: C) {
     );
 }
 
-/// A core completes an outbound TCP flow through the userspace NAT — `CC-16`
-/// parity, over the shared devbus, through that core's MMIO transport.
+/// A core initiates (opens) an outbound TCP connection through the userspace
+/// NAT — `CC-16` parity, over the shared devbus, through that core's MMIO
+/// transport. The witness asserts only the egress OPEN that carries the
+/// destination; a *completed* flow (SYN-ACK/established/data/reply) is the real
+/// boot in `cc46_realboot.rs`.
 fn check_nat_outbound<C: Mmio>(mut cpu: C) {
     let (egress, router): (ChannelEgress, RouterChannel) = ChannelEgress::new();
     cpu.attach_net(Box::new(egress));
@@ -507,15 +510,16 @@ fn check_nat_outbound<C: Mmio>(mut cpu: C) {
         .find(|f| f.len() >= 11 && f[0] == 0x01 && f[5..9] == dst_ip);
     assert!(
         opened.is_some(),
-        "the guest's TCP SYN drove an outbound NAT connection to {dst_ip:?} \
+        "the guest's TCP SYN drove the NAT to emit an outbound OPEN toward {dst_ip:?} \
          (CC-16 parity); egress frames: {frames:?}"
     );
 }
 
-/// A core exposes the in-process guest bridge — `CC-33` parity. The bridge
+/// A core exposes the guest-bridge API — `CC-33` parity. The bridge
 /// (dial/send/recv/close) is the core-agnostic loopback surface over the shared
-/// NAT; here it is enabled on the core's net device and a dial opens an in-process
-/// ingress connection toward a guest listener.
+/// NAT; here it is enabled on the core's net device, a dial issues a connection
+/// id, and the id reports open after a local send. No delivery to a guest
+/// listener is asserted (there is no guest in this device-level witness).
 fn check_guest_bridge<C: Mmio>(mut cpu: C) {
     // The bridge requires a network device (it shares the NAT's ingress path).
     assert!(
@@ -529,18 +533,17 @@ fn check_guest_bridge<C: Mmio>(mut cpu: C) {
         "the net device exposes the in-process loopback bridge (CC-33 parity)"
     );
 
-    // The workbench dials a guest listener; the bridge issues a connection id and
-    // the host side is open (the NAT opens toward the guest on the next pump).
+    // The workbench dials through the bridge API; it issues a connection id and,
+    // after a local send, the id reports open (no delivery to a guest asserted).
     let id = cpu
         .dial_guest(8080)
         .expect("dial_guest returns a connection id once the loopback is enabled");
     cpu.guest_send(id, b"GET / HTTP/1.0\r\n\r\n");
     assert!(
         cpu.guest_is_open(id),
-        "the dialed bridge connection is open and writable (CC-33 parity)"
+        "the bridge API reports the dialed connection open after a local send (CC-33 parity)"
     );
-    // Pumping the machine advances the NAT's ingress toward the guest; the host
-    // side stays usable and drains cleanly on close (no relay, no socket).
+    // Exercise the rest of the API surface (pump, recv, close) for coverage.
     cpu.run(2000);
     let _ = cpu.guest_recv(id);
     cpu.guest_close(id);
@@ -554,12 +557,12 @@ fn the_aarch64_core_mounts_a_9p_workspace_over_the_shared_devbus() {
 }
 
 #[test]
-fn the_aarch64_core_nats_an_outbound_tcp_flow_over_the_shared_devbus() {
+fn the_aarch64_core_opens_an_outbound_tcp_connection_over_the_shared_devbus() {
     check_nat_outbound(aarch64());
 }
 
 #[test]
-fn the_aarch64_core_exposes_the_in_process_guest_bridge() {
+fn the_aarch64_core_exposes_the_guest_bridge_api() {
     check_guest_bridge(aarch64());
 }
 
@@ -571,12 +574,12 @@ fn the_x86_64_core_mounts_a_9p_workspace_over_the_shared_devbus() {
 }
 
 #[test]
-fn the_x86_64_core_nats_an_outbound_tcp_flow_over_the_shared_devbus() {
+fn the_x86_64_core_opens_an_outbound_tcp_connection_over_the_shared_devbus() {
     check_nat_outbound(x86_64());
 }
 
 #[test]
-fn the_x86_64_core_exposes_the_in_process_guest_bridge() {
+fn the_x86_64_core_exposes_the_guest_bridge_api() {
     check_guest_bridge(x86_64());
 }
 

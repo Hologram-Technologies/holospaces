@@ -117,7 +117,7 @@ fn the_boundary_check_rejects_a_liar_but_the_trusted_read_trusts_the_store() {
             .unwrap()
             .as_deref(),
         Some(&b"tampered bytes the gateway actually served"[..]),
-        "the trusted read returns the store's bytes without re-deriving (Law L3)"
+        "the trusted read returns the store's bytes as-is (does not reject the forged blob)"
     );
 }
 

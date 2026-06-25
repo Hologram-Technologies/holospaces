@@ -88,9 +88,10 @@ fn restore_is_the_inverse_of_snapshot_and_continues_identically() {
 
 #[test]
 fn restore_reconstructs_a_machine_with_a_virtio_disk() {
-    // A machine with a virtio-blk disk attached — restore must reconstruct the
-    // device (its negotiated queue state and disk contents), so the snapshot
-    // round-trips exactly.
+    // A machine with a virtio-blk disk attached: the restored machine
+    // re-serializes to byte-identical snapshot bytes (the disk/queue state is
+    // captured in the snapshot). This does not read disk bytes back out of the
+    // restored machine.
     let mut emu = Emulator::new(0x8000_0000, 1024 * 1024);
     let disk: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
     emu.attach_disk(disk);
@@ -99,7 +100,7 @@ fn restore_reconstructs_a_machine_with_a_virtio_disk() {
     assert_eq!(
         resumed.snapshot(),
         snap,
-        "a machine with a virtio disk round-trips through snapshot/restore exactly"
+        "a machine with a virtio disk re-serializes to byte-identical snapshot bytes after restore"
     );
 }
 

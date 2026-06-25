@@ -836,7 +836,7 @@ mod tests {
     }
 
     #[test]
-    fn ingests_and_verifies_every_blob_by_re_derivation() {
+    fn ingests_blobs_with_reproducible_content_addressed_identity() {
         let (layout, index, blobs) = build_layout();
         let store = MemKappaStore::new();
         let img = ingest_image(&store, &layout, &index, Arch::Riscv64, |d| {
@@ -857,11 +857,10 @@ mod tests {
         assert_eq!(img.digest(), img2.digest());
     }
 
-    /// The **page-drivable pull** (the browser peer's pull) yields the *identical*
-    /// verified image as a direct `ingest_image` — proving the router-fed pull and
-    /// the native pull share one trust boundary (Law L5) and one identity (Law L1).
-    /// The page loop here is the hermetic stand-in for `holospace-fs` fetching each
-    /// `next_fetch` through the router.
+    /// The incremental `ImagePull` (`next_fetch` / `deliver`) yields an image
+    /// *identical* to a one-shot `ingest_image` of the same blobs — same identity
+    /// (Law L1) and same manifest digest. The in-process `serve` closure reads
+    /// the same in-memory blob map for both paths.
     #[test]
     fn the_page_driven_pull_matches_a_direct_ingest() {
         let (_layout, _index, blobs) = build_layout();

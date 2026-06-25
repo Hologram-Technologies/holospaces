@@ -75,11 +75,10 @@ fn the_emulator_core_conforms_to_the_risc_v_isa() {
 /// across identical runs (Law L1 — a κ snapshot is content). (CC-9 foundation.)
 #[test]
 fn the_emulator_writes_console_output_and_snapshots_reproducibly() {
-    // A real program: write(1, msg, 5) then exit(0). msg "hi!\n\0" is placed by
-    // the program at a known RAM address via store immediates (no relocation).
+    // A real program: write(1, msg, 2) then exit(0). The 2 bytes "Hi" are placed
+    // by the program at a known RAM address via store immediates (no relocation).
     // li a0,1 (fd); place bytes; li a1,addr; li a2,len; li a7,64; ecall; exit.
-    // Assembled equivalent is shipped as console.bin if present; otherwise this
-    // test drives the syscall via a tiny hand-encoded program.
+    // This test drives the syscall via a tiny hand-encoded program.
     let prog: &[u8] = &[
         // addi t0, x0, 0x48 ; sb t0, 0x100(x0)   'H'
         0x93, 0x02, 0x80, 0x04, // addi t0,x0,0x48
@@ -118,19 +117,17 @@ fn the_emulator_writes_console_output_and_snapshots_reproducibly() {
     );
 }
 
-/// The emulator passes the **official RISC-V `riscv-tests` conformance suite** —
-/// the canonical external authority for the RISC-V ISA, the same suite hardware
-/// and QEMU are validated against: the unprivileged `rv64ui` (base) + `rv64um`
-/// (mul/div) + `rv64ua` (atomics) + `rv64uc` (compressed) + `rv64uf`/`rv64ud`
-/// (single/double float), and the **full** machine- and supervisor-mode
-/// privileged suites (`rv64mi`/`rv64si`) — the WARL/read-only CSRs, the
-/// debug-trigger absence, misaligned access, the FP-disabled trap, and the
-/// composite vectored-interrupt/S-mode/paging test (`mstatus.TVM`/`TSR`). Each
-/// runs in a real machine-mode environment (installs `mtvec`, drops to a lower
-/// mode via `mret`/`sret`, runs its self-checking cases, and signals pass/fail
-/// through the HTIF `tohost` channel), so passing them exercises the privileged
-/// trap architecture as fully as the base ISA. (CC-9, the canonical
-/// ISA-conformance authority.)
+/// The emulator runs the **official RISC-V `riscv-tests` conformance suite** as
+/// pinned in the manifest — the canonical external authority for the RISC-V ISA,
+/// the same suite hardware and QEMU are validated against. The manifest's scope
+/// spans the unprivileged `rv64ui`/`rv64um`/`rv64ua`/`rv64uc`/`rv64uf`/`rv64ud`
+/// families and the machine-/supervisor-mode privileged suites
+/// (`rv64mi`/`rv64si`); that family enumeration is the manifest's, not asserted
+/// here. What this test asserts: the manifest yields ≥80 images and each image
+/// runs to completion and halts with `Exit(0)` (each runs in a real machine-mode
+/// environment — installs `mtvec`, drops to a lower mode via `mret`/`sret`, runs
+/// its self-checking cases, and signals pass/fail through the HTIF `tohost`
+/// channel). (CC-9, the canonical ISA-conformance authority.)
 #[test]
 fn the_emulator_passes_the_official_riscv_tests() {
     let dir = artifact_dir().join("riscv-tests");

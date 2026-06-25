@@ -79,10 +79,10 @@ const CONFIG: &[u8] = br#"{
 
 /// The base busybox shell image (reused from CC-22), the feature OCI artifact
 /// (CC-25), the parsed config, and the assembled rootfs: the feature's files are
-/// placed at `/opt/holospaces/features/0/`, the lifecycle `/init` runs its
-/// `install.sh`, over the busybox base.
+/// placed at `/opt/holospaces/features/0/`, the lifecycle `/init` is generated to
+/// run its `install.sh`, over the busybox base.
 fn assemble(store: &MemKappaStore) -> (Vec<u8>, Vec<u8>) {
-    let dc = devcontainer::parse(CONFIG).expect("parse the devcontainer (features honoured)");
+    let dc = devcontainer::parse(CONFIG).expect("parse the devcontainer (feature parsed)");
     assert_eq!(dc.features.len(), 1, "the feature is parsed");
     assert_eq!(
         dc.features[0].options.get("version").map(String::as_str),
@@ -124,12 +124,14 @@ fn assemble(store: &MemKappaStore) -> (Vec<u8>, Vec<u8>) {
     (init, rootfs)
 }
 
-/// (1) The feature is parsed and *honoured*: the generated `/init` runs the
-/// feature's `install.sh` (with the option as env) before the lifecycle, and the
-/// feature's files are present in the assembled `ext4` rootfs — verified against
-/// the format by e2fsprogs (`e2fsck` clean; `debugfs` reads the feature back).
+/// (1) The feature is parsed and the generated `/init` is **wired** to run the
+/// feature's `install.sh` (with the option as env, before the lifecycle — spec
+/// order), and the feature's files are **staged** in the assembled `ext4` rootfs —
+/// verified against the format by e2fsprogs (`e2fsck` clean; `debugfs` reads the
+/// feature back). The actual `install.sh` *execution* is witnessed by the emulator
+/// boot tests below, not here.
 #[test]
-fn the_feature_is_installed_into_the_rootfs() {
+fn the_feature_is_staged_and_scheduled_in_the_rootfs() {
     let store = MemKappaStore::new();
     let (init, rootfs) = assemble(&store);
 
@@ -148,7 +150,7 @@ fn the_feature_is_installed_into_the_rootfs() {
     );
     assert!(
         inits.contains("busybox sh ./install.sh"),
-        "the install.sh runs: {inits}"
+        "the init is wired to run install.sh: {inits}"
     );
     let feat = inits.find("FEATURES-DONE").expect("features done");
     let life = inits.find("LIFECYCLE-START").expect("lifecycle start");

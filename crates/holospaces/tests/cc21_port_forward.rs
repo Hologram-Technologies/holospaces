@@ -165,10 +165,11 @@ fn a_server_in_the_devcontainer_is_reachable_through_a_forwarded_port() {
     );
 }
 
-/// The config's `forwardPorts` is honoured end-to-end: parsing it yields a real
-/// bound forward per declared port (a host listener bridged to the guest port),
-/// never a parsed-and-dropped field. Light (no OS boot) — it witnesses the
-/// config → ingress wiring [`DevContainer::port_forwards`] establishes.
+/// The config's `forwardPorts` is honoured on the host side: parsing it yields a
+/// real bound forward per declared port — each is a live HOST listener carrying
+/// its declared guest-port target — never a parsed-and-dropped field. There is
+/// no guest side here. Light (no OS boot) — it witnesses the config → ingress
+/// wiring [`DevContainer::port_forwards`] establishes.
 #[test]
 fn declared_forward_ports_are_honoured_from_the_config() {
     use holospaces::boot::devcontainer;

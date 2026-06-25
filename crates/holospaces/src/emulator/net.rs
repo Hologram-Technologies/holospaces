@@ -1599,11 +1599,11 @@ impl Ingress for LoopbackIngress {
 mod tests {
     use super::*;
 
-    /// The guest's egress routes through an external router over the
-    /// `RouterChannel` seam: a connection opens, data round-trips, and it closes
-    /// — the exact frame exchange the router extension (`CC-41`) and the node
-    /// (`CC-39`) implement, so the guest's package managers / apps reach the
-    /// internet through whichever router the page is wired to.
+    /// The `RouterChannel` frame protocol drives the egress OPEN → DATA → CLOSE
+    /// state machine: the test echoes the guest's own outbound payload back as an
+    /// RDATA frame and asserts `recv` returns those bytes — exercising the frame
+    /// exchange the router extension (`CC-41`) and the node (`CC-39`) implement.
+    /// No socket or internet is involved.
     #[test]
     fn channel_egress_routes_a_connection_through_the_router() {
         let (mut egress, channel) = ChannelEgress::new();

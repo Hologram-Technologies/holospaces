@@ -258,23 +258,24 @@ fn the_control_plane_actually_drives_its_managed_instance() {
     });
 }
 
-/// The **live network directive** modifies the *running* machine: the control
-/// plane's `ForwardPort` is applied to an already-constructed machine, and the
-/// new route is a real, reachable host listener — no reboot. (The dual of the
-/// `CC-21` ingress, bound live; ADR-018.)
+/// The **live network directive** binds a port-forward on a net-attached machine:
+/// the control plane's `ForwardPort` is applied to a machine that has networking
+/// attached (no guest is booted here), and the new route is a real, reachable
+/// host listener — no reboot. (The dual of the `CC-21` ingress, bound live;
+/// ADR-018.)
 #[test]
-fn a_forward_port_directive_modifies_the_running_machine() {
-    // A running machine with networking attached (as after boot).
+fn a_forward_port_directive_binds_a_live_host_listener() {
+    // A net-attached machine (networking attached as after boot; no guest booted).
     let mut machine = Emulator::new(0x8000_0000, 1 << 20);
     machine.attach_net_forward(Box::new(StdEgress::new()), Box::new(StdIngress::new()));
 
-    // The control plane forwards a port on the *running* instance.
+    // The control plane forwards a port on the net-attached instance.
     let host_port = machine
         .forward_port(8080)
-        .expect("the live forward is bound on the running machine");
+        .expect("the live forward binds a host listener");
 
     // The new route is real: a connection to the host port is accepted (the
-    // running instance now forwards it — its state changed, live).
+    // instance now forwards it — its state changed, live).
     TcpStream::connect(("127.0.0.1", host_port))
-        .expect("the live-forwarded port is reachable on the running machine");
+        .expect("the live-forwarded port is a reachable host listener");
 }

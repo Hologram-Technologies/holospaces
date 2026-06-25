@@ -169,7 +169,7 @@ mod tests {
         assert_eq!(back, roster);
         assert_eq!(back.operator(), operator.identity());
         assert_eq!(back.holospaces(), holospaces.as_slice());
-        // The roster is itself content — a stable κ links the operator's instances.
+        // kappa() is deterministic for identical roster content.
         assert_eq!(roster.kappa(), Roster::new(&operator, holospaces).kappa());
     }
 }

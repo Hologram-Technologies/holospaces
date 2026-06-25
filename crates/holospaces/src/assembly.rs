@@ -1383,8 +1383,10 @@ mod tests {
     }
 
     /// Emit a multi-block-group image (>128 MiB → ≥5 groups, exercising the
-    /// geometry sizing loop, backup superblocks, and per-group bitmaps). The
-    /// external oracle (`e2fsck`) must find it clean. Run on demand.
+    /// geometry sizing loop, backup superblocks, and per-group bitmaps) to
+    /// `/tmp` for manual `e2fsck` inspection. This test only writes the image
+    /// and logs its size; the gated `e2fsck` oracle runs in the cc14/cc50/cc45
+    /// suites. Run on demand.
     #[test]
     #[ignore]
     fn writes_a_multigroup_ext4_image() {
