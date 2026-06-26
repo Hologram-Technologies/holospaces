@@ -27,6 +27,7 @@ const ok = (c, m) => { if (!c) throw new Error("FAIL: " + m); pass++; console.lo
   const brace = core.compileGlobs(["**/*.{js,ts}"]);
   ok(brace("src/a.ts") && brace("src/b.js"), "{js,ts} alternation matches both");
   ok(!brace("src/a.css"), "{js,ts} alternation excludes .css");
+  ok(!brace("src/a.x/js"), "{js,ts} alternative does NOT match across a path separator (no any-depth prefix)");
 
   const q = core.compileGlobs(["src/?.js"]);
   ok(q("src/a.js") && !q("src/ab.js"), "? matches exactly one char within a segment");

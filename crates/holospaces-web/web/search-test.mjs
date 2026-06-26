@@ -77,6 +77,9 @@ const TYPES = {
 };
 const server = http.createServer(async (req, res) => {
   const rel = decodeURIComponent(req.url.split("?")[0]);
+  // Reject path traversal — `rel` is mapped onto disk via path.join, so refuse any
+  // `..` segment before it can escape the served directories.
+  if (rel.split("/").includes("..")) { res.writeHead(403).end("forbidden"); return; }
   const send = (b, ct) => { res.writeHead(200, { "content-type": ct || "application/octet-stream" }); res.end(b); };
   try {
     if (rel === "/" || rel === "/workbench.html") return send(html, "text/html");
