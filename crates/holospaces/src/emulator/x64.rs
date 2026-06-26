@@ -4962,4 +4962,63 @@ mod tests {
         assert_eq!(got, want, "JIT block diverged from step() on register dataflow");
         assert_eq!(got[3], (init[0].wrapping_add(init[1])) ^ init[2], "rbx = (rax+rcx)^rdx");
     }
+
+    /// Step-C de-risk #2: the JIT's `rflags` model (`compile_tlb_flags`) must match the real
+    /// interpreter's flag computation (`flags_arith`/`flags_logic`), not just the in-module
+    /// oracle. A flag-setting block run through both must agree on registers AND rflags —
+    /// including that AF (which the interpreter never touches) is preserved unchanged.
+    #[test]
+    fn jit_flags_block_matches_step() {
+        use crate::emulator::jit;
+        use wasmtime::{Engine, Instance, Module, Store};
+
+        // rbx ^= rax ; rbx += rcx ; rbx -= rdx — exercises logical + add + sub flags. No hlt:
+        // run exactly the three ALU instructions (a hlt with IF=1 would tick the timer and
+        // perturb rflags, which is not what we are comparing).
+        let code = [
+            0x48, 0x31, 0xc3, // xor rbx, rax
+            0x48, 0x01, 0xcb, // add rbx, rcx
+            0x48, 0x29, 0xd3, // sub rbx, rdx
+        ];
+        let mut init = [0u64; 16];
+        init[0] = 0x0000_0000_dead_beef; // rax
+        init[1] = 0x0000_0000_0000_0007; // rcx
+        init[2] = 0xffff_ffff_ffff_fff0; // rdx (forces a borrow on the final sub)
+        init[3] = 0x1234_5678_9abc_def0; // rbx
+        let rflags0 = 0x2 | (1 << 4) | (1 << 9); // reserved + AF=1 + IF=1 (must be preserved)
+
+        let mut cpu = Cpu::new(64 * 1024);
+        cpu.load_at(0, &code);
+        cpu.r = init;
+        cpu.rflags = rflags0;
+        cpu.run(3); // exactly the three ALU instructions
+        let (want_r, want_f) = (cpu.r, cpu.rflags);
+
+        let ir = jit::decode_x86(&code);
+        let wasm = jit::compile_tlb_flags(&ir);
+        let engine = Engine::default();
+        let module = Module::new(&engine, &wasm).unwrap();
+        let mut store = Store::new(&engine, ());
+        let inst = Instance::new(&mut store, &module, &[]).unwrap();
+        let mem = inst.get_memory(&mut store, "mem").unwrap();
+        let run = inst.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+        for (i, v) in init.iter().enumerate() {
+            mem.write(&mut store, i * 8, &v.to_le_bytes()).unwrap();
+        }
+        mem.write(&mut store, 128, &rflags0.to_le_bytes()).unwrap(); // RFLAGS_MEM
+        let bail = run.call(&mut store, ()).unwrap();
+        assert_eq!(bail, 3, "no memory ops → block completes (bail == len)");
+        let mut got_r = [0u64; 16];
+        for (i, g) in got_r.iter_mut().enumerate() {
+            let mut b = [0u8; 8];
+            mem.read(&store, i * 8, &mut b).unwrap();
+            *g = u64::from_le_bytes(b);
+        }
+        let mut fb = [0u8; 8];
+        mem.read(&store, 128, &mut fb).unwrap();
+        let got_f = u64::from_le_bytes(fb);
+
+        assert_eq!(got_r, want_r, "JIT registers diverged from step()");
+        assert_eq!(got_f, want_f, "JIT rflags diverged from step() (incl. preserved AF/IF)");
+    }
 }

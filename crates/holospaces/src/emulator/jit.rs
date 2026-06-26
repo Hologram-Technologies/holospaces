@@ -65,10 +65,12 @@ const GUEST_LEN: usize = 0x3000; // 3 pages of test guest RAM
 const TLB_BASE: u64 = 0x200;
 const TLB_SIZE: u64 = 64; // power of two; slot = vpage & (TLB_SIZE-1)
 
-/// The guest `rflags` slot in wasm memory (just past the 16 registers), and the six
-/// arithmetic flag bits an ALU op writes: CF(0) PF(2) AF(4) ZF(6) SF(7) OF(11).
+/// The guest `rflags` slot in wasm memory (just past the 16 registers), and the flag bits
+/// an ALU op writes: CF(0) PF(2) ZF(6) SF(7) OF(11). AF(4) is deliberately NOT modelled —
+/// `x64.rs::flags_arith`/`flags_logic` leave AF untouched, so to stay bit-identical to
+/// `step()` the JIT must leave it untouched too.
 const RFLAGS_MEM: u64 = NREG as u64 * 8; // mem offset 128
-const ALU_FLAGS_MASK: u64 = 0x8d5; // CF|PF|AF|ZF|SF|OF
+const ALU_FLAGS_MASK: u64 = 0x8c5; // CF|PF|ZF|SF|OF (no AF — matches the interpreter)
 
 // Local layout: 21 × i64 then 2 × i32 (always declared; unused ones are harmless).
 const VA_LOCAL: u8 = NREG as u8; // i64 16: vaddr scratch (TLB)
@@ -361,26 +363,9 @@ fn compile_mode(block: &[Op], tlb: bool, flags: bool) -> Vec<u8> {
         c.push(0xad); // extend
         shl(2, c);
         or_in(c);
-        // AF, CF, OF depend on the op kind
-        let xor3 = |x: u8, y: u8, z: u8, c: &mut Vec<u8>| {
-            get(x, c);
-            get(y, c);
-            c.push(0x85); // xor
-            get(z, c);
-            c.push(0x85); // xor
-        };
+        // CF and OF depend on the op kind (logical ops leave them cleared)
         match op {
             Bin::Add | Bin::Sub => {
-                // AF = (((fa ^ fb ^ fr) >> 4) & 1) << 4
-                xor3(FA_LOCAL, FB_LOCAL, FR_LOCAL, c);
-                c.push(0x42);
-                sleb(4, c);
-                c.push(0x88); // >> 4
-                c.push(0x42);
-                sleb(1, c);
-                c.push(0x83); // & 1
-                shl(4, c);
-                or_in(c);
                 if matches!(op, Bin::Add) {
                     // CF = (fr <u fa)
                     get(FR_LOCAL, c);
@@ -1094,9 +1079,6 @@ fn x86_alu_flags(op: Bin, a: u64, b: u64, r: u64, rflags: u64) -> u64 {
             if ((a ^ r) & (b ^ r)) >> 63 != 0 {
                 f |= 1 << 11; // OF
             }
-            if ((a ^ b ^ r) >> 4) & 1 != 0 {
-                f |= 1 << 4; // AF
-            }
         }
         Bin::Sub => {
             if a < b {
@@ -1105,11 +1087,8 @@ fn x86_alu_flags(op: Bin, a: u64, b: u64, r: u64, rflags: u64) -> u64 {
             if ((a ^ b) & (a ^ r)) >> 63 != 0 {
                 f |= 1 << 11; // OF
             }
-            if ((a ^ b ^ r) >> 4) & 1 != 0 {
-                f |= 1 << 4; // AF
-            }
         }
-        Bin::And | Bin::Or | Bin::Xor => {} // logical: CF = OF = AF = 0
+        Bin::And | Bin::Or | Bin::Xor => {} // logical: CF = OF = 0 (AF untouched)
     }
     f
 }
