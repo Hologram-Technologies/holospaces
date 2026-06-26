@@ -1120,6 +1120,74 @@ impl Cpu {
         &self.ram
     }
 
+    /// Serialize the core architectural CPU state + guest RAM into a deterministic snapshot
+    /// (Law L1: identical machine → identical bytes → identical κ). The GP/instruction/flags
+    /// registers, control registers, `EFER`, the debug registers, and RAM. (Segments, CPL,
+    /// and the device `Sys` state are the remaining fields for a full boot-resume; the
+    /// TLB/`ifetch` caches are intentionally NOT serialized — a resume rebuilds them lazily.)
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.ram.len() + 512);
+        for v in self.r {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [
+            self.rip, self.rflags, self.insns, self.cr0, self.cr2, self.cr3, self.cr4, self.efer,
+        ] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in self.dr {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.ram.len() as u64).to_le_bytes());
+        out.extend_from_slice(&self.ram);
+        out
+    }
+
+    /// Restore the core CPU state + RAM from a [`Cpu::snapshot`], resetting the TLB/`ifetch`
+    /// caches (they rebuild lazily). Returns `false` if the bytes are truncated/malformed.
+    pub fn restore(&mut self, snap: &[u8]) -> bool {
+        fn ru64(snap: &[u8], p: &mut usize) -> Option<u64> {
+            let s = snap.get(*p..*p + 8)?;
+            *p += 8;
+            Some(u64::from_le_bytes(s.try_into().unwrap()))
+        }
+        let mut p = 0usize;
+        for i in 0..16 {
+            self.r[i] = match ru64(snap, &mut p) {
+                Some(v) => v,
+                None => return false,
+            };
+        }
+        let mut sc = [0u64; 8];
+        for s in &mut sc {
+            *s = match ru64(snap, &mut p) {
+                Some(v) => v,
+                None => return false,
+            };
+        }
+        [self.rip, self.rflags, self.insns, self.cr0, self.cr2, self.cr3, self.cr4, self.efer] = sc;
+        for i in 0..8 {
+            self.dr[i] = match ru64(snap, &mut p) {
+                Some(v) => v,
+                None => return false,
+            };
+        }
+        let ram_len = match ru64(snap, &mut p) {
+            Some(v) => v as usize,
+            None => return false,
+        };
+        let Some(ram) = snap.get(p..p + ram_len) else {
+            return false;
+        };
+        self.ram.clear();
+        self.ram.extend_from_slice(ram);
+        // the software caches are stale after a state swap — flush them (they rebuild lazily)
+        self.tlb_gen = self.tlb_gen.wrapping_add(1);
+        self.ifetch_gen = 0;
+        true
+    }
+
     /// Feed terminal input to the guest's serial console (readable at `0x3f8`).
     pub fn feed_console(&mut self, bytes: &[u8]) {
         if let Some(sys) = self.sys.as_mut() {
@@ -4792,6 +4860,41 @@ mod tests {
             "unexpected halt: {h:?}"
         );
         cpu
+    }
+
+    /// κ-snapshot foundation: the core CPU state + RAM round-trip through `snapshot`/`restore`
+    /// byte-for-byte (the serialization the κ-snapshot path content-addresses + streams). The
+    /// device `Sys` state is the remaining piece for a full boot-resume.
+    #[test]
+    fn snapshot_restores_core_cpu_state_and_ram() {
+        let mut a = Cpu::new(64 * 1024);
+        for (i, r) in a.r.iter_mut().enumerate() {
+            *r = 0x1111_0000 + i as u64;
+        }
+        a.rip = 0xdead_beef;
+        a.rflags = 0x2 | (1 << 9);
+        a.insns = 12345;
+        a.cr0 = 0x8000_0011;
+        a.cr2 = 0xcafe;
+        a.cr3 = 0x1000;
+        a.cr4 = 0x20;
+        a.efer = 0x500;
+        for (i, d) in a.dr.iter_mut().enumerate() {
+            *d = 0xd0 + i as u64;
+        }
+        a.ram[0x2000..0x2008].copy_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+
+        let snap = a.snapshot();
+        // restore into a DIFFERENTLY-SIZED fresh machine — restore resizes RAM to match.
+        let mut b = Cpu::new(4096);
+        assert!(b.restore(&snap), "snapshot round-trips");
+
+        assert_eq!(b.r, a.r, "GP registers");
+        assert_eq!((b.rip, b.rflags, b.insns), (a.rip, a.rflags, a.insns));
+        assert_eq!((b.cr0, b.cr2, b.cr3, b.cr4, b.efer), (a.cr0, a.cr2, a.cr3, a.cr4, a.efer));
+        assert_eq!(b.dr, a.dr, "debug registers");
+        assert_eq!(b.ram, a.ram, "RAM restored byte-for-byte (and resized)");
+        assert!(!b.restore(&snap[..snap.len() - 1]), "a truncated snapshot is rejected");
     }
 
     #[test]
