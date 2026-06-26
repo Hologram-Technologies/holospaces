@@ -777,6 +777,12 @@ impl BlockCache {
         self.entries.get(key).and_then(|e| e.wasm.as_deref())
     }
 
+    /// `(distinct blocks seen, how many have been compiled)` — for boot-time reporting.
+    pub(crate) fn stats(&self) -> (usize, usize) {
+        let compiled = self.entries.values().filter(|e| e.wasm.is_some()).count();
+        (self.entries.len(), compiled)
+    }
+
     /// Record one execution of the block at κ `key`; once hotness reaches the threshold,
     /// compile it (`compile_tlb_flags`) and cache the wasm. Returns the compiled wasm when
     /// available (so the caller can execute it this turn).

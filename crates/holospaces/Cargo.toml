@@ -43,13 +43,16 @@ cc44-trace = ["std"]
 # the `jit_exec` module runs `compile_tlb_flags` blocks via `wasmtime` over the live
 # `Cpu` state. A `std` host surface — the portable peer core never links it; the
 # browser peer executes the same blocks through `js_sys::WebAssembly` instead.
-jit = ["std", "dep:wasmtime"]
+jit = ["std", "dep:wasmtime", "dep:blake3"]
 
 [dependencies]
 # The native block-JIT executor (the `jit` feature). The JIT *codegen* is pure
 # no_std byte-emission in `emulator::jit`; only *executing* the emitted wasm needs a
 # runtime, so wasmtime is gated here (a bare-function runner, NOT the .holo engine).
 wasmtime = { version = "45", optional = true }
+# BLAKE3 = the κ content-address (the JIT's block cache key); the substrate's canonical
+# hash. Gated with the `jit` feature; also a dev-dependency (KAT cross-checks).
+blake3 = { version = "1", optional = true }
 # The hologram substrate, consumed by reference (ADR-003, ADR-006). holospaces
 # composes these contracts; it never re-implements them. Pinned by rev,
 # no_std-capable (default features off; the `std` feature re-enables).

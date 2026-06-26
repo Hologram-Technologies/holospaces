@@ -213,6 +213,34 @@ fn fastpaths_on() -> bool {
     }
 }
 
+// JIT Rung 3 — the block JIT dispatch (the `jit` feature, OFF by default so the shipping
+// run loop pays nothing). When armed (`set_jit_on`), `run()` discovers the linear block at
+// each basic-block entry, keys it by **BLAKE3** (κ), and records it; the cache compiles a
+// block to wasm once it crosses the hotness threshold. Step A wires the discovery + compile
+// path on real boots (no execution yet — that, plus the differential, is the next sub-step;
+// the discovery is side-effect-free, so it cannot perturb the boot).
+#[cfg(feature = "jit")]
+thread_local! {
+    static JIT_ON: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    static JIT_AT_ENTRY: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
+    static JIT_CACHE: core::cell::RefCell<crate::emulator::jit::BlockCache> =
+        core::cell::RefCell::new(crate::emulator::jit::BlockCache::new(16));
+    static JIT_DECODED: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+/// Arm/disarm the block JIT (off in production; a test or the host turns it on).
+#[cfg(feature = "jit")]
+pub fn set_jit_on(on: bool) {
+    JIT_ON.with(|c| c.set(on));
+}
+/// Drain JIT dispatch stats: `(blocks_recorded, distinct_blocks, compiled_blocks)`.
+#[cfg(feature = "jit")]
+#[must_use]
+pub fn drain_jit_stats() -> (u64, usize, usize) {
+    let recorded = JIT_DECODED.with(|c| c.replace(0));
+    let (entries, compiled) = JIT_CACHE.with(|c| c.borrow().stats());
+    (recorded, entries, compiled)
+}
+
 struct Sys {
     uart: Uart,
     /// The `virtio-blk` κ-disk rootfs (`CC-7`), when a disk is attached. The
@@ -1312,6 +1340,40 @@ impl Cpu {
     }
 
     /// Run up to `max_steps` instructions; returns why it stopped.
+    /// JIT block discovery at a basic-block entry: translate `rip` to its guest bytes,
+    /// decode the linear block, key it by BLAKE3 (κ), and record it (the cache compiles hot
+    /// blocks). Side-effect-free w.r.t. architectural state — a probe-only fetch translation
+    /// (any fault it raises is cleared; `step()` does the real fetch). Only substantial
+    /// blocks (≥4 modelled ops) are recorded — tiny blocks aren't worth compiling.
+    #[cfg(feature = "jit")]
+    fn jit_dispatch(&mut self) {
+        if self.fault.is_some() {
+            return;
+        }
+        let pa = self.translate_acc(self.rip, false, false);
+        if self.fault.is_some() {
+            self.fault = None; // page not currently mapped — let step() fetch + fault
+            return;
+        }
+        let off = pa as usize;
+        let end = ((off & !0xfff) + 0x1000).min(self.ram.len());
+        if off >= end {
+            return;
+        }
+        let (ops, _offsets, len) = crate::emulator::jit::decode_block(&self.ram[off..end]);
+        if ops.len() < 4 || len == 0 {
+            return;
+        }
+        let key: [u8; 32] = *blake3::hash(&self.ram[off..off + len]).as_bytes();
+        JIT_DECODED.with(|c| c.set(c.get() + 1));
+        JIT_CACHE.with(|c| {
+            let _ = c.borrow_mut().record(key, &ops);
+        });
+    }
+
+    /// Run up to `max_steps` guest instructions, returning why execution stopped (the guest
+    /// powered off, hit a budget, etc.). The interpreter loop: pump timers/interrupts/devices,
+    /// optionally dispatch the block JIT (off by default), then `step()` one instruction.
     pub fn run(&mut self, max_steps: u64) -> Halt {
         for i in 0..max_steps {
             #[cfg(feature = "cc44-trace")]
@@ -1377,9 +1439,19 @@ impl Cpu {
             // JIT Rung 2 (off by default): remember rip to detect a control transfer.
             #[cfg(feature = "std")]
             let rip0 = self.rip;
+            // JIT Rung 3 (off by default): at a basic-block entry, discover + record the block.
+            #[cfg(feature = "jit")]
+            if JIT_ON.with(core::cell::Cell::get) && JIT_AT_ENTRY.with(core::cell::Cell::get) {
+                self.jit_dispatch();
+            }
             match self.step() {
                 Ok(()) => self.insns = self.insns.wrapping_add(1),
                 Err(h) => return h,
+            }
+            #[cfg(feature = "jit")]
+            if JIT_ON.with(core::cell::Cell::get) {
+                let r = self.rip; // a non-sequential rip → the next instruction is a block entry
+                JIT_AT_ENTRY.with(|c| c.set(r < rip0 || r > rip0.wrapping_add(15)));
             }
             // A non-sequential rip (backward, or > 15 B ahead) means the instruction
             // branched/returned/faulted — the new rip is a basic-block entry.

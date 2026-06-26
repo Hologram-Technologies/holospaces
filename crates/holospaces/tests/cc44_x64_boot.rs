@@ -133,6 +133,38 @@ fn smoke_amd64_linux_boots_to_userspace() {
     assert_eq!(halt, Halt::Halted, "PID 1 powered the machine off cleanly");
 }
 
+/// JIT Rung 3 — block discovery + compile on a real boot (the `jit` feature). Boots real
+/// amd64 Linux to userspace with the JIT armed: every basic-block entry is discovered,
+/// BLAKE3-keyed (κ), and recorded, and hot blocks (≥4 modelled ops) compile to wasm. The
+/// discovery is side-effect-free, so the boot must still reach userspace identically — this
+/// proves `decode_block` + `compile_tlb_flags` run clean over real guest code at boot scale.
+/// Run with `cargo test -p holospaces --features jit`.
+#[cfg(feature = "jit")]
+#[test]
+fn jit_records_and_compiles_blocks_during_amd64_boot() {
+    holospaces::emulator::x64::set_jit_on(true);
+    let kernel = vmlinux_elf();
+    let mut cpu = Cpu::boot_linux(
+        1024 * 1024 * 1024,
+        &kernel,
+        "earlyprintk=serial,ttyS0 console=ttyS0 random.trust_cpu=on",
+    );
+    let halt = cpu.run(40_000_000_000);
+    let console = String::from_utf8_lossy(cpu.console());
+    assert!(
+        console.contains("HOLOSPACES-LINUX-USERSPACE-OK"),
+        "JIT-armed boot still reaches userspace\n---- guest console ----\n{console}"
+    );
+    assert_eq!(halt, Halt::Halted, "clean power-off with the JIT armed");
+    let (recorded, distinct, compiled) = holospaces::emulator::x64::drain_jit_stats();
+    eprintln!(
+        "\n==== JIT RUNG 3: discovery + compile on a real boot ====\n\
+         {recorded} block records · {distinct} distinct blocks (≥4 modelled ops) · \
+         {compiled} compiled to wasm\n====\n"
+    );
+    assert!(compiled > 0, "at least one hot block crossed the threshold and compiled");
+}
+
 /// JIT Rung 0 — the thesis check. Boots real amd64 Linux to userspace while sampling
 /// the executing code page (1/1024 instructions), then reports how concentrated
 /// execution is. If a small set of code pages dominates the samples, the interpreter
