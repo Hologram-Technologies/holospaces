@@ -13,7 +13,13 @@
 
 use wasmtime::{Engine, Instance, Module, Store};
 
-use super::jit::{GUEST_BASE, RFLAGS_MEM, TLB_BASE};
+use super::jit::{eff_addr, op_mem_addr, Op, GUEST_BASE, RFLAGS_MEM, TLB_BASE, TLB_SIZE};
+
+/// Pages in the executor's guest-RAM page pool (~256 KiB). A block touches only a handful;
+/// the pool holds its working set, indexed by `host_off` (a slot offset, NOT a physical
+/// address — so the wasm memory stays tiny regardless of guest RAM size).
+const POOL_PAGES: usize = 60;
+const PAGE: usize = 0x1000;
 
 /// Execute one compiled block over the given architectural state. `regs`, `rflags`, and `ram`
 /// are updated in place; `tlb` is the software-TLB image (read-only this run). Returns the
@@ -63,4 +69,120 @@ pub(crate) fn exec_block(
     *rflags = u64::from_le_bytes(fb);
     mem.read(&store, GUEST_BASE as usize, ram).unwrap();
     bail
+}
+
+/// Execute a compiled block over a small **page pool**, lazily filling guest pages on a
+/// TLB-miss bail and restarting until the block completes — the scalable boot executor
+/// (the wasm memory is constant-size regardless of guest RAM). On a bail at op `k`, the
+/// faulting vaddr is recomputed from `ops[k]`'s address mode + the post-`k` registers,
+/// `translate`d to a physical page, copied into a free pool slot, and the run retries from
+/// the block entry (idempotent: the block is deterministic from `entry_regs`).
+///
+/// Returns `Some((regs, rflags))` when the block runs to completion (all dirtied pool pages
+/// written back to `ram`), or `None` when it cannot — a real fault (`translate` → `None`),
+/// the pool fills, or a slot collision — in which case the caller interprets the block.
+pub(crate) fn exec_block_pooled(
+    wasm: &[u8],
+    ops: &[Op],
+    entry_regs: [u64; 16],
+    entry_rflags: u64,
+    ram: &mut [u8],
+    translate: impl Fn(u64) -> Option<u64>,
+) -> Option<([u64; 16], u64)> {
+    let engine = Engine::default();
+    let module = Module::new(&engine, wasm).ok()?;
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).ok()?;
+    let mem = instance.get_memory(&mut store, "mem").unwrap();
+    let need = (GUEST_BASE as usize + POOL_PAGES * PAGE).div_ceil(0x10000);
+    let have = mem.size(&store) as usize;
+    if need > have {
+        mem.grow(&mut store, (need - have) as u64).ok()?;
+    }
+    let run = instance.get_typed_func::<(), i32>(&mut store, "run").ok()?;
+
+    let mut tlb = vec![0u8; TLB_SIZE as usize * 16];
+    let mut pool = vec![0u8; POOL_PAGES * PAGE];
+    let mut mapped: Vec<u64> = Vec::new(); // slot -> vpage
+
+    for _ in 0..=POOL_PAGES {
+        for (i, v) in entry_regs.iter().enumerate() {
+            mem.write(&mut store, i * 8, &v.to_le_bytes()).ok()?;
+        }
+        mem.write(&mut store, RFLAGS_MEM as usize, &entry_rflags.to_le_bytes()).ok()?;
+        mem.write(&mut store, TLB_BASE as usize, &tlb).ok()?;
+        mem.write(&mut store, GUEST_BASE as usize, &pool).ok()?;
+        let bail = run.call(&mut store, ()).ok()?;
+        let mut regs = [0u64; 16];
+        for (i, r) in regs.iter_mut().enumerate() {
+            let mut b = [0u8; 8];
+            mem.read(&store, i * 8, &mut b).ok()?;
+            *r = u64::from_le_bytes(b);
+        }
+        let mut fb = [0u8; 8];
+        mem.read(&store, RFLAGS_MEM as usize, &mut fb).ok()?;
+        let rflags = u64::from_le_bytes(fb);
+        mem.read(&store, GUEST_BASE as usize, &mut pool).ok()?;
+
+        if (bail as usize) >= ops.len() {
+            // completed — write every mapped page back to guest RAM (clean pages are no-ops)
+            for (slot, &vpage) in mapped.iter().enumerate() {
+                if let Some(pa) = translate(vpage << 12) {
+                    let f = (pa & !0xfff) as usize;
+                    ram[f..f + PAGE].copy_from_slice(&pool[slot * PAGE..slot * PAGE + PAGE]);
+                }
+            }
+            return Some((regs, rflags));
+        }
+
+        // bail at a memory op — recompute its vaddr, fill the page, retry
+        let (base, idx, scale, disp) = op_mem_addr(&ops[bail as usize])?;
+        let vpage = (eff_addr(&regs, base, idx, scale, disp) as u64) >> 12;
+        if mapped.contains(&vpage) || mapped.len() >= POOL_PAGES {
+            return None; // already mapped yet still missed (slot collision) / pool full
+        }
+        let pa = translate(vpage << 12)?; // None → real #PF → interpret
+        let f = (pa & !0xfff) as usize;
+        if f + PAGE > ram.len() {
+            return None;
+        }
+        let slot = mapped.len();
+        pool[slot * PAGE..slot * PAGE + PAGE].copy_from_slice(&ram[f..f + PAGE]);
+        mapped.push(vpage);
+        let s = (vpage & (TLB_SIZE - 1)) as usize;
+        tlb[s * 16..s * 16 + 8].copy_from_slice(&vpage.to_le_bytes());
+        tlb[s * 16 + 8..s * 16 + 16].copy_from_slice(&((slot * PAGE) as u64).to_le_bytes());
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::emulator::jit::{compile_tlb_flags, NO_REG};
+
+    #[test]
+    fn pooled_executor_fills_pages_on_bail_and_completes() {
+        // rax = [rbx] ; [rbp] = rax — source in page 2, dest in page 5 (two TLB misses).
+        let block = [
+            Op::Load { d: 0, base: 3, idx: NO_REG, scale: 0, disp: 0 },
+            Op::Store { base: 5, idx: NO_REG, scale: 0, disp: 0, s: 0 },
+        ];
+        let wasm = compile_tlb_flags(&block);
+        let mut ram = vec![0u8; 0x10000];
+        let v: u64 = 0xCAFE_F00D_1234_5678;
+        ram[0x2000..0x2008].copy_from_slice(&v.to_le_bytes());
+        let mut regs = [0u64; 16];
+        regs[3] = 0x2000; // rbx → page 2
+        regs[5] = 0x5000; // rbp → page 5
+        // start with an empty pool: the block bails twice, the executor fills both pages.
+        let out = exec_block_pooled(&wasm, &block, regs, 0x2, &mut ram, |va| Some(va));
+        let (out_regs, _rf) = out.expect("the block completes after the pool fills both pages");
+        assert_eq!(out_regs[0], v, "rax loaded from the lazily-filled source page");
+        assert_eq!(
+            u64::from_le_bytes(ram[0x5000..0x5008].try_into().unwrap()),
+            v,
+            "the store landed in the pool and was written back to guest RAM"
+        );
+    }
 }

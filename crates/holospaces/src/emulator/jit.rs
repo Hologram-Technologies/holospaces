@@ -51,7 +51,7 @@ pub(crate) enum Op {
 }
 
 /// Address-mode sentinels: no base register / no index register.
-const NO_REG: u8 = 0xff;
+pub(crate) const NO_REG: u8 = 0xff;
 
 /// Guest RAM lives in the same wasm memory as the register file, after a page of
 /// headroom: regs at `r*8`, guest byte `A` at wasm offset `GUEST_BASE + A`.
@@ -82,10 +82,20 @@ const FR_LOCAL: u8 = NREG as u8 + 4; // i64 20: flag result
 const BAIL_LOCAL: u8 = NREG as u8 + 5; // i32 21: bail instruction index (TLB)
 const TE_LOCAL: u8 = NREG as u8 + 6; // i32 22: TLB entry address scratch
 
+/// The address mode `(base, idx, scale, disp)` of a memory op (`None` for non-memory ops) —
+/// lets the executor recompute a faulting access's vaddr from `ops[bail]` + the regs.
+pub(crate) fn op_mem_addr(op: &Op) -> Option<(u8, u8, u8, i32)> {
+    match *op {
+        Op::Load { base, idx, scale, disp, .. }
+        | Op::Store { base, idx, scale, disp, .. }
+        | Op::LoadOp { base, idx, scale, disp, .. } => Some((base, idx, scale, disp)),
+        _ => None,
+    }
+}
+
 /// Effective address `base + idx<<scale + disp` (sentinels skipped) — the meaning shared
 /// by the interpreter oracle and (mirrored in wasm) the codegen.
-#[cfg(test)]
-fn eff_addr(r: &[u64; NREG], base: u8, idx: u8, scale: u8, disp: i32) -> usize {
+pub(crate) fn eff_addr(r: &[u64; NREG], base: u8, idx: u8, scale: u8, disp: i32) -> usize {
     let mut a = disp as i64 as u64;
     if base != NO_REG {
         a = a.wrapping_add(r[base as usize]);
