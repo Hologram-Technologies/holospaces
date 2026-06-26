@@ -848,10 +848,20 @@ impl<'a> Snap<'a> {
         self.p += n;
         Some(s.to_vec())
     }
+    /// `n` raw bytes (no length prefix).
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let s = self.b.get(self.p..self.p + n)?;
+        self.p += n;
+        Some(s)
+    }
 }
 
 /// The 4 KiB page granularity κ-snapshots content-address guest RAM at.
 const KAPPA_PAGE: usize = 0x1000;
+/// A BLAKE3 κ-label is 71 ASCII bytes (`blake3:` + 64 hex).
+const KAPPA_LABEL_LEN: usize = 71;
+/// Magic prefixing a serialized κ-snapshot manifest (versioned for forward compatibility).
+const KAPPA_MANIFEST_MAGIC: &[u8; 8] = b"HOLOKSN1";
 
 /// A **content-addressed** machine snapshot (the κ-snapshot path): the small CPU + device
 /// `state` inline, and guest RAM as a per-4 KiB-page BLAKE3 κ **manifest** (`ram_pages`) whose
@@ -879,6 +889,52 @@ impl KappaSnapshot {
     #[must_use]
     pub fn state_len(&self) -> usize {
         self.state.len()
+    }
+
+    /// The ordered per-page RAM κ-labels (the manifest). An adopter walks these to fetch each
+    /// page by κ from a peer (deduping on its store — only the unique κ are pulled over the wire).
+    #[must_use]
+    pub fn page_kappas(&self) -> &[KappaLabel71] {
+        &self.ram_pages
+    }
+
+    /// Serialize the manifest (CPU+device state + the ordered RAM-page κ list) to a deterministic
+    /// blob. `put`ting this blob yields the **snapshot κ** — one content label that transitively
+    /// names the whole machine (the state inline + every RAM page by κ). The unique pages live in
+    /// the store; this blob is small (state + 71 B per page label).
+    #[must_use]
+    pub fn to_manifest_bytes(&self) -> Vec<u8> {
+        let mut out =
+            Vec::with_capacity(32 + self.state.len() + self.ram_pages.len() * KAPPA_LABEL_LEN);
+        out.extend_from_slice(KAPPA_MANIFEST_MAGIC);
+        out.extend_from_slice(&(self.ram_len as u64).to_le_bytes());
+        out.extend_from_slice(&(self.state.len() as u64).to_le_bytes());
+        out.extend_from_slice(&self.state);
+        out.extend_from_slice(&(self.ram_pages.len() as u64).to_le_bytes());
+        for k in &self.ram_pages {
+            out.extend_from_slice(k.as_array());
+        }
+        out
+    }
+
+    /// Parse a [`KappaSnapshot::to_manifest_bytes`] blob back into a manifest. Returns `None` on a
+    /// bad magic or truncation. (The RAM pages themselves are fetched lazily by κ at resume.)
+    #[must_use]
+    pub fn from_manifest_bytes(b: &[u8]) -> Option<KappaSnapshot> {
+        let mut s = Snap::new(b);
+        if s.take(KAPPA_MANIFEST_MAGIC.len())? != KAPPA_MANIFEST_MAGIC.as_slice() {
+            return None;
+        }
+        let ram_len = s.u64()? as usize;
+        let state_len = s.u64()? as usize;
+        let state = s.take(state_len)?.to_vec();
+        let npages = s.u64()? as usize;
+        let mut ram_pages = Vec::with_capacity(npages);
+        for _ in 0..npages {
+            let arr: [u8; KAPPA_LABEL_LEN] = s.take(KAPPA_LABEL_LEN)?.try_into().ok()?;
+            ram_pages.push(KappaLabel71::from_bytes(&arr).ok()?);
+        }
+        Some(KappaSnapshot { state, ram_pages, ram_len })
     }
 }
 
@@ -1479,6 +1535,35 @@ impl Cpu {
         self.ram = ram;
         self.flush_caches_after_restore();
         true
+    }
+
+    /// Seal the whole machine into ONE content κ: content-address RAM (pages → `store`), then
+    /// `put` the manifest (CPU+device state + the page-κ list) itself → the returned **snapshot
+    /// κ** transitively names the entire machine. An adopter that has only this κ + access to the
+    /// store (locally or over `content_net`) can [`resume_kappa`](Cpu::resume_kappa) it. Returns
+    /// `None` if a store write fails.
+    pub fn seal_kappa(&self, store: &dyn KappaStore) -> Option<KappaLabel71> {
+        let snap = self.snapshot_kappa(store)?;
+        store.put("blake3", &snap.to_manifest_bytes()).ok()
+    }
+
+    /// Resume from a sealed snapshot κ ([`Cpu::seal_kappa`]): fetch the manifest by κ and
+    /// **verify it before use** (L5), parse it, then [`restore_kappa`](Cpu::restore_kappa) (which
+    /// fetches + verifies each RAM page). The adopter needs ONLY the snapshot κ + a store — the
+    /// core "boot once, resume anywhere" entry point. Returns `false` on a missing/tampered
+    /// manifest, a missing/tampered page, or malformed state.
+    pub fn resume_kappa(&mut self, snapshot_kappa: &KappaLabel71, store: &dyn KappaStore) -> bool {
+        let manifest = match store.get(snapshot_kappa) {
+            Ok(Some(b)) => b,
+            _ => return false,
+        };
+        if !matches!(verify_kappa(&manifest, snapshot_kappa), Ok(true)) {
+            return false; // L5: the manifest blob must hash to its claimed κ
+        }
+        match KappaSnapshot::from_manifest_bytes(&manifest) {
+            Some(snap) => self.restore_kappa(&snap, store),
+            None => false,
+        }
     }
 
     /// Read the CPU + device state (everything except RAM) — the inverse of
@@ -5281,6 +5366,114 @@ mod tests {
         assert!(
             !c.restore_kappa(&snap, &MemKappaStore::new()),
             "a κ-resume against a store missing the pages is refused"
+        );
+    }
+
+    /// κ-snapshot Step 3a: the whole machine seals into ONE content κ, and an adopter holding only
+    /// that κ + the store resumes bit-exact. The manifest (state + page-κ list) round-trips, and a
+    /// κ whose blob isn't a valid manifest — or one absent from the store — is refused (L5).
+    #[test]
+    fn kappa_snapshot_seal_and_resume_from_one_kappa() {
+        use hologram_store_mem::MemKappaStore;
+        let mut a = Cpu::new(16 * KAPPA_PAGE);
+        a.r[3] = 0xfeed;
+        a.rip = 0x8000;
+        a.cpl = 3;
+        a.sys.as_mut().unwrap().tsc = 4242;
+        a.ram[0..8].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+        a.ram[15 * KAPPA_PAGE..15 * KAPPA_PAGE + 8].copy_from_slice(&0x99u64.to_le_bytes());
+
+        let store = MemKappaStore::new();
+
+        // The manifest serialization round-trips deterministically.
+        let snap = a.snapshot_kappa(&store).unwrap();
+        let manifest = snap.to_manifest_bytes();
+        let reparsed = KappaSnapshot::from_manifest_bytes(&manifest).expect("manifest parses");
+        assert_eq!(reparsed.to_manifest_bytes(), manifest, "manifest round-trips");
+        assert_eq!(reparsed.page_count(), snap.page_count());
+
+        // Seal → one κ; resume from ONLY that κ + the store.
+        let kappa = a.seal_kappa(&store).expect("seal");
+        let mut b = Cpu::new(KAPPA_PAGE);
+        assert!(b.resume_kappa(&kappa, &store), "resume from the sealed κ");
+        assert_eq!(b.ram, a.ram, "RAM bit-exact via the sealed κ");
+        assert_eq!(b.snapshot(), a.snapshot(), "full machine identical after a sealed-κ resume");
+
+        // L5: a κ whose blob is real but ISN'T a manifest is refused (verify passes, parse fails).
+        let mut c = Cpu::new(KAPPA_PAGE);
+        let not_a_manifest = store.put("blake3", b"not a manifest").unwrap();
+        assert!(!c.resume_kappa(&not_a_manifest, &store), "a non-manifest κ is refused");
+
+        // A sealed κ absent from the store is refused (nothing to fetch).
+        let mut d = Cpu::new(KAPPA_PAGE);
+        assert!(!d.resume_kappa(&kappa, &MemKappaStore::new()), "a κ missing from the store is refused");
+    }
+
+    /// κ-snapshot Step 3b/3c: a machine sealed on peer A resumes BIT-EXACT on a *second* peer B
+    /// that starts with an empty store and pulls the manifest + unique pages over `content_net`,
+    /// verifying every byte on receipt — and a FORGING peer (serving attacker-chosen bytes for any
+    /// κ) is refused on receipt (L5), so the adversary cannot corrupt the resume. Boot once on A,
+    /// resume on B.
+    #[test]
+    fn kappa_snapshot_resumes_on_a_second_peer_over_content_net() {
+        use crate::content_net::{drive_fetch, forging_peer, peer, PacketLink};
+        use alloc::sync::Arc;
+        use hologram_store_mem::MemKappaStore;
+        const MTU: u32 = 64 * 1024;
+
+        // Origin machine A with non-trivial state + RAM (page 0 unique, page 7 unique, rest zero).
+        let mut a = Cpu::new(16 * KAPPA_PAGE);
+        a.r[5] = 0x00c0_ffee;
+        a.rip = 0x1234;
+        a.sys.as_mut().unwrap().tsc = 1000;
+        a.ram[0..8].copy_from_slice(&0xabad_1dea_dead_c0deu64.to_le_bytes());
+        a.ram[7 * KAPPA_PAGE..7 * KAPPA_PAGE + 4].copy_from_slice(&[1, 2, 3, 4]);
+
+        // A seals into its store → the whole machine is ONE κ.
+        let a_store: Arc<dyn KappaStore> = Arc::new(MemKappaStore::new());
+        let snapshot_kappa = a.seal_kappa(&*a_store).expect("seal");
+
+        // Adopter B: empty store + a content-net link to A.
+        let b_store: Arc<dyn KappaStore> = Arc::new(MemKappaStore::new());
+        let (b_link, a_link) = PacketLink::loopback_pair(MTU);
+        let server = peer(a_link, a_store.clone());
+        let fetcher = peer(b_link, b_store.clone());
+
+        // B pulls the manifest by κ (verify-on-receipt), then each UNIQUE page κ — into its store.
+        let manifest = drive_fetch(&fetcher, &server, &snapshot_kappa).expect("fetch manifest");
+        b_store.put("blake3", &manifest).unwrap();
+        let snap = KappaSnapshot::from_manifest_bytes(&manifest).expect("manifest");
+        let mut fetched = 0usize;
+        for k in snap.page_kappas() {
+            if b_store.contains(k) {
+                continue; // dedup — fetch each unique page once
+            }
+            let page = drive_fetch(&fetcher, &server, k).expect("fetch page");
+            b_store.put("blake3", &page).unwrap();
+            fetched += 1;
+        }
+
+        // B resumes from its now-populated store — bit-exact, having pulled only the unique pages.
+        let mut b = Cpu::new(KAPPA_PAGE);
+        assert!(b.resume_kappa(&snapshot_kappa, &*b_store), "B resumes from the adopted κ");
+        assert_eq!(b.ram, a.ram, "B's RAM is byte-identical to A");
+        assert_eq!(b.snapshot(), a.snapshot(), "B ≡ A after a content-net resume");
+        assert!(
+            fetched < snap.page_count(),
+            "deduped over the wire: {fetched} unique pages fetched < {} total",
+            snap.page_count()
+        );
+
+        // 3c — a FORGING peer answers every fetch with attacker bytes; the fetcher re-derives the
+        // κ and REJECTS them, so B cannot even obtain a verifiable manifest (the resume is refused,
+        // not silently corrupted).
+        let (g_link, f_link) = PacketLink::loopback_pair(MTU);
+        let forger = forging_peer(f_link, b"forged-bytes".to_vec());
+        let victim_store: Arc<dyn KappaStore> = Arc::new(MemKappaStore::new());
+        let victim = peer(g_link, victim_store);
+        assert!(
+            drive_fetch(&victim, &forger, &snapshot_kappa).is_none(),
+            "a forged response is rejected on receipt (L5) — the adversary cannot serve the snapshot"
         );
     }
 
