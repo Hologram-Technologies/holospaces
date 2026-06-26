@@ -2034,6 +2034,9 @@ pub struct X64Workspace {
     cpu: x64::Cpu,
     halted: bool,
     console_cursor: usize,
+    /// Pages of the most recent κ-seal ([`suspend_kappa_sealed`](X64Workspace::suspend_kappa_sealed)),
+    /// keyed by κ — a peer serves these by κ to adopters that stream a resume.
+    snap_store: Option<MemKappaStore>,
 }
 
 #[wasm_bindgen]
@@ -2073,6 +2076,7 @@ impl X64Workspace {
             cpu,
             halted: false,
             console_cursor: 0,
+            snap_store: None,
         })
     }
 
@@ -2110,6 +2114,7 @@ impl X64Workspace {
             cpu,
             halted: false,
             console_cursor: 0,
+            snap_store: None,
         })
     }
 
@@ -2186,6 +2191,7 @@ impl X64Workspace {
             cpu,
             halted: false,
             console_cursor: 0,
+            snap_store: None,
         })
     }
 
@@ -2212,6 +2218,59 @@ impl X64Workspace {
             cpu,
             halted: false,
             console_cursor: 0,
+            snap_store: None,
+        })
+    }
+
+    /// Seal the running machine for **streaming** sharing: content-address its RAM into an
+    /// internal κ-store (only the unique pages) and return the small **manifest** (CPU+device
+    /// state + the per-page κ list). A peer publishes the manifest (e.g. in a κ-link) and serves
+    /// the pages by κ via [`serve_kappa_page`](X64Workspace::serve_kappa_page); an adopter streams
+    /// a resume with [`resume_kappa_streamed`](X64Workspace::resume_kappa_streamed).
+    pub fn suspend_kappa_sealed(&mut self) -> Result<Vec<u8>, JsValue> {
+        let store = MemKappaStore::new();
+        let snap = self.cpu.snapshot_kappa(&store).ok_or_else(|| js_err("κ-seal failed"))?;
+        let manifest = snap.to_manifest_bytes();
+        self.snap_store = Some(store);
+        Ok(manifest)
+    }
+
+    /// Serve a single RAM page by its κ-label (from the most recent
+    /// [`suspend_kappa_sealed`](X64Workspace::suspend_kappa_sealed)) — the peer side of a streamed
+    /// resume. Returns `None` for an unknown κ or before any seal.
+    #[must_use]
+    pub fn serve_kappa_page(&self, kappa: &str) -> Option<Vec<u8>> {
+        let store = self.snap_store.as_ref()?;
+        let k = parse_kappa(kappa).ok()?;
+        store.get(&k).ok().flatten().map(|b| b.to_vec())
+    }
+
+    /// **Streaming** κ-resume: rebuild a machine from a manifest by fetching each page on demand
+    /// through `fetch` (a JS transport — `content_net`, a WebRTC peer, the page's `fetch`, OPFS …);
+    /// `fetch(kappaString)` returns the page bytes (a `Uint8Array`) or `null`. Each page is
+    /// **verified before use** (L5); a missing or tampered page aborts the resume. Only the unique
+    /// pages cross the wire — the seam a fresh tab uses to resume from a shared κ-link.
+    pub fn resume_kappa_streamed(
+        manifest: &[u8],
+        fetch: &js_sys::Function,
+    ) -> Result<X64Workspace, JsValue> {
+        let mut cpu = x64::Cpu::new(0x1000);
+        let ok = cpu.restore_kappa_streaming(manifest, |k| {
+            let arg = JsValue::from_str(k.as_str());
+            let res = fetch.call1(&JsValue::NULL, &arg).ok()?;
+            if res.is_null() || res.is_undefined() {
+                return None;
+            }
+            Some(js_sys::Uint8Array::new(&res).to_vec())
+        });
+        if !ok {
+            return Err(js_err("κ-stream resume failed (missing/tampered page or bad manifest)"));
+        }
+        Ok(X64Workspace {
+            cpu,
+            halted: false,
+            console_cursor: 0,
+            snap_store: None,
         })
     }
 }

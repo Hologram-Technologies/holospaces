@@ -1653,6 +1653,57 @@ impl Cpu {
         Some(())
     }
 
+    /// The κ page-manifest alone (CPU+device state + the per-page BLAKE3 κ list) — no page bytes.
+    /// A peer publishes this (small) and serves the unique pages by κ; an adopter walks it and
+    /// streams each page on demand via [`Cpu::restore_kappa_streaming`].
+    #[must_use]
+    pub fn snapshot_kappa_manifest(&self) -> Vec<u8> {
+        let ram_pages = self.ram.chunks(KAPPA_PAGE).map(address_bytes).collect();
+        KappaSnapshot { state: self.snapshot_state(), ram_pages, ram_len: self.ram.len() }
+            .to_manifest_bytes()
+    }
+
+    /// **Streaming** κ-resume: given a [`Cpu::snapshot_kappa_manifest`], fetch each page's bytes
+    /// on demand via `fetch` (the transport — a local store, `content_net`, OPFS, the page's
+    /// `fetch`, …), **verify each before use** (L5 — re-derive its κ; refuse a missing/tampered
+    /// page), and reconstruct. Duplicate/zero pages are fetched once (cached by κ), so only the
+    /// unique working set crosses the wire. Returns `false` on a bad manifest or any page that
+    /// fails to arrive or verify.
+    pub fn restore_kappa_streaming<F: FnMut(&KappaLabel71) -> Option<Vec<u8>>>(
+        &mut self,
+        manifest: &[u8],
+        mut fetch: F,
+    ) -> bool {
+        let Some(snap) = KappaSnapshot::from_manifest_bytes(manifest) else {
+            return false;
+        };
+        let mut cache: BTreeMap<[u8; KAPPA_LABEL_LEN], Vec<u8>> = BTreeMap::new();
+        let mut ram = vec![0u8; snap.ram_len];
+        for (i, k) in snap.ram_pages.iter().enumerate() {
+            let key = *k.as_array();
+            if !cache.contains_key(&key) {
+                let bytes = match fetch(k) {
+                    Some(b) => b,
+                    None => return false,
+                };
+                if !matches!(verify_kappa(&bytes, k), Ok(true)) {
+                    return false; // L5: never write a page that doesn't re-derive to its κ
+                }
+                cache.insert(key, bytes);
+            }
+            let b = &cache[&key];
+            let off = i * KAPPA_PAGE;
+            let end = (off + b.len()).min(ram.len());
+            ram[off..end].copy_from_slice(&b[..end - off]);
+        }
+        if self.restore_state(&mut Snap::new(&snap.state)).is_none() {
+            return false;
+        }
+        self.ram = ram;
+        self.flush_caches_after_restore();
+        true
+    }
+
     /// Read the CPU + device state (everything except RAM) — the inverse of
     /// [`Cpu::snapshot_state`]. Returns `None` on truncated/malformed bytes.
     fn restore_state(&mut self, s: &mut Snap) -> Option<()> {
@@ -5603,6 +5654,55 @@ mod tests {
         assert!(
             !Cpu::new(KAPPA_PAGE).restore_kappa_blob(&blob[..blob.len() / 2]),
             "a truncated κ-blob is refused"
+        );
+    }
+
+    /// κ-snapshot Step-4 Phase 4 (streaming): an adopter resumes from a manifest by fetching each
+    /// page ONE-BY-κ through a transport closure, verifying each on receipt (L5) and deduping —
+    /// the exact seam a browser tab uses over `content_net`. A forging transport (attacker bytes
+    /// for every κ) and a missing page are both refused.
+    #[test]
+    fn kappa_streaming_resume_fetches_by_kappa_and_refuses_forgery() {
+        use hologram_store_mem::MemKappaStore;
+        let mut a = Cpu::new(16 * KAPPA_PAGE);
+        a.r[1] = 0xcafe;
+        a.rip = 0x6000;
+        a.sys.as_mut().unwrap().tsc = 7;
+        a.ram[0..8].copy_from_slice(&0x1111_2222_3333_4444u64.to_le_bytes());
+        a.ram[5 * KAPPA_PAGE..5 * KAPPA_PAGE + 4].copy_from_slice(&[9, 8, 7, 6]);
+
+        // Publisher: a manifest (small) + a store holding only the UNIQUE pages.
+        let store = MemKappaStore::new();
+        let snap = a.snapshot_kappa(&store).unwrap();
+        let manifest = a.snapshot_kappa_manifest();
+        assert_eq!(manifest, snap.to_manifest_bytes(), "manifest matches the seal");
+
+        // Adopter: stream each page by κ from the store (verify-on-receipt), counting fetches.
+        let mut fetched = 0usize;
+        let mut b = Cpu::new(KAPPA_PAGE);
+        let ok = b.restore_kappa_streaming(&manifest, |k| {
+            fetched += 1;
+            store.get(k).ok().flatten().map(|x| x.to_vec())
+        });
+        assert!(ok, "streaming resume reconstructs");
+        assert_eq!(b.ram, a.ram, "RAM bit-exact via streamed pages");
+        assert_eq!(b.snapshot(), a.snapshot(), "full machine identical after a streamed resume");
+        assert!(
+            fetched < a.ram.len() / KAPPA_PAGE,
+            "deduped over the wire: {fetched} unique fetches < 16 pages"
+        );
+
+        // A FORGING transport (attacker bytes for every κ) is refused on receipt (L5).
+        let mut c = Cpu::new(KAPPA_PAGE);
+        assert!(
+            !c.restore_kappa_streaming(&manifest, |_k| Some(alloc::vec![0xaau8; KAPPA_PAGE])),
+            "forged pages are refused (verify-on-receipt)"
+        );
+        // A missing page is refused (the transport can't serve it).
+        let mut d = Cpu::new(KAPPA_PAGE);
+        assert!(
+            !d.restore_kappa_streaming(&manifest, |_k| None),
+            "a missing page is refused"
         );
     }
 
