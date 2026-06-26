@@ -252,6 +252,7 @@ thread_local! {
         core::cell::RefCell::new(std::collections::HashMap::new());
     static JIT_MATCH: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
     static JIT_MISMATCH: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+    static JIT_COMMITTED: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
     // mismatch breakdown (which field diverged, and whether the block had a shift)
     static JIT_MM_REGS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
     static JIT_MM_RFLAGS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
@@ -274,17 +275,18 @@ pub fn drain_jit_diag() -> (u64, u64, u64, u64) {
 pub fn set_jit_on(on: bool) {
     JIT_ON.with(|c| c.set(on));
 }
-/// Drain JIT stats: `(recorded, distinct, compiled, shadow_match, shadow_mismatch, trusted, refused)`.
+/// Drain JIT stats: `(recorded, distinct, compiled, match, mismatch, trusted, refused, committed)`.
 #[cfg(feature = "jit")]
 #[must_use]
-pub fn drain_jit_stats() -> (u64, usize, usize, u64, u64, usize, usize) {
+pub fn drain_jit_stats() -> (u64, usize, usize, u64, u64, usize, usize, u64) {
     let recorded = JIT_DECODED.with(|c| c.replace(0));
     let (entries, compiled) = JIT_CACHE.with(|c| c.borrow().stats());
     let m = JIT_MATCH.with(|c| c.replace(0));
     let mm = JIT_MISMATCH.with(|c| c.replace(0));
     let trusted = JIT_TRUSTED.with(|c| c.borrow().len());
     let refused = JIT_REFUSED.with(|c| c.borrow().len());
-    (recorded, entries, compiled, m, mm, trusted, refused)
+    let committed = JIT_COMMITTED.with(|c| c.replace(0));
+    (recorded, entries, compiled, m, mm, trusted, refused, committed)
 }
 
 struct Sys {
@@ -1391,44 +1393,60 @@ impl Cpu {
     /// blocks). Side-effect-free w.r.t. architectural state — a probe-only fetch translation
     /// (any fault it raises is cleared; `step()` does the real fetch). Only substantial
     /// blocks (≥4 modelled ops) are recorded — tiny blocks aren't worth compiling.
+    /// Returns `true` if it executed the block (the caller skips `step()` this iteration) —
+    /// only for a TRUSTED κ, where the result is committed. An un-trusted block is run dry and
+    /// shadow-validated (returns `false`; `step()` runs and `jit_shadow_check` compares).
     #[cfg(feature = "jit")]
-    fn jit_dispatch(&mut self) {
+    fn jit_dispatch(&mut self) -> bool {
         if self.fault.is_some() {
-            return;
+            return false;
         }
         let pa = self.translate_acc(self.rip, false, false);
         if self.fault.is_some() {
             self.fault = None; // page not currently mapped — let step() fetch + fault
-            return;
+            return false;
         }
         let off = pa as usize;
         let end = ((off & !0xfff) + 0x1000).min(self.ram.len());
         if off >= end {
-            return;
+            return false;
         }
         let (ops, _offsets, len) = crate::emulator::jit::decode_block(&self.ram[off..end]);
         if ops.len() < 4 || len == 0 {
-            return;
+            return false;
         }
         let key: [u8; 32] = *blake3::hash(&self.ram[off..off + len]).as_bytes();
         JIT_DECODED.with(|c| c.set(c.get() + 1));
         // compile hot blocks; clone the wasm so the cache borrow is released
         let wasm = JIT_CACHE.with(|c| c.borrow_mut().record(key, &ops).map(<[u8]>::to_vec));
-        let Some(wasm) = wasm else { return };
-        // shadow-validate only un-trusted, un-refused blocks (caps work per block at K matches)
-        let skip = JIT_TRUSTED.with(|c| c.borrow().contains(&key))
-            || JIT_REFUSED.with(|c| c.borrow().contains(&key));
-        if skip {
-            return;
+        let Some(wasm) = wasm else { return false };
+        if JIT_REFUSED.with(|c| c.borrow().contains(&key)) {
+            return false; // known-divergent block — always interpret
         }
-        // run the JIT dry — one `self` borrow via the page-fetch closure (read-only `walk`)
+        let trusted = JIT_TRUSTED.with(|c| c.borrow().contains(&key));
+        // run the JIT — one `self` borrow via the page-fetch closure (read-only `walk`)
         let (entry_r, entry_f, block_start) = (self.r, self.rflags, self.rip);
-        let jit = crate::emulator::jit_exec::exec_block_pooled(&wasm, &ops, entry_r, entry_f, |va| {
+        let jit = crate::emulator::jit_exec::exec_block_pooled(key, &wasm, &ops, entry_r, entry_f, |va| {
             let pa = self.walk(va).ok()?;
             let f = (pa & !0xfff) as usize;
             (f + 0x1000 <= self.ram.len()).then(|| (f, self.ram[f..f + 0x1000].to_vec()))
         });
-        if let Some((regs, rflags, dirty)) = jit {
+        let Some((regs, rflags, dirty)) = jit else {
+            return false; // couldn't complete (fault/pool/collision) — interpret
+        };
+        if trusted {
+            // COMMIT — the block is validated bit-identical, so apply its result and skip step()
+            self.r = regs;
+            self.rflags = rflags;
+            for (pa, bytes) in dirty {
+                self.ram[pa..pa + bytes.len()].copy_from_slice(&bytes);
+            }
+            self.rip = block_start + len as u64;
+            self.insns = self.insns.wrapping_add(ops.len() as u64);
+            JIT_COMMITTED.with(|c| c.set(c.get() + 1));
+            true
+        } else {
+            // SHADOW — record the dry result; the interpreter runs and jit_shadow_check compares
             JIT_PENDING.with(|c| {
                 *c.borrow_mut() = Some(JitPending {
                     key,
@@ -1440,6 +1458,7 @@ impl Cpu {
                     has_shift: crate::emulator::jit::block_has_shift(&ops),
                 });
             });
+            false
         }
     }
 
@@ -1576,20 +1595,27 @@ impl Cpu {
             // JIT Rung 2 (off by default): remember rip to detect a control transfer.
             #[cfg(feature = "std")]
             let rip0 = self.rip;
-            // JIT Rung 3 (off by default): at a basic-block entry, discover + record the block.
+            // JIT Rung 3 (off by default): at a block entry, dispatch the JIT. A trusted block
+            // executes + commits here (handled = true → skip step); others run dry + shadow.
             #[cfg(feature = "jit")]
-            if JIT_ON.with(core::cell::Cell::get) && JIT_AT_ENTRY.with(core::cell::Cell::get) {
-                self.jit_dispatch();
-            }
-            match self.step() {
-                Ok(()) => self.insns = self.insns.wrapping_add(1),
-                Err(h) => return h,
+            let jit_handled = JIT_ON.with(core::cell::Cell::get)
+                && JIT_AT_ENTRY.with(core::cell::Cell::get)
+                && self.jit_dispatch();
+            #[cfg(not(feature = "jit"))]
+            let jit_handled = false;
+            if !jit_handled {
+                match self.step() {
+                    Ok(()) => self.insns = self.insns.wrapping_add(1),
+                    Err(h) => return h,
+                }
             }
             #[cfg(feature = "jit")]
             if JIT_ON.with(core::cell::Cell::get) {
                 let r = self.rip; // a non-sequential rip → the next instruction is a block entry
                 JIT_AT_ENTRY.with(|c| c.set(r < rip0 || r > rip0.wrapping_add(15)));
-                self.jit_shadow_check();
+                if !jit_handled {
+                    self.jit_shadow_check();
+                }
             }
             // A non-sequential rip (backward, or > 15 B ahead) means the instruction
             // branched/returned/faulted — the new rip is a basic-block entry.

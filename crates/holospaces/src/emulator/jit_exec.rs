@@ -21,6 +21,14 @@ use super::jit::{eff_addr, op_mem_addr, Op, GUEST_BASE, RFLAGS_MEM, TLB_BASE, TL
 const POOL_PAGES: usize = 60;
 const PAGE: usize = 0x1000;
 
+thread_local! {
+    /// One wasmtime engine for the thread's JIT, and a κ-keyed cache of compiled `Module`s —
+    /// so a hot block compiles wasm→native ONCE, not on every execution (the dominant cost).
+    static JIT_ENGINE: Engine = Engine::default();
+    static JIT_MODULES: core::cell::RefCell<std::collections::HashMap<[u8; 32], Module>> =
+        core::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 /// Execute one compiled block over the given architectural state. `regs`, `rflags`, and `ram`
 /// are updated in place; `tlb` is the software-TLB image (read-only this run). Returns the
 /// bail index — the instruction the block stopped at on a TLB miss, or the block length if it
@@ -87,14 +95,25 @@ pub(crate) fn exec_block(
 /// case the caller interprets the block. (One callback, not `&ram`+`translate`, so the caller
 /// borrows its `Cpu` exactly once.)
 pub(crate) fn exec_block_pooled(
+    key: [u8; 32],
     wasm: &[u8],
     ops: &[Op],
     entry_regs: [u64; 16],
     entry_rflags: u64,
     fetch_page: impl Fn(u64) -> Option<(usize, Vec<u8>)>,
 ) -> Option<([u64; 16], u64, Vec<(usize, Vec<u8>)>)> {
-    let engine = Engine::default();
-    let module = Module::new(&engine, wasm).ok()?;
+    let engine = JIT_ENGINE.with(Engine::clone);
+    // compile the wasm→native module once per κ, then reuse it for every execution
+    let module = JIT_MODULES.with(|m| {
+        let mut map = m.borrow_mut();
+        if let Some(md) = map.get(&key) {
+            Some(md.clone())
+        } else {
+            let md = Module::new(&engine, wasm).ok()?;
+            map.insert(key, md.clone());
+            Some(md)
+        }
+    })?;
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).ok()?;
     let mem = instance.get_memory(&mut store, "mem").unwrap();
@@ -110,12 +129,17 @@ pub(crate) fn exec_block_pooled(
     let mut mapped: Vec<(u64, usize)> = Vec::new(); // slot -> (vpage, pa_frame)
 
     for _ in 0..=POOL_PAGES {
+        // marshal only the pages actually mapped so far (slots fill sequentially), not the
+        // whole 240 KiB pool — the per-block I/O is then proportional to the working set.
+        let used = mapped.len() * PAGE;
         for (i, v) in entry_regs.iter().enumerate() {
             mem.write(&mut store, i * 8, &v.to_le_bytes()).ok()?;
         }
         mem.write(&mut store, RFLAGS_MEM as usize, &entry_rflags.to_le_bytes()).ok()?;
-        mem.write(&mut store, TLB_BASE as usize, &tlb).ok()?;
-        mem.write(&mut store, GUEST_BASE as usize, &pool).ok()?;
+        mem.write(&mut store, TLB_BASE as usize, &tlb).ok()?; // 1 KiB, entries at scattered slots
+        if used > 0 {
+            mem.write(&mut store, GUEST_BASE as usize, &pool[..used]).ok()?;
+        }
         let bail = run.call(&mut store, ()).ok()?;
         let mut regs = [0u64; 16];
         for (i, r) in regs.iter_mut().enumerate() {
@@ -126,7 +150,9 @@ pub(crate) fn exec_block_pooled(
         let mut fb = [0u8; 8];
         mem.read(&store, RFLAGS_MEM as usize, &mut fb).ok()?;
         let rflags = u64::from_le_bytes(fb);
-        mem.read(&store, GUEST_BASE as usize, &mut pool).ok()?;
+        if used > 0 {
+            mem.read(&store, GUEST_BASE as usize, &mut pool[..used]).ok()?;
+        }
 
         if (bail as usize) >= ops.len() {
             // completed — return every mapped page as a dirty candidate (clean pages equal RAM)
@@ -185,7 +211,7 @@ mod tests {
             let f = (va as usize) & !0xfff; // identity translation for the test
             (f + 0x1000 <= ram.len()).then(|| (f, ram[f..f + 0x1000].to_vec()))
         };
-        let out = exec_block_pooled(&wasm, &block, regs, 0x2, fetch);
+        let out = exec_block_pooled([0u8; 32], &wasm, &block, regs, 0x2, fetch);
         let (out_regs, _rf, dirty) = out.expect("the block completes after the pool fills both pages");
         assert_eq!(out_regs[0], v, "rax loaded from the lazily-filled source page");
         // dry mode: commit the returned dirty pages, then the store is visible in guest RAM.

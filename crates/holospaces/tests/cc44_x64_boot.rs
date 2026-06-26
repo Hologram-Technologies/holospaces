@@ -156,13 +156,14 @@ fn jit_records_and_compiles_blocks_during_amd64_boot() {
         "JIT-armed boot still reaches userspace\n---- guest console ----\n{console}"
     );
     assert_eq!(halt, Halt::Halted, "clean power-off with the JIT armed");
-    let (recorded, distinct, compiled, m, mm, trusted, refused) =
+    let (recorded, distinct, compiled, m, mm, trusted, refused, committed) =
         holospaces::emulator::x64::drain_jit_stats();
     let (d_regs, d_rflags, d_mem, d_shift) = holospaces::emulator::x64::drain_jit_diag();
     eprintln!(
-        "\n==== JIT RUNG 3: discovery + compile + SHADOW-DIFFERENTIAL on a real boot ====\n\
+        "\n==== JIT RUNG 3: discovery + compile + DIFFERENTIAL + COMMIT on a real boot ====\n\
          {recorded} block records · {distinct} distinct blocks (≥4 ops) · {compiled} compiled\n\
          shadow: {m} matched · {mm} MISMATCHED · {trusted} trusted · {refused} refused\n\
+         COMMITTED (executed via JIT, step skipped): {committed} block executions\n\
          mismatch breakdown: regs={d_regs} rflags={d_rflags} mem={d_mem} (in shift-blocks={d_shift})\n====\n"
     );
     assert!(compiled > 0, "at least one hot block crossed the threshold and compiled");
@@ -181,6 +182,9 @@ fn jit_records_and_compiles_blocks_during_amd64_boot() {
         d_shift == 0,
         "no mismatch came from an unmodelled-shift-flag block (d_shift={d_shift})"
     );
+    // The JIT actually EXECUTED trusted blocks (step skipped) — and the boot still reached
+    // userspace, so those committed executions were correct (the boot is deterministic).
+    assert!(committed > 0, "trusted blocks were executed via the JIT and committed");
 }
 
 /// JIT Rung 0 — the thesis check. Boots real amd64 Linux to userspace while sampling

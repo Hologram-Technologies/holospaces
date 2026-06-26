@@ -1,0 +1,18 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>booting</title></head>
+<body style="margin:0;background:#07070c;color:#cfe;font:13px ui-monospace,monospace">
+<pre id="t" style="padding:10px;white-space:pre-wrap"></pre>
+<script type="module">
+// Minimal x86-64 Alpine boot witness on an http origin (OPFS createSyncAccessHandle works here, unlike holo://).
+const t = document.getElementById("t");
+t.textContent = "spawning x64-alpine boot worker…\n";
+const w = new Worker("./x64-alpine-boot-worker.mjs", { type: "module" });
+w.onmessage = (e) => {
+  window.__bootResult = e.data;
+  t.textContent = JSON.stringify(e.data, null, 2);
+  document.title = e.data && e.data.ok ? "BOOT-DONE" : "BOOT-FAIL";
+};
+w.onerror = (e) => { window.__bootResult = { ok: false, error: e.message || (e.filename + ":" + e.lineno) }; document.title = "BOOT-FAIL"; t.textContent = "worker error: " + t.textContent; };
+w.postMessage("go");
+</script>
+</body></html>
