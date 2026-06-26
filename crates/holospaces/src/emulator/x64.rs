@@ -235,6 +235,11 @@ struct JitPending {
 /// Shadow matches required before a block is trusted (and shadowing stops).
 #[cfg(feature = "jit")]
 const JIT_TRUST_K: u32 = 4;
+/// Minimum block length (modelled ops) to JIT. Short blocks lose to the interpreter — the
+/// per-execution wasmtime instantiate+marshal overhead only amortizes over a long compute
+/// block (the SHA-512 transform's 80-round bodies; long memset/memcpy). The go/no-go knob.
+#[cfg(feature = "jit")]
+const JIT_MIN_OPS: usize = 32;
 #[cfg(feature = "jit")]
 thread_local! {
     static JIT_ON: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
@@ -1412,8 +1417,8 @@ impl Cpu {
             return false;
         }
         let (ops, _offsets, len) = crate::emulator::jit::decode_block(&self.ram[off..end]);
-        if ops.len() < 4 || len == 0 {
-            return false;
+        if ops.len() < JIT_MIN_OPS || len == 0 {
+            return false; // short blocks lose to the interpreter — don't JIT them
         }
         let key: [u8; 32] = *blake3::hash(&self.ram[off..off + len]).as_bytes();
         JIT_DECODED.with(|c| c.set(c.get() + 1));

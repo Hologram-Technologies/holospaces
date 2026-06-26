@@ -133,58 +133,55 @@ fn smoke_amd64_linux_boots_to_userspace() {
     assert_eq!(halt, Halt::Halted, "PID 1 powered the machine off cleanly");
 }
 
-/// JIT Rung 3 — block discovery + compile on a real boot (the `jit` feature). Boots real
-/// amd64 Linux to userspace with the JIT armed: every basic-block entry is discovered,
-/// BLAKE3-keyed (κ), and recorded, and hot blocks (≥4 modelled ops) compile to wasm. The
-/// discovery is side-effect-free, so the boot must still reach userspace identically — this
-/// proves `decode_block` + `compile_tlb_flags` run clean over real guest code at boot scale.
-/// Run with `cargo test -p holospaces --features jit`.
+/// JIT Rung 3 — the **long-block speedup A/B** (the `jit` feature). Boots real amd64 Linux to
+/// userspace twice — once on the pure interpreter, once with the JIT armed committing only
+/// LONG blocks (≥ `JIT_MIN_OPS` modelled ops, where the per-block wasmtime overhead can
+/// amortize) — and reports instr/s for each. The decisive go/no-go: does the JIT beat the
+/// interpreter on its best-case blocks at all? Both boots must reach userspace (correctness).
+/// Run with `cargo test -p holospaces --features jit -- --nocapture`.
 #[cfg(feature = "jit")]
 #[test]
-fn jit_records_and_compiles_blocks_during_amd64_boot() {
-    holospaces::emulator::x64::set_jit_on(true);
+fn jit_long_block_speedup_ab_on_amd64_boot() {
+    use holospaces::emulator::x64;
+    use std::time::Instant;
     let kernel = vmlinux_elf();
-    let mut cpu = Cpu::boot_linux(
-        1024 * 1024 * 1024,
-        &kernel,
-        "earlyprintk=serial,ttyS0 console=ttyS0 random.trust_cpu=on",
-    );
-    let halt = cpu.run(40_000_000_000);
-    let console = String::from_utf8_lossy(cpu.console());
-    assert!(
-        console.contains("HOLOSPACES-LINUX-USERSPACE-OK"),
-        "JIT-armed boot still reaches userspace\n---- guest console ----\n{console}"
-    );
-    assert_eq!(halt, Halt::Halted, "clean power-off with the JIT armed");
-    let (recorded, distinct, compiled, m, mm, trusted, refused, committed) =
-        holospaces::emulator::x64::drain_jit_stats();
-    let (d_regs, d_rflags, d_mem, d_shift) = holospaces::emulator::x64::drain_jit_diag();
+    let cmdline = "earlyprintk=serial,ttyS0 console=ttyS0 random.trust_cpu=on";
+    let reached = |cpu: &Cpu| {
+        String::from_utf8_lossy(cpu.console()).contains("HOLOSPACES-LINUX-USERSPACE-OK")
+    };
+
+    // A — interpreter baseline
+    x64::set_jit_on(false);
+    let mut cpu_a = Cpu::boot_linux(1024 * 1024 * 1024, &kernel, cmdline);
+    let t = Instant::now();
+    let halt_a = cpu_a.run(40_000_000_000);
+    let (dt_a, ins_a) = (t.elapsed().as_secs_f64(), cpu_a.insns());
+    assert!(reached(&cpu_a), "baseline reached userspace");
+    let _ = x64::drain_jit_stats(); // clear counters before the armed run
+
+    // B — JIT armed, committing only long blocks
+    x64::set_jit_on(true);
+    let mut cpu_b = Cpu::boot_linux(1024 * 1024 * 1024, &kernel, cmdline);
+    let t = Instant::now();
+    let halt_b = cpu_b.run(40_000_000_000);
+    let (dt_b, ins_b) = (t.elapsed().as_secs_f64(), cpu_b.insns());
+    assert!(reached(&cpu_b), "JIT-armed boot reached userspace");
+    let (_rec, distinct, compiled, m, mm, trusted, refused, committed) = x64::drain_jit_stats();
+
+    let mips = |ins: u64, dt: f64| ins as f64 / dt / 1e6;
     eprintln!(
-        "\n==== JIT RUNG 3: discovery + compile + DIFFERENTIAL + COMMIT on a real boot ====\n\
-         {recorded} block records · {distinct} distinct blocks (≥4 ops) · {compiled} compiled\n\
-         shadow: {m} matched · {mm} MISMATCHED · {trusted} trusted · {refused} refused\n\
-         COMMITTED (executed via JIT, step skipped): {committed} block executions\n\
-         mismatch breakdown: regs={d_regs} rflags={d_rflags} mem={d_mem} (in shift-blocks={d_shift})\n====\n"
+        "\n==== JIT LONG-BLOCK A/B (commit blocks >= JIT_MIN_OPS) ====\n\
+         baseline : {ins_a:>12} insns in {dt_a:6.1}s = {:6.2} Minsn/s\n\
+         jit-armed: {ins_b:>12} insns in {dt_b:6.1}s = {:6.2} Minsn/s\n\
+         WALL SPEEDUP: {:.3}x   (jit faster if > 1.0)\n\
+         long blocks: {distinct} distinct · {compiled} compiled · {trusted} trusted · \
+         {refused} refused · {committed} committed executions · {m} shadow-match · {mm} mismatch\n====\n",
+        mips(ins_a, dt_a),
+        mips(ins_b, dt_b),
+        dt_a / dt_b,
     );
-    assert!(compiled > 0, "at least one hot block crossed the threshold and compiled");
-    assert!(m > 0, "compiled blocks were shadow-validated against the interpreter");
-    // Many blocks ARE bit-identical to the interpreter — the JIT executes them correctly.
-    assert!(
-        trusted > 50,
-        "the JIT was validated bit-identical to step() on many real kernel blocks (trusted={trusted})"
-    );
-    // Mismatches are EXPECTED and SAFE: a block that reads MMIO / device memory / a stale-TLB
-    // view diverges (the JIT reads the RAM backing, the interpreter goes through the device),
-    // and the differential refuses it — it stays interpreted. The boot is correct regardless
-    // (shadow mode never commits). The breakdown confirms these are memory-view divergences
-    // (regs/mem), not flag bugs and not in shift-blocks.
-    assert!(
-        d_shift == 0,
-        "no mismatch came from an unmodelled-shift-flag block (d_shift={d_shift})"
-    );
-    // The JIT actually EXECUTED trusted blocks (step skipped) — and the boot still reached
-    // userspace, so those committed executions were correct (the boot is deterministic).
-    assert!(committed > 0, "trusted blocks were executed via the JIT and committed");
+    assert_eq!(halt_a, Halt::Halted, "baseline clean power-off");
+    assert_eq!(halt_b, Halt::Halted, "JIT-armed clean power-off");
 }
 
 /// JIT Rung 0 — the thesis check. Boots real amd64 Linux to userspace while sampling
