@@ -64,9 +64,20 @@ const GUEST_LEN: usize = 0x3000; // 3 pages of test guest RAM
 /// — the mechanism that lets the JIT touch real (paged) guest RAM. `$va` scratch = local 16.
 const TLB_BASE: u64 = 0x200;
 const TLB_SIZE: u64 = 64; // power of two; slot = vpage & (TLB_SIZE-1)
-const VA_LOCAL: u8 = NREG as u8; // i64 local: vaddr scratch (local 16)
-const BAIL_LOCAL: u8 = NREG as u8 + 1; // i32 local: bail instruction index (local 17)
-const TE_LOCAL: u8 = NREG as u8 + 2; // i32 local: TLB entry address scratch (local 18)
+
+/// The guest `rflags` slot in wasm memory (just past the 16 registers), and the six
+/// arithmetic flag bits an ALU op writes: CF(0) PF(2) AF(4) ZF(6) SF(7) OF(11).
+const RFLAGS_MEM: u64 = NREG as u64 * 8; // mem offset 128
+const ALU_FLAGS_MASK: u64 = 0x8d5; // CF|PF|AF|ZF|SF|OF
+
+// Local layout: 21 × i64 then 2 × i32 (always declared; unused ones are harmless).
+const VA_LOCAL: u8 = NREG as u8; // i64 16: vaddr scratch (TLB)
+const RFLAGS_LOCAL: u8 = NREG as u8 + 1; // i64 17: live rflags value (flags mode)
+const FA_LOCAL: u8 = NREG as u8 + 2; // i64 18: flag operand a
+const FB_LOCAL: u8 = NREG as u8 + 3; // i64 19: flag operand b
+const FR_LOCAL: u8 = NREG as u8 + 4; // i64 20: flag result
+const BAIL_LOCAL: u8 = NREG as u8 + 5; // i32 21: bail instruction index (TLB)
+const TE_LOCAL: u8 = NREG as u8 + 6; // i32 22: TLB entry address scratch
 
 /// Effective address `base + idx<<scale + disp` (sentinels skipped) — the meaning shared
 /// by the interpreter oracle and (mirrored in wasm) the codegen.
@@ -163,36 +174,37 @@ fn section(id: u8, body: Vec<u8>, out: &mut Vec<u8>) {
     out.extend(body);
 }
 
-/// Direct-mapped codegen: guest address maps straight to `GUEST_BASE + addr` (no paging) —
-/// the model the unit differentials use.
+/// Direct-mapped codegen: guest address maps straight to `GUEST_BASE + addr` (no paging),
+/// no flags — the model the register/memory unit differentials use.
 pub(crate) fn compile(block: &[Op]) -> Vec<u8> {
-    compile_mode(block, false)
+    compile_mode(block, false, false)
 }
 
 /// Inline-TLB codegen: a guest *virtual* address is translated through the software TLB
 /// (hit path) before the load/store — the real paged-memory model the boot needs.
 pub(crate) fn compile_tlb(block: &[Op]) -> Vec<u8> {
-    compile_mode(block, true)
+    compile_mode(block, true, false)
+}
+
+/// Direct codegen that also maintains the guest `rflags` (CF/PF/AF/ZF/SF/OF) for the ALU
+/// ops — what the boot's `regs`+`rflags` differential against `step()` requires.
+pub(crate) fn compile_flags(block: &[Op]) -> Vec<u8> {
+    compile_mode(block, false, true)
 }
 
 /// Register-allocated codegen: load all 16 regs from memory into i64 locals at entry,
 /// compute on locals, store back at exit (per-op traffic is `local.get/set`, not memory).
-/// `tlb` selects the address path (direct vs inline software-TLB translation).
-fn compile_mode(block: &[Op], tlb: bool) -> Vec<u8> {
+/// `tlb` selects the address path (direct vs inline software-TLB translation); `flags`
+/// additionally tracks `rflags` (mem slot `RFLAGS_MEM`) across the ALU ops.
+fn compile_mode(block: &[Op], tlb: bool, flags: bool) -> Vec<u8> {
     let mut code = Vec::new();
-    // locals. Direct: 17 × i64 (16 regs + vaddr scratch). TLB: also 2 × i32
-    // (bail-index + TLB-entry scratch) for the miss/bail control flow.
-    if tlb {
-        uleb(2, &mut code);
-        uleb(NREG as u64 + 1, &mut code);
-        code.push(0x7e); // i64 × 17
-        uleb(2, &mut code);
-        code.push(0x7f); // i32 × 2
-    } else {
-        uleb(1, &mut code);
-        uleb(NREG as u64 + 1, &mut code);
-        code.push(0x7e); // i64 × 17
-    }
+    // locals: 21 × i64 (16 regs + vaddr + rflags + 3 flag scratch) then 2 × i32
+    // (bail-index + TLB-entry scratch). Always declared; unused ones are harmless.
+    uleb(2, &mut code);
+    uleb(NREG as u64 + 5, &mut code);
+    code.push(0x7e); // i64 × 21
+    uleb(2, &mut code);
+    code.push(0x7f); // i32 × 2
     let getl = |r: u8, c: &mut Vec<u8>| {
         c.push(0x20);
         uleb(u64::from(r), c);
@@ -288,10 +300,131 @@ fn compile_mode(block: &[Op], tlb: bool) -> Vec<u8> {
         c.push(0x7c); // i64.add
         c.push(0xa7); // i32.wrap_i64
     };
-    // entry: regs → locals
+    // emit the x86 rflags update for an ALU op, reading operands a/b in $fa/$fb and the
+    // result in $fr (set by the caller) and folding CF/PF/AF/ZF/SF/OF into $rflags. Mirrors
+    // the `interpret`-side `x86_flags` oracle exactly. Logical ops clear CF/OF/AF.
+    let emit_flags = |op: Bin, c: &mut Vec<u8>| {
+        let get = |l: u8, c: &mut Vec<u8>| {
+            c.push(0x20);
+            uleb(u64::from(l), c);
+        };
+        // RFLAGS &= ~ALU_FLAGS_MASK  (keep IF/DF/reserved bits, clear the 6 ALU flags)
+        get(RFLAGS_LOCAL, c);
+        c.push(0x42);
+        sleb(!ALU_FLAGS_MASK as i64, c);
+        c.push(0x83); // i64.and
+        c.push(0x21);
+        uleb(u64::from(RFLAGS_LOCAL), c);
+        // OR the i64 value currently on the stack into $rflags
+        let or_in = |c: &mut Vec<u8>| {
+            get(RFLAGS_LOCAL, c);
+            c.push(0x84); // i64.or
+            c.push(0x21);
+            uleb(u64::from(RFLAGS_LOCAL), c);
+        };
+        let shl = |n: i64, c: &mut Vec<u8>| {
+            c.push(0x42);
+            sleb(n, c);
+            c.push(0x86); // i64.shl
+        };
+        // ZF = (fr == 0) << 6
+        get(FR_LOCAL, c);
+        c.push(0x50); // i64.eqz → i32
+        c.push(0xad); // i64.extend_i32_u
+        shl(6, c);
+        or_in(c);
+        // SF = (fr >> 63) << 7
+        get(FR_LOCAL, c);
+        c.push(0x42);
+        sleb(63, c);
+        c.push(0x88); // i64.shr_u → 0/1
+        shl(7, c);
+        or_in(c);
+        // PF = (popcount(fr & 0xff) is even) << 2
+        get(FR_LOCAL, c);
+        c.push(0x42);
+        sleb(0xff, c);
+        c.push(0x83); // & 0xff
+        c.push(0x7b); // i64.popcnt
+        c.push(0x42);
+        sleb(1, c);
+        c.push(0x83); // & 1
+        c.push(0x50); // i64.eqz → i32 (1 if even)
+        c.push(0xad); // extend
+        shl(2, c);
+        or_in(c);
+        // AF, CF, OF depend on the op kind
+        let xor3 = |x: u8, y: u8, z: u8, c: &mut Vec<u8>| {
+            get(x, c);
+            get(y, c);
+            c.push(0x85); // xor
+            get(z, c);
+            c.push(0x85); // xor
+        };
+        match op {
+            Bin::Add | Bin::Sub => {
+                // AF = (((fa ^ fb ^ fr) >> 4) & 1) << 4
+                xor3(FA_LOCAL, FB_LOCAL, FR_LOCAL, c);
+                c.push(0x42);
+                sleb(4, c);
+                c.push(0x88); // >> 4
+                c.push(0x42);
+                sleb(1, c);
+                c.push(0x83); // & 1
+                shl(4, c);
+                or_in(c);
+                if matches!(op, Bin::Add) {
+                    // CF = (fr <u fa)
+                    get(FR_LOCAL, c);
+                    get(FA_LOCAL, c);
+                    c.push(0x54); // i64.lt_u → i32
+                    c.push(0xad);
+                    or_in(c);
+                    // OF = (((fa ^ fr) & (fb ^ fr)) >> 63) << 11
+                    get(FA_LOCAL, c);
+                    get(FR_LOCAL, c);
+                    c.push(0x85); // fa^fr
+                    get(FB_LOCAL, c);
+                    get(FR_LOCAL, c);
+                    c.push(0x85); // fb^fr
+                    c.push(0x83); // and
+                } else {
+                    // CF = (fa <u fb)
+                    get(FA_LOCAL, c);
+                    get(FB_LOCAL, c);
+                    c.push(0x54);
+                    c.push(0xad);
+                    or_in(c);
+                    // OF = (((fa ^ fb) & (fa ^ fr)) >> 63) << 11
+                    get(FA_LOCAL, c);
+                    get(FB_LOCAL, c);
+                    c.push(0x85); // fa^fb
+                    get(FA_LOCAL, c);
+                    get(FR_LOCAL, c);
+                    c.push(0x85); // fa^fr
+                    c.push(0x83); // and
+                }
+                c.push(0x42);
+                sleb(63, c);
+                c.push(0x88); // >> 63
+                shl(11, c);
+                or_in(c);
+            }
+            // logical ops: CF = OF = AF = 0 (already cleared)
+            Bin::And | Bin::Or | Bin::Xor => {}
+        }
+    };
+    // entry: regs → locals (and the live rflags, in flags mode)
     for r in 0..NREG {
         load_mem(r, &mut code);
         setl(r as u8, &mut code);
+    }
+    if flags {
+        code.push(0x41);
+        sleb(RFLAGS_MEM as i64, &mut code); // i32.const RFLAGS_MEM
+        code.extend([0x29, 0x03, 0x00]); // i64.load
+        code.push(0x21);
+        uleb(u64::from(RFLAGS_LOCAL), &mut code); // local.set $rflags
     }
     if tlb {
         // bail-index defaults to "completed" (= block length); body wrapped in a block $exit
@@ -315,16 +448,33 @@ fn compile_mode(block: &[Op], tlb: bool) -> Vec<u8> {
                 setl(d, &mut code);
             }
             Op::Bin { op, d, a, b } => {
-                getl(a, &mut code);
-                getl(b, &mut code);
-                code.push(match op {
+                let opcode = match op {
                     Bin::Add => 0x7c,
                     Bin::Sub => 0x7d,
                     Bin::Xor => 0x85,
                     Bin::And => 0x83,
                     Bin::Or => 0x84,
-                });
-                setl(d, &mut code);
+                };
+                if flags {
+                    // capture a, b, result in scratch (a/b may alias d) so the flag math is
+                    // correct, then write d and fold the flags into $rflags.
+                    getl(a, &mut code);
+                    setl(FA_LOCAL, &mut code);
+                    getl(b, &mut code);
+                    setl(FB_LOCAL, &mut code);
+                    getl(FA_LOCAL, &mut code);
+                    getl(FB_LOCAL, &mut code);
+                    code.push(opcode);
+                    setl(FR_LOCAL, &mut code);
+                    getl(FR_LOCAL, &mut code);
+                    setl(d, &mut code);
+                    emit_flags(op, &mut code);
+                } else {
+                    getl(a, &mut code);
+                    getl(b, &mut code);
+                    code.push(opcode);
+                    setl(d, &mut code);
+                }
             }
             Op::Shift { op, d, a, sh } => {
                 getl(a, &mut code);
@@ -373,6 +523,13 @@ fn compile_mode(block: &[Op], tlb: bool) -> Vec<u8> {
         code.push(0x41);
         sleb((r * 8) as i64, &mut code); // i32.const addr
         getl(r as u8, &mut code);
+        code.extend([0x37, 0x03, 0x00]); // i64.store
+    }
+    if flags {
+        code.push(0x41);
+        sleb(RFLAGS_MEM as i64, &mut code); // i32.const RFLAGS_MEM
+        code.push(0x20);
+        uleb(u64::from(RFLAGS_LOCAL), &mut code); // local.get $rflags
         code.extend([0x37, 0x03, 0x00]); // i64.store
     }
     if tlb {
@@ -888,4 +1045,129 @@ fn jit_inline_tlb_bail_is_correct() {
     assert_eq!(regs_w[1], 0x5555, "the bailing load must not have written its dst");
     assert_eq!(regs_w[2], 0x6666, "the instruction after the bail must not have run");
     assert_eq!(u64::from_le_bytes(host[0x10..0x18].try_into().unwrap()), 0x1234, "op1 store landed");
+}
+
+/// The x86 ALU rflags oracle — the exact CF/PF/AF/ZF/SF/OF semantics `emit_flags` mirrors.
+#[cfg(test)]
+fn x86_alu_flags(op: Bin, a: u64, b: u64, r: u64, rflags: u64) -> u64 {
+    let mut f = rflags & !ALU_FLAGS_MASK;
+    if r == 0 {
+        f |= 1 << 6; // ZF
+    }
+    if r >> 63 != 0 {
+        f |= 1 << 7; // SF
+    }
+    if (r & 0xff).count_ones() % 2 == 0 {
+        f |= 1 << 2; // PF (even parity of low byte)
+    }
+    match op {
+        Bin::Add => {
+            if r < a {
+                f |= 1; // CF
+            }
+            if ((a ^ r) & (b ^ r)) >> 63 != 0 {
+                f |= 1 << 11; // OF
+            }
+            if ((a ^ b ^ r) >> 4) & 1 != 0 {
+                f |= 1 << 4; // AF
+            }
+        }
+        Bin::Sub => {
+            if a < b {
+                f |= 1; // CF (borrow)
+            }
+            if ((a ^ b) & (a ^ r)) >> 63 != 0 {
+                f |= 1 << 11; // OF
+            }
+            if ((a ^ b ^ r) >> 4) & 1 != 0 {
+                f |= 1 << 4; // AF
+            }
+        }
+        Bin::And | Bin::Or | Bin::Xor => {} // logical: CF = OF = AF = 0
+    }
+    f
+}
+
+/// Reference interpreter that also tracks `rflags` (Movi/Movr/Bin only — the flags test set).
+#[cfg(test)]
+fn interpret_flags(block: &[Op], r: &mut [u64; NREG], rflags: &mut u64) {
+    for op in block {
+        match *op {
+            Op::Movi { d, imm } => r[d as usize] = imm,
+            Op::Movr { d, s } => r[d as usize] = r[s as usize],
+            Op::Bin { op, d, a, b } => {
+                let (av, bv) = (r[a as usize], r[b as usize]);
+                let res = match op {
+                    Bin::Add => av.wrapping_add(bv),
+                    Bin::Sub => av.wrapping_sub(bv),
+                    Bin::Xor => av ^ bv,
+                    Bin::And => av & bv,
+                    Bin::Or => av | bv,
+                };
+                r[d as usize] = res;
+                *rflags = x86_alu_flags(op, av, bv, res, *rflags);
+            }
+            _ => unreachable!("the flags differential uses only Movi/Movr/Bin"),
+        }
+    }
+}
+
+/// Run a flags-mode block: regs at `0..128`, `rflags` at `RFLAGS_MEM`. Returns `(regs, rflags)`.
+#[cfg(test)]
+fn run_wasm_flags(bytes: &[u8], regs: [u64; NREG], rflags_in: u64) -> ([u64; NREG], u64) {
+    let engine = Engine::default();
+    let module = Module::new(&engine, bytes).expect("emitted wasm is valid");
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).expect("instantiate");
+    let mem = instance.get_memory(&mut store, "mem").unwrap();
+    let run = instance.get_typed_func::<(), ()>(&mut store, "run").unwrap();
+    for (i, v) in regs.iter().enumerate() {
+        mem.write(&mut store, i * 8, &v.to_le_bytes()).unwrap();
+    }
+    mem.write(&mut store, RFLAGS_MEM as usize, &rflags_in.to_le_bytes()).unwrap();
+    run.call(&mut store, ()).expect("run");
+    let mut out = [0u64; NREG];
+    for (i, o) in out.iter_mut().enumerate() {
+        let mut b = [0u8; 8];
+        mem.read(&store, i * 8, &mut b).unwrap();
+        *o = u64::from_le_bytes(b);
+    }
+    let mut fb = [0u8; 8];
+    mem.read(&store, RFLAGS_MEM as usize, &mut fb).unwrap();
+    (out, u64::from_le_bytes(fb))
+}
+
+/// Flags differential: random Movi/Movr/Bin blocks, interpret (with the x86 flags oracle)
+/// vs `compile_flags`→wasmtime, must agree on registers AND `rflags` — closing the last
+/// correctness gap (the boot differential is regs+rflags). Non-ALU rflags bits are
+/// preserved; CF/PF/AF/ZF/SF/OF computed per op.
+#[cfg(test)]
+#[test]
+fn jit_flags_match_the_x86_oracle() {
+    let mut rng = Rng(0x243f_6a88_85a3_08d3);
+    for _ in 0..400 {
+        let n = 1 + rng.next() % 30;
+        let mut block = Vec::new();
+        for _ in 0..n {
+            let (d, a, b) = (rng.reg(), rng.reg(), rng.reg());
+            block.push(match rng.next() % 6 {
+                0 => Op::Movi { d, imm: rng.next() },
+                1 => Op::Bin { op: Bin::Add, d, a, b },
+                2 => Op::Bin { op: Bin::Sub, d, a, b },
+                3 => Op::Bin { op: Bin::And, d, a, b },
+                4 => Op::Bin { op: Bin::Or, d, a, b },
+                _ => Op::Bin { op: Bin::Xor, d, a, b },
+            });
+        }
+        let mut regs = [0u64; NREG];
+        for r in regs.iter_mut() {
+            *r = rng.next();
+        }
+        let rflags0 = (rng.next() & 0xffff) | 0x2; // random flags incl. non-ALU bits + reserved
+        let (mut regs_i, mut rf_i) = (regs, rflags0);
+        interpret_flags(&block, &mut regs_i, &mut rf_i);
+        let (regs_w, rf_w) = run_wasm_flags(&compile_flags(&block), regs, rflags0);
+        assert_eq!(regs_w, regs_i, "flags-mode block: regs diverged");
+        assert_eq!(rf_w, rf_i, "flags-mode block: rflags diverged");
+    }
 }
