@@ -21,11 +21,24 @@ use super::jit::{eff_addr, op_mem_addr, Op, GUEST_BASE, RFLAGS_MEM, TLB_BASE, TL
 const POOL_PAGES: usize = 60;
 const PAGE: usize = 0x1000;
 
+/// A warm wasmtime instance kept resident per κ, so a hot block's executions reuse the
+/// `Store`/`Instance`/`Memory` instead of paying `Instance::new` (a 256 KiB linear-memory
+/// alloc+zero) every time — the dominant per-commit cost. The TLB is re-written fresh and
+/// pages re-fetched each call, so reuse is correctness-safe (no stale reads).
+struct Warm {
+    store: Store<()>,
+    instance: Instance,
+    memory: wasmtime::Memory,
+}
+
 thread_local! {
     /// One wasmtime engine for the thread's JIT, and a κ-keyed cache of compiled `Module`s —
     /// so a hot block compiles wasm→native ONCE, not on every execution (the dominant cost).
     static JIT_ENGINE: Engine = Engine::default();
     static JIT_MODULES: core::cell::RefCell<std::collections::HashMap<[u8; 32], Module>> =
+        core::cell::RefCell::new(std::collections::HashMap::new());
+    /// κ-keyed warm instances (reused across a block's executions).
+    static JIT_WARM: core::cell::RefCell<std::collections::HashMap<[u8; 32], Warm>> =
         core::cell::RefCell::new(std::collections::HashMap::new());
 }
 
@@ -102,89 +115,97 @@ pub(crate) fn exec_block_pooled(
     entry_rflags: u64,
     fetch_page: impl Fn(u64) -> Option<(usize, Vec<u8>)>,
 ) -> Option<([u64; 16], u64, Vec<(usize, Vec<u8>)>)> {
-    let engine = JIT_ENGINE.with(Engine::clone);
-    // compile the wasm→native module once per κ, then reuse it for every execution
-    let module = JIT_MODULES.with(|m| {
-        let mut map = m.borrow_mut();
-        if let Some(md) = map.get(&key) {
-            Some(md.clone())
-        } else {
-            let md = Module::new(&engine, wasm).ok()?;
-            map.insert(key, md.clone());
-            Some(md)
+    JIT_WARM.with(|wm| {
+        let mut warms = wm.borrow_mut();
+        // get-or-create the warm instance for this κ — `Instance::new` (a 256 KiB linear-memory
+        // alloc+zero) is paid ONCE per block, then every execution reuses Store/Instance/Memory.
+        if !warms.contains_key(&key) {
+            let engine = JIT_ENGINE.with(Engine::clone);
+            let module = JIT_MODULES.with(|m| {
+                let mut map = m.borrow_mut();
+                if let Some(md) = map.get(&key) {
+                    Some(md.clone())
+                } else {
+                    let md = Module::new(&engine, wasm).ok()?;
+                    map.insert(key, md.clone());
+                    Some(md)
+                }
+            })?;
+            let mut store = Store::new(&engine, ());
+            let instance = Instance::new(&mut store, &module, &[]).ok()?;
+            let memory = instance.get_memory(&mut store, "mem").unwrap();
+            let need = (GUEST_BASE as usize + POOL_PAGES * PAGE).div_ceil(0x10000);
+            let have = memory.size(&store) as usize;
+            if need > have {
+                memory.grow(&mut store, (need - have) as u64).ok()?;
+            }
+            warms.insert(key, Warm { store, instance, memory });
         }
-    })?;
-    let mut store = Store::new(&engine, ());
-    let instance = Instance::new(&mut store, &module, &[]).ok()?;
-    let mem = instance.get_memory(&mut store, "mem").unwrap();
-    let need = (GUEST_BASE as usize + POOL_PAGES * PAGE).div_ceil(0x10000);
-    let have = mem.size(&store) as usize;
-    if need > have {
-        mem.grow(&mut store, (need - have) as u64).ok()?;
-    }
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").ok()?;
+        let warm = warms.get_mut(&key).unwrap();
+        let (instance, mem) = (warm.instance, warm.memory); // Copy handles into the Store
+        let run = instance.get_typed_func::<(), i32>(&mut warm.store, "run").ok()?;
+        let store = &mut warm.store;
 
-    let mut tlb = vec![0u8; TLB_SIZE as usize * 16];
-    let mut pool = vec![0u8; POOL_PAGES * PAGE];
-    let mut mapped: Vec<(u64, usize)> = Vec::new(); // slot -> (vpage, pa_frame)
+        // A FRESH TLB and a lazily-grown pool each call: the warm memory's stale pages are never
+        // referenced (no TLB entry), and pages are re-fetched on bail — so reuse is correct.
+        let mut tlb = vec![0u8; TLB_SIZE as usize * 16];
+        let mut pool: Vec<u8> = Vec::new(); // grows by one page per fetch (no 240 KiB upfront)
+        let mut mapped: Vec<(u64, usize)> = Vec::new(); // slot -> (vpage, pa_frame)
 
-    for _ in 0..=POOL_PAGES {
-        // marshal only the pages actually mapped so far (slots fill sequentially), not the
-        // whole 240 KiB pool — the per-block I/O is then proportional to the working set.
-        let used = mapped.len() * PAGE;
-        for (i, v) in entry_regs.iter().enumerate() {
-            mem.write(&mut store, i * 8, &v.to_le_bytes()).ok()?;
-        }
-        mem.write(&mut store, RFLAGS_MEM as usize, &entry_rflags.to_le_bytes()).ok()?;
-        mem.write(&mut store, TLB_BASE as usize, &tlb).ok()?; // 1 KiB, entries at scattered slots
-        if used > 0 {
-            mem.write(&mut store, GUEST_BASE as usize, &pool[..used]).ok()?;
-        }
-        let bail = run.call(&mut store, ()).ok()?;
-        let mut regs = [0u64; 16];
-        for (i, r) in regs.iter_mut().enumerate() {
-            let mut b = [0u8; 8];
-            mem.read(&store, i * 8, &mut b).ok()?;
-            *r = u64::from_le_bytes(b);
-        }
-        let mut fb = [0u8; 8];
-        mem.read(&store, RFLAGS_MEM as usize, &mut fb).ok()?;
-        let rflags = u64::from_le_bytes(fb);
-        if used > 0 {
-            mem.read(&store, GUEST_BASE as usize, &mut pool[..used]).ok()?;
-        }
+        for _ in 0..=POOL_PAGES {
+            for (i, v) in entry_regs.iter().enumerate() {
+                mem.write(&mut *store, i * 8, &v.to_le_bytes()).ok()?;
+            }
+            mem.write(&mut *store, RFLAGS_MEM as usize, &entry_rflags.to_le_bytes()).ok()?;
+            mem.write(&mut *store, TLB_BASE as usize, &tlb).ok()?;
+            if !pool.is_empty() {
+                mem.write(&mut *store, GUEST_BASE as usize, &pool).ok()?;
+            }
+            let bail = run.call(&mut *store, ()).ok()?;
+            let mut regs = [0u64; 16];
+            for (i, r) in regs.iter_mut().enumerate() {
+                let mut b = [0u8; 8];
+                mem.read(&*store, i * 8, &mut b).ok()?;
+                *r = u64::from_le_bytes(b);
+            }
+            let mut fb = [0u8; 8];
+            mem.read(&*store, RFLAGS_MEM as usize, &mut fb).ok()?;
+            let rflags = u64::from_le_bytes(fb);
+            if !pool.is_empty() {
+                mem.read(&*store, GUEST_BASE as usize, &mut pool).ok()?;
+            }
 
-        if (bail as usize) >= ops.len() {
-            // completed — return every mapped page as a dirty candidate (clean pages equal RAM)
-            let dirty = mapped
-                .iter()
-                .enumerate()
-                .map(|(slot, &(_vpage, pa_frame))| {
-                    (pa_frame, pool[slot * PAGE..slot * PAGE + PAGE].to_vec())
-                })
-                .collect();
-            return Some((regs, rflags, dirty));
-        }
+            if (bail as usize) >= ops.len() {
+                let dirty = mapped
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, &(_vpage, pa_frame))| {
+                        (pa_frame, pool[slot * PAGE..slot * PAGE + PAGE].to_vec())
+                    })
+                    .collect();
+                return Some((regs, rflags, dirty));
+            }
 
-        // bail at a memory op — recompute its vaddr, fetch the page, retry
-        let (base, idx, scale, disp) = op_mem_addr(&ops[bail as usize])?;
-        let vaddr = eff_addr(&regs, base, idx, scale, disp) as u64;
-        let vpage = vaddr >> 12;
-        if mapped.iter().any(|&(vp, _)| vp == vpage) || mapped.len() >= POOL_PAGES {
-            return None; // already mapped yet still missed (slot collision) / pool full
+            // bail at a memory op — recompute its vaddr, fetch the page, retry
+            let (base, idx, scale, disp) = op_mem_addr(&ops[bail as usize])?;
+            let vaddr = eff_addr(&regs, base, idx, scale, disp) as u64;
+            let vpage = vaddr >> 12;
+            if mapped.iter().any(|&(vp, _)| vp == vpage) || mapped.len() >= POOL_PAGES {
+                return None; // already mapped yet still missed (slot collision) / pool full
+            }
+            let (pa_frame, bytes) = fetch_page(vaddr)?; // None → real #PF → interpret
+            if bytes.len() != PAGE {
+                return None;
+            }
+            let slot = mapped.len();
+            pool.extend_from_slice(&bytes);
+            mapped.push((vpage, pa_frame));
+            let s = (vpage & (TLB_SIZE - 1)) as usize;
+            tlb[s * 16..s * 16 + 8].copy_from_slice(&vpage.to_le_bytes());
+            tlb[s * 16 + 8..s * 16 + 16].copy_from_slice(&((slot * PAGE) as u64).to_le_bytes());
         }
-        let (pa_frame, bytes) = fetch_page(vaddr)?; // None → real #PF → interpret
-        if bytes.len() != PAGE {
-            return None;
-        }
-        let slot = mapped.len();
-        pool[slot * PAGE..slot * PAGE + PAGE].copy_from_slice(&bytes);
-        mapped.push((vpage, pa_frame));
-        let s = (vpage & (TLB_SIZE - 1)) as usize;
-        tlb[s * 16..s * 16 + 8].copy_from_slice(&vpage.to_le_bytes());
-        tlb[s * 16 + 8..s * 16 + 16].copy_from_slice(&((slot * PAGE) as u64).to_le_bytes());
-    }
-    None
+        None
+    })
 }
 
 #[cfg(test)]

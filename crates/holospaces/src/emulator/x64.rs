@@ -235,11 +235,12 @@ struct JitPending {
 /// Shadow matches required before a block is trusted (and shadowing stops).
 #[cfg(feature = "jit")]
 const JIT_TRUST_K: u32 = 4;
-/// Minimum block length (modelled ops) to JIT. Short blocks lose to the interpreter — the
-/// per-execution wasmtime instantiate+marshal overhead only amortizes over a long compute
-/// block (the SHA-512 transform's 80-round bodies; long memset/memcpy). The go/no-go knob.
+/// Minimum block length (modelled ops) to JIT. With warm-instance reuse the per-commit cost
+/// drops to a register marshal + page re-fetch, so short blocks become worth committing; this
+/// gate just skips the tiniest blocks (4–7 ops) where even that overhead doesn't pay. Tune
+/// against the A/B measurement. (The boot has NO blocks ≥32 ops — every hot block is short.)
 #[cfg(feature = "jit")]
-const JIT_MIN_OPS: usize = 32;
+const JIT_MIN_OPS: usize = 8;
 #[cfg(feature = "jit")]
 thread_local! {
     static JIT_ON: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
