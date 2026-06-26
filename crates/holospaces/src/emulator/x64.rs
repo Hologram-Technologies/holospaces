@@ -1112,6 +1112,14 @@ impl Cpu {
         self.sys.as_ref().map_or(&[], |s| &s.uart.output)
     }
 
+    /// The guest's physical RAM (read-only) — for the κ-snapshot path: content-address it by
+    /// 4 KiB page so a booted machine's mostly-zero/duplicate RAM deduplicates to a small
+    /// working set (the dual of [`Cpu::run`]'s `ram`).
+    #[must_use]
+    pub fn ram(&self) -> &[u8] {
+        &self.ram
+    }
+
     /// Feed terminal input to the guest's serial console (readable at `0x3f8`).
     pub fn feed_console(&mut self, bytes: &[u8]) {
         if let Some(sys) = self.sys.as_mut() {

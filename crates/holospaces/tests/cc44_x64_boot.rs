@@ -337,3 +337,57 @@ fn an_amd64_linux_boots_from_a_streamed_kappa_disk() {
         "PID 1 printed its marker — the real amd64 kernel booted from the streamed κ-disk"
     );
 }
+
+/// κ-snapshot thesis: a booted machine's RAM content-addresses to a tiny working set. Boots
+/// real amd64 Linux to userspace, splits the 1 GiB guest RAM into 4 KiB pages, BLAKE3-keys
+/// each, and reports how few UNIQUE pages there are. That dedup ratio IS the "boot-once,
+/// resume-anywhere" speed: a resume streams only the unique pages (verify-before-use), not the
+/// nominal gigabyte — which is why it can be seconds while a cold boot is minutes.
+#[test]
+fn kappa_snapshot_ram_dedup_ratio_after_amd64_boot() {
+    use std::collections::HashSet;
+    let kernel = vmlinux_elf();
+    let mut cpu = Cpu::boot_linux(
+        1024 * 1024 * 1024,
+        &kernel,
+        "earlyprintk=serial,ttyS0 console=ttyS0 random.trust_cpu=on",
+    );
+    let halt = cpu.run(40_000_000_000);
+    assert!(
+        String::from_utf8_lossy(cpu.console()).contains("HOLOSPACES-LINUX-USERSPACE-OK"),
+        "reached userspace"
+    );
+    assert_eq!(halt, Halt::Halted);
+
+    const PAGE: usize = 0x1000;
+    let ram = cpu.ram();
+    let total = ram.len() / PAGE;
+    let zero = [0u8; PAGE];
+    let mut unique: HashSet<[u8; 32]> = HashSet::new();
+    let mut zero_pages = 0usize;
+    for p in ram.chunks_exact(PAGE) {
+        if p == zero {
+            zero_pages += 1;
+        }
+        unique.insert(*blake3::hash(p).as_bytes());
+    }
+    let unique_n = unique.len();
+    let mib = |pages: usize| pages * PAGE / (1024 * 1024);
+    eprintln!(
+        "\n==== κ-SNAPSHOT RAM DEDUP (post-boot, BLAKE3 per 4 KiB page) ====\n\
+         total : {total} pages = {} MiB nominal\n\
+         zero  : {zero_pages} pages ({:.1}%)\n\
+         UNIQUE: {unique_n} pages = {} MiB  →  {:.1}x dedup\n\
+         a resume streams {} MiB (the unique κ pages), not {} MiB\n====\n",
+        mib(total),
+        100.0 * zero_pages as f64 / total as f64,
+        mib(unique_n),
+        total as f64 / unique_n as f64,
+        mib(unique_n),
+        mib(total),
+    );
+    assert!(
+        unique_n < total / 4,
+        "RAM deduplicates by >4x (the κ-snapshot thesis): {unique_n} unique / {total} total"
+    );
+}
