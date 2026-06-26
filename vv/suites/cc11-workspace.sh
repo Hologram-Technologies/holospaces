@@ -39,6 +39,13 @@ cargo test --release --manifest-path "$ROOT/Cargo.toml" -p holospaces \
 cargo test --release --manifest-path "$ROOT/Cargo.toml" -p holospaces \
     --test cc11_raw_terminal -- --ignored --nocapture || exit 1
 
+# A *real-image* devcontainer (REAL_IMAGE_INIT) must stay up + interactive: the
+# init runs the login shell with a controlling terminal in a respawn loop, so the
+# guest does NOT halt after boot (the regression: exec'ing the shell as PID 1 let
+# its exit panic the kernel — the devcontainer halted the instant it was used).
+cargo test --release --manifest-path "$ROOT/Cargo.toml" -p holospaces \
+    --test real_image_init_stays_up -- --ignored --nocapture || exit 1
+
 # The differential oracle, when the reference is available: the same interactive
 # Image, fed input.txt after boot, must produce expected-session.txt on
 # qemu-system-riscv64 (echo disabled so the session is deterministic). Re-derives

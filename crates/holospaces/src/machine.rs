@@ -80,10 +80,19 @@ exec /bin/busybox setsid -c /bin/busybox sh\n";
 /// coreutils + `mount` rather than BusyBox. Unlike [`DEVCONTAINER_INIT`] (which
 /// assumes a static `/bin/busybox`), this uses the image's own tools: it mounts
 /// the pseudo-filesystems and the shared `/workspace` (virtio-9p, CC-15), sets a
-/// sane environment, and execs the image's login shell (`bash` if present, else
+/// sane environment, and runs the image's login shell (`bash` if present, else
 /// `sh`) on the console — so the launched holospace is an interactive, real
 /// devcontainer. `2>/dev/null` keeps a tool the image happens to lack from
 /// aborting the boot.
+///
+/// The shell is run as a session leader with the console as its **controlling
+/// terminal** (`setsid -c`, falling back to a plain shell if `setsid` is absent)
+/// so it is genuinely interactive — without a controlling tty a login shell
+/// reads EOF and exits immediately. It is run in a **respawn loop, not
+/// `exec`ed**: PID 1 must never exit, or the kernel panics ("Attempted to kill
+/// init") and **halts the guest** — the user would boot the devcontainer only to
+/// watch it stop. The loop keeps the devcontainer up and usable: if the shell
+/// exits (e.g. `exit`/Ctrl-D), a fresh one starts.
 pub const REAL_IMAGE_INIT: &[u8] = b"#!/bin/sh\n\
 mkdir -p /proc /sys /dev /tmp /workspace 2>/dev/null\n\
 mount -t proc proc /proc 2>/dev/null\n\
@@ -96,7 +105,7 @@ cd /workspace 2>/dev/null || cd /root 2>/dev/null || cd /\n\
 mkdir -p /workspace/.hs-tasks 2>/dev/null\n\
 ( while true; do for f in /workspace/.hs-tasks/*.cmd; do [ -e $f ] || continue; b=${f%.cmd}; mv $f $b.run 2>/dev/null || continue; ( cd /workspace 2>/dev/null; sh $b.run > $b.out 2>&1; echo $? > $b.exit ); rm -f $b.run; done; sleep 1; done ) &\n\
 echo 'holospace devcontainer ready \xe2\x80\x94 the repository image; /workspace is shared with the editor'\n\
-[ -x /bin/bash ] && exec /bin/bash -l || exec /bin/sh\n";
+while : ; do if [ -x /bin/bash ]; then setsid -c /bin/bash -l 2>/dev/null || /bin/bash -l; else setsid -c /bin/sh 2>/dev/null || /bin/sh; fi; sleep 1; done\n";
 
 /// The machine a holospace boots on: a single RV64GC hart over `ram_bytes` of
 /// RAM mapped at `base`, with the CLINT, the PLIC, and one `virtio-mmio` block
