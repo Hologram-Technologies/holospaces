@@ -56,7 +56,9 @@ const GUEST_LEN: usize = 0x3000; // 3 pages of test guest RAM
 /// — the mechanism that lets the JIT touch real (paged) guest RAM. `$va` scratch = local 16.
 const TLB_BASE: u64 = 0x200;
 const TLB_SIZE: u64 = 64; // power of two; slot = vpage & (TLB_SIZE-1)
-const VA_LOCAL: u8 = NREG as u8; // local index of the vaddr scratch (17th i64 local)
+const VA_LOCAL: u8 = NREG as u8; // i64 local: vaddr scratch (local 16)
+const BAIL_LOCAL: u8 = NREG as u8 + 1; // i32 local: bail instruction index (local 17)
+const TE_LOCAL: u8 = NREG as u8 + 2; // i32 local: TLB entry address scratch (local 18)
 
 /// Effective address `base + idx<<scale + disp` (sentinels skipped) — the meaning shared
 /// by the interpreter and (mirrored in wasm) the codegen.
@@ -168,10 +170,19 @@ fn compile_tlb(block: &[Op]) -> Vec<u8> {
 /// `tlb` selects the address path (direct vs inline software-TLB translation).
 fn compile_mode(block: &[Op], tlb: bool) -> Vec<u8> {
     let mut code = Vec::new();
-    // locals: 17 × i64 (16 guest regs + 1 vaddr scratch for the TLB path)
-    uleb(1, &mut code);
-    uleb(NREG as u64 + 1, &mut code);
-    code.push(0x7e); // i64
+    // locals. Direct: 17 × i64 (16 regs + vaddr scratch). TLB: also 2 × i32
+    // (bail-index + TLB-entry scratch) for the miss/bail control flow.
+    if tlb {
+        uleb(2, &mut code);
+        uleb(NREG as u64 + 1, &mut code);
+        code.push(0x7e); // i64 × 17
+        uleb(2, &mut code);
+        code.push(0x7f); // i32 × 2
+    } else {
+        uleb(1, &mut code);
+        uleb(NREG as u64 + 1, &mut code);
+        code.push(0x7e); // i64 × 17
+    }
     let getl = |r: u8, c: &mut Vec<u8>| {
         c.push(0x20);
         uleb(u64::from(r), c);
@@ -186,9 +197,10 @@ fn compile_mode(block: &[Op], tlb: bool) -> Vec<u8> {
         c.extend([0x29, 0x03, 0x00]); // i64.load align=3 off=0
     };
     // emit the i32 wasm offset for an effective address `base + idx<<scale + disp`.
-    // Direct: + GUEST_BASE, wrap. TLB: translate the vaddr through the software TLB (hit
-    // path) — host = tlb[vpage].host_off + GUEST_BASE + page-offset. Captures `tlb`.
-    let emit_addr = |base: u8, idx: u8, scale: u8, disp: i32, c: &mut Vec<u8>| {
+    // Direct: + GUEST_BASE, wrap. TLB: translate the vaddr through the software TLB; on a
+    // tag miss, set bail-index = `k` and `br $exit` (depth 1 — out of the `if`, to the
+    // body block). Bail happens BEFORE any reg/mem write for op `k`, so state stays clean.
+    let emit_addr = |base: u8, idx: u8, scale: u8, disp: i32, k: usize, c: &mut Vec<u8>| {
         // vaddr = disp + base + idx<<scale  (i64)
         c.push(0x42);
         sleb(i64::from(disp), c); // i64.const disp
@@ -215,7 +227,7 @@ fn compile_mode(block: &[Op], tlb: bool) -> Vec<u8> {
         // vaddr → $va scratch
         c.push(0x21);
         uleb(u64::from(VA_LOCAL), c); // local.set $va
-        // te = TLB_BASE + ((($va >> 12) & (TLB_SIZE-1)) * 16)  → i32
+        // te = TLB_BASE + ((($va >> 12) & (TLB_SIZE-1)) * 16)  → i32, kept in $te
         c.push(0x20);
         uleb(u64::from(VA_LOCAL), c); // local.get $va
         c.push(0x42);
@@ -231,13 +243,33 @@ fn compile_mode(block: &[Op], tlb: bool) -> Vec<u8> {
         sleb(TLB_BASE as i64, c);
         c.push(0x7c); // i64.add  → entry addr
         c.push(0xa7); // i32.wrap_i64
-        // host_off = i64.load offset=8 [te]
-        c.extend([0x29, 0x03, 0x08]); // i64.load align=3 offset=8
-        // + GUEST_BASE
+        c.push(0x21);
+        uleb(u64::from(TE_LOCAL), c); // local.set $te
+        // tag check: if [$te].tag != vpage → bail
+        c.push(0x20);
+        uleb(u64::from(TE_LOCAL), c); // local.get $te
+        c.extend([0x29, 0x03, 0x00]); // i64.load [te]  → tag
+        c.push(0x20);
+        uleb(u64::from(VA_LOCAL), c); // local.get $va
+        c.push(0x42);
+        sleb(12, c);
+        c.push(0x88); // i64.shr_u → vpage
+        c.push(0x52); // i64.ne
+        c.push(0x04);
+        c.push(0x40); // if (void blocktype)
+        c.push(0x41);
+        sleb(k as i64, c); // i32.const k
+        c.push(0x21);
+        uleb(u64::from(BAIL_LOCAL), c); // local.set $bail
+        c.extend([0x0c, 0x01]); // br 1  → $exit (out of if, out of body block)
+        c.push(0x0b); // end if
+        // hit: host = [$te+8].host_off + GUEST_BASE + ($va & 0xfff)
+        c.push(0x20);
+        uleb(u64::from(TE_LOCAL), c); // local.get $te
+        c.extend([0x29, 0x03, 0x08]); // i64.load offset=8 → host_off
         c.push(0x42);
         sleb(GUEST_BASE as i64, c);
         c.push(0x7c); // i64.add
-        // + ($va & 0xfff)  (page offset)
         c.push(0x20);
         uleb(u64::from(VA_LOCAL), c); // local.get $va
         c.push(0x42);
@@ -251,8 +283,17 @@ fn compile_mode(block: &[Op], tlb: bool) -> Vec<u8> {
         load_mem(r, &mut code);
         setl(r as u8, &mut code);
     }
+    if tlb {
+        // bail-index defaults to "completed" (= block length); body wrapped in a block $exit
+        code.push(0x41);
+        sleb(block.len() as i64, &mut code); // i32.const len
+        code.push(0x21);
+        uleb(u64::from(BAIL_LOCAL), &mut code); // local.set $bail
+        code.push(0x02);
+        code.push(0x40); // block (void) $exit
+    }
     // body
-    for op in block {
+    for (k, op) in block.iter().enumerate() {
         match *op {
             Op::Movi { d, imm } => {
                 code.push(0x42);
@@ -286,20 +327,21 @@ fn compile_mode(block: &[Op], tlb: bool) -> Vec<u8> {
                 });
                 setl(d, &mut code);
             }
-            // memory ops: emit_addr leaves the i32 wasm offset on the stack
+            // memory ops: emit_addr leaves the i32 wasm offset on the stack (and on the
+            // TLB path may bail to $exit before this op writes anything)
             Op::Load { d, base, idx, scale, disp } => {
-                emit_addr(base, idx, scale, disp, &mut code);
+                emit_addr(base, idx, scale, disp, k, &mut code);
                 code.extend([0x29, 0x03, 0x00]); // i64.load align=3
                 setl(d, &mut code);
             }
             Op::Store { base, idx, scale, disp, s } => {
-                emit_addr(base, idx, scale, disp, &mut code); // addr
+                emit_addr(base, idx, scale, disp, k, &mut code); // addr
                 getl(s, &mut code); // value
                 code.extend([0x37, 0x03, 0x00]); // i64.store align=3
             }
             Op::LoadOp { op, d, base, idx, scale, disp } => {
                 getl(d, &mut code); // current d on stack
-                emit_addr(base, idx, scale, disp, &mut code);
+                emit_addr(base, idx, scale, disp, k, &mut code);
                 code.extend([0x29, 0x03, 0x00]); // i64.load → mem value
                 code.push(match op {
                     Bin::Add => 0x7c,
@@ -312,18 +354,31 @@ fn compile_mode(block: &[Op], tlb: bool) -> Vec<u8> {
             }
         }
     }
-    // exit: locals → regs
+    if tlb {
+        code.push(0x0b); // end block $exit — bail and fall-through converge here
+    }
+    // exit: locals → regs (store back architectural state; at a bail it is exactly the
+    // state before the faulting op, so the interpreter can re-execute from there)
     for r in 0..NREG {
         code.push(0x41);
         sleb((r * 8) as i64, &mut code); // i32.const addr
         getl(r as u8, &mut code);
         code.extend([0x37, 0x03, 0x00]); // i64.store
     }
-    code.push(0x0b); // end
+    if tlb {
+        code.push(0x20);
+        uleb(u64::from(BAIL_LOCAL), &mut code); // local.get $bail → i32 result
+    }
+    code.push(0x0b); // end function
 
-    // assemble the module
+    // assemble the module; TLB blocks return i32 (the bail index / block length)
     let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
-    section(1, vec![0x01, 0x60, 0x00, 0x00], &mut m); // type () -> ()
+    let functype = if tlb {
+        vec![0x01, 0x60, 0x00, 0x01, 0x7f] // () -> i32
+    } else {
+        vec![0x01, 0x60, 0x00, 0x00] // () -> ()
+    };
+    section(1, functype, &mut m);
     section(3, vec![0x01, 0x00], &mut m); // func 0: type 0
     section(5, vec![0x01, 0x00, 0x04], &mut m); // memory min 4 pages (regs + guest RAM)
     let mut exp = vec![0x02];
@@ -363,20 +418,22 @@ fn run_wasm(bytes: &[u8], regs: [u64; NREG], ram: &mut [u8]) -> [u64; NREG] {
 }
 
 /// As `run_wasm`, plus the software TLB image written at `TLB_BASE` — for inline-TLB blocks
-/// whose memory ops translate guest virtual addresses through it.
-fn run_wasm_tlb(bytes: &[u8], regs: [u64; NREG], ram: &mut [u8], tlb: &[u8]) -> [u64; NREG] {
+/// whose memory ops translate guest virtual addresses through it. Returns `(regs, bail)`
+/// where `bail` is the index of the instruction that took a TLB miss (or `block.len()` if
+/// the block completed) — what the interpreter would resume from.
+fn run_wasm_tlb(bytes: &[u8], regs: [u64; NREG], ram: &mut [u8], tlb: &[u8]) -> ([u64; NREG], i32) {
     let engine = Engine::default();
     let module = Module::new(&engine, bytes).expect("emitted wasm is valid");
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).expect("instantiate");
     let mem = instance.get_memory(&mut store, "mem").unwrap();
-    let run = instance.get_typed_func::<(), ()>(&mut store, "run").unwrap();
+    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
     for (i, v) in regs.iter().enumerate() {
         mem.write(&mut store, i * 8, &v.to_le_bytes()).unwrap();
     }
     mem.write(&mut store, TLB_BASE as usize, tlb).unwrap();
     mem.write(&mut store, GUEST_BASE as usize, ram).unwrap();
-    run.call(&mut store, ()).expect("run");
+    let bail = run.call(&mut store, ()).expect("run");
     let mut out = [0u64; NREG];
     for (i, o) in out.iter_mut().enumerate() {
         let mut b = [0u8; 8];
@@ -384,7 +441,7 @@ fn run_wasm_tlb(bytes: &[u8], regs: [u64; NREG], ram: &mut [u8], tlb: &[u8]) -> 
         *o = u64::from_le_bytes(b);
     }
     mem.read(&store, GUEST_BASE as usize, ram).unwrap();
-    out
+    (out, bail)
 }
 
 // A tiny seeded PRNG (deterministic, no Math.random/Date) for the fuzz corpus.
@@ -761,7 +818,8 @@ fn jit_inline_tlb_translation_is_bit_identical() {
         }
         let (mut regs_i, mut virt_i) = (regs, virt.clone());
         interpret(&block, &mut regs_i, &mut virt_i); // flat vaddr indexing — no translation
-        let regs_w = run_wasm_tlb(&compile_tlb(&block), regs, &mut host, &tlb);
+        let (regs_w, bail) = run_wasm_tlb(&compile_tlb(&block), regs, &mut host, &tlb);
+        assert_eq!(bail as usize, block.len(), "all pages present — block must complete");
         assert_eq!(regs_w, regs_i, "inline-TLB block: regs diverged");
         for p in 0..3 {
             assert_eq!(
@@ -771,4 +829,49 @@ fn jit_inline_tlb_translation_is_bit_identical() {
             );
         }
     }
+}
+
+/// Inline-TLB **miss/bail**: when an access hits a page absent from the TLB, the block must
+/// stop at that instruction, store back clean architectural state (exactly "before op k"),
+/// and return `k` — what the interpreter resumes from (it fills the TLB via the #PF path,
+/// then re-dispatches). Identity mapping (host == virtual) keeps the focus on the bail.
+#[test]
+fn jit_inline_tlb_bail_is_correct() {
+    // page 0 & 2 present in the TLB; page 1 ABSENT (tag mismatch → miss).
+    let mut tlb = vec![0u8; TLB_SIZE as usize * 16];
+    for &p in &[0usize, 2] {
+        tlb[p * 16..p * 16 + 8].copy_from_slice(&(p as u64).to_le_bytes());
+        tlb[p * 16 + 8..p * 16 + 16].copy_from_slice(&((p as u64) * 0x1000).to_le_bytes());
+    }
+    tlb[1 * 16..1 * 16 + 8].copy_from_slice(&0xDEADu64.to_le_bytes()); // wrong tag for slot 1
+
+    let block = [
+        Op::Movi { d: 0, imm: 0x1234 },                                  // op0: reg
+        Op::Store { base: 13, idx: NO_REG, scale: 0, disp: 0x10, s: 0 }, // op1: page 0 (present)
+        Op::Load { d: 1, base: 14, idx: NO_REG, scale: 0, disp: 0x20 },  // op2: page 1 → BAIL
+        Op::Movi { d: 2, imm: 0x9999 },                                  // op3: never runs
+    ];
+    let mut regs = [0u64; NREG];
+    regs[1] = 0x5555; // must survive untouched (op2 bailed before writing it)
+    regs[2] = 0x6666; // must survive untouched (op3 never ran)
+    regs[13] = 0x0000; // page 0 base
+    regs[14] = 0x1000; // page 1 base
+
+    let mut virt = vec![0u8; GUEST_LEN];
+    for b in virt.iter_mut() {
+        *b = 0xAB;
+    }
+    let mut host = virt.clone(); // identity map
+
+    // oracle: only ops 0..2 execute (op2 is the one that bails)
+    let (mut regs_i, mut virt_i) = (regs, virt.clone());
+    interpret(&block[..2], &mut regs_i, &mut virt_i);
+
+    let (regs_w, bail) = run_wasm_tlb(&compile_tlb(&block), regs, &mut host, &tlb);
+    assert_eq!(bail, 2, "must bail at op2 (first access to the absent page)");
+    assert_eq!(regs_w, regs_i, "bailed block: regs must equal the oracle run of ops 0..2");
+    assert_eq!(host, virt_i, "bailed block: guest RAM must equal the oracle run of ops 0..2");
+    assert_eq!(regs_w[1], 0x5555, "the bailing load must not have written its dst");
+    assert_eq!(regs_w[2], 0x6666, "the instruction after the bail must not have run");
+    assert_eq!(u64::from_le_bytes(host[0x10..0x18].try_into().unwrap()), 0x1234, "op1 store landed");
 }
