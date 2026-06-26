@@ -1,0 +1,44 @@
+{
+  "name": "holospace-scm",
+  "displayName": "holospace Source Control",
+  "description": "Source Control (Git) for a holospace — a real Git engine on the browser peer over the holospace's own virtio-9p workspace (CC-51).",
+  "publisher": "holospace",
+  "version": "0.0.1",
+  "engines": { "vscode": "^1.80.0" },
+  "browser": "./extension.js",
+  "extensionKind": ["web"],
+  "activationEvents": ["onStartupFinished"],
+  "contributes": {
+    "commands": [
+      { "command": "holospaceGit.refresh", "title": "Refresh", "category": "holospace Git", "icon": "$(refresh)" },
+      { "command": "holospaceGit.commit", "title": "Commit", "category": "holospace Git", "icon": "$(check)" },
+      { "command": "holospaceGit.stage", "title": "Stage Changes", "category": "holospace Git", "icon": "$(add)" },
+      { "command": "holospaceGit.unstage", "title": "Unstage Changes", "category": "holospace Git", "icon": "$(remove)" },
+      { "command": "holospaceGit.stageAll", "title": "Stage All Changes", "category": "holospace Git", "icon": "$(add)" },
+      { "command": "holospaceGit.unstageAll", "title": "Unstage All Changes", "category": "holospace Git", "icon": "$(remove)" },
+      { "command": "holospaceGit.openChange", "title": "Open Changes", "category": "holospace Git", "icon": "$(git-compare)" },
+      { "command": "holospaceGit.push", "title": "Push", "category": "holospace Git", "icon": "$(cloud-upload)" },
+      { "command": "holospaceGit.pull", "title": "Pull", "category": "holospace Git", "icon": "$(cloud-download)" },
+      { "command": "holospaceGit.init", "title": "Initialize Repository", "category": "holospace Git" },
+      { "command": "holospaceGit.checkout", "title": "Checkout to…", "category": "holospace Git" },
+      { "command": "holospaceGit.createBranch", "title": "Create Branch…", "category": "holospace Git" },
+      { "command": "holospaceGit.addRemote", "title": "Add Remote…", "category": "holospace Git" }
+    ],
+    "menus": {
+      "scm/title": [
+        { "command": "holospaceGit.commit", "group": "navigation", "when": "scmProvider == holospace-git" },
+        { "command": "holospaceGit.refresh", "group": "navigation", "when": "scmProvider == holospace-git" },
+        { "command": "holospaceGit.pull", "group": "1_sync", "when": "scmProvider == holospace-git" },
+        { "command": "holospaceGit.push", "group": "1_sync", "when": "scmProvider == holospace-git" }
+      ],
+      "scm/resourceGroup/context": [
+        { "command": "holospaceGit.stageAll", "when": "scmProvider == holospace-git && scmResourceGroup == working", "group": "inline" },
+        { "command": "holospaceGit.unstageAll", "when": "scmProvider == holospace-git && scmResourceGroup == index", "group": "inline" }
+      ],
+      "scm/resourceState/context": [
+        { "command": "holospaceGit.stage", "when": "scmProvider == holospace-git && scmResourceGroup == working", "group": "inline" },
+        { "command": "holospaceGit.unstage", "when": "scmProvider == holospace-git && scmResourceGroup == index", "group": "inline" }
+      ]
+    }
+  }
+}

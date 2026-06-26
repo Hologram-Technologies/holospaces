@@ -1,0 +1,26 @@
+isomorphic-git — the Git engine the holospace-scm Source Control provider runs as
+native exec on the browser peer (CC-51). A faithful, spec-conformant pure-JS Git
+implementation; its commit/tree/blob objects ARE canonical Git objects (the
+on-disk object format is the external authority a commit re-derives against,
+Law L5), readable by stock `git`.
+
+Imported external artifact, κ-pinned (Law L5 at the import boundary): the
+extension re-derives each bundle to its sha256 before it runs.
+
+  version:  isomorphic-git@1.27.1  (npm; https://github.com/isomorphic-git/isomorphic-git)
+  license:  MIT
+
+Files (the standalone UMD bundles — the only self-contained distributables; the
+ESM `module` build has bare imports and is not standalone):
+
+  index.umd.min.js   the Git engine    (npm: isomorphic-git/index.umd.min.js)
+  http-web.umd.js    the web smart-http client for push/pull
+                     (npm: isomorphic-git/http/web/index.umd.js)
+
+Reproduce:
+  npm pack isomorphic-git@1.27.1   # or: npm install isomorphic-git@1.27.1
+  cp node_modules/isomorphic-git/index.umd.min.js        index.umd.min.js
+  cp node_modules/isomorphic-git/http/web/index.umd.js   http-web.umd.js
+  sha256sum index.umd.min.js http-web.umd.js  # must match SHA256SUMS
+
+Pins are also embedded in extension.js (GIT_PINS) and verified at load.
