@@ -4906,4 +4906,60 @@ mod tests {
         ];
         assert_eq!(run(&code).reg(3), 0x1234);
     }
+
+    /// Step-C de-risk: real guest bytes from a `Cpu`'s RAM, decoded by the library JIT
+    /// (`emulator::jit`), compiled to wasm, and executed over the same register state, must
+    /// match what the interpreter `step()` produces — proving the decode→compile→execute
+    /// dispatch plumbing on register dataflow before the boot-gated integration. (rflags is
+    /// the next slab: the IR does not yet model x86 flags, so this compares registers; a
+    /// flag-reading block would need flag modeling first. Memory/TLB dispatch is also later.)
+    #[test]
+    fn jit_block_matches_step_on_register_dataflow() {
+        use crate::emulator::jit;
+        use wasmtime::{Engine, Instance, Module, Store};
+
+        // rbx = rax ; rbx += rcx ; rbx ^= rdx ; hlt — reg-reg ops the JIT models.
+        let code = [
+            0x48, 0x89, 0xc3, // mov rbx, rax
+            0x48, 0x01, 0xcb, // add rbx, rcx
+            0x48, 0x31, 0xd3, // xor rbx, rdx
+            0xf4, // hlt
+        ];
+        let mut init = [0u64; 16];
+        init[0] = 0x0102_0304_0506_0708; // rax
+        init[1] = 0x1111_1111_1111_1111; // rcx
+        init[2] = 0xffff_0000_ffff_0000; // rdx
+        init[3] = 0xDEAD; // rbx (overwritten by the block)
+
+        // oracle: the real interpreter steps the block to the hlt.
+        let mut cpu = Cpu::new(64 * 1024);
+        cpu.load_at(0, &code);
+        cpu.r = init;
+        cpu.run(100);
+        let want = cpu.r;
+
+        // JIT: decode the same guest bytes → compile → execute over the same registers.
+        let ir = jit::decode_x86(&code);
+        assert_eq!(ir.len(), 3, "the three reg-reg ops decode (hlt bails)");
+        let wasm = jit::compile(&ir);
+        let engine = Engine::default();
+        let module = Module::new(&engine, &wasm).unwrap();
+        let mut store = Store::new(&engine, ());
+        let inst = Instance::new(&mut store, &module, &[]).unwrap();
+        let mem = inst.get_memory(&mut store, "mem").unwrap();
+        let run = inst.get_typed_func::<(), ()>(&mut store, "run").unwrap();
+        for (i, v) in init.iter().enumerate() {
+            mem.write(&mut store, i * 8, &v.to_le_bytes()).unwrap();
+        }
+        run.call(&mut store, ()).unwrap();
+        let mut got = [0u64; 16];
+        for (i, g) in got.iter_mut().enumerate() {
+            let mut b = [0u8; 8];
+            mem.read(&store, i * 8, &mut b).unwrap();
+            *g = u64::from_le_bytes(b);
+        }
+
+        assert_eq!(got, want, "JIT block diverged from step() on register dataflow");
+        assert_eq!(got[3], (init[0].wrapping_add(init[1])) ^ init[2], "rbx = (rax+rcx)^rdx");
+    }
 }
