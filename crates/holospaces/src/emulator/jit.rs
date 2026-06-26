@@ -1,19 +1,26 @@
-//! JIT decode → IR → codegen, differentially proven bit-identical (the block-JIT front-end).
+//! The block JIT's decode → IR → codegen front-end (M2 Rung 3).
 //!
-//! A typed micro-op IR over a 16×u64 register file + guest RAM, an interpreter oracle, an
-//! x86-64 decoder (reg-reg ALU/mov + memory forms with full SIB addressing), a register-
-//! allocated IR→wasm-bytecode codegen run via `wasmtime`, and an inline software-TLB
-//! address-translation path. Seeded-random differentials (interpret vs codegen→wasmtime)
-//! prove every layer bit-exact — the discipline the real block JIT lives by. This covers
-//! every instruction shape `sha512_transform` uses. Remaining for the live boot is
-//! integration: the TLB *miss/bail* path, `run()` dispatch, and the BLAKE3 block cache.
+//! A typed micro-op IR over the x86-64 integer register file + guest RAM, an x86-64 decoder
+//! (reg-reg ALU/mov + memory forms with full SIB addressing), a register-allocated
+//! IR→WebAssembly-bytecode codegen, and an inline software-TLB address-translation path with
+//! a miss/bail back to the interpreter. `compile`/`compile_tlb` emit a bare wasm function the
+//! caller runs (native: `wasmtime`; browser: `js_sys::WebAssembly`) — so this module stays
+//! `no_std` + `alloc` (pure byte codegen, no runtime dependency). Every layer is proven
+//! bit-identical to a Rust interpreter oracle by the seeded-random differentials in the test
+//! module below; it covers every instruction shape `sha512_transform` uses. `run()` dispatch
+//! and the BLAKE3 block cache (Step C) are wired in `x64.rs`.
+#![allow(dead_code)] // the JIT API is exercised by the test module; run() dispatch lands in Step C
 
+use alloc::vec;
+use alloc::vec::Vec;
+
+#[cfg(test)]
 use wasmtime::{Engine, Instance, Module, Store};
 
 const NREG: usize = 16;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Bin {
+pub(crate) enum Bin {
     Add,
     Sub,
     Xor,
@@ -21,13 +28,13 @@ enum Bin {
     Or,
 }
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Sh {
+pub(crate) enum Sh {
     ShrU,
     Shl,
     Rotr,
 }
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Op {
+pub(crate) enum Op {
     Movi { d: u8, imm: u64 },
     Movr { d: u8, s: u8 },
     Bin { op: Bin, d: u8, a: u8, b: u8 },
@@ -48,6 +55,7 @@ const NO_REG: u8 = 0xff;
 /// Guest RAM lives in the same wasm memory as the register file, after a page of
 /// headroom: regs at `r*8`, guest byte `A` at wasm offset `GUEST_BASE + A`.
 const GUEST_BASE: u64 = 0x1000;
+#[cfg(test)]
 const GUEST_LEN: usize = 0x3000; // 3 pages of test guest RAM
 
 /// Software TLB region in wasm memory (between the regs and guest RAM): a direct-mapped
@@ -61,7 +69,8 @@ const BAIL_LOCAL: u8 = NREG as u8 + 1; // i32 local: bail instruction index (loc
 const TE_LOCAL: u8 = NREG as u8 + 2; // i32 local: TLB entry address scratch (local 18)
 
 /// Effective address `base + idx<<scale + disp` (sentinels skipped) — the meaning shared
-/// by the interpreter and (mirrored in wasm) the codegen.
+/// by the interpreter oracle and (mirrored in wasm) the codegen.
+#[cfg(test)]
 fn eff_addr(r: &[u64; NREG], base: u8, idx: u8, scale: u8, disp: i32) -> usize {
     let mut a = disp as i64 as u64;
     if base != NO_REG {
@@ -74,6 +83,7 @@ fn eff_addr(r: &[u64; NREG], base: u8, idx: u8, scale: u8, disp: i32) -> usize {
 }
 
 /// The reference oracle — the meaning of the IR, in plain Rust.
+#[cfg(test)]
 fn interpret(block: &[Op], r: &mut [u64; NREG], ram: &mut [u8]) {
     for op in block {
         match *op {
@@ -155,13 +165,13 @@ fn section(id: u8, body: Vec<u8>, out: &mut Vec<u8>) {
 
 /// Direct-mapped codegen: guest address maps straight to `GUEST_BASE + addr` (no paging) —
 /// the model the unit differentials use.
-fn compile(block: &[Op]) -> Vec<u8> {
+pub(crate) fn compile(block: &[Op]) -> Vec<u8> {
     compile_mode(block, false)
 }
 
 /// Inline-TLB codegen: a guest *virtual* address is translated through the software TLB
 /// (hit path) before the load/store — the real paged-memory model the boot needs.
-fn compile_tlb(block: &[Op]) -> Vec<u8> {
+pub(crate) fn compile_tlb(block: &[Op]) -> Vec<u8> {
     compile_mode(block, true)
 }
 
@@ -395,6 +405,7 @@ fn compile_mode(block: &[Op], tlb: bool) -> Vec<u8> {
 
 /// Run a compiled block via wasmtime over a register file (mem `0..128`) and guest RAM
 /// (mem `GUEST_BASE..`). `ram` is updated in place by any stores; returns the result regs.
+#[cfg(test)]
 fn run_wasm(bytes: &[u8], regs: [u64; NREG], ram: &mut [u8]) -> [u64; NREG] {
     let engine = Engine::default();
     let module = Module::new(&engine, bytes).expect("emitted wasm is valid");
@@ -421,6 +432,7 @@ fn run_wasm(bytes: &[u8], regs: [u64; NREG], ram: &mut [u8]) -> [u64; NREG] {
 /// whose memory ops translate guest virtual addresses through it. Returns `(regs, bail)`
 /// where `bail` is the index of the instruction that took a TLB miss (or `block.len()` if
 /// the block completed) — what the interpreter would resume from.
+#[cfg(test)]
 fn run_wasm_tlb(bytes: &[u8], regs: [u64; NREG], ram: &mut [u8], tlb: &[u8]) -> ([u64; NREG], i32) {
     let engine = Engine::default();
     let module = Module::new(&engine, bytes).expect("emitted wasm is valid");
@@ -445,7 +457,9 @@ fn run_wasm_tlb(bytes: &[u8], regs: [u64; NREG], ram: &mut [u8], tlb: &[u8]) -> 
 }
 
 // A tiny seeded PRNG (deterministic, no Math.random/Date) for the fuzz corpus.
+#[cfg(test)]
 struct Rng(u64);
+#[cfg(test)]
 impl Rng {
     fn next(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
@@ -568,7 +582,7 @@ fn decode_mem(bytes: &[u8], p0: usize, rex: u8, mod_: u8, modrm: u8) -> Option<(
 /// memory-operand forms (`mov reg,[mem]`, `mov [mem],reg`, `add/or/and/sub/xor reg,[mem]`)
 /// with full base+index*scale+disp addressing. **Bails** (stops) on anything else — the
 /// JIT's "interpret what I don't model" discipline.
-fn decode_x86(bytes: &[u8]) -> Vec<Op> {
+pub(crate) fn decode_x86(bytes: &[u8]) -> Vec<Op> {
     let mut out = Vec::new();
     let mut p = 0;
     while p < bytes.len() {

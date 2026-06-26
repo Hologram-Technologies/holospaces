@@ -54,6 +54,13 @@ pub mod aarch64;
 /// `virtio`/κ-disk device substrate. Conformance: `CC-43`.
 pub mod x64;
 
+/// The **block JIT** (M2 Rung 3): a content-addressed x86-64 → WebAssembly translator that
+/// compiles the hot guest blocks the `x64` interpreter would otherwise step one instruction
+/// at a time. Pure `no_std` decode → IR → codegen + an inline software-TLB; every block is
+/// proven bit-identical to the interpreter before it is trusted. Wired into [`x64`]'s run
+/// loop (Step C). Conformance: `CC-43` (shares the x86-64 differential oracle).
+pub mod jit;
+
 /// The shared virtio-mmio device bus: the substrate-backed `virtio` devices and
 /// their split-virtqueue servicing, used by **both** the RISC-V and AArch64
 /// machines (one κ-disk/9p/NAT implementation, two thin MMIO transports).
