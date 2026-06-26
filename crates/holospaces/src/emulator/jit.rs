@@ -192,6 +192,14 @@ pub(crate) fn compile_flags(block: &[Op]) -> Vec<u8> {
     compile_mode(block, false, true)
 }
 
+/// The codegen the live `run()` dispatch uses: inline-TLB address translation (with
+/// miss/bail) AND `rflags` maintenance, composed. Returns an `i32` (bail index / block
+/// length). Note: `Shift`/`Rotr` flags are not yet modelled — a block whose shift flags are
+/// live must bail (the boot's differential-vs-`step()` enforces this).
+pub(crate) fn compile_tlb_flags(block: &[Op]) -> Vec<u8> {
+    compile_mode(block, true, true)
+}
+
 /// Register-allocated codegen: load all 16 regs from memory into i64 locals at entry,
 /// compute on locals, store back at exit (per-op traffic is `local.get/set`, not memory).
 /// `tlb` selects the address path (direct vs inline software-TLB translation); `flags`
@@ -500,17 +508,35 @@ fn compile_mode(block: &[Op], tlb: bool, flags: bool) -> Vec<u8> {
                 code.extend([0x37, 0x03, 0x00]); // i64.store align=3
             }
             Op::LoadOp { op, d, base, idx, scale, disp } => {
-                getl(d, &mut code); // current d on stack
-                emit_addr(base, idx, scale, disp, k, &mut code);
-                code.extend([0x29, 0x03, 0x00]); // i64.load → mem value
-                code.push(match op {
+                let opcode = match op {
                     Bin::Add => 0x7c,
                     Bin::Sub => 0x7d,
                     Bin::Xor => 0x85,
                     Bin::And => 0x83,
                     Bin::Or => 0x84,
-                });
-                setl(d, &mut code);
+                };
+                if flags {
+                    // FA = d_old, FB = [mem] (emit_addr may bail before either is written),
+                    // FR = result; then d = result and fold the flags.
+                    getl(d, &mut code);
+                    setl(FA_LOCAL, &mut code);
+                    emit_addr(base, idx, scale, disp, k, &mut code);
+                    code.extend([0x29, 0x03, 0x00]); // i64.load
+                    setl(FB_LOCAL, &mut code);
+                    getl(FA_LOCAL, &mut code);
+                    getl(FB_LOCAL, &mut code);
+                    code.push(opcode);
+                    setl(FR_LOCAL, &mut code);
+                    getl(FR_LOCAL, &mut code);
+                    setl(d, &mut code);
+                    emit_flags(op, &mut code);
+                } else {
+                    getl(d, &mut code); // current d on stack
+                    emit_addr(base, idx, scale, disp, k, &mut code);
+                    code.extend([0x29, 0x03, 0x00]); // i64.load → mem value
+                    code.push(opcode);
+                    setl(d, &mut code);
+                }
             }
         }
     }
@@ -1169,5 +1195,153 @@ fn jit_flags_match_the_x86_oracle() {
         let (regs_w, rf_w) = run_wasm_flags(&compile_flags(&block), regs, rflags0);
         assert_eq!(regs_w, regs_i, "flags-mode block: regs diverged");
         assert_eq!(rf_w, rf_i, "flags-mode block: rflags diverged");
+    }
+}
+
+/// Apply a binary ALU op (shared by the flags oracles).
+#[cfg(test)]
+fn bin_apply(op: Bin, a: u64, b: u64) -> u64 {
+    match op {
+        Bin::Add => a.wrapping_add(b),
+        Bin::Sub => a.wrapping_sub(b),
+        Bin::Xor => a ^ b,
+        Bin::And => a & b,
+        Bin::Or => a | b,
+    }
+}
+
+/// Combined oracle: registers, guest RAM, AND rflags (Movi/Movr/Bin/Load/Store/LoadOp —
+/// the `compile_tlb_flags` set, excluding Shift whose flags are not yet modelled).
+#[cfg(test)]
+fn interpret_full(block: &[Op], r: &mut [u64; NREG], ram: &mut [u8], rflags: &mut u64) {
+    for op in block {
+        match *op {
+            Op::Movi { d, imm } => r[d as usize] = imm,
+            Op::Movr { d, s } => r[d as usize] = r[s as usize],
+            Op::Load { d, base, idx, scale, disp } => {
+                let a = eff_addr(r, base, idx, scale, disp);
+                r[d as usize] = u64::from_le_bytes(ram[a..a + 8].try_into().unwrap());
+            }
+            Op::Store { base, idx, scale, disp, s } => {
+                let a = eff_addr(r, base, idx, scale, disp);
+                ram[a..a + 8].copy_from_slice(&r[s as usize].to_le_bytes());
+            }
+            Op::Bin { op, d, a, b } => {
+                let (av, bv) = (r[a as usize], r[b as usize]);
+                let res = bin_apply(op, av, bv);
+                r[d as usize] = res;
+                *rflags = x86_alu_flags(op, av, bv, res, *rflags);
+            }
+            Op::LoadOp { op, d, base, idx, scale, disp } => {
+                let a = eff_addr(r, base, idx, scale, disp);
+                let m = u64::from_le_bytes(ram[a..a + 8].try_into().unwrap());
+                let dv = r[d as usize];
+                let res = bin_apply(op, dv, m);
+                r[d as usize] = res;
+                *rflags = x86_alu_flags(op, dv, m, res, *rflags);
+            }
+            Op::Shift { .. } => unreachable!("the tlb+flags differential excludes Shift"),
+        }
+    }
+}
+
+/// Run a `compile_tlb_flags` block: regs `0..128`, rflags at `RFLAGS_MEM`, TLB at
+/// `TLB_BASE`, guest RAM at `GUEST_BASE`. Returns `(regs, rflags, bail)`.
+#[cfg(test)]
+fn run_wasm_tlb_flags(
+    bytes: &[u8],
+    regs: [u64; NREG],
+    ram: &mut [u8],
+    tlb: &[u8],
+    rflags_in: u64,
+) -> ([u64; NREG], u64, i32) {
+    let engine = Engine::default();
+    let module = Module::new(&engine, bytes).expect("emitted wasm is valid");
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).expect("instantiate");
+    let mem = instance.get_memory(&mut store, "mem").unwrap();
+    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    for (i, v) in regs.iter().enumerate() {
+        mem.write(&mut store, i * 8, &v.to_le_bytes()).unwrap();
+    }
+    mem.write(&mut store, RFLAGS_MEM as usize, &rflags_in.to_le_bytes()).unwrap();
+    mem.write(&mut store, TLB_BASE as usize, tlb).unwrap();
+    mem.write(&mut store, GUEST_BASE as usize, ram).unwrap();
+    let bail = run.call(&mut store, ()).expect("run");
+    let mut out = [0u64; NREG];
+    for (i, o) in out.iter_mut().enumerate() {
+        let mut b = [0u8; 8];
+        mem.read(&store, i * 8, &mut b).unwrap();
+        *o = u64::from_le_bytes(b);
+    }
+    let mut fb = [0u8; 8];
+    mem.read(&store, RFLAGS_MEM as usize, &mut fb).unwrap();
+    mem.read(&store, GUEST_BASE as usize, ram).unwrap();
+    (out, u64::from_le_bytes(fb), bail)
+}
+
+/// The codegen mode the live `run()` dispatch uses, end-to-end: inline-TLB translation
+/// (page-permuted, so the TLB is genuinely consulted) composed with rflags maintenance and
+/// memory ops. Oracle vs `compile_tlb_flags`→wasmtime = bit-identical on regs, rflags, AND
+/// every guest page. Proves the two paths compose correctly.
+#[cfg(test)]
+#[test]
+fn jit_tlb_flags_compose() {
+    let mut rng = Rng(0x1234_5678_9abc_def0);
+    const PERM: [usize; 3] = [2, 0, 1];
+    const BASES: [u8; 3] = [13, 14, 15];
+    for _ in 0..200 {
+        let n = 1 + rng.next() % 20;
+        let mut block = Vec::new();
+        for _ in 0..n {
+            let d = (rng.next() % 13) as u8;
+            let base = BASES[(rng.next() % 3) as usize];
+            let disp = ((rng.next() % 0x200) * 8) as i32; // 8-aligned, within a page
+            block.push(match rng.next() % 7 {
+                0 => Op::Movi { d, imm: rng.next() },
+                1 => Op::Bin { op: Bin::Add, d, a: rng.reg(), b: rng.reg() },
+                2 => Op::Bin { op: Bin::Sub, d, a: rng.reg(), b: rng.reg() },
+                3 => Op::Bin { op: Bin::Xor, d, a: rng.reg(), b: rng.reg() },
+                4 => Op::Load { d, base, idx: NO_REG, scale: 0, disp },
+                5 => Op::Store { base, idx: NO_REG, scale: 0, disp, s: rng.reg() },
+                _ => Op::LoadOp { op: Bin::Add, d, base, idx: NO_REG, scale: 0, disp },
+            });
+        }
+        let mut regs = [0u64; NREG];
+        for r in regs[..13].iter_mut() {
+            *r = rng.next();
+        }
+        regs[13] = 0x0000;
+        regs[14] = 0x1000;
+        regs[15] = 0x2000;
+        let mut virt = vec![0u8; GUEST_LEN];
+        for b in virt.iter_mut() {
+            *b = (rng.next() & 0xff) as u8;
+        }
+        let mut host = vec![0u8; GUEST_LEN];
+        for p in 0..3 {
+            host[PERM[p] * 0x1000..PERM[p] * 0x1000 + 0x1000]
+                .copy_from_slice(&virt[p * 0x1000..p * 0x1000 + 0x1000]);
+        }
+        let mut tlb = vec![0u8; TLB_SIZE as usize * 16];
+        for p in 0..3 {
+            tlb[p * 16..p * 16 + 8].copy_from_slice(&(p as u64).to_le_bytes());
+            tlb[p * 16 + 8..p * 16 + 16].copy_from_slice(&((PERM[p] as u64) * 0x1000).to_le_bytes());
+        }
+        let rflags0 = (rng.next() & 0xffff) | 0x2;
+        let (mut regs_i, mut virt_i, mut rf_i) = (regs, virt.clone(), rflags0);
+        interpret_full(&block, &mut regs_i, &mut virt_i, &mut rf_i);
+        let (regs_w, rf_w, bail) =
+            run_wasm_tlb_flags(&compile_tlb_flags(&block), regs, &mut host, &tlb, rflags0);
+        assert_eq!(bail as usize, block.len(), "all pages present — block completes");
+        assert_eq!(regs_w, regs_i, "tlb+flags: regs diverged");
+        assert_eq!(rf_w, rf_i, "tlb+flags: rflags diverged");
+        for p in 0..3 {
+            assert_eq!(
+                &host[PERM[p] * 0x1000..PERM[p] * 0x1000 + 0x1000],
+                &virt_i[p * 0x1000..p * 0x1000 + 0x1000],
+                "tlb+flags: guest page {p} diverged"
+            );
+        }
     }
 }
