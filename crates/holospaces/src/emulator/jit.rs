@@ -1288,6 +1288,14 @@ fn run_wasm_tlb_flags(
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).expect("instantiate");
     let mem = instance.get_memory(&mut store, "mem").unwrap();
+    // Grow the module's linear memory so the guest-RAM region [GUEST_BASE, +ram.len()) fits —
+    // the codegen declares only 4 pages, but real guest RAM / high physical addresses need
+    // more. This is the executor capability `run()` relies on for arbitrary RAM sizes.
+    let need_pages = (GUEST_BASE as usize + ram.len()).div_ceil(0x10000);
+    let have_pages = mem.size(&store) as usize;
+    if need_pages > have_pages {
+        mem.grow(&mut store, (need_pages - have_pages) as u64).expect("grow guest RAM region");
+    }
     let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
     for (i, v) in regs.iter().enumerate() {
         mem.write(&mut store, i * 8, &v.to_le_bytes()).unwrap();
@@ -1405,4 +1413,41 @@ fn block_cache_is_kappa_keyed_with_smc_invalidation() {
     assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]), "cached a real wasm module");
     // a different κ (self-modified bytes) is a miss — free SMC invalidation
     assert!(cache.get(&[0x22u8; 32]).is_none(), "changed bytes → changed κ → miss → recompile");
+}
+
+/// Executor capability: run a compiled block over guest RAM LARGER than the codegen's
+/// default 4-page (256 KiB) module memory, with an access at a high physical address — the
+/// executor must grow the wasm memory to fit. Identity TLB so host == virtual; oracle
+/// `interpret_full` vs `run_wasm_tlb_flags` (which grows) agree on regs, rflags, and RAM.
+#[cfg(test)]
+#[test]
+fn jit_executor_grows_memory_for_large_guest_ram() {
+    const RAM_LEN: usize = 0x5_0000; // 320 KiB — exceeds the default 256 KiB module memory
+    const HI: u64 = 0x4_8000; // a high, page-aligned physical address (beyond 4 wasm pages)
+
+    let block = [
+        Op::Movi { d: 0, imm: 0xDEAD_BEEF_CAFE_BABE },
+        Op::Store { base: 13, idx: NO_REG, scale: 0, disp: 0, s: 0 }, // [r13] = rax
+        Op::Load { d: 1, base: 13, idx: NO_REG, scale: 0, disp: 0 },  // rcx = [r13]
+    ];
+    let mut regs = [0u64; NREG];
+    regs[13] = HI;
+
+    // identity TLB entry for the touched page: vpage = HI>>12, host_off = HI
+    let vpage = HI >> 12;
+    let mut tlb = vec![0u8; TLB_SIZE as usize * 16];
+    let slot = (vpage & (TLB_SIZE - 1)) as usize;
+    tlb[slot * 16..slot * 16 + 8].copy_from_slice(&vpage.to_le_bytes());
+    tlb[slot * 16 + 8..slot * 16 + 16].copy_from_slice(&HI.to_le_bytes());
+
+    let mut virt = vec![0u8; RAM_LEN];
+    let (mut regs_i, mut virt_i, mut rf_i) = (regs, virt.clone(), 0x2u64);
+    interpret_full(&block, &mut regs_i, &mut virt_i, &mut rf_i);
+
+    let (regs_w, rf_w, bail) = run_wasm_tlb_flags(&compile_tlb_flags(&block), regs, &mut virt, &tlb, 0x2);
+    assert_eq!(bail as usize, block.len(), "block completes (page present in the TLB)");
+    assert_eq!(regs_w, regs_i, "large-RAM block: regs diverged");
+    assert_eq!(rf_w, rf_i, "large-RAM block: rflags diverged");
+    assert_eq!(virt, virt_i, "large-RAM block: guest RAM diverged");
+    assert_eq!(regs_w[1], 0xDEAD_BEEF_CAFE_BABE, "rcx round-tripped through high guest RAM");
 }
