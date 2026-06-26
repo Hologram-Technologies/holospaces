@@ -11,6 +11,7 @@
 //! and the BLAKE3 block cache (Step C) are wired in `x64.rs`.
 #![allow(dead_code)] // the JIT API is exercised by the test module; run() dispatch lands in Step C
 
+use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -746,13 +747,59 @@ fn decode_mem(bytes: &[u8], p0: usize, rex: u8, mod_: u8, modrm: u8) -> Option<(
     Some(((base, idx, scale, disp), p))
 }
 
-/// x86-64 decoder for the SHA-512 compression subset: reg-reg ALU/mov (ModRM mod=3) AND
-/// memory-operand forms (`mov reg,[mem]`, `mov [mem],reg`, `add/or/and/sub/xor reg,[mem]`)
-/// with full base+index*scale+disp addressing. **Bails** (stops) on anything else — the
-/// JIT's "interpret what I don't model" discipline.
+/// Decode the IR for the bytes (no length). See [`decode_block`].
 pub(crate) fn decode_x86(bytes: &[u8]) -> Vec<Op> {
+    decode_block(bytes).0
+}
+
+/// κ-keyed compiled-block cache (Rung 2). Keyed by the **BLAKE3** digest of a block's guest
+/// bytes (κ) — a self-modifying write changes the bytes → changes κ → misses → recompiles
+/// under the new key (free SMC invalidation). The cache is hash-agnostic: `run()` supplies
+/// the digest (via the substrate's `kr_blake3`); the cache only counts hotness and stores
+/// the compiled wasm once a block crosses the threshold.
+pub(crate) struct BlockCache {
+    entries: BTreeMap<[u8; 32], CacheEntry>,
+    threshold: u32,
+}
+
+struct CacheEntry {
+    hits: u32,
+    wasm: Option<Vec<u8>>, // Some once compiled at the hotness threshold
+}
+
+impl BlockCache {
+    pub(crate) fn new(threshold: u32) -> Self {
+        Self { entries: BTreeMap::new(), threshold }
+    }
+
+    /// The compiled wasm for this block's κ if it is already compiled, else `None`.
+    pub(crate) fn get(&self, key: &[u8; 32]) -> Option<&[u8]> {
+        self.entries.get(key).and_then(|e| e.wasm.as_deref())
+    }
+
+    /// Record one execution of the block at κ `key`; once hotness reaches the threshold,
+    /// compile it (`compile_tlb_flags`) and cache the wasm. Returns the compiled wasm when
+    /// available (so the caller can execute it this turn).
+    pub(crate) fn record(&mut self, key: [u8; 32], ops: &[Op]) -> Option<&[u8]> {
+        let e = self.entries.entry(key).or_insert(CacheEntry { hits: 0, wasm: None });
+        e.hits = e.hits.saturating_add(1);
+        if e.wasm.is_none() && e.hits >= self.threshold {
+            e.wasm = Some(compile_tlb_flags(ops));
+        }
+        e.wasm.as_deref()
+    }
+}
+
+/// x86-64 block discovery for the SHA-512 compression subset: reg-reg ALU/mov (ModRM mod=3)
+/// AND memory-operand forms (`mov reg,[mem]`, `mov [mem],reg`, `add/or/and/sub/xor reg,[mem]`)
+/// with full base+index*scale+disp addressing. Returns the decoded ops AND the exact number
+/// of guest bytes they cover (the block length — for the κ key and to advance `rip`).
+/// **Bails** (stops) at anything else — the JIT's "interpret what I don't model" discipline;
+/// the unmodelled instruction's bytes are NOT counted, so the interpreter resumes there.
+pub(crate) fn decode_block(bytes: &[u8]) -> (Vec<Op>, usize) {
     let mut out = Vec::new();
     let mut p = 0;
+    let mut consumed = 0;
     while p < bytes.len() {
         let mut rex = 0u8;
         if bytes[p] & 0xf0 == 0x40 {
@@ -788,6 +835,7 @@ pub(crate) fn decode_x86(bytes: &[u8]) -> Vec<Op> {
             };
             out.push(op);
             p += 2;
+            consumed = p;
         } else {
             let ((base, idx, scale, disp), np) = match decode_mem(bytes, p + 1, rex, mod_, modrm) {
                 Some(x) => x,
@@ -806,9 +854,10 @@ pub(crate) fn decode_x86(bytes: &[u8]) -> Vec<Op> {
             };
             out.push(op);
             p = np;
+            consumed = p;
         }
     }
-    out
+    (out, consumed)
 }
 
 #[test]
@@ -1323,4 +1372,37 @@ fn jit_tlb_flags_compose() {
             );
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn decode_block_reports_length_and_bails_at_a_branch() {
+    // two reg-reg ALU ops then a jmp rel8 (unmodelled) — the block covers only the 6 bytes;
+    // the branch is left for the interpreter to resume at.
+    let bytes = [
+        0x48, 0x01, 0xd8, // add rax, rbx
+        0x48, 0x31, 0xc8, // xor rax, rcx
+        0xeb, 0xf0, // jmp -16 (control transfer → bail)
+    ];
+    let (ops, consumed) = decode_block(&bytes);
+    assert_eq!(ops.len(), 2, "two ALU ops decoded before the branch");
+    assert_eq!(consumed, 6, "only the two 3-byte ops are counted; the jmp is left to step()");
+}
+
+#[cfg(test)]
+#[test]
+fn block_cache_is_kappa_keyed_with_smc_invalidation() {
+    let ops = decode_x86(&[0x48, 0x01, 0xd8]); // add rax, rbx
+    let mut cache = BlockCache::new(3);
+    let key = [0x11u8; 32];
+    // below threshold: counted, not compiled
+    assert!(cache.record(key, &ops).is_none());
+    assert!(cache.record(key, &ops).is_none());
+    assert!(cache.get(&key).is_none());
+    // crossing the threshold compiles + caches a real wasm module
+    assert!(cache.record(key, &ops).is_some(), "compiled at the hotness threshold");
+    let wasm = cache.get(&key).expect("now cached").to_vec();
+    assert!(wasm.starts_with(&[0x00, 0x61, 0x73, 0x6d]), "cached a real wasm module");
+    // a different κ (self-modified bytes) is a miss — free SMC invalidation
+    assert!(cache.get(&[0x22u8; 32]).is_none(), "changed bytes → changed κ → miss → recompile");
 }
