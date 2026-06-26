@@ -153,36 +153,35 @@ function activate(context) {
       let limitHit = false;
       let files = 0;
 
-      // Collect candidate files first (the walk streams them), then read + match.
-      const candidates = [];
+      // Read + match + report INSIDE the walk, so matches stream to the Search
+      // view as files are discovered (non-blocking on a large tree) rather than
+      // after a full enumeration. The walk awaits this callback per file.
       await core.walk(
-        { ...params, maxResults: 0, isCancelled: () => token.isCancellationRequested },
-        (rel) => candidates.push(rel),
+        { ...params, maxResults: 0, isCancelled: () => token.isCancellationRequested || limitHit },
+        async (rel) => {
+          if (limitHit || token.isCancellationRequested) return;
+          let u8;
+          try { u8 = await fs.read(rel); } catch { return; }
+          const text = decodeTextOrNull(u8, options.maxFileSize);
+          if (text == null) return;
+          const matches = core.searchContent(text, query);
+          if (!matches.length) return;
+          files++;
+          const uri = vscode.Uri.joinPath(options.folder, ...rel.split("/"));
+          for (const m of matches) {
+            if (limitHit) break;
+            // The document range (used for navigation AND replace-all) and a
+            // single-line preview with the match highlighted within it.
+            const range = new vscode.Range(m.line, m.startCol, m.endLine, m.endCol);
+            const previewMatch =
+              m.line === m.endLine
+                ? new vscode.Range(0, m.startCol, 0, m.endCol)
+                : new vscode.Range(0, m.startCol, 0, m.lineText.length);
+            progress.report({ uri, ranges: range, preview: { text: m.lineText, matches: previewMatch } });
+            if (++total >= maxResults) limitHit = true;
+          }
+        },
       );
-
-      for (const rel of candidates) {
-        if (token.isCancellationRequested || limitHit) break;
-        let u8;
-        try { u8 = await fs.read(rel); } catch { continue; }
-        const text = decodeTextOrNull(u8, options.maxFileSize);
-        if (text == null) continue;
-        const matches = core.searchContent(text, query);
-        if (!matches.length) continue;
-        files++;
-        const uri = vscode.Uri.joinPath(options.folder, ...rel.split("/"));
-        for (const m of matches) {
-          if (limitHit) break;
-          // The document range (used for navigation AND replace-all) and a
-          // single-line preview with the match highlighted within it.
-          const range = new vscode.Range(m.line, m.startCol, m.endLine, m.endCol);
-          const previewMatch =
-            m.line === m.endLine
-              ? new vscode.Range(0, m.startCol, 0, m.endCol)
-              : new vscode.Range(0, m.startCol, 0, m.lineText.length);
-          progress.report({ uri, ranges: range, preview: { text: m.lineText, matches: previewMatch } });
-          if (++total >= maxResults) limitHit = true;
-        }
-      }
       log(`textSearch "${query.pattern}" → ${total} matches in ${files} files${limitHit ? " (limit hit)" : ""}`);
       return { limitHit };
     },

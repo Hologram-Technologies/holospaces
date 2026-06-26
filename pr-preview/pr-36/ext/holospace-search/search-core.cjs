@@ -18,15 +18,14 @@
 // none), `*` (any run within a segment), `?` (one char within a segment),
 // `{a,b,c}` alternation, and `[...]` character classes. Matching is against a
 // POSIX, root-relative path (no leading slash).
-function globToRegExp(glob) {
+// Translate a glob to a regex BODY (no anchors, no any-depth prefix). `{a,b}`
+// alternatives are translated through this same body function, so an alternative
+// NEVER inherits the no-slash "anywhere" prefix `globToRegExp` adds — otherwise
+// `**/*.{js,ts}` would let `js`/`ts` match across a `/` (e.g. `src/a.x/js`).
+function globBody(glob) {
   let re = "";
   let i = 0;
   const n = glob.length;
-  // A bare `**/x` or `x` (no slash) conventionally matches at any depth — VS Code
-  // treats a pattern with no leading `**/` and no slash as "anywhere". We anchor
-  // explicitly below by allowing an optional leading-path prefix when the glob
-  // has no slash.
-  const hasSlash = glob.includes("/");
   while (i < n) {
     const c = glob[i];
     if (c === "*") {
@@ -43,10 +42,10 @@ function globToRegExp(glob) {
       re += "[^/]";
       i++;
     } else if (c === "{") {
-      // `{a,b,c}` → `(?:a|b|c)` (segment-safe; commas split alternatives).
+      // `{a,b,c}` → `(?:a|b|c)` (commas split alternatives; each a glob body).
       const end = glob.indexOf("}", i);
       if (end < 0) { re += "\\{"; i++; continue; }
-      const parts = glob.slice(i + 1, end).split(",").map((p) => globToRegExp(p).source.replace(/^\^|\$$/g, ""));
+      const parts = glob.slice(i + 1, end).split(",").map(globBody);
       re += "(?:" + parts.join("|") + ")";
       i = end + 1;
     } else if (c === "[") {
@@ -62,9 +61,16 @@ function globToRegExp(glob) {
       i++;
     }
   }
-  // No-slash globs (e.g. `*.log`, `node_modules`) match a basename at any depth.
-  const body = hasSlash ? re : "(?:.*/)?" + re;
-  return new RegExp("^" + body + "$");
+  return re;
+}
+
+// A glob with no `/` (e.g. `*.log`, `node_modules`) matches a basename at any
+// depth (the no-slash "anywhere" prefix); a glob with a `/` is anchored to the
+// root-relative path.
+function globToRegExp(glob) {
+  const body = globBody(glob);
+  const full = glob.includes("/") ? body : "(?:.*/)?" + body;
+  return new RegExp("^" + full + "$");
 }
 
 // Compile a list of globs into a single predicate `(relPath) => boolean` (true if
@@ -89,9 +95,11 @@ function buildIgnore(ignoreFactory, gitignoreText) {
 // ── The streaming tree walk ───────────────────────────────────────────────────
 // `list(relDir)` → Promise<[{ name, dir }]> over the workspace (CC-15); excluded
 // directories are pruned (never descended), so a large `node_modules` costs
-// nothing. `onFile(relPath)` is called for each surviving file as it is found
-// (streamed). Honours excludes/includes/gitignore, `maxResults`, and
-// cancellation. Returns `{ limitHit }`.
+// nothing. `onFile(relPath)` is AWAITED for each surviving file AS it is found —
+// so a caller that reads + matches + reports inside it streams results while the
+// walk is still running (the text provider does exactly this), instead of after
+// a full enumeration. Honours excludes/includes/gitignore, `maxResults` (a bound
+// on files handed to `onFile`), and cancellation. Returns `{ limitHit }`.
 async function walk({ list, isExcluded, isIncluded, ig, maxResults, isCancelled }, onFile) {
   let found = 0;
   let limitHit = false;
@@ -115,7 +123,7 @@ async function walk({ list, isExcluded, isIncluded, ig, maxResults, isCancelled 
         queue.push(rel);
       } else {
         if (isIncluded && !isIncluded(rel)) continue;
-        onFile(rel);
+        await onFile(rel);
         found++;
         if (found >= max) { limitHit = true; break; }
       }
