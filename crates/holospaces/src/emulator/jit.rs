@@ -792,15 +792,19 @@ impl BlockCache {
 
 /// x86-64 block discovery for the SHA-512 compression subset: reg-reg ALU/mov (ModRM mod=3)
 /// AND memory-operand forms (`mov reg,[mem]`, `mov [mem],reg`, `add/or/and/sub/xor reg,[mem]`)
-/// with full base+index*scale+disp addressing. Returns the decoded ops AND the exact number
-/// of guest bytes they cover (the block length — for the κ key and to advance `rip`).
-/// **Bails** (stops) at anything else — the JIT's "interpret what I don't model" discipline;
-/// the unmodelled instruction's bytes are NOT counted, so the interpreter resumes there.
-pub(crate) fn decode_block(bytes: &[u8]) -> (Vec<Op>, usize) {
+/// with full base+index*scale+disp addressing. Returns `(ops, offsets, len)`: the decoded
+/// ops, the guest-byte offset where each op's instruction starts (so a bail at op `k` resumes
+/// at `block_start + offsets[k]`), and the exact block byte length (`len`, for the κ key and
+/// to advance `rip`). **Bails** (stops) at anything else — the JIT's "interpret what I don't
+/// model" discipline; the unmodelled instruction's bytes are NOT counted, so the interpreter
+/// resumes there.
+pub(crate) fn decode_block(bytes: &[u8]) -> (Vec<Op>, Vec<u32>, usize) {
     let mut out = Vec::new();
+    let mut offsets = Vec::new();
     let mut p = 0;
     let mut consumed = 0;
     while p < bytes.len() {
+        let inst_start = p;
         let mut rex = 0u8;
         if bytes[p] & 0xf0 == 0x40 {
             rex = bytes[p];
@@ -834,6 +838,7 @@ pub(crate) fn decode_block(bytes: &[u8]) -> (Vec<Op>, usize) {
                 _ => break,
             };
             out.push(op);
+            offsets.push(inst_start as u32);
             p += 2;
             consumed = p;
         } else {
@@ -853,11 +858,12 @@ pub(crate) fn decode_block(bytes: &[u8]) -> (Vec<Op>, usize) {
                 _ => break,
             };
             out.push(op);
+            offsets.push(inst_start as u32);
             p = np;
             consumed = p;
         }
     }
-    (out, consumed)
+    (out, offsets, consumed)
 }
 
 #[test]
@@ -1392,9 +1398,23 @@ fn decode_block_reports_length_and_bails_at_a_branch() {
         0x48, 0x31, 0xc8, // xor rax, rcx
         0xeb, 0xf0, // jmp -16 (control transfer → bail)
     ];
-    let (ops, consumed) = decode_block(&bytes);
+    let (ops, offsets, consumed) = decode_block(&bytes);
     assert_eq!(ops.len(), 2, "two ALU ops decoded before the branch");
     assert_eq!(consumed, 6, "only the two 3-byte ops are counted; the jmp is left to step()");
+    // per-op byte offsets — a bail at op k resumes at block_start + offsets[k]
+    assert_eq!(offsets, vec![0u32, 3], "op 0 at byte 0, op 1 at byte 3");
+
+    // offsets must track variable-length instructions: a 3-byte reg-reg op, an 8-byte
+    // disp32 memory op, then another 3-byte op.
+    let mixed = [
+        0x48, 0x01, 0xd8, // add rax, rbx            (3 bytes)  @0
+        0x48, 0x8b, 0x84, 0x24, 0x00, 0x01, 0x00, 0x00, // mov rax,[rsp+0x100] (8 bytes) @3
+        0x48, 0x01, 0xd8, // add rax, rbx            (3 bytes)  @11
+    ];
+    let (mops, moffsets, mlen) = decode_block(&mixed);
+    assert_eq!(mops.len(), 3);
+    assert_eq!(moffsets, vec![0u32, 3, 11], "offsets follow the real instruction lengths");
+    assert_eq!(mlen, 14);
 }
 
 #[cfg(test)]
