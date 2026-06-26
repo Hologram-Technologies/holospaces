@@ -449,3 +449,64 @@ fn kappa_snapshot_midboot_restore_is_bit_exact_to_userspace() {
         c_orig.len()
     );
 }
+
+/// κ-snapshot Step 2 GATE — **content-addressed** resume on a real boot. Boots amd64 Linux
+/// partway, snapshots it with [`Cpu::snapshot_kappa`] (RAM → a BLAKE3 4 KiB page manifest whose
+/// UNIQUE pages dedup into a `KappaStore`), reports the real dedup (unique MiB vs 1 GiB — the
+/// thesis number), then resumes into a FRESH `Cpu` with [`Cpu::restore_kappa`] (every page
+/// verified before use, L5) and drives BOTH machines to userspace — consoles byte-identical.
+/// A resume streams only the unique pages held in the store, not the nominal 1 GiB.
+#[test]
+fn kappa_snapshot_kappa_resume_to_userspace() {
+    const MARKER: &str = "HOLOSPACES-LINUX-USERSPACE-OK";
+    const PAGE: usize = 0x1000;
+    let kernel = vmlinux_elf();
+    let cmdline = "earlyprintk=serial,ttyS0 console=ttyS0 random.trust_cpu=on";
+
+    let mut orig = Cpu::boot_linux(1024 * 1024 * 1024, &kernel, cmdline);
+    assert_eq!(orig.run(200_000_000), Halt::OutOfBudget, "snapshot point is mid-boot");
+
+    // Content-address the machine: RAM pages dedup into the store automatically.
+    let store = MemKappaStore::new();
+    let snap = orig.snapshot_kappa(&store).expect("snapshot_kappa");
+    let total = snap.page_count();
+    let unique = store.approximate_count();
+    let mib = |pages: usize| pages * PAGE / (1024 * 1024);
+    eprintln!(
+        "\n==== κ-SNAPSHOT (content-addressed) @ {} insns ====\n\
+         total : {total} pages = {} MiB\n\
+         UNIQUE: {unique} pages = {} MiB in the KappaStore  →  {:.1}x dedup\n\
+         a κ-resume streams {} MiB (+ {} B state), not {} MiB\n====\n",
+        orig.insns(),
+        mib(total),
+        mib(unique),
+        total as f64 / unique as f64,
+        mib(unique),
+        snap.state_len(),
+        mib(total),
+    );
+
+    // Resume BY κ into a fresh core — each page fetched from the store + verified (L5).
+    let mut resumed = Cpu::new(0x1000);
+    assert!(resumed.restore_kappa(&snap, &store), "κ-resume verifies every page + reconstructs");
+
+    // Both machines run to userspace and stay byte-identical.
+    let h_orig = orig.run(40_000_000_000);
+    let h_resumed = resumed.run(40_000_000_000);
+    let c_orig = String::from_utf8_lossy(orig.console()).into_owned();
+    let c_resumed = String::from_utf8_lossy(resumed.console()).into_owned();
+
+    assert!(
+        c_resumed.contains(MARKER),
+        "the κ-RESUMED machine reached userspace\n---- resumed console ----\n{c_resumed}"
+    );
+    assert!(c_orig.contains(MARKER), "the original reached userspace");
+    assert_eq!(h_orig, Halt::Halted);
+    assert_eq!(h_resumed, Halt::Halted, "κ-resumed machine powered off cleanly");
+    assert_eq!(
+        c_orig, c_resumed,
+        "the κ-resumed console is BYTE-IDENTICAL to the original — bit-exact content-addressed resume"
+    );
+    assert!(unique < total / 4, "RAM deduplicates by >4x in the store ({unique}/{total})");
+    eprintln!("==== κ-RESUME BIT-EXACT from {} unique pages ====\n", unique);
+}

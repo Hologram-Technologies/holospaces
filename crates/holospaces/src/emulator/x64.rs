@@ -36,6 +36,8 @@ use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use hologram_substrate_core::{verify_kappa, KappaLabel71, KappaStore};
+
 /// Why the core stopped.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Halt {
@@ -848,6 +850,38 @@ impl<'a> Snap<'a> {
     }
 }
 
+/// The 4 KiB page granularity κ-snapshots content-address guest RAM at.
+const KAPPA_PAGE: usize = 0x1000;
+
+/// A **content-addressed** machine snapshot (the κ-snapshot path): the small CPU + device
+/// `state` inline, and guest RAM as a per-4 KiB-page BLAKE3 κ **manifest** (`ram_pages`) whose
+/// *unique* pages live in a [`KappaStore`]. Post-boot RAM is overwhelmingly zero/duplicate, so
+/// the store holds a tiny working set (measured 22.8× on a real boot: 1 GiB → 44 MiB unique).
+/// A resume streams only the unique pages and verifies each before use (L5). Build with
+/// [`Cpu::snapshot_kappa`], resume with [`Cpu::restore_kappa`].
+pub struct KappaSnapshot {
+    state: Vec<u8>,
+    ram_pages: Vec<KappaLabel71>,
+    ram_len: usize,
+}
+impl KappaSnapshot {
+    /// The number of 4 KiB RAM pages (the manifest length).
+    #[must_use]
+    pub fn page_count(&self) -> usize {
+        self.ram_pages.len()
+    }
+    /// Total guest RAM the snapshot reconstructs.
+    #[must_use]
+    pub fn ram_len(&self) -> usize {
+        self.ram_len
+    }
+    /// The serialized CPU + device state (everything except RAM).
+    #[must_use]
+    pub fn state_len(&self) -> usize {
+        self.state.len()
+    }
+}
+
 impl Seg {
     fn snap(&self, o: &mut Vec<u8>) {
         o.extend_from_slice(&self.selector.to_le_bytes());
@@ -1352,7 +1386,18 @@ impl Cpu {
     /// TLB/`ifetch` caches are intentionally NOT serialized — a resume rebuilds them lazily.)
     #[must_use]
     pub fn snapshot(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.ram.len() + 512);
+        let mut out = self.snapshot_state();
+        out.reserve(self.ram.len() + 8);
+        out.extend_from_slice(&(self.ram.len() as u64).to_le_bytes());
+        out.extend_from_slice(&self.ram);
+        out
+    }
+
+    /// The CPU + device state — everything in [`Cpu::snapshot`] **except** guest RAM. Shared by
+    /// the flat [`Cpu::snapshot`] (which appends RAM as a blob) and [`Cpu::snapshot_kappa`]
+    /// (which content-addresses RAM into a κ page manifest instead).
+    fn snapshot_state(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(512);
         for v in self.r {
             out.extend_from_slice(&v.to_le_bytes());
         }
@@ -1375,17 +1420,70 @@ impl Cpu {
             }
             None => out.push(0),
         }
-        out.extend_from_slice(&(self.ram.len() as u64).to_le_bytes());
-        out.extend_from_slice(&self.ram);
         out
+    }
+
+    /// Content-address the machine into a [`KappaSnapshot`] (the κ-snapshot path): serialize the
+    /// CPU + device state, split guest RAM into 4 KiB pages, and `put` each into `store` keyed by
+    /// BLAKE3 — identical/zero pages dedup to one κ automatically (idempotent `put`). The returned
+    /// manifest is a `Vec<κ>`; the store ends up holding only the *unique* pages. Returns `None`
+    /// if a store write fails.
+    pub fn snapshot_kappa(&self, store: &dyn KappaStore) -> Option<KappaSnapshot> {
+        let state = self.snapshot_state();
+        let mut ram_pages = Vec::with_capacity(self.ram.len() / KAPPA_PAGE + 1);
+        for page in self.ram.chunks(KAPPA_PAGE) {
+            ram_pages.push(store.put("blake3", page).ok()?);
+        }
+        Some(KappaSnapshot { state, ram_pages, ram_len: self.ram.len() })
     }
 
     /// Restore the core CPU state + RAM from a [`Cpu::snapshot`], resetting the TLB/`ifetch`
     /// caches (they rebuild lazily). Returns `false` if the bytes are truncated/malformed.
     pub fn restore(&mut self, snap: &[u8]) -> bool {
-        self.restore_from(&mut Snap::new(snap)).is_some()
+        let mut s = Snap::new(snap);
+        if self.restore_state(&mut s).is_none() {
+            return false;
+        }
+        match s.blob() {
+            Some(ram) => {
+                self.ram = ram;
+                self.flush_caches_after_restore();
+                true
+            }
+            None => false,
+        }
     }
-    fn restore_from(&mut self, s: &mut Snap) -> Option<()> {
+
+    /// Resume a [`KappaSnapshot`]: restore the CPU + device state, then reconstruct guest RAM by
+    /// fetching each page's κ from `store` and **verifying it before use** (L5 — re-derive the
+    /// BLAKE3 digest and compare; a tampered/wrong page is refused). The cost is bounded by the
+    /// *unique* pages fetched, not nominal RAM — boot once, resume in seconds. Returns `false` on
+    /// malformed state, a missing page, or a κ verification failure.
+    pub fn restore_kappa(&mut self, snap: &KappaSnapshot, store: &dyn KappaStore) -> bool {
+        if self.restore_state(&mut Snap::new(&snap.state)).is_none() {
+            return false;
+        }
+        let mut ram = vec![0u8; snap.ram_len];
+        for (i, k) in snap.ram_pages.iter().enumerate() {
+            let bytes = match store.get(k) {
+                Ok(Some(b)) => b,
+                _ => return false,
+            };
+            if !matches!(verify_kappa(&bytes, k), Ok(true)) {
+                return false; // L5: never trust a fetched page without re-deriving its κ
+            }
+            let off = i * KAPPA_PAGE;
+            let end = (off + bytes.len()).min(ram.len());
+            ram[off..end].copy_from_slice(&bytes[..end - off]);
+        }
+        self.ram = ram;
+        self.flush_caches_after_restore();
+        true
+    }
+
+    /// Read the CPU + device state (everything except RAM) — the inverse of
+    /// [`Cpu::snapshot_state`]. Returns `None` on truncated/malformed bytes.
+    fn restore_state(&mut self, s: &mut Snap) -> Option<()> {
         for r in &mut self.r {
             *r = s.u64()?;
         }
@@ -1408,11 +1506,14 @@ impl Cpu {
             0 => None,
             _ => Some(Box::new(Sys::unsnap(s)?)),
         };
-        self.ram = s.blob()?;
-        // the software caches are stale after a state swap — flush them (they rebuild lazily)
+        Some(())
+    }
+
+    /// After swapping in restored state, the software TLB/`ifetch` caches are stale — flush them
+    /// (they rebuild lazily from the restored `cr3` + RAM, so they are never serialized).
+    fn flush_caches_after_restore(&mut self) {
         self.tlb_gen = self.tlb_gen.wrapping_add(1);
         self.ifetch_gen = 0;
-        Some(())
     }
 
     /// Feed terminal input to the guest's serial console (readable at `0x3f8`).
@@ -5139,6 +5240,48 @@ mod tests {
         // misordered field would diverge here.
         assert_eq!(b.snapshot(), snap, "the full machine round-trips identically");
         assert!(!b.restore(&snap[..snap.len() - 1]), "a truncated snapshot is rejected");
+    }
+
+    /// κ-snapshot Step 2: RAM content-addresses into a per-page BLAKE3 manifest whose UNIQUE
+    /// pages dedup in a `KappaStore`, and a κ-resume verifies every page (L5) + reconstructs RAM
+    /// bit-exact. (The boot-scale 22.8× dedup + bit-exact κ-resume to userspace is gated by the
+    /// integration test `kappa_snapshot_kappa_resume_to_userspace`.)
+    #[test]
+    fn kappa_snapshot_dedups_ram_and_restores_bit_exact() {
+        use hologram_store_mem::MemKappaStore;
+        let mut a = Cpu::new(16 * KAPPA_PAGE); // 16 pages = 64 KiB
+        a.r[0] = 0x0abc;
+        a.rip = 0x4000;
+        a.cpl = 3;
+        a.sys.as_mut().unwrap().tsc = 777;
+        a.sys.as_mut().unwrap().uart.output.extend_from_slice(b"hi");
+        // page 0: a unique pattern; pages 1..=14: zero (→ one κ); page 15: a copy of page 0 (→ its κ).
+        a.ram[0..8].copy_from_slice(&0xdead_beef_cafe_babeu64.to_le_bytes());
+        let p0 = a.ram[0..KAPPA_PAGE].to_vec();
+        a.ram[15 * KAPPA_PAGE..16 * KAPPA_PAGE].copy_from_slice(&p0);
+
+        let store = MemKappaStore::new();
+        let snap = a.snapshot_kappa(&store).expect("snapshot_kappa");
+        assert_eq!(snap.page_count(), 16, "16-page manifest");
+        assert_eq!(
+            store.approximate_count(),
+            2,
+            "16 RAM pages dedup to 2 unique κ (the nonzero pattern + the all-zero page)"
+        );
+
+        // Resume into a fresh, differently-sized core — every page fetched-by-κ + verified (L5).
+        let mut b = Cpu::new(KAPPA_PAGE);
+        assert!(b.restore_kappa(&snap, &store), "κ-resume verifies + reconstructs");
+        assert_eq!(b.ram, a.ram, "RAM reconstructed byte-for-byte from the κ pages");
+        assert_eq!(b.snapshot(), a.snapshot(), "full machine identical after a κ-resume");
+
+        // A missing page is refused, not silently zero-filled (verify-before-use has nothing to
+        // serve) — resuming against an empty store fails.
+        let mut c = Cpu::new(KAPPA_PAGE);
+        assert!(
+            !c.restore_kappa(&snap, &MemKappaStore::new()),
+            "a κ-resume against a store missing the pages is refused"
+        );
     }
 
     #[test]
