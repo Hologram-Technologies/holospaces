@@ -1,0 +1,9 @@
+<!doctype html><meta charset=utf8><title>resuming</title><pre id=t style="color:#cfe;background:#07070c;padding:10px;white-space:pre-wrap;font:12px monospace"></pre>
+<script type=module>
+const t=document.getElementById('t');const w=new Worker('./x64-resume-worker.mjs',{type:'module'});
+w.onmessage=e=>{const d=e.data;window.__last=d;
+  if(d.ok!==undefined){window.__resumeResult=d;document.title=d.ok?'RESUME-DONE':'RESUME-FAIL';t.textContent=JSON.stringify(d,null,1);}
+  else{t.textContent='stage: '+(d.stage||'')+(d.tResume!==undefined?(' resume='+d.tResume.toFixed(1)+'ms'):'')+(d.blobBytes?(' blob='+(d.blobBytes/1048576).toFixed(1)+'MiB'):'')+'\n'+(d.tail||'');}};
+w.onerror=e=>{window.__resumeResult={ok:false,error:e.message||(e.filename+':'+e.lineno)};document.title='RESUME-FAIL';};
+w.postMessage('go');
+</script>
