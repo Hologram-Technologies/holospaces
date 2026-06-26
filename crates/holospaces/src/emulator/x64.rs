@@ -5106,4 +5106,61 @@ mod tests {
         assert_eq!(got_data, want_data, "executor guest RAM diverged from step() under paging");
         assert_eq!(got_data, data0.wrapping_add(rcx), "stored sum landed at the data VA");
     }
+
+    /// The same paging gate, but through the real library executor `jit_exec::exec_block`
+    /// (the `jit` feature) rather than inline wasmtime — proving the promoted lib executor
+    /// matches `step()`. Run with `cargo test -p holospaces --features jit`.
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_exec_block_matches_step_through_paging() {
+        use crate::emulator::{jit, jit_exec};
+
+        let code = [
+            0x48, 0x8b, 0x03, // mov rax, [rbx]
+            0x48, 0x01, 0xc8, // add rax, rcx
+            0x48, 0x89, 0x03, // mov [rbx], rax
+        ];
+        let data0: u64 = 0x0000_1111_2222_3333;
+        let rcx: u64 = 7;
+
+        let mut cpu = Cpu::new(64 * 1024);
+        let put = |cpu: &mut Cpu, at: usize, e: u64| {
+            cpu.ram[at..at + 8].copy_from_slice(&e.to_le_bytes());
+        };
+        put(&mut cpu, 0x1000, 0x2000 | 1);
+        put(&mut cpu, 0x2000, 0x3000 | 1);
+        put(&mut cpu, 0x3000, 0x4000 | 1);
+        put(&mut cpu, 0x4000, 0x5000 | 1);
+        cpu.ram[0x5000..0x5000 + code.len()].copy_from_slice(&code);
+        cpu.ram[0x5800..0x5808].copy_from_slice(&data0.to_le_bytes());
+        cpu.cr3 = 0x1000;
+        cpu.cr4 = 1 << 5;
+        cpu.efer = 1 << 8;
+        cpu.cr0 = 1 << 31;
+        cpu.r[3] = 0x800;
+        cpu.r[1] = rcx;
+        let (init_r, init_f) = (cpu.r, cpu.rflags);
+        let mut ram = cpu.ram.clone(); // initial guest RAM (before the store)
+        cpu.run(3);
+        let (want_r, want_f) = (cpu.r, cpu.rflags);
+        let want_data = u64::from_le_bytes(cpu.ram[0x5800..0x5808].try_into().unwrap());
+
+        let (ops, _, _) = jit::decode_block(&code);
+        let wasm = jit::compile_tlb_flags(&ops);
+        let pa = cpu.translate(0x800);
+        let (vpage, host_off) = (0x800u64 >> 12, pa & !0xfff);
+        let mut tlb = [0u8; 64 * 16];
+        let slot = (vpage & 63) as usize;
+        tlb[slot * 16..slot * 16 + 8].copy_from_slice(&vpage.to_le_bytes());
+        tlb[slot * 16 + 8..slot * 16 + 16].copy_from_slice(&host_off.to_le_bytes());
+
+        let mut regs = init_r;
+        let mut rflags = init_f;
+        let bail = jit_exec::exec_block(&wasm, &mut regs, &mut rflags, &mut ram, &tlb);
+        assert_eq!(bail, 3, "block completes via the lib executor");
+        assert_eq!(regs, want_r, "lib executor regs diverged from step()");
+        assert_eq!(rflags, want_f, "lib executor rflags diverged from step()");
+        let got_data = u64::from_le_bytes(ram[0x5800..0x5808].try_into().unwrap());
+        assert_eq!(got_data, want_data, "lib executor guest RAM diverged from step()");
+    }
 }

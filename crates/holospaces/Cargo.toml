@@ -39,8 +39,17 @@ net = ["std", "dep:ureq", "dep:sha2"]
 # live to stderr and samples `rip`/TSC periodically — boot-progress visibility
 # for the CC-44 long-mode bring-up. Never enabled in CI or the default build.
 cc44-trace = ["std"]
+# `jit` (off by default) enables the x86-64 block JIT's native executor (M2 Rung 3):
+# the `jit_exec` module runs `compile_tlb_flags` blocks via `wasmtime` over the live
+# `Cpu` state. A `std` host surface — the portable peer core never links it; the
+# browser peer executes the same blocks through `js_sys::WebAssembly` instead.
+jit = ["std", "dep:wasmtime"]
 
 [dependencies]
+# The native block-JIT executor (the `jit` feature). The JIT *codegen* is pure
+# no_std byte-emission in `emulator::jit`; only *executing* the emitted wasm needs a
+# runtime, so wasmtime is gated here (a bare-function runner, NOT the .holo engine).
+wasmtime = { version = "45", optional = true }
 # The hologram substrate, consumed by reference (ADR-003, ADR-006). holospaces
 # composes these contracts; it never re-implements them. Pinned by rev,
 # no_std-capable (default features off; the `std` feature re-enables).

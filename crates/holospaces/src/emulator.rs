@@ -61,6 +61,12 @@ pub mod x64;
 /// loop (Step C). Conformance: `CC-43` (shares the x86-64 differential oracle).
 pub mod jit;
 
+/// The block JIT's **native executor** (the `jit` feature): runs `jit::compile_tlb_flags`
+/// blocks via `wasmtime` over the live `Cpu` state. A `std` host surface — the codegen stays
+/// `no_std`, only execution needs a runtime; the browser peer uses `js_sys::WebAssembly`.
+#[cfg(feature = "jit")]
+pub mod jit_exec;
+
 /// The shared virtio-mmio device bus: the substrate-backed `virtio` devices and
 /// their split-virtqueue servicing, used by **both** the RISC-V and AArch64
 /// machines (one κ-disk/9p/NAT implementation, two thin MMIO transports).

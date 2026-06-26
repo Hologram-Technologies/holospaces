@@ -55,7 +55,7 @@ const NO_REG: u8 = 0xff;
 
 /// Guest RAM lives in the same wasm memory as the register file, after a page of
 /// headroom: regs at `r*8`, guest byte `A` at wasm offset `GUEST_BASE + A`.
-const GUEST_BASE: u64 = 0x1000;
+pub(crate) const GUEST_BASE: u64 = 0x1000;
 #[cfg(test)]
 const GUEST_LEN: usize = 0x3000; // 3 pages of test guest RAM
 
@@ -63,14 +63,14 @@ const GUEST_LEN: usize = 0x3000; // 3 pages of test guest RAM
 /// array of `TLB_SIZE` 16-byte entries `(tag: vpage @0, host_off: byte offset @8)`. The
 /// inline-TLB codegen translates a guest virtual address by indexing this on the hit path
 /// — the mechanism that lets the JIT touch real (paged) guest RAM. `$va` scratch = local 16.
-const TLB_BASE: u64 = 0x200;
-const TLB_SIZE: u64 = 64; // power of two; slot = vpage & (TLB_SIZE-1)
+pub(crate) const TLB_BASE: u64 = 0x200;
+pub(crate) const TLB_SIZE: u64 = 64; // power of two; slot = vpage & (TLB_SIZE-1)
 
 /// The guest `rflags` slot in wasm memory (just past the 16 registers), and the flag bits
 /// an ALU op writes: CF(0) PF(2) ZF(6) SF(7) OF(11). AF(4) is deliberately NOT modelled —
 /// `x64.rs::flags_arith`/`flags_logic` leave AF untouched, so to stay bit-identical to
 /// `step()` the JIT must leave it untouched too.
-const RFLAGS_MEM: u64 = NREG as u64 * 8; // mem offset 128
+pub(crate) const RFLAGS_MEM: u64 = NREG as u64 * 8; // mem offset 128
 const ALU_FLAGS_MASK: u64 = 0x8c5; // CF|PF|ZF|SF|OF (no AF — matches the interpreter)
 
 // Local layout: 21 × i64 then 2 × i32 (always declared; unused ones are harmless).
