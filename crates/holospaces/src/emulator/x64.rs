@@ -806,6 +806,231 @@ const MSR_APIC_BASE: u32 = 0x1B;
 const LAPIC_BASE: u64 = 0xFEE0_0000;
 const LAPIC_END: u64 = 0xFEE0_1000;
 
+/// A little-endian read cursor over κ-snapshot bytes (the dual of the `*.snap` writers below);
+/// every reader returns `None` on truncation so a malformed snapshot is rejected, not panics.
+struct Snap<'a> {
+    b: &'a [u8],
+    p: usize,
+}
+impl<'a> Snap<'a> {
+    fn new(b: &'a [u8]) -> Self {
+        Snap { b, p: 0 }
+    }
+    fn u8(&mut self) -> Option<u8> {
+        let v = *self.b.get(self.p)?;
+        self.p += 1;
+        Some(v)
+    }
+    fn u16(&mut self) -> Option<u16> {
+        let s = self.b.get(self.p..self.p + 2)?;
+        self.p += 2;
+        Some(u16::from_le_bytes(s.try_into().unwrap()))
+    }
+    fn u32(&mut self) -> Option<u32> {
+        let s = self.b.get(self.p..self.p + 4)?;
+        self.p += 4;
+        Some(u32::from_le_bytes(s.try_into().unwrap()))
+    }
+    fn u64(&mut self) -> Option<u64> {
+        let s = self.b.get(self.p..self.p + 8)?;
+        self.p += 8;
+        Some(u64::from_le_bytes(s.try_into().unwrap()))
+    }
+    fn flag(&mut self) -> Option<bool> {
+        Some(self.u8()? != 0)
+    }
+    /// A length-prefixed byte blob (`u64` len + bytes).
+    fn blob(&mut self) -> Option<Vec<u8>> {
+        let n = self.u64()? as usize;
+        let s = self.b.get(self.p..self.p + n)?;
+        self.p += n;
+        Some(s.to_vec())
+    }
+}
+
+impl Seg {
+    fn snap(&self, o: &mut Vec<u8>) {
+        o.extend_from_slice(&self.selector.to_le_bytes());
+        o.extend_from_slice(&self.base.to_le_bytes());
+        o.push(self.long as u8);
+    }
+    fn unsnap(s: &mut Snap) -> Option<Seg> {
+        Some(Seg { selector: s.u16()?, base: s.u64()?, long: s.flag()? })
+    }
+}
+impl Uart {
+    fn snap(&self, o: &mut Vec<u8>) {
+        o.extend_from_slice(&(self.output.len() as u64).to_le_bytes());
+        o.extend_from_slice(&self.output);
+        o.extend_from_slice(&(self.input.len() as u64).to_le_bytes());
+        o.extend_from_slice(&self.input);
+        o.extend_from_slice(&(self.in_cursor as u64).to_le_bytes());
+        o.extend_from_slice(&[self.lcr, self.ier, self.mcr, self.scratch, self.fcr]);
+        o.extend_from_slice(&self.divisor.to_le_bytes());
+        o.push(self.thre_pending as u8);
+    }
+    fn unsnap(s: &mut Snap) -> Option<Uart> {
+        Some(Uart {
+            output: s.blob()?,
+            input: s.blob()?,
+            in_cursor: s.u64()? as usize,
+            lcr: s.u8()?,
+            ier: s.u8()?,
+            mcr: s.u8()?,
+            scratch: s.u8()?,
+            fcr: s.u8()?,
+            divisor: s.u16()?,
+            thre_pending: s.flag()?,
+        })
+    }
+}
+impl Pic {
+    fn snap(&self, o: &mut Vec<u8>) {
+        o.extend_from_slice(&self.mask.to_le_bytes());
+        o.extend_from_slice(&self.request.to_le_bytes());
+        o.extend_from_slice(&[self.base_master, self.base_slave, self.init_master, self.init_slave]);
+    }
+    fn unsnap(s: &mut Snap) -> Option<Pic> {
+        Some(Pic {
+            mask: s.u16()?,
+            request: s.u16()?,
+            base_master: s.u8()?,
+            base_slave: s.u8()?,
+            init_master: s.u8()?,
+            init_slave: s.u8()?,
+        })
+    }
+}
+impl Pit {
+    fn snap(&self, o: &mut Vec<u8>) {
+        o.extend_from_slice(&self.reload.to_le_bytes());
+        o.extend_from_slice(&self.counter.to_le_bytes());
+        o.extend_from_slice(&[self.write_hi as u8, self.enabled as u8, self.ch0_periodic as u8]);
+        o.extend_from_slice(&self.ch2_reload.to_le_bytes());
+        o.extend_from_slice(&self.ch2_counter.to_le_bytes());
+        o.extend_from_slice(&[self.ch2_write_hi as u8, self.ch2_gate as u8, self.ch2_out as u8]);
+    }
+    fn unsnap(s: &mut Snap) -> Option<Pit> {
+        Some(Pit {
+            reload: s.u16()?,
+            counter: s.u32()?,
+            write_hi: s.flag()?,
+            enabled: s.flag()?,
+            ch0_periodic: s.flag()?,
+            ch2_reload: s.u16()?,
+            ch2_counter: s.u32()?,
+            ch2_write_hi: s.flag()?,
+            ch2_gate: s.flag()?,
+            ch2_out: s.flag()?,
+        })
+    }
+}
+impl Lapic {
+    fn snap(&self, o: &mut Vec<u8>) {
+        for v in [
+            self.svr, self.lvt_timer, self.initial_count, self.current_count, self.divide, self.tpr,
+        ] {
+            o.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in self.irr.iter().chain(self.isr.iter()) {
+            o.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    fn unsnap(s: &mut Snap) -> Option<Lapic> {
+        let (svr, lvt_timer, initial_count, current_count, divide, tpr) =
+            (s.u32()?, s.u32()?, s.u32()?, s.u32()?, s.u32()?, s.u32()?);
+        let mut irr = [0u64; 4];
+        let mut isr = [0u64; 4];
+        for x in irr.iter_mut().chain(isr.iter_mut()) {
+            *x = s.u64()?;
+        }
+        Some(Lapic { svr, lvt_timer, initial_count, current_count, divide, tpr, irr, isr })
+    }
+}
+impl Sys {
+    /// Serialize the plain-data device state (NO external handles — `virtio`/`9p`/`net`/
+    /// `loopback` are `None` for the embedded-initramfs boot and are restored as `None`).
+    fn snap(&self, o: &mut Vec<u8>) {
+        debug_assert!(
+            self.virtio.is_none()
+                && self.virtio9p.is_none()
+                && self.virtionet.is_none()
+                && self.loopback.is_none(),
+            "κ-snapshot of an attached virtio/9p/net/loopback device is not yet supported \
+             (the embedded-initramfs smoke boot attaches none); serializing one would silently \
+             drop it on restore — extend Sys::snap/unsnap before snapshotting a disk/net machine",
+        );
+        self.uart.snap(o);
+        o.extend_from_slice(&self.idtr.0.to_le_bytes());
+        o.extend_from_slice(&self.idtr.1.to_le_bytes());
+        o.extend_from_slice(&self.gdtr.0.to_le_bytes());
+        o.extend_from_slice(&self.gdtr.1.to_le_bytes());
+        o.extend_from_slice(&self.tr_base.to_le_bytes());
+        o.extend_from_slice(&(self.msr.len() as u64).to_le_bytes());
+        for (k, v) in &self.msr {
+            o.extend_from_slice(&k.to_le_bytes());
+            o.extend_from_slice(&v.to_le_bytes());
+        }
+        self.pic.snap(o);
+        self.pit.snap(o);
+        self.lapic.snap(o);
+        o.extend_from_slice(&self.tsc.to_le_bytes());
+        o.push(self.halted as u8);
+        o.extend_from_slice(&self.rng.to_le_bytes());
+        o.extend_from_slice(&self.tdiv.to_le_bytes());
+        o.extend_from_slice(&self.pci_addr.to_le_bytes());
+        o.extend_from_slice(&(self.dcache.len() as u64).to_le_bytes());
+        for v in &self.dcache {
+            o.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    fn unsnap(s: &mut Snap) -> Option<Sys> {
+        let uart = Uart::unsnap(s)?;
+        let idtr = (s.u64()?, s.u16()?);
+        let gdtr = (s.u64()?, s.u16()?);
+        let tr_base = s.u64()?;
+        let nmsr = s.u64()? as usize;
+        let mut msr = BTreeMap::new();
+        for _ in 0..nmsr {
+            let (k, v) = (s.u32()?, s.u64()?);
+            msr.insert(k, v);
+        }
+        let pic = Pic::unsnap(s)?;
+        let pit = Pit::unsnap(s)?;
+        let lapic = Lapic::unsnap(s)?;
+        let tsc = s.u64()?;
+        let halted = s.flag()?;
+        let rng = s.u64()?;
+        let tdiv = s.u64()?;
+        let pci_addr = s.u32()?;
+        let ndc = s.u64()? as usize;
+        let mut dcache = Vec::with_capacity(ndc);
+        for _ in 0..ndc {
+            dcache.push(s.u64()?);
+        }
+        Some(Sys {
+            uart,
+            virtio: None,
+            virtio9p: None,
+            virtionet: None,
+            loopback: None,
+            idtr,
+            gdtr,
+            tr_base,
+            msr,
+            pic,
+            pit,
+            lapic,
+            tsc,
+            halted,
+            rng,
+            tdiv,
+            pci_addr,
+            dcache,
+        })
+    }
+}
+
 impl Cpu {
     /// A fresh core with `ram_bytes` of zeroed RAM and `rip`/`rsp` reset.
     #[must_use]
@@ -1139,6 +1364,17 @@ impl Cpu {
         for v in self.dr {
             out.extend_from_slice(&v.to_le_bytes());
         }
+        for sg in &self.seg {
+            sg.snap(&mut out);
+        }
+        out.push(self.cpl);
+        match &self.sys {
+            Some(sys) => {
+                out.push(1);
+                sys.snap(&mut out);
+            }
+            None => out.push(0),
+        }
         out.extend_from_slice(&(self.ram.len() as u64).to_le_bytes());
         out.extend_from_slice(&self.ram);
         out
@@ -1147,45 +1383,36 @@ impl Cpu {
     /// Restore the core CPU state + RAM from a [`Cpu::snapshot`], resetting the TLB/`ifetch`
     /// caches (they rebuild lazily). Returns `false` if the bytes are truncated/malformed.
     pub fn restore(&mut self, snap: &[u8]) -> bool {
-        fn ru64(snap: &[u8], p: &mut usize) -> Option<u64> {
-            let s = snap.get(*p..*p + 8)?;
-            *p += 8;
-            Some(u64::from_le_bytes(s.try_into().unwrap()))
+        self.restore_from(&mut Snap::new(snap)).is_some()
+    }
+    fn restore_from(&mut self, s: &mut Snap) -> Option<()> {
+        for r in &mut self.r {
+            *r = s.u64()?;
         }
-        let mut p = 0usize;
-        for i in 0..16 {
-            self.r[i] = match ru64(snap, &mut p) {
-                Some(v) => v,
-                None => return false,
-            };
+        self.rip = s.u64()?;
+        self.rflags = s.u64()?;
+        self.insns = s.u64()?;
+        self.cr0 = s.u64()?;
+        self.cr2 = s.u64()?;
+        self.cr3 = s.u64()?;
+        self.cr4 = s.u64()?;
+        self.efer = s.u64()?;
+        for d in &mut self.dr {
+            *d = s.u64()?;
         }
-        let mut sc = [0u64; 8];
-        for s in &mut sc {
-            *s = match ru64(snap, &mut p) {
-                Some(v) => v,
-                None => return false,
-            };
+        for sg in &mut self.seg {
+            *sg = Seg::unsnap(s)?;
         }
-        [self.rip, self.rflags, self.insns, self.cr0, self.cr2, self.cr3, self.cr4, self.efer] = sc;
-        for i in 0..8 {
-            self.dr[i] = match ru64(snap, &mut p) {
-                Some(v) => v,
-                None => return false,
-            };
-        }
-        let ram_len = match ru64(snap, &mut p) {
-            Some(v) => v as usize,
-            None => return false,
+        self.cpl = s.u8()?;
+        self.sys = match s.u8()? {
+            0 => None,
+            _ => Some(Box::new(Sys::unsnap(s)?)),
         };
-        let Some(ram) = snap.get(p..p + ram_len) else {
-            return false;
-        };
-        self.ram.clear();
-        self.ram.extend_from_slice(ram);
+        self.ram = s.blob()?;
         // the software caches are stale after a state swap — flush them (they rebuild lazily)
         self.tlb_gen = self.tlb_gen.wrapping_add(1);
         self.ifetch_gen = 0;
-        true
+        Some(())
     }
 
     /// Feed terminal input to the guest's serial console (readable at `0x3f8`).
@@ -4883,6 +5110,18 @@ mod tests {
             *d = 0xd0 + i as u64;
         }
         a.ram[0x2000..0x2008].copy_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+        a.seg[1] = Seg { selector: 0x10, base: 0, long: true }; // CS
+        a.cpl = 3;
+        // non-trivial device state (the plain-data Sys: console, MSRs, timers, interrupts)
+        let sys = a.sys.as_mut().unwrap();
+        sys.tsc = 0x1234_5678;
+        sys.msr.insert(0xC000_0080, 0x500); // IA32_EFER shadow
+        sys.msr.insert(0xC000_0100, 0xffff_8000_0000_0000); // FS_BASE
+        sys.uart.output.extend_from_slice(b"early boot log");
+        sys.pic.request = 0x42;
+        sys.lapic.svr = 0x1ff;
+        sys.pit.counter = 0x9999;
+        sys.dcache = vec![1, 2, 3, 4, 5];
 
         let snap = a.snapshot();
         // restore into a DIFFERENTLY-SIZED fresh machine — restore resizes RAM to match.
@@ -4893,7 +5132,12 @@ mod tests {
         assert_eq!((b.rip, b.rflags, b.insns), (a.rip, a.rflags, a.insns));
         assert_eq!((b.cr0, b.cr2, b.cr3, b.cr4, b.efer), (a.cr0, a.cr2, a.cr3, a.cr4, a.efer));
         assert_eq!(b.dr, a.dr, "debug registers");
+        assert_eq!(b.cpl, a.cpl, "CPL");
         assert_eq!(b.ram, a.ram, "RAM restored byte-for-byte (and resized)");
+        // The decisive check: re-snapshotting the restored machine yields IDENTICAL bytes, so
+        // EVERY field (core + segments + CPL + all devices + RAM) round-tripped — a missed or
+        // misordered field would diverge here.
+        assert_eq!(b.snapshot(), snap, "the full machine round-trips identically");
         assert!(!b.restore(&snap[..snap.len() - 1]), "a truncated snapshot is rejected");
     }
 

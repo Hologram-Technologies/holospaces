@@ -391,3 +391,61 @@ fn kappa_snapshot_ram_dedup_ratio_after_amd64_boot() {
         "RAM deduplicates by >4x (the κ-snapshot thesis): {unique_n} unique / {total} total"
     );
 }
+
+/// κ-snapshot Step 1 GATE — a mid-boot snapshot/restore is **bit-exact**. Boots real amd64
+/// Linux partway (a live, running machine), snapshots it with [`Cpu::snapshot`], restores it
+/// into a FRESH `Cpu` with [`Cpu::restore`], then runs BOTH the original and the restored
+/// machine forward to the userspace marker — their consoles must be byte-identical and both
+/// power off cleanly. Any omitted CPU/segment/device/timer/interrupt state would diverge the
+/// resumed guest, so a green run proves the snapshot captures the *whole* machine. This is the
+/// serialization the κ-snapshot path content-addresses (1 GiB → 44 MiB unique, measured) and
+/// streams to resume in seconds instead of re-running the multi-minute boot.
+#[test]
+fn kappa_snapshot_midboot_restore_is_bit_exact_to_userspace() {
+    const MARKER: &str = "HOLOSPACES-LINUX-USERSPACE-OK";
+    let kernel = vmlinux_elf();
+    let cmdline = "earlyprintk=serial,ttyS0 console=ttyS0 random.trust_cpu=on";
+
+    // Boot partway — a live, mid-boot machine (kernel running, NOT yet at userspace).
+    let mut orig = Cpu::boot_linux(1024 * 1024 * 1024, &kernel, cmdline);
+    let mid = orig.run(200_000_000);
+    assert_eq!(mid, Halt::OutOfBudget, "the snapshot point is mid-boot (still running)");
+    assert!(
+        !String::from_utf8_lossy(orig.console()).contains(MARKER),
+        "userspace has NOT been reached yet at the snapshot point"
+    );
+
+    // Snapshot the running machine; restore into a fresh, small core (restore resizes RAM +
+    // flushes the lazily-rebuilt TLB/ifetch caches).
+    let snap = orig.snapshot();
+    eprintln!(
+        "\n==== κ-SNAPSHOT mid-boot: {} MiB flat snapshot @ {} insns ====",
+        snap.len() / (1024 * 1024),
+        orig.insns()
+    );
+    let mut resumed = Cpu::new(0x1000);
+    assert!(resumed.restore(&snap), "restore accepts the snapshot");
+    drop(snap); // free ~1 GiB before running two full machines forward
+
+    // Run BOTH forward to userspace — a bit-exact resume stays identical the whole way.
+    let h_orig = orig.run(40_000_000_000);
+    let h_resumed = resumed.run(40_000_000_000);
+    let c_orig = String::from_utf8_lossy(orig.console()).into_owned();
+    let c_resumed = String::from_utf8_lossy(resumed.console()).into_owned();
+
+    assert!(
+        c_resumed.contains(MARKER),
+        "the RESUMED machine reached userspace from the snapshot\n---- resumed console ----\n{c_resumed}"
+    );
+    assert!(c_orig.contains(MARKER), "the original machine reached userspace");
+    assert_eq!(h_orig, Halt::Halted, "original powered off cleanly");
+    assert_eq!(h_resumed, Halt::Halted, "resumed powered off cleanly");
+    assert_eq!(
+        c_orig, c_resumed,
+        "the resumed machine's console is BYTE-IDENTICAL to the original — bit-exact resume"
+    );
+    eprintln!(
+        "==== κ-SNAPSHOT resume BIT-EXACT: original ≡ resumed to userspace ({} console bytes) ====\n",
+        c_orig.len()
+    );
+}
