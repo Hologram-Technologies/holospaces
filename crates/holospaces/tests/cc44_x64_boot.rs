@@ -510,3 +510,44 @@ fn kappa_snapshot_kappa_resume_to_userspace() {
     assert!(unique < total / 4, "RAM deduplicates by >4x in the store ({unique}/{total})");
     eprintln!("==== κ-RESUME BIT-EXACT from {} unique pages ====\n", unique);
 }
+
+/// Fixture generator for the browser/node resume witness (Step 4): boots real amd64 Linux far
+/// enough to produce console, snapshots the WHOLE machine, and writes the snapshot + the expected
+/// console next to the wasm harness. The node witness (`x64-resume-test.mjs`) then loads these,
+/// `X64Workspace.resume`s the snapshot in the compiled wasm, and confirms the console comes back
+/// bit-exact and the machine continues — a *running* userspace from a snapshot, no boot in the tab.
+/// Run explicitly: `cargo test -p holospaces --test cc44_x64_boot generate_x64_resume_fixture -- --ignored --nocapture`.
+#[test]
+#[ignore = "fixture generator — writes a host snapshot for the browser/node resume witness"]
+fn generate_x64_resume_fixture() {
+    use std::io::Write;
+    let kernel = vmlinux_elf();
+    // 128 MiB is plenty for early boot; smaller snapshot = a light fixture for the node harness.
+    let mut cpu = Cpu::boot_linux(
+        128 * 1024 * 1024,
+        &kernel,
+        "earlyprintk=serial,ttyS0 console=ttyS0 random.trust_cpu=on",
+    );
+    assert_eq!(cpu.run(120_000_000), Halt::OutOfBudget, "snapshot a live, mid-boot machine");
+    let console = String::from_utf8_lossy(cpu.console()).into_owned();
+    assert!(console.len() > 32, "captured real early-boot console ({} bytes)", console.len());
+    let snap = cpu.snapshot();
+
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../holospaces-web/web/fixtures");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::File::create(dir.join("x64-resume-snapshot.bin"))
+        .unwrap()
+        .write_all(&snap)
+        .unwrap();
+    std::fs::File::create(dir.join("x64-resume-console.txt"))
+        .unwrap()
+        .write_all(console.as_bytes())
+        .unwrap();
+    eprintln!(
+        "==== x64 RESUME FIXTURE: {} MiB snapshot, {} B console @ {} insns → {} ====",
+        snap.len() / (1024 * 1024),
+        console.len(),
+        cpu.insns(),
+        dir.display()
+    );
+}
