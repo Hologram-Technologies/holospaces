@@ -2159,4 +2159,33 @@ impl X64Workspace {
     pub fn exc_trace(&self) -> String {
         x64::drain_exc_trace().join("\n")
     }
+
+    /// Suspend the running machine to a **bit-exact** snapshot of the WHOLE machine —
+    /// CPU + segments + CPL + every device (UART, PIC, PIT, local APIC, TSC, MSRs, …) +
+    /// RAM. The browser gzips + persists these to OPFS so the next launch *resumes*
+    /// instead of cold-booting (the x64 analogue of [`Workspace::suspend`]). Most of
+    /// guest RAM is zero, so the gzipped snapshot is a small fraction of the machine.
+    /// Verify the snapshot's κ by re-derivation before trusting it across a session
+    /// boundary (Law L5; OPFS is durable but untrusted).
+    #[must_use]
+    pub fn suspend(&self) -> Vec<u8> {
+        self.cpu.snapshot()
+    }
+
+    /// Resume a machine from a snapshot [`suspend`](X64Workspace::suspend) produced —
+    /// the running OS comes back **exactly** (bit-exact), so the tab skips the
+    /// multi-minute boot entirely and continues from the suspended instruction. The
+    /// snapshot's integrity is the caller's to check by re-derivation before trusting
+    /// it across a boundary (Law L5; ADR-019).
+    pub fn resume(snapshot: &[u8]) -> Result<X64Workspace, JsValue> {
+        let mut cpu = x64::Cpu::new(0x1000);
+        if !cpu.restore(snapshot) {
+            return Err(js_err("malformed x64 snapshot"));
+        }
+        Ok(X64Workspace {
+            cpu,
+            halted: false,
+            console_cursor: 0,
+        })
+    }
 }
