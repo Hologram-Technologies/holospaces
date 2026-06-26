@@ -5021,4 +5021,89 @@ mod tests {
         assert_eq!(got_r, want_r, "JIT registers diverged from step()");
         assert_eq!(got_f, want_f, "JIT rflags diverged from step() (incl. preserved AF/IF)");
     }
+
+    /// Step-1 gate: the JIT executor matches `step()` over REAL long-mode paging — the
+    /// in-wasm TLB is filled from the interpreter's own translation, and a load/add/store
+    /// block executes against guest RAM indexed by physical address. Maps VA page 0 → PA
+    /// frame 0x5000; code lives low in the frame (VA 0), data high (VA 0x800).
+    #[test]
+    fn jit_executor_matches_step_through_paging() {
+        use crate::emulator::jit;
+        use wasmtime::{Engine, Instance, Module, Store};
+
+        let code = [
+            0x48, 0x8b, 0x03, // mov rax, [rbx]
+            0x48, 0x01, 0xc8, // add rax, rcx
+            0x48, 0x89, 0x03, // mov [rbx], rax
+        ];
+        let data0: u64 = 0x0000_1111_2222_3333;
+        let rcx: u64 = 0x0000_0000_0000_0007;
+
+        let mut cpu = Cpu::new(64 * 1024);
+        let put = |cpu: &mut Cpu, at: usize, e: u64| {
+            cpu.ram[at..at + 8].copy_from_slice(&e.to_le_bytes());
+        };
+        put(&mut cpu, 0x1000, 0x2000 | 1); // PML4[0] → PDPT
+        put(&mut cpu, 0x2000, 0x3000 | 1); // PDPT[0] → PD
+        put(&mut cpu, 0x3000, 0x4000 | 1); // PD[0]   → PT
+        put(&mut cpu, 0x4000, 0x5000 | 1); // PT[0]   → frame 0x5000
+        cpu.ram[0x5000..0x5000 + code.len()].copy_from_slice(&code); // code at VA 0
+        cpu.ram[0x5800..0x5808].copy_from_slice(&data0.to_le_bytes()); // data at VA 0x800
+        cpu.cr3 = 0x1000;
+        cpu.cr4 = 1 << 5; // PAE
+        cpu.efer = 1 << 8; // LME
+        cpu.cr0 = 1 << 31; // PG → paging on
+        cpu.r[3] = 0x800; // rbx → VA of the data
+        cpu.r[1] = rcx;
+        let (init_r, init_f) = (cpu.r, cpu.rflags);
+        let init_ram = cpu.ram.clone(); // snapshot BEFORE the store mutates guest RAM
+        cpu.run(3); // load ; add ; store
+        let (want_r, want_f) = (cpu.r, cpu.rflags);
+        let want_data = u64::from_le_bytes(cpu.ram[0x5800..0x5808].try_into().unwrap());
+
+        // JIT: decode the block, fill the in-wasm TLB from the interpreter's own translation,
+        // execute over a copy of guest RAM (indexed by physical address: host = GUEST_BASE+PA).
+        let (ops, _, _) = jit::decode_block(&code);
+        let wasm = jit::compile_tlb_flags(&ops);
+        let pa = cpu.translate(0x800); // the interpreter's translation of the data VA
+        let (vpage, host_off) = (0x800u64 >> 12, pa & !0xfff);
+        let mut tlb = [0u8; 64 * 16]; // TLB_SIZE * 16
+        let slot = (vpage & 63) as usize;
+        tlb[slot * 16..slot * 16 + 8].copy_from_slice(&vpage.to_le_bytes());
+        tlb[slot * 16 + 8..slot * 16 + 16].copy_from_slice(&host_off.to_le_bytes());
+
+        let engine = Engine::default();
+        let module = Module::new(&engine, &wasm).unwrap();
+        let mut store = Store::new(&engine, ());
+        let inst = Instance::new(&mut store, &module, &[]).unwrap();
+        let mem = inst.get_memory(&mut store, "mem").unwrap();
+        let run = inst.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+        // jit.rs offsets: regs at i*8, rflags at 128, TLB at 0x200, guest RAM at 0x1000.
+        for (i, v) in init_r.iter().enumerate() {
+            mem.write(&mut store, i * 8, &v.to_le_bytes()).unwrap();
+        }
+        mem.write(&mut store, 128, &init_f.to_le_bytes()).unwrap();
+        mem.write(&mut store, 0x200, &tlb).unwrap();
+        mem.write(&mut store, 0x1000, &init_ram).unwrap(); // guest RAM (initial) by physical address
+        let bail = run.call(&mut store, ()).unwrap();
+        assert_eq!(bail, 3, "page present in the TLB → block completes");
+
+        let mut got_r = [0u64; 16];
+        for (i, g) in got_r.iter_mut().enumerate() {
+            let mut b = [0u8; 8];
+            mem.read(&store, i * 8, &mut b).unwrap();
+            *g = u64::from_le_bytes(b);
+        }
+        let mut fb = [0u8; 8];
+        mem.read(&store, 128, &mut fb).unwrap();
+        let got_f = u64::from_le_bytes(fb);
+        let mut db = [0u8; 8];
+        mem.read(&store, 0x1000 + 0x5800, &mut db).unwrap();
+        let got_data = u64::from_le_bytes(db);
+
+        assert_eq!(got_r, want_r, "executor regs diverged from step() under paging");
+        assert_eq!(got_f, want_f, "executor rflags diverged from step() under paging");
+        assert_eq!(got_data, want_data, "executor guest RAM diverged from step() under paging");
+        assert_eq!(got_data, data0.wrapping_add(rcx), "stored sum landed at the data VA");
+    }
 }
