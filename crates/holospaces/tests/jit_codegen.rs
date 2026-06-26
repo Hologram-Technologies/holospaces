@@ -1,10 +1,12 @@
-//! JIT codegen + differential (the second slab: IR → wasm, proven bit-identical).
+//! JIT decode → IR → codegen, differentially proven bit-identical (the block-JIT front-end).
 //!
-//! A typed micro-op IR over a 16×u64 register file, an interpreter oracle, and a
-//! register-allocated IR→wasm-bytecode codegen run via `wasmtime`. A seeded-random
-//! differential check (interpret vs codegen→wasmtime) proves the codegen is bit-exact —
-//! the discipline the real block JIT lives by. This covers the ALU/shift/rotate ops the
-//! SHA-512 round function needs; the x86 *decoder* (bytes → this IR) is the next slab.
+//! A typed micro-op IR over a 16×u64 register file + guest RAM, an interpreter oracle, an
+//! x86-64 decoder (reg-reg ALU/mov + memory forms with full SIB addressing), a register-
+//! allocated IR→wasm-bytecode codegen run via `wasmtime`, and an inline software-TLB
+//! address-translation path. Seeded-random differentials (interpret vs codegen→wasmtime)
+//! prove every layer bit-exact — the discipline the real block JIT lives by. This covers
+//! every instruction shape `sha512_transform` uses. Remaining for the live boot is
+//! integration: the TLB *miss/bail* path, `run()` dispatch, and the BLAKE3 block cache.
 
 use wasmtime::{Engine, Instance, Module, Store};
 
@@ -47,6 +49,14 @@ const NO_REG: u8 = 0xff;
 /// headroom: regs at `r*8`, guest byte `A` at wasm offset `GUEST_BASE + A`.
 const GUEST_BASE: u64 = 0x1000;
 const GUEST_LEN: usize = 0x3000; // 3 pages of test guest RAM
+
+/// Software TLB region in wasm memory (between the regs and guest RAM): a direct-mapped
+/// array of `TLB_SIZE` 16-byte entries `(tag: vpage @0, host_off: byte offset @8)`. The
+/// inline-TLB codegen translates a guest virtual address by indexing this on the hit path
+/// — the mechanism that lets the JIT touch real (paged) guest RAM. `$va` scratch = local 16.
+const TLB_BASE: u64 = 0x200;
+const TLB_SIZE: u64 = 64; // power of two; slot = vpage & (TLB_SIZE-1)
+const VA_LOCAL: u8 = NREG as u8; // local index of the vaddr scratch (17th i64 local)
 
 /// Effective address `base + idx<<scale + disp` (sentinels skipped) — the meaning shared
 /// by the interpreter and (mirrored in wasm) the codegen.
@@ -141,13 +151,26 @@ fn section(id: u8, body: Vec<u8>, out: &mut Vec<u8>) {
     out.extend(body);
 }
 
+/// Direct-mapped codegen: guest address maps straight to `GUEST_BASE + addr` (no paging) —
+/// the model the unit differentials use.
+fn compile(block: &[Op]) -> Vec<u8> {
+    compile_mode(block, false)
+}
+
+/// Inline-TLB codegen: a guest *virtual* address is translated through the software TLB
+/// (hit path) before the load/store — the real paged-memory model the boot needs.
+fn compile_tlb(block: &[Op]) -> Vec<u8> {
+    compile_mode(block, true)
+}
+
 /// Register-allocated codegen: load all 16 regs from memory into i64 locals at entry,
 /// compute on locals, store back at exit (per-op traffic is `local.get/set`, not memory).
-fn compile(block: &[Op]) -> Vec<u8> {
+/// `tlb` selects the address path (direct vs inline software-TLB translation).
+fn compile_mode(block: &[Op], tlb: bool) -> Vec<u8> {
     let mut code = Vec::new();
-    // locals: one group of 16 × i64
+    // locals: 17 × i64 (16 guest regs + 1 vaddr scratch for the TLB path)
     uleb(1, &mut code);
-    uleb(NREG as u64, &mut code);
+    uleb(NREG as u64 + 1, &mut code);
     code.push(0x7e); // i64
     let getl = |r: u8, c: &mut Vec<u8>| {
         c.push(0x20);
@@ -162,9 +185,11 @@ fn compile(block: &[Op]) -> Vec<u8> {
         sleb((r * 8) as i64, c); // i32.const addr
         c.extend([0x29, 0x03, 0x00]); // i64.load align=3 off=0
     };
-    // emit the i32 wasm offset for an effective address `base + idx<<scale + disp`,
-    // mirroring `eff_addr` then adding GUEST_BASE and wrapping to i32. Captures nothing.
+    // emit the i32 wasm offset for an effective address `base + idx<<scale + disp`.
+    // Direct: + GUEST_BASE, wrap. TLB: translate the vaddr through the software TLB (hit
+    // path) — host = tlb[vpage].host_off + GUEST_BASE + page-offset. Captures `tlb`.
     let emit_addr = |base: u8, idx: u8, scale: u8, disp: i32, c: &mut Vec<u8>| {
+        // vaddr = disp + base + idx<<scale  (i64)
         c.push(0x42);
         sleb(i64::from(disp), c); // i64.const disp
         if base != NO_REG {
@@ -180,8 +205,44 @@ fn compile(block: &[Op]) -> Vec<u8> {
             c.push(0x86); // i64.shl
             c.push(0x7c); // i64.add
         }
+        if !tlb {
+            c.push(0x42);
+            sleb(GUEST_BASE as i64, c); // + GUEST_BASE
+            c.push(0x7c); // i64.add
+            c.push(0xa7); // i32.wrap_i64
+            return;
+        }
+        // vaddr → $va scratch
+        c.push(0x21);
+        uleb(u64::from(VA_LOCAL), c); // local.set $va
+        // te = TLB_BASE + ((($va >> 12) & (TLB_SIZE-1)) * 16)  → i32
+        c.push(0x20);
+        uleb(u64::from(VA_LOCAL), c); // local.get $va
         c.push(0x42);
-        sleb(GUEST_BASE as i64, c); // + GUEST_BASE
+        sleb(12, c);
+        c.push(0x88); // i64.shr_u  → vpage
+        c.push(0x42);
+        sleb((TLB_SIZE - 1) as i64, c);
+        c.push(0x83); // i64.and  → slot
+        c.push(0x42);
+        sleb(16, c);
+        c.push(0x7e); // i64.mul  → byte offset
+        c.push(0x42);
+        sleb(TLB_BASE as i64, c);
+        c.push(0x7c); // i64.add  → entry addr
+        c.push(0xa7); // i32.wrap_i64
+        // host_off = i64.load offset=8 [te]
+        c.extend([0x29, 0x03, 0x08]); // i64.load align=3 offset=8
+        // + GUEST_BASE
+        c.push(0x42);
+        sleb(GUEST_BASE as i64, c);
+        c.push(0x7c); // i64.add
+        // + ($va & 0xfff)  (page offset)
+        c.push(0x20);
+        uleb(u64::from(VA_LOCAL), c); // local.get $va
+        c.push(0x42);
+        sleb(0xfff, c);
+        c.push(0x83); // i64.and
         c.push(0x7c); // i64.add
         c.push(0xa7); // i32.wrap_i64
     };
@@ -289,6 +350,31 @@ fn run_wasm(bytes: &[u8], regs: [u64; NREG], ram: &mut [u8]) -> [u64; NREG] {
     for (i, v) in regs.iter().enumerate() {
         mem.write(&mut store, i * 8, &v.to_le_bytes()).unwrap();
     }
+    mem.write(&mut store, GUEST_BASE as usize, ram).unwrap();
+    run.call(&mut store, ()).expect("run");
+    let mut out = [0u64; NREG];
+    for (i, o) in out.iter_mut().enumerate() {
+        let mut b = [0u8; 8];
+        mem.read(&store, i * 8, &mut b).unwrap();
+        *o = u64::from_le_bytes(b);
+    }
+    mem.read(&store, GUEST_BASE as usize, ram).unwrap();
+    out
+}
+
+/// As `run_wasm`, plus the software TLB image written at `TLB_BASE` — for inline-TLB blocks
+/// whose memory ops translate guest virtual addresses through it.
+fn run_wasm_tlb(bytes: &[u8], regs: [u64; NREG], ram: &mut [u8], tlb: &[u8]) -> [u64; NREG] {
+    let engine = Engine::default();
+    let module = Module::new(&engine, bytes).expect("emitted wasm is valid");
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).expect("instantiate");
+    let mem = instance.get_memory(&mut store, "mem").unwrap();
+    let run = instance.get_typed_func::<(), ()>(&mut store, "run").unwrap();
+    for (i, v) in regs.iter().enumerate() {
+        mem.write(&mut store, i * 8, &v.to_le_bytes()).unwrap();
+    }
+    mem.write(&mut store, TLB_BASE as usize, tlb).unwrap();
     mem.write(&mut store, GUEST_BASE as usize, ram).unwrap();
     run.call(&mut store, ()).expect("run");
     let mut out = [0u64; NREG];
@@ -621,4 +707,68 @@ fn decoded_x86_memory_block_runs_through_the_jit() {
     assert_eq!(ram_w, ram_i, "decoded memory block: guest RAM diverged");
     let stored = u64::from_le_bytes(ram_i[0x100..0x108].try_into().unwrap());
     assert_eq!(stored, 0x1111_2222_3333_4444u64.wrapping_add(0x0001_0001), "summed-and-stored");
+}
+
+/// Inline software-TLB differential: guest *virtual* addresses are translated through a
+/// modeled TLB whose entries are a non-trivial page permutation, so a codegen that ignored
+/// the TLB (used the vaddr directly) would diverge. Oracle = `interpret` over the flat
+/// virtual RAM; JIT = `compile_tlb` translating over the permuted host RAM. Bit-identical
+/// (regs AND every guest page under the permutation) proves the inline-TLB hit path — the
+/// address translation the real paged boot depends on.
+#[test]
+fn jit_inline_tlb_translation_is_bit_identical() {
+    let mut rng = Rng(0x51ed_270b_7c4f_a1c9);
+    const PERM: [usize; 3] = [2, 0, 1]; // virtual page p → host page PERM[p]
+    const BASES: [u8; 3] = [13, 14, 15]; // page-aligned base pointers, never written
+    for _ in 0..300 {
+        let n = 1 + (rng.next() % 24);
+        let mut block = Vec::new();
+        for _ in 0..n {
+            let d = (rng.next() % 13) as u8;
+            let base = BASES[(rng.next() % 3) as usize];
+            let disp = ((rng.next() % 0x200) * 8) as i32; // 8-aligned, ≤ 0xff8 (within a page)
+            block.push(match rng.next() % 6 {
+                0 => Op::Movi { d, imm: rng.next() },
+                1 => Op::Bin { op: Bin::Add, d, a: rng.reg(), b: rng.reg() },
+                2 => Op::Shift { op: Sh::Rotr, d, a: rng.reg(), sh: (rng.next() % 64) as u8 },
+                3 => Op::Load { d, base, idx: NO_REG, scale: 0, disp },
+                4 => Op::Store { base, idx: NO_REG, scale: 0, disp, s: rng.reg() },
+                _ => Op::LoadOp { op: Bin::Xor, d, base, idx: NO_REG, scale: 0, disp },
+            });
+        }
+        let mut regs = [0u64; NREG];
+        for r in regs[..13].iter_mut() {
+            *r = rng.next();
+        }
+        regs[13] = 0x0000;
+        regs[14] = 0x1000;
+        regs[15] = 0x2000;
+        // virtual RAM (oracle view); host RAM = each virtual page placed at its PERM page.
+        let mut virt = vec![0u8; GUEST_LEN];
+        for b in virt.iter_mut() {
+            *b = (rng.next() & 0xff) as u8;
+        }
+        let mut host = vec![0u8; GUEST_LEN];
+        for p in 0..3 {
+            host[PERM[p] * 0x1000..PERM[p] * 0x1000 + 0x1000]
+                .copy_from_slice(&virt[p * 0x1000..p * 0x1000 + 0x1000]);
+        }
+        // TLB image: entry p → (tag=p @0, host_off=PERM[p]*0x1000 @8)
+        let mut tlb = vec![0u8; TLB_SIZE as usize * 16];
+        for p in 0..3 {
+            tlb[p * 16..p * 16 + 8].copy_from_slice(&(p as u64).to_le_bytes());
+            tlb[p * 16 + 8..p * 16 + 16].copy_from_slice(&((PERM[p] as u64) * 0x1000).to_le_bytes());
+        }
+        let (mut regs_i, mut virt_i) = (regs, virt.clone());
+        interpret(&block, &mut regs_i, &mut virt_i); // flat vaddr indexing — no translation
+        let regs_w = run_wasm_tlb(&compile_tlb(&block), regs, &mut host, &tlb);
+        assert_eq!(regs_w, regs_i, "inline-TLB block: regs diverged");
+        for p in 0..3 {
+            assert_eq!(
+                &host[PERM[p] * 0x1000..PERM[p] * 0x1000 + 0x1000],
+                &virt_i[p * 0x1000..p * 0x1000 + 0x1000],
+                "inline-TLB block: guest page {p} diverged after translation"
+            );
+        }
+    }
 }
