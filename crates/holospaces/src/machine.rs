@@ -49,6 +49,14 @@ const DTB_OFFSET: u64 = 0x0700_0000;
 /// bridge (ADR-020, `CC-33`) — language intelligence with no Node. The guard
 /// (`[ -x … ]`) makes it a no-op for an image without it.
 ///
+/// It also starts the **task-runner agent** (`CC-53`): a tiny `/bin/sh` loop
+/// that watches `/workspace/.hs-tasks/` (on the shared `virtio-9p` workspace) for
+/// `<id>.cmd` request files, runs each in the devcontainer (`sh <id>.cmd`,
+/// stdout+stderr → `<id>.out`, exit code → `<id>.exit`), and cleans up. The
+/// workbench's `holospace-tasks` provider drives `tasks.json` tasks through this
+/// file channel — a real run in the guest, output + exit captured, no server
+/// outside the holospace. Image-agnostic: it needs only `sh` and the share.
+///
 /// The base image must provide a static `/bin/busybox` with the `setsid`/`stty`
 /// applets (the `CC-22` BusyBox base).
 pub const DEVCONTAINER_INIT: &[u8] = b"#!/bin/busybox sh\n\
@@ -62,6 +70,8 @@ export PATH=/bin:/sbin:/usr/bin:/usr/sbin HOME=/root PS1='holospace:$PWD\\$ '\n\
 /bin/busybox stty rows 24 cols 80 2>/dev/null\n\
 cd /workspace\n\
 [ -x /usr/bin/lsp-demo ] && /usr/bin/lsp-demo --listen 7000 &\n\
+mkdir -p /workspace/.hs-tasks 2>/dev/null\n\
+( while true; do for f in /workspace/.hs-tasks/*.cmd; do [ -e $f ] || continue; b=${f%.cmd}; mv $f $b.run 2>/dev/null || continue; ( cd /workspace 2>/dev/null; sh $b.run > $b.out 2>&1; echo $? > $b.exit ); rm -f $b.run; done; sleep 1; done ) &\n\
 /bin/busybox echo 'holospace devcontainer ready \xe2\x80\x94 /workspace is your shared workspace'\n\
 exec /bin/busybox setsid -c /bin/busybox sh\n";
 
@@ -83,6 +93,8 @@ mount -t tmpfs tmpfs /tmp 2>/dev/null\n\
 mount -t 9p -o trans=virtio,version=9p2000.L,msize=65536 hsworkspace /workspace 2>/dev/null\n\
 export HOME=/root TERM=xterm PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin PS1='holospace:$PWD\\$ '\n\
 cd /workspace 2>/dev/null || cd /root 2>/dev/null || cd /\n\
+mkdir -p /workspace/.hs-tasks 2>/dev/null\n\
+( while true; do for f in /workspace/.hs-tasks/*.cmd; do [ -e $f ] || continue; b=${f%.cmd}; mv $f $b.run 2>/dev/null || continue; ( cd /workspace 2>/dev/null; sh $b.run > $b.out 2>&1; echo $? > $b.exit ); rm -f $b.run; done; sleep 1; done ) &\n\
 echo 'holospace devcontainer ready \xe2\x80\x94 the repository image; /workspace is shared with the editor'\n\
 [ -x /bin/bash ] && exec /bin/bash -l || exec /bin/sh\n";
 
