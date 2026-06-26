@@ -40,3 +40,4 @@ boot-diag.log
 /dev-boot.out
 crates/holospaces-web/web/scm-test-failure.png
 crates/holospaces-web/web/search-test-failure.png
+crates/holospaces-web/web/tasks-test-failure.png

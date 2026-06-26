@@ -1,0 +1,60 @@
+{
+  "name": "holospace-tasks",
+  "displayName": "Holospace Tasks",
+  "description": "Run tasks.json tasks in the devcontainer (CC-53) — a TaskProvider whose CustomExecution runs each task in the guest over the holospace's own primitives (CC-11 terminal / CC-15 workspace), never a server outside the holospace.",
+  "version": "0.0.1",
+  "publisher": "holospaces",
+  "engines": { "vscode": "^1.75.0" },
+  "browser": "./extension.js",
+  "capabilities": {
+    "virtualWorkspaces": true,
+    "untrustedWorkspaces": { "supported": true }
+  },
+  "activationEvents": ["onStartupFinished", "onTaskType:holospace"],
+  "contributes": {
+    "commands": [
+      { "command": "holospaceTasks.runBuild", "title": "Holospace: Run Build Task" },
+      { "command": "holospaceTasks.run", "title": "Holospace: Run Task" }
+    ],
+    "taskDefinitions": [
+      {
+        "type": "holospace",
+        "required": ["command"],
+        "properties": {
+          "command": { "type": "string", "description": "The shell command to run in the devcontainer" },
+          "args": { "type": "array", "description": "Arguments appended to the command", "items": { "type": "string" } },
+          "label": { "type": "string", "description": "The task label" }
+        }
+      }
+    ],
+    "problemMatchers": [
+      {
+        "name": "holospace-generic",
+        "label": "Holospace generic (file:line:col: severity: message)",
+        "owner": "holospace",
+        "source": "holospace",
+        "fileLocation": ["relative", "${workspaceFolder}"],
+        "pattern": {
+          "regexp": "^(.+?):(\\d+):(\\d+):\\s+(warning|error):\\s+(.*)$",
+          "file": 1, "line": 2, "column": 3, "severity": 4, "message": 5
+        }
+      },
+      {
+        "name": "holospace-watch",
+        "label": "Holospace background/watch",
+        "owner": "holospace",
+        "source": "holospace",
+        "fileLocation": ["relative", "${workspaceFolder}"],
+        "pattern": {
+          "regexp": "^(.+?):(\\d+):(\\d+):\\s+(warning|error):\\s+(.*)$",
+          "file": 1, "line": 2, "column": 3, "severity": 4, "message": 5
+        },
+        "background": {
+          "activeOnStart": false,
+          "beginsPattern": "^BUILD-START",
+          "endsPattern": "^BUILD-DONE"
+        }
+      }
+    ]
+  }
+}

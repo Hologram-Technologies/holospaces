@@ -420,6 +420,45 @@ async function bootHolospace() {
       "main.rs",
       new TextEncoder().encode("fn greet(name) {\n  // TODO: greet\n  return greet(name)\n}\n"),
     );
+    // Seed a sample `.vscode/tasks.json` (CC-53) — the holospace-tasks provider
+    // runs these in the devcontainer over 9p. A nested path, so use the
+    // nested-path API (the riscv64 Workspace has it; the guard above covers the
+    // cores that do not).
+    if (typeof ws.ws_write_path === "function") {
+      ws.ws_write_path(
+        ".vscode/tasks.json",
+        new TextEncoder().encode(
+          JSON.stringify(
+            {
+              version: "2.0.0",
+              tasks: [
+                {
+                  // The default build task (Ctrl+Shift+B): emits a problem line
+                  // (the matcher turns it into a diagnostic), some output, and a
+                  // non-zero exit — so output, exit status, and problem matchers
+                  // are all exercised by one run in the devcontainer.
+                  label: "build",
+                  type: "holospace",
+                  command: "echo 'main.rs:2:5: warning: TODO found here'; echo 'build complete'; exit 2",
+                  group: { kind: "build", isDefault: true },
+                  problemMatcher: "$holospace-generic",
+                },
+                { label: "hello", type: "holospace", command: "echo 'Hello from the devcontainer'" },
+                {
+                  label: "watch",
+                  type: "holospace",
+                  isBackground: true,
+                  command: "echo BUILD-START; sleep 2; echo BUILD-DONE",
+                  problemMatcher: "$holospace-watch",
+                },
+              ],
+            },
+            null,
+            2,
+          ) + "\n",
+        ),
+      );
+    }
   }
 }
 
