@@ -2188,4 +2188,30 @@ impl X64Workspace {
             console_cursor: 0,
         })
     }
+
+    /// Suspend to a **content-addressed, deduplicated** snapshot blob — only the
+    /// unique 4 KiB pages are kept (post-boot RAM is overwhelmingly zero/duplicate),
+    /// so it is far smaller than [`suspend`](X64Workspace::suspend)'s flat snapshot.
+    /// The browser persists this to OPFS (and may gzip it further) so a fresh tab
+    /// resumes from only the unique pages, never the nominal RAM. Resume with
+    /// [`resume_kappa`](X64Workspace::resume_kappa).
+    #[must_use]
+    pub fn suspend_kappa(&self) -> Vec<u8> {
+        self.cpu.snapshot_kappa_blob()
+    }
+
+    /// Resume from a [`suspend_kappa`](X64Workspace::suspend_kappa) blob — rebuild
+    /// guest RAM from the bundled unique pages, **verifying each before use** (L5),
+    /// bit-exact. Rejects a tampered or truncated blob.
+    pub fn resume_kappa(blob: &[u8]) -> Result<X64Workspace, JsValue> {
+        let mut cpu = x64::Cpu::new(0x1000);
+        if !cpu.restore_kappa_blob(blob) {
+            return Err(js_err("malformed or tampered κ-snapshot blob"));
+        }
+        Ok(X64Workspace {
+            cpu,
+            halted: false,
+            console_cursor: 0,
+        })
+    }
 }

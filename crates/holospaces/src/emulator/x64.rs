@@ -36,7 +36,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use hologram_substrate_core::{verify_kappa, KappaLabel71, KappaStore};
+use hologram_substrate_core::{address_bytes, verify_kappa, KappaLabel71, KappaStore};
 
 /// Why the core stopped.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -862,6 +862,8 @@ const KAPPA_PAGE: usize = 0x1000;
 const KAPPA_LABEL_LEN: usize = 71;
 /// Magic prefixing a serialized κ-snapshot manifest (versioned for forward compatibility).
 const KAPPA_MANIFEST_MAGIC: &[u8; 8] = b"HOLOKSN1";
+/// Magic prefixing a self-contained κ-snapshot *blob* (manifest + bundled unique pages).
+const KAPPA_BLOB_MAGIC: &[u8; 8] = b"HOLOKSB1";
 
 /// A **content-addressed** machine snapshot (the κ-snapshot path): the small CPU + device
 /// `state` inline, and guest RAM as a per-4 KiB-page BLAKE3 κ **manifest** (`ram_pages`) whose
@@ -1564,6 +1566,91 @@ impl Cpu {
             Some(snap) => self.restore_kappa(&snap, store),
             None => false,
         }
+    }
+
+    /// Serialize a **self-contained, content-addressed** snapshot blob: the manifest (CPU+device
+    /// state + the per-page κ list) plus each UNIQUE 4 KiB page's bytes exactly once. Zero and
+    /// duplicate pages collapse to a single copy, so the blob is far smaller than the flat
+    /// [`Cpu::snapshot`] yet needs no external store to resume — the browser persists it to OPFS
+    /// (and may gzip it further) so a fresh tab resumes from only the unique pages, not the
+    /// nominal RAM. The dual of [`Cpu::restore_kappa_blob`].
+    #[must_use]
+    pub fn snapshot_kappa_blob(&self) -> Vec<u8> {
+        let state = self.snapshot_state();
+        let mut labels: Vec<KappaLabel71> = Vec::with_capacity(self.ram.len() / KAPPA_PAGE + 1);
+        let mut seen: BTreeMap<[u8; KAPPA_LABEL_LEN], ()> = BTreeMap::new();
+        let mut unique: Vec<(KappaLabel71, &[u8])> = Vec::new();
+        for page in self.ram.chunks(KAPPA_PAGE) {
+            let k = address_bytes(page);
+            if seen.insert(*k.as_array(), ()).is_none() {
+                unique.push((k, page));
+            }
+            labels.push(k);
+        }
+        let mut out = Vec::with_capacity(
+            32 + state.len() + labels.len() * KAPPA_LABEL_LEN + unique.len() * (KAPPA_PAGE + 80),
+        );
+        out.extend_from_slice(KAPPA_BLOB_MAGIC);
+        out.extend_from_slice(&(self.ram.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(state.len() as u64).to_le_bytes());
+        out.extend_from_slice(&state);
+        out.extend_from_slice(&(labels.len() as u64).to_le_bytes());
+        for k in &labels {
+            out.extend_from_slice(k.as_array());
+        }
+        out.extend_from_slice(&(unique.len() as u64).to_le_bytes());
+        for (k, bytes) in &unique {
+            out.extend_from_slice(k.as_array());
+            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
+        out
+    }
+
+    /// Resume from a [`Cpu::snapshot_kappa_blob`]: rebuild guest RAM from the bundled unique pages,
+    /// **verifying each before use** (L5 — re-derive its BLAKE3 κ; refuse a tampered blob), then
+    /// restore CPU+device state. Returns `false` on a bad magic, truncation, a κ mismatch, or a
+    /// page the manifest references but the blob omits.
+    pub fn restore_kappa_blob(&mut self, blob: &[u8]) -> bool {
+        self.restore_kappa_blob_inner(blob).is_some()
+    }
+    fn restore_kappa_blob_inner(&mut self, blob: &[u8]) -> Option<()> {
+        let mut s = Snap::new(blob);
+        if s.take(KAPPA_BLOB_MAGIC.len())? != KAPPA_BLOB_MAGIC.as_slice() {
+            return None;
+        }
+        let ram_len = s.u64()? as usize;
+        let state_len = s.u64()? as usize;
+        let state = s.take(state_len)?.to_vec();
+        let n_pages = s.u64()? as usize;
+        let mut labels = Vec::with_capacity(n_pages);
+        for _ in 0..n_pages {
+            let arr: [u8; KAPPA_LABEL_LEN] = s.take(KAPPA_LABEL_LEN)?.try_into().ok()?;
+            labels.push(arr);
+        }
+        let n_unique = s.u64()? as usize;
+        let mut pages: BTreeMap<[u8; KAPPA_LABEL_LEN], Vec<u8>> = BTreeMap::new();
+        for _ in 0..n_unique {
+            let arr: [u8; KAPPA_LABEL_LEN] = s.take(KAPPA_LABEL_LEN)?.try_into().ok()?;
+            let len = s.u32()? as usize;
+            let bytes = s.take(len)?;
+            let k = KappaLabel71::from_bytes(&arr).ok()?;
+            if !matches!(verify_kappa(bytes, &k), Ok(true)) {
+                return None; // L5: a page that doesn't re-derive to its κ is refused
+            }
+            pages.insert(arr, bytes.to_vec());
+        }
+        let mut ram = vec![0u8; ram_len];
+        for (i, label) in labels.iter().enumerate() {
+            let bytes = pages.get(label)?;
+            let off = i * KAPPA_PAGE;
+            let end = (off + bytes.len()).min(ram.len());
+            ram[off..end].copy_from_slice(&bytes[..end - off]);
+        }
+        self.restore_state(&mut Snap::new(&state))?;
+        self.ram = ram;
+        self.flush_caches_after_restore();
+        Some(())
     }
 
     /// Read the CPU + device state (everything except RAM) — the inverse of
@@ -5474,6 +5561,48 @@ mod tests {
         assert!(
             drive_fetch(&victim, &forger, &snapshot_kappa).is_none(),
             "a forged response is rejected on receipt (L5) — the adversary cannot serve the snapshot"
+        );
+    }
+
+    /// κ-snapshot Step-4 Phase 1: the self-contained, deduplicated κ-blob is smaller than the flat
+    /// snapshot (zero/duplicate pages collapse), resumes RAM bit-exact, and a tampered or truncated
+    /// blob is refused (L5). This is what the browser persists to OPFS so a fresh tab resumes from
+    /// only the unique pages.
+    #[test]
+    fn kappa_snapshot_blob_dedups_and_restores_bit_exact() {
+        let mut a = Cpu::new(16 * KAPPA_PAGE);
+        a.r[2] = 0xbeef;
+        a.rip = 0x5000;
+        a.sys.as_mut().unwrap().tsc = 55;
+        a.ram[0..8].copy_from_slice(&0xfeed_face_dead_beefu64.to_le_bytes());
+        a.ram[9 * KAPPA_PAGE..9 * KAPPA_PAGE + 8].copy_from_slice(&0x42u64.to_le_bytes());
+
+        let blob = a.snapshot_kappa_blob();
+        let flat = a.snapshot();
+        assert!(
+            blob.len() < flat.len(),
+            "the deduped κ-blob ({}) is smaller than the flat snapshot ({})",
+            blob.len(),
+            flat.len()
+        );
+
+        // Resume into a fresh, differently-sized core — bit-exact.
+        let mut b = Cpu::new(KAPPA_PAGE);
+        assert!(b.restore_kappa_blob(&blob), "κ-blob resumes");
+        assert_eq!(b.ram, a.ram, "RAM reconstructed byte-for-byte from the κ-blob");
+        assert_eq!(b.snapshot(), flat, "full machine identical after a κ-blob resume");
+
+        // L5: flipping a byte in a bundled page makes it fail to re-derive → refused.
+        let mut tampered = blob.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xff;
+        assert!(
+            !Cpu::new(KAPPA_PAGE).restore_kappa_blob(&tampered),
+            "a tampered κ-blob is refused (page no longer re-derives to its κ)"
+        );
+        assert!(
+            !Cpu::new(KAPPA_PAGE).restore_kappa_blob(&blob[..blob.len() / 2]),
+            "a truncated κ-blob is refused"
         );
     }
 

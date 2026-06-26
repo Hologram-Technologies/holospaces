@@ -61,8 +61,20 @@ const term1 = ws.terminal();
 if (term1.length < term0.length) fail("console shrank after running the resumed machine");
 
 console.log("PASS — x64 κ-snapshot RESUME witness (compiled wasm, nodejs target):");
-console.log(`  snapshot : ${(snap.length / 1048576).toFixed(0)} MiB   κ=${k.slice(0, 24)}…`);
-console.log(`  resume   : ${tResume.toFixed(1)} ms  → console BIT-EXACT (${term0.length} B preserved)`);
-console.log(`  run 8M   : ${tRun.toFixed(0)} ms  → machine LIVE, console ${term1.length} B (+${term1.length - term0.length})`);
-console.log("  → a running guest from a snapshot in milliseconds, never re-running the boot.");
+console.log(`  flat snapshot : ${(snap.length / 1048576).toFixed(0)} MiB   κ=${k.slice(0, 24)}…`);
+console.log(`  resume        : ${tResume.toFixed(1)} ms  → console BIT-EXACT (${term0.length} B preserved)`);
+console.log(`  run 8M        : ${tRun.toFixed(0)} ms  → machine LIVE, console ${term1.length} B (+${term1.length - term0.length})`);
+
+// Phase 1 — the CONTENT-ADDRESSED, deduplicated κ-blob: the browser persists THIS to OPFS, not
+// the flat snapshot. Re-suspend the resumed machine as a κ-blob, then resume a fresh machine from
+// it — bit-exact, from only the unique pages.
+const blob = ws.suspend_kappa();
+const t2 = performance.now();
+const ws2 = hs.X64Workspace.resume_kappa(blob);
+const tKappa = performance.now() - t2;
+if (ws2.terminal() !== term0) fail("κ-blob resume did not reproduce the console bit-exact");
+const reduction = (snap.length / blob.length).toFixed(1);
+console.log(`  κ-blob        : ${(blob.length / 1048576).toFixed(1)} MiB  (${reduction}x smaller than flat — unique pages only)`);
+console.log(`  κ-blob resume : ${tKappa.toFixed(1)} ms  → console BIT-EXACT, deduped`);
+console.log("  → a running guest from a snapshot in milliseconds, persisting only the unique pages.");
 process.exit(0);
