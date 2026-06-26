@@ -219,6 +219,22 @@ fn fastpaths_on() -> bool {
 // block to wasm once it crosses the hotness threshold. Step A wires the discovery + compile
 // path on real boots (no execution yet — that, plus the differential, is the next sub-step;
 // the discovery is side-effect-free, so it cannot perturb the boot).
+/// A compiled block whose JIT result is being shadow-validated against the interpreter: the
+/// executor's `(regs, rflags, dirty pages)` for the block `[start, end)`, recorded when
+/// `jit_dispatch` ran the JIT dry, compared once the interpreter reaches `end` straight-line.
+#[cfg(feature = "jit")]
+struct JitPending {
+    key: [u8; 32],
+    start: u64,
+    end: u64,
+    regs: [u64; 16],
+    rflags: u64,
+    dirty: Vec<(usize, Vec<u8>)>,
+    has_shift: bool,
+}
+/// Shadow matches required before a block is trusted (and shadowing stops).
+#[cfg(feature = "jit")]
+const JIT_TRUST_K: u32 = 4;
 #[cfg(feature = "jit")]
 thread_local! {
     static JIT_ON: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
@@ -226,19 +242,49 @@ thread_local! {
     static JIT_CACHE: core::cell::RefCell<crate::emulator::jit::BlockCache> =
         core::cell::RefCell::new(crate::emulator::jit::BlockCache::new(16));
     static JIT_DECODED: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+    static JIT_PENDING: core::cell::RefCell<Option<JitPending>> =
+        const { core::cell::RefCell::new(None) };
+    static JIT_TRUSTED: core::cell::RefCell<std::collections::HashSet<[u8; 32]>> =
+        core::cell::RefCell::new(std::collections::HashSet::new());
+    static JIT_REFUSED: core::cell::RefCell<std::collections::HashSet<[u8; 32]>> =
+        core::cell::RefCell::new(std::collections::HashSet::new());
+    static JIT_COUNT: core::cell::RefCell<std::collections::HashMap<[u8; 32], u32>> =
+        core::cell::RefCell::new(std::collections::HashMap::new());
+    static JIT_MATCH: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+    static JIT_MISMATCH: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+    // mismatch breakdown (which field diverged, and whether the block had a shift)
+    static JIT_MM_REGS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+    static JIT_MM_RFLAGS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+    static JIT_MM_MEM: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+    static JIT_MM_SHIFT: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+/// Drain the mismatch breakdown: `(diverged_regs, diverged_rflags, diverged_mem, had_shift)`.
+#[cfg(feature = "jit")]
+#[must_use]
+pub fn drain_jit_diag() -> (u64, u64, u64, u64) {
+    (
+        JIT_MM_REGS.with(|c| c.replace(0)),
+        JIT_MM_RFLAGS.with(|c| c.replace(0)),
+        JIT_MM_MEM.with(|c| c.replace(0)),
+        JIT_MM_SHIFT.with(|c| c.replace(0)),
+    )
 }
 /// Arm/disarm the block JIT (off in production; a test or the host turns it on).
 #[cfg(feature = "jit")]
 pub fn set_jit_on(on: bool) {
     JIT_ON.with(|c| c.set(on));
 }
-/// Drain JIT dispatch stats: `(blocks_recorded, distinct_blocks, compiled_blocks)`.
+/// Drain JIT stats: `(recorded, distinct, compiled, shadow_match, shadow_mismatch, trusted, refused)`.
 #[cfg(feature = "jit")]
 #[must_use]
-pub fn drain_jit_stats() -> (u64, usize, usize) {
+pub fn drain_jit_stats() -> (u64, usize, usize, u64, u64, usize, usize) {
     let recorded = JIT_DECODED.with(|c| c.replace(0));
     let (entries, compiled) = JIT_CACHE.with(|c| c.borrow().stats());
-    (recorded, entries, compiled)
+    let m = JIT_MATCH.with(|c| c.replace(0));
+    let mm = JIT_MISMATCH.with(|c| c.replace(0));
+    let trusted = JIT_TRUSTED.with(|c| c.borrow().len());
+    let refused = JIT_REFUSED.with(|c| c.borrow().len());
+    (recorded, entries, compiled, m, mm, trusted, refused)
 }
 
 struct Sys {
@@ -1366,9 +1412,100 @@ impl Cpu {
         }
         let key: [u8; 32] = *blake3::hash(&self.ram[off..off + len]).as_bytes();
         JIT_DECODED.with(|c| c.set(c.get() + 1));
-        JIT_CACHE.with(|c| {
-            let _ = c.borrow_mut().record(key, &ops);
+        // compile hot blocks; clone the wasm so the cache borrow is released
+        let wasm = JIT_CACHE.with(|c| c.borrow_mut().record(key, &ops).map(<[u8]>::to_vec));
+        let Some(wasm) = wasm else { return };
+        // shadow-validate only un-trusted, un-refused blocks (caps work per block at K matches)
+        let skip = JIT_TRUSTED.with(|c| c.borrow().contains(&key))
+            || JIT_REFUSED.with(|c| c.borrow().contains(&key));
+        if skip {
+            return;
+        }
+        // run the JIT dry — one `self` borrow via the page-fetch closure (read-only `walk`)
+        let (entry_r, entry_f, block_start) = (self.r, self.rflags, self.rip);
+        let jit = crate::emulator::jit_exec::exec_block_pooled(&wasm, &ops, entry_r, entry_f, |va| {
+            let pa = self.walk(va).ok()?;
+            let f = (pa & !0xfff) as usize;
+            (f + 0x1000 <= self.ram.len()).then(|| (f, self.ram[f..f + 0x1000].to_vec()))
         });
+        if let Some((regs, rflags, dirty)) = jit {
+            JIT_PENDING.with(|c| {
+                *c.borrow_mut() = Some(JitPending {
+                    key,
+                    start: block_start,
+                    end: block_start + len as u64,
+                    regs,
+                    rflags,
+                    dirty,
+                    has_shift: crate::emulator::jit::block_has_shift(&ops),
+                });
+            });
+        }
+    }
+
+    /// After `step()`: if a shadowed JIT block has just been completed by the interpreter
+    /// (straight-line to `end`), compare the JIT's dry result to the real architectural state.
+    /// K matches → trust (stop shadowing); a mismatch → refuse the block's κ forever. A block
+    /// the interpreter left early (interrupt/branch/fault) is discarded uncompared.
+    #[cfg(feature = "jit")]
+    fn jit_shadow_check(&mut self) {
+        enum Act {
+            Compare,
+            Discard,
+            Keep,
+        }
+        let act = JIT_PENDING.with(|c| match c.borrow().as_ref() {
+            None => None,
+            Some(p) if self.rip == p.end => Some(Act::Compare),
+            Some(p) if self.rip >= p.start && self.rip < p.end => Some(Act::Keep),
+            Some(_) => Some(Act::Discard),
+        });
+        match act {
+            Some(Act::Compare) => {
+                let p = JIT_PENDING.with(|c| c.borrow_mut().take()).unwrap();
+                let regs_ok = self.r == p.regs;
+                let rflags_ok = self.rflags == p.rflags;
+                let mem_ok = p.dirty.iter().all(|(pa, b)| {
+                    *pa + b.len() <= self.ram.len() && self.ram[*pa..*pa + b.len()] == b[..]
+                });
+                let ok = regs_ok && rflags_ok && mem_ok;
+                if !ok {
+                    if !regs_ok {
+                        JIT_MM_REGS.with(|c| c.set(c.get() + 1));
+                    }
+                    if !rflags_ok {
+                        JIT_MM_RFLAGS.with(|c| c.set(c.get() + 1));
+                    }
+                    if !mem_ok {
+                        JIT_MM_MEM.with(|c| c.set(c.get() + 1));
+                    }
+                    if p.has_shift {
+                        JIT_MM_SHIFT.with(|c| c.set(c.get() + 1));
+                    }
+                }
+                if ok {
+                    JIT_MATCH.with(|c| c.set(c.get() + 1));
+                    let n = JIT_COUNT.with(|c| {
+                        let mut m = c.borrow_mut();
+                        let e = m.entry(p.key).or_insert(0);
+                        *e += 1;
+                        *e
+                    });
+                    if n >= JIT_TRUST_K {
+                        JIT_TRUSTED.with(|c| {
+                            c.borrow_mut().insert(p.key);
+                        });
+                    }
+                } else {
+                    JIT_MISMATCH.with(|c| c.set(c.get() + 1));
+                    JIT_REFUSED.with(|c| {
+                        c.borrow_mut().insert(p.key);
+                    });
+                }
+            }
+            Some(Act::Discard) => JIT_PENDING.with(|c| *c.borrow_mut() = None),
+            Some(Act::Keep) | None => {}
+        }
     }
 
     /// Run up to `max_steps` guest instructions, returning why execution stopped (the guest
@@ -1452,6 +1589,7 @@ impl Cpu {
             if JIT_ON.with(core::cell::Cell::get) {
                 let r = self.rip; // a non-sequential rip → the next instruction is a block entry
                 JIT_AT_ENTRY.with(|c| c.set(r < rip0 || r > rip0.wrapping_add(15)));
+                self.jit_shadow_check();
             }
             // A non-sequential rip (backward, or > 15 B ahead) means the instruction
             // branched/returned/faulted — the new rip is a basic-block entry.

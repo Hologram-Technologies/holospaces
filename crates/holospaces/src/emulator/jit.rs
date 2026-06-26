@@ -82,6 +82,13 @@ const FR_LOCAL: u8 = NREG as u8 + 4; // i64 20: flag result
 const BAIL_LOCAL: u8 = NREG as u8 + 5; // i32 21: bail instruction index (TLB)
 const TE_LOCAL: u8 = NREG as u8 + 6; // i32 22: TLB entry address scratch
 
+/// Whether a block contains a `Shift`/`Rotr` op — whose flags the codegen does not yet
+/// model, so such a block diverges from `step()` on `rflags` (a known gap, used to diagnose
+/// shadow mismatches and to gate the JIT off those blocks until shift flags land).
+pub(crate) fn block_has_shift(ops: &[Op]) -> bool {
+    ops.iter().any(|o| matches!(o, Op::Shift { .. }))
+}
+
 /// The address mode `(base, idx, scale, disp)` of a memory op (`None` for non-memory ops) —
 /// lets the executor recompute a faulting access's vaddr from `ops[bail]` + the regs.
 pub(crate) fn op_mem_addr(op: &Op) -> Option<(u8, u8, u8, i32)> {

@@ -78,17 +78,21 @@ pub(crate) fn exec_block(
 /// `translate`d to a physical page, copied into a free pool slot, and the run retries from
 /// the block entry (idempotent: the block is deterministic from `entry_regs`).
 ///
-/// Returns `Some((regs, rflags))` when the block runs to completion (all dirtied pool pages
-/// written back to `ram`), or `None` when it cannot — a real fault (`translate` → `None`),
-/// the pool fills, or a slot collision — in which case the caller interprets the block.
+/// Runs "dry": `fetch_page(vaddr) -> Some((pa_frame, 4 KiB bytes))` supplies a guest page on
+/// a miss (`None` = a real `#PF`), and the block's effects are RETURNED, not committed —
+/// `Some((regs, rflags, dirty))` where `dirty` is each mapped page as `(pa_frame, bytes)`.
+/// The caller commits (writes `dirty` into guest RAM) only for a *trusted* block; the
+/// differential compares `dirty` to what `step()` produced without committing. `None` when
+/// the block cannot complete — a real fault, the pool fills, or a slot collision — in which
+/// case the caller interprets the block. (One callback, not `&ram`+`translate`, so the caller
+/// borrows its `Cpu` exactly once.)
 pub(crate) fn exec_block_pooled(
     wasm: &[u8],
     ops: &[Op],
     entry_regs: [u64; 16],
     entry_rflags: u64,
-    ram: &mut [u8],
-    translate: impl Fn(u64) -> Option<u64>,
-) -> Option<([u64; 16], u64)> {
+    fetch_page: impl Fn(u64) -> Option<(usize, Vec<u8>)>,
+) -> Option<([u64; 16], u64, Vec<(usize, Vec<u8>)>)> {
     let engine = Engine::default();
     let module = Module::new(&engine, wasm).ok()?;
     let mut store = Store::new(&engine, ());
@@ -103,7 +107,7 @@ pub(crate) fn exec_block_pooled(
 
     let mut tlb = vec![0u8; TLB_SIZE as usize * 16];
     let mut pool = vec![0u8; POOL_PAGES * PAGE];
-    let mut mapped: Vec<u64> = Vec::new(); // slot -> vpage
+    let mut mapped: Vec<(u64, usize)> = Vec::new(); // slot -> (vpage, pa_frame)
 
     for _ in 0..=POOL_PAGES {
         for (i, v) in entry_regs.iter().enumerate() {
@@ -125,30 +129,31 @@ pub(crate) fn exec_block_pooled(
         mem.read(&store, GUEST_BASE as usize, &mut pool).ok()?;
 
         if (bail as usize) >= ops.len() {
-            // completed — write every mapped page back to guest RAM (clean pages are no-ops)
-            for (slot, &vpage) in mapped.iter().enumerate() {
-                if let Some(pa) = translate(vpage << 12) {
-                    let f = (pa & !0xfff) as usize;
-                    ram[f..f + PAGE].copy_from_slice(&pool[slot * PAGE..slot * PAGE + PAGE]);
-                }
-            }
-            return Some((regs, rflags));
+            // completed — return every mapped page as a dirty candidate (clean pages equal RAM)
+            let dirty = mapped
+                .iter()
+                .enumerate()
+                .map(|(slot, &(_vpage, pa_frame))| {
+                    (pa_frame, pool[slot * PAGE..slot * PAGE + PAGE].to_vec())
+                })
+                .collect();
+            return Some((regs, rflags, dirty));
         }
 
-        // bail at a memory op — recompute its vaddr, fill the page, retry
+        // bail at a memory op — recompute its vaddr, fetch the page, retry
         let (base, idx, scale, disp) = op_mem_addr(&ops[bail as usize])?;
-        let vpage = (eff_addr(&regs, base, idx, scale, disp) as u64) >> 12;
-        if mapped.contains(&vpage) || mapped.len() >= POOL_PAGES {
+        let vaddr = eff_addr(&regs, base, idx, scale, disp) as u64;
+        let vpage = vaddr >> 12;
+        if mapped.iter().any(|&(vp, _)| vp == vpage) || mapped.len() >= POOL_PAGES {
             return None; // already mapped yet still missed (slot collision) / pool full
         }
-        let pa = translate(vpage << 12)?; // None → real #PF → interpret
-        let f = (pa & !0xfff) as usize;
-        if f + PAGE > ram.len() {
+        let (pa_frame, bytes) = fetch_page(vaddr)?; // None → real #PF → interpret
+        if bytes.len() != PAGE {
             return None;
         }
         let slot = mapped.len();
-        pool[slot * PAGE..slot * PAGE + PAGE].copy_from_slice(&ram[f..f + PAGE]);
-        mapped.push(vpage);
+        pool[slot * PAGE..slot * PAGE + PAGE].copy_from_slice(&bytes);
+        mapped.push((vpage, pa_frame));
         let s = (vpage & (TLB_SIZE - 1)) as usize;
         tlb[s * 16..s * 16 + 8].copy_from_slice(&vpage.to_le_bytes());
         tlb[s * 16 + 8..s * 16 + 16].copy_from_slice(&((slot * PAGE) as u64).to_le_bytes());
@@ -175,14 +180,22 @@ mod tests {
         let mut regs = [0u64; 16];
         regs[3] = 0x2000; // rbx → page 2
         regs[5] = 0x5000; // rbp → page 5
-        // start with an empty pool: the block bails twice, the executor fills both pages.
-        let out = exec_block_pooled(&wasm, &block, regs, 0x2, &mut ram, |va| Some(va));
-        let (out_regs, _rf) = out.expect("the block completes after the pool fills both pages");
+        // start with an empty pool: the block bails twice, the executor fetches both pages.
+        let fetch = |va: u64| {
+            let f = (va as usize) & !0xfff; // identity translation for the test
+            (f + 0x1000 <= ram.len()).then(|| (f, ram[f..f + 0x1000].to_vec()))
+        };
+        let out = exec_block_pooled(&wasm, &block, regs, 0x2, fetch);
+        let (out_regs, _rf, dirty) = out.expect("the block completes after the pool fills both pages");
         assert_eq!(out_regs[0], v, "rax loaded from the lazily-filled source page");
+        // dry mode: commit the returned dirty pages, then the store is visible in guest RAM.
+        for (pa, bytes) in &dirty {
+            ram[*pa..*pa + bytes.len()].copy_from_slice(bytes);
+        }
         assert_eq!(
             u64::from_le_bytes(ram[0x5000..0x5008].try_into().unwrap()),
             v,
-            "the store landed in the pool and was written back to guest RAM"
+            "the store landed in the pool and committed to guest RAM"
         );
     }
 }
