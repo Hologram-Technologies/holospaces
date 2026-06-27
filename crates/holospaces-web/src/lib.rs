@@ -116,6 +116,24 @@ pub fn verify_kappa(bytes: &[u8], kappa: &str) -> Result<bool, JsValue> {
     verify(bytes, &parse_kappa(kappa)?).map_err(js_err)
 }
 
+/// The **unique** page κ-labels of a κ-snapshot manifest (see
+/// [`X64Workspace::suspend_kappa_sealed`]). A streaming adopter fetches exactly these by κ over
+/// its transport, then resumes via [`X64Workspace::resume_kappa_streamed`].
+#[wasm_bindgen]
+pub fn kappa_manifest_pages(manifest: &[u8]) -> Result<Vec<String>, JsValue> {
+    let snap = x64::KappaSnapshot::from_manifest_bytes(manifest)
+        .ok_or_else(|| js_err("malformed κ-snapshot manifest"))?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for k in snap.page_kappas() {
+        let s = k.as_str().to_owned();
+        if seen.insert(s.clone()) {
+            out.push(s);
+        }
+    }
+    Ok(out)
+}
+
 /// The **usable default** Dev Container base image the peer provisions when a
 /// repository declares no `devcontainer.json` (`buildpack-deps` — `curl`/`git`
 /// over apt; the Dev Container spec's default, `CC-20`). Exposed so the
