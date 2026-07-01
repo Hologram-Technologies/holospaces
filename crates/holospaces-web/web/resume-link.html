@@ -1,0 +1,103 @@
+<!doctype html>
+<!-- resume-link.html — paste a κ-link, land in a live machine. Reads `#k=<κ>` from the URL, blooms
+     a loader while the manifest + unique pages stream in by κ (verify-on-receipt), and paints the
+     resumed x86-64 console. The streaming/resume logic lives in resume-link-worker.mjs (identical
+     to the proven x64-stream-worker.mjs; headless witness: x64-link-resume-test.mjs). Serve a
+     `make-link-bundle.mjs` output statically with COOP/COEP and open this with `#k=<κ>`. -->
+<meta charset="utf-8" />
+<title>Hologram — opening a computer…</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; height: 100vh; display: grid; place-items: center; background: #07090d;
+         color: #d7e0ea; font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .stage { text-align: center; max-width: 680px; padding: 24px; }
+  .bloom { width: 96px; height: 96px; margin: 0 auto 18px; border-radius: 50%;
+           background: radial-gradient(circle at 50% 45%, #3aa0ff 0%, #1648a8 45%, #0a1830 75%);
+           box-shadow: 0 0 60px 8px #1d6fe055; animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { transform: scale(.92); opacity:.8 } 50% { transform: scale(1.04); opacity:1 } }
+  h1 { font-size: 16px; font-weight: 600; margin: 0 0 4px; letter-spacing: .2px; }
+  .sub { color: #8aa0b8; margin: 0 0 16px; }
+  .bar { height: 6px; background: #131922; border-radius: 4px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; width: 0; background: linear-gradient(90deg,#2a7fe6,#5ab0ff);
+             transition: width .12s linear; }
+  .meta { margin-top: 10px; color: #6f86a0; font-size: 12px; }
+  pre#term { display: none; text-align: left; width: 80ch; max-width: 92vw; height: 60vh; overflow: auto;
+             background: #04060a; color: #c7d4e2; padding: 14px 16px; border-radius: 8px;
+             border: 1px solid #16202c; white-space: pre-wrap; }
+  .err { color: #ff7a7a; }
+</style>
+<div class="stage" id="stage">
+  <div class="bloom" id="bloom"></div>
+  <h1 id="title">Opening a computer…</h1>
+  <p class="sub" id="sub">resolving the link</p>
+  <div class="bar"><i id="fill"></i></div>
+  <div class="meta" id="meta"></div>
+  <pre id="term"></pre>
+</div>
+<script type="module">
+  const $ = (id) => document.getElementById(id);
+  const set = (t, s) => { $("title").textContent = t; if (s !== undefined) $("sub").textContent = s; };
+  const fill = (f) => { $("fill").style.width = Math.round(f * 100) + "%"; };
+
+  // The link carries ONE hash: `#k=<manifest-κ>`. Nothing else is needed to open the machine.
+  const base = new URLSearchParams(location.search).get("base") || "./"; // where the κ-objects live
+  const kappa = new URLSearchParams(location.hash.slice(1)).get("k") || location.hash.replace(/^#k=/, "");
+  if (!kappa || !kappa.startsWith("blake3:")) {
+    set("No κ-link", "append #k=blake3:… to open a machine"); $("bloom").style.animation = "none";
+  } else {
+    const w = new Worker("./resume-link-worker.mjs", { type: "module" });
+    const t0 = performance.now();
+    const term = $("term");
+    const dec = new TextDecoder();
+    // Minimal terminal: a growing buffer with \b (backspace) + \r handling, autoscrolled.
+    let buf = "";
+    const render = () => { term.textContent = buf; term.scrollTop = term.scrollHeight; };
+    const write = (s) => {
+      for (const ch of s) {
+        if (ch === "\b" || ch === "\x7f") buf = buf.slice(0, -1);
+        // The guest terminates lines with CRLF ("…\r\n") and echoes typed input the same way; a
+        // bare CR is just "cursor to column 0". Either way, dropping CR (and letting LF make the
+        // newline) renders a real console — truncating the line on CR would erase every command's
+        // echo and output (the line is rebuilt right after by the following bytes).
+        else if (ch === "\r") { /* no-op: CRLF → LF; CR alone = column 0 */ }
+        else buf += ch;
+      }
+      render();
+    };
+    // Keystrokes → bytes → the guest serial console (feed_input in the worker).
+    const enc = new TextEncoder();
+    const onKey = (e) => {
+      let b = null;
+      if (e.key === "Enter") b = "\n";
+      else if (e.key === "Backspace") b = "\x7f";
+      else if (e.key === "Tab") b = "\t";
+      else if (e.key.length === 1 && e.ctrlKey) b = String.fromCharCode(e.key.toUpperCase().charCodeAt(0) & 0x1f);
+      else if (e.key.length === 1) b = e.key;
+      if (b !== null) { e.preventDefault(); w.postMessage({ input: enc.encode(b) }); }
+    };
+    w.onmessage = (ev) => {
+      const m = ev.data;
+      if (m.stage === "init") set("Opening a computer…", "starting the runtime");
+      else if (m.stage === "manifest") set("Opening a computer…", "verifying the link (κ)");
+      else if (m.stage === "streaming") {
+        fill(m.fetched / m.total);
+        set("Streaming the machine…", `${m.fetched} / ${m.total} pages by κ (verified on receipt)`);
+      } else if (m.stage === "resume") { fill(1); set("Reconstructing…", "verifying every page (L5)"); }
+      else if (m.stage === "out") { write(dec.decode(m.delta)); }
+      else if (m.ok) {
+        $("bloom").style.animation = "none"; $("bloom").style.opacity = ".25";
+        set("Live — type to use it.", `${m.pages} pages = ${m.mib.toFixed(1)} MiB by κ · ${((performance.now()-t0)/1000).toFixed(1)} s`);
+        $("meta").textContent = `manifest ${m.manifestKiB.toFixed(0)} KiB · stream ${m.tFetch.toFixed(0)} ms · resume ${m.tResume.toFixed(0)} ms · verified L5`;
+        buf = m.screen || ""; render();
+        term.style.display = "block"; term.tabIndex = 0; term.focus();
+        term.addEventListener("keydown", onKey);
+        addEventListener("keydown", onKey); // also accept keys without an explicit focus click
+      } else {
+        $("bloom").style.animation = "none";
+        set("Couldn't open this link", "");
+        $("meta").innerHTML = `<span class="err">${(m.error || "error").slice(0, 400)}</span>`;
+      }
+    };
+    w.postMessage({ kappa, base });
+  }
+</script>

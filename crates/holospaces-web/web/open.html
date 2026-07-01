@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>open(κ) — a live app from one link</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; background: #0b0e14; color: #cdd6f4; }
+  header { padding: 10px 16px; border-bottom: 1px solid #1c2130; display: flex; gap: 12px; align-items: baseline; }
+  header b { color: #89b4fa; } #stat { color: #a6e3a1; } #stat.err { color: #f38ba8; }
+  main { display: grid; grid-template-columns: 1fr 1fr; gap: 0; height: calc(100vh - 44px); }
+  #app { border: 0; width: 100%; height: 100%; background: #fff; }
+  #side { border-left: 1px solid #1c2130; overflow: auto; }
+  #side h3 { margin: 10px 16px 4px; color: #94a3b8; font-weight: 600; }
+  pre { margin: 0 16px 12px; white-space: pre-wrap; word-break: break-word; color: #a6adc8; }
+  #body { color: #cdd6f4; }
+</style>
+</head>
+<body>
+<header>
+  <b>open(κ)</b>
+  <span id="stat">idle</span>
+  <span id="timing"></span>
+</header>
+<main>
+  <!-- the guest app's REAL response, rendered sandboxed (untrusted content) -->
+  <iframe id="app" sandbox="allow-scripts" title="the live app"></iframe>
+  <div id="side">
+    <h3>app response</h3><pre id="body">—</pre>
+    <h3>machine console (resumed, not booted)</h3><pre id="term">—</pre>
+  </div>
+</main>
+<script type="module">
+  const q = new URLSearchParams(location.search);
+  // `?k=` is the warm .holo to open (a content-addressed static asset for now; a real κ resolves to the same
+  // bytes). `?port=` is the guest port the app serves on. Everything is static — no app server.
+  const src = q.get("k") || "./fixtures/x64-server-loopback.holo";
+  const store = q.get("store") || "./fixtures/store"; // content-addressed page store for a κ handle
+  const port = Number(q.get("port") || "8080");
+
+  const stat = document.getElementById("stat");
+  const timing = document.getElementById("timing");
+  const termEl = document.getElementById("term");
+  const bodyEl = document.getElementById("body");
+  const app = document.getElementById("app");
+  const setStat = (s, err = false) => { stat.textContent = s; stat.className = err ? "err" : ""; };
+
+  const worker = new Worker("./open-worker.mjs", { type: "module" });
+  worker.onmessage = (e) => {
+    const d = e.data || {};
+    if (d.term !== undefined) termEl.textContent = d.term.slice(-4000);
+    switch (d.stage) {
+      case "fetching": setStat("fetching warm .holo…"); break;
+      case "resuming": setStat("resuming (no boot)…"); break;
+      case "resumed": setStat("resumed — dialing the app…"); timing.textContent = `resume ${d.resumeMs} ms`; break;
+      case "streaming": setStat("app responding…"); break;
+      case "rendered":
+        setStat(`live · ${d.status || "app responded"}`);
+        window.__open_kappa = { rendered: true, status: d.status, body: d.body, resumeMs: d.resumeMs };
+        bodyEl.textContent = d.body || "(empty body)";
+        // Render the app's real output sandboxed. HTML apps paint; plain text shows as text.
+        const looksHtml = /<\s*(!doctype|html|head|body|h1|div|p)\b/i.test(d.body || "");
+        app.srcdoc = looksHtml ? d.body : `<pre style="font:16px ui-monospace;padding:24px">${(d.body || "").replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]))}</pre>`;
+        break;
+      case "error":
+        setStat(`error: ${d.error}`, true);
+        window.__open_kappa = { rendered: false, error: d.error };
+        break;
+    }
+  };
+  setStat("opening…");
+  worker.postMessage({ src, store, port });
+</script>
+</body>
+</html>

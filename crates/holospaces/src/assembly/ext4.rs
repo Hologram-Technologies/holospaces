@@ -713,8 +713,21 @@ impl Geometry {
             let need = div_ceil(total, BLOCKS_PER_GROUP);
             if need <= groups {
                 let inodes_count = ipg * groups;
+                // Round a MULTI-group image up to whole block groups so the final
+                // group always spans its full metadata footprint (super/GDT/block+
+                // inode bitmaps/inode table). A short trailing group — `total` just
+                // past a group boundary — would otherwise place that metadata past
+                // the image end (an out-of-bounds write for any large, multi-group
+                // build-capable disk). The extra blocks are free, sparse data space.
+                // A single-group image keeps its exact size: its one (partial) group
+                // already contains its metadata.
+                let total_blocks = if groups > 1 {
+                    groups * BLOCKS_PER_GROUP
+                } else {
+                    total
+                };
                 return Geometry {
-                    total_blocks: total,
+                    total_blocks,
                     groups,
                     inodes_per_group: ipg,
                     inodes_count,
@@ -923,6 +936,11 @@ fn encode_inode(inode: &Inode, tree_blocks: Option<&Vec<(u64, Vec<u8>)>>) -> Vec
 
     put32(&mut b, 100, 0); // i_generation
     put32(&mut b, 108, (size >> 32) as u32); // i_size_high
+    // High 16 bits of uid/gid (l_i_uid_high / l_i_gid_high, linux2 osd2). Without
+    // these, an image whose files are owned by uid/gid ≥ 65536 (rootless/namespaced
+    // builds, e.g. 100000:100000) gets silently wrong ownership.
+    put16(&mut b, 120, (inode.uid >> 16) as u16);
+    put16(&mut b, 122, (inode.gid >> 16) as u16);
     put16(&mut b, 128, EXTRA_ISIZE);
     put32(&mut b, 144, inode.mtime); // i_crtime
     b

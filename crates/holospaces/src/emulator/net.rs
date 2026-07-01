@@ -1158,6 +1158,18 @@ impl StdIngress {
         self.listeners.push((listener, guest_port));
         Ok(chosen)
     }
+
+    /// Like [`Self::forward`], but binds `0.0.0.0` so the guest server is reachable at the host's real
+    /// (non-loopback) address — a client on another machine on the LAN, or the host's public IP, reaches
+    /// the app inside the devcontainer. (Behind NAT, internet-facing reach needs an external relay/tunnel;
+    /// this is the direct "beyond localhost" bind.) `CC-68`.
+    pub fn forward_public(&mut self, host_port: u16, guest_port: u16) -> std::io::Result<u16> {
+        let listener = std::net::TcpListener::bind(("0.0.0.0", host_port))?;
+        listener.set_nonblocking(true)?;
+        let chosen = listener.local_addr()?.port();
+        self.listeners.push((listener, guest_port));
+        Ok(chosen)
+    }
 }
 
 #[cfg(feature = "std")]

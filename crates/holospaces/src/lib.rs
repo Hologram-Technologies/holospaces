@@ -128,6 +128,12 @@ pub mod import;
 /// a kernel + κ-disk on the emulator — the first-class `CC-14` boot operation.
 pub mod machine;
 pub mod manager;
+/// Generate the PID-1 init that runs an arbitrary OCI image's real entrypoint (`Entrypoint`/`Cmd`/
+/// `Env`/`WorkingDir`/`User`) — the keystone of "run any docker image". Conformance: `CC-65`. Host-side
+/// tooling (the `holo run` pipeline produces a bootable `.holo`; the browser resumes the result), so it
+/// is not built for `wasm32` (and a rustc 1.95 lint ICE on that target is thereby avoided).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod image_init;
 /// OCI image ingestion (the host-side provisioning surface for a devcontainer's
 /// operating-system image; `std` only). Conformance: `CC-10`.
 #[cfg(feature = "std")]
