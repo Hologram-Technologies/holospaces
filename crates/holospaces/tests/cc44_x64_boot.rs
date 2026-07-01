@@ -35,6 +35,110 @@ fn vmlinux_elf() -> Vec<u8> {
     img
 }
 
+/// BISECT (x64 graphical desktop, init-crash hunt): boot the current cc44 kernel and report whether
+/// PID 1 runs CLEAN (prints the freestanding marker `HOLOSPACES-LINUX-USERSPACE-OK`) or CRASHES
+/// (`Attempted to kill init`). Used to isolate the userspace-init SIGSEGV: build a gcc-15 NO-FB kernel
+/// → if this reports CLEAN, the framebuffer config breaks init; if it CRASHES, the gcc-15 build does.
+/// Run: `cargo test -p holospaces --release --test cc44_x64_boot bisect_does_init_run_clean -- --ignored --nocapture`
+#[test]
+#[ignore = "init-crash bisect: boots the current cc44 kernel at several RAM sizes, reports CLEAN vs CRASH"]
+fn bisect_does_init_run_clean() {
+    let kernel = vmlinux_elf();
+    // The crash is a divide-by-zero in blk_mq_alloc_map_and_rqs (RBX=0). cc44 ran blk_mq fine at 1 GiB;
+    // all crashes seen at 512 MiB → test the RAM size directly.
+    for ram_mb in [512u64, 1024, 256, 2048] {
+        let mut cpu = Cpu::boot_linux(
+            (ram_mb * 1024 * 1024) as usize,
+            &kernel,
+            "earlyprintk=serial,ttyS0 console=ttyS0 random.trust_cpu=on",
+        );
+        let mut outcome = "TIMEOUT";
+        for _ in 0..40 {
+            let halt = cpu.run(100_000_000);
+            let console = String::from_utf8_lossy(cpu.console());
+            if console.contains("HOLOSPACES-LINUX-USERSPACE-OK") {
+                outcome = "CLEAN (init ran, marker printed)";
+                break;
+            }
+            if console.contains("Attempted to kill init") || console.contains("divide error") {
+                outcome = "CRASH (blk_mq divide-by-zero → kill init)";
+                break;
+            }
+            if matches!(halt, Halt::Halted) {
+                outcome = "HALTED (no marker)";
+                break;
+            }
+        }
+        eprintln!("==== RAM {ram_mb} MiB → {outcome} ====");
+    }
+}
+
+/// G3 (x64 graphical desktop): the rebuilt kernel (DRM_SIMPLEDRM + fbcon) BINDS the passive linear
+/// framebuffer the emulator advertises via `screen_info`, and its console renders PIXELS into it.
+/// Proven natively — fbcon binds during kernel init (before PID 1), so the serial log shows the bind
+/// message and `read_framebuffer()` is non-zero, no browser needed. The foundation for the desktop.
+/// Run: `cargo test -p holospaces --release --test cc44_x64_boot the_kernel_binds_a_graphical_framebuffer -- --ignored --nocapture`
+#[test]
+#[ignore = "needs the rebuilt FB kernel (DRM_SIMPLEDRM+fbcon); proves the framebuffer binds + renders"]
+fn the_kernel_binds_a_graphical_framebuffer() {
+    let kernel = vmlinux_elf();
+    // `console=tty0` (alongside ttyS0) so fbcon drives the VT onto the framebuffer; the fbcon-bind
+    // message is printk (reaches BOTH consoles), so the serial log still witnesses it.
+    let mut cpu = Cpu::boot_linux(
+        512 * 1024 * 1024,
+        &kernel,
+        "earlyprintk=serial,ttyS0 console=ttyS0 console=tty0 random.trust_cpu=on",
+    );
+    let mut fbcon_bound = false;
+    let mut max_pixels = 0usize;
+    let mut first_pixel_chunk = -1i32;
+    // Progress trace so a watcher can see crawl-vs-hang in real time (last serial line + length).
+    let progress = std::env::var("HOLO_FB_PROGRESS").ok();
+    for chunk in 0..1500 {
+        let halt = cpu.run(100_000_000);
+        let console = String::from_utf8_lossy(cpu.console());
+        if let Some(p) = &progress {
+            let last = console.lines().last().unwrap_or("");
+            let _ = std::fs::write(
+                p,
+                format!("chunk={chunk} steps={}M serial_len={} fbcon={fbcon_bound} pixels={max_pixels}\nlast: {last}\n",
+                    (chunk + 1) * 100, console.len()),
+            );
+        }
+        // The canonical fbcon / simpledrm bind messages.
+        fbcon_bound = fbcon_bound
+            || console.contains("frame buffer device")
+            || console.contains("simple-framebuffer")
+            || console.contains("simpledrm")
+            || console.contains("Console: switching to colour");
+        // Peak non-zero pixels DURING the run (robust to a blank on power-off).
+        let fb = cpu.read_framebuffer();
+        let nz = fb.iter().step_by(16).filter(|&&b| b != 0).count();
+        if nz > 0 && first_pixel_chunk < 0 {
+            first_pixel_chunk = chunk;
+        }
+        max_pixels = max_pixels.max(nz);
+        if matches!(halt, Halt::Halted) {
+            break;
+        }
+        // Solid witness — fbcon bound and the console drew pixels; stop early.
+        if fbcon_bound && max_pixels > 0 && first_pixel_chunk >= 0 && chunk > first_pixel_chunk + 2 {
+            break;
+        }
+    }
+    let console = String::from_utf8_lossy(cpu.console());
+    eprintln!(
+        "---- serial tail ----\n{}\n---- end ----",
+        console.lines().rev().take(40).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"),
+    );
+    eprintln!(
+        "\n==== G3 FRAMEBUFFER WITNESS ====\n  fbcon/simpledrm bound: {fbcon_bound}\n  peak framebuffer pixels (non-zero): {max_pixels}\n  ({}×{} = {} px)\n====\n",
+        Cpu::FB_W, Cpu::FB_H, Cpu::FB_W * Cpu::FB_H,
+    );
+    assert!(fbcon_bound, "the kernel bound fbcon/simpledrm to the advertised framebuffer (serial log)");
+    assert!(max_pixels > 0, "the console rendered live pixels into the framebuffer");
+}
+
 #[test]
 #[ignore = "boots a real amd64 Linux to userspace (~release) — run by the CC-44 vv suite"]
 fn an_amd64_linux_kernel_boots_to_userspace() {
@@ -509,6 +613,65 @@ fn kappa_snapshot_kappa_resume_to_userspace() {
     );
     assert!(unique < total / 4, "RAM deduplicates by >4x in the store ({unique}/{total})");
     eprintln!("==== κ-RESUME BIT-EXACT from {} unique pages ====\n", unique);
+}
+
+/// **"Resume, don't re-run" — the headline of the speed architecture (Layer 1).** Boots a real
+/// amd64 Linux to userspace (timed), content-addresses the *running* machine into a κ-snapshot,
+/// then resumes it into a FRESH core (timed) and shows the resumed machine is **already at
+/// userspace** — the console marker is present without executing a single guest instruction. The
+/// resume is page-reconstruct + verify (L5), not a re-boot, so it is dramatically faster than the
+/// cold boot. This is why opening a warm κ feels instant: nobody re-runs the boot (or the `apk`)
+/// — they resume the state the planet computed once.
+#[test]
+#[ignore = "measures resume-vs-boot (release boot is ~tens of seconds) — run explicitly"]
+fn kappa_resume_lands_at_userspace_instantly() {
+    use std::time::Instant;
+    const MARKER: &str = "HOLOSPACES-LINUX-USERSPACE-OK";
+    let kernel = vmlinux_elf();
+    let cmdline = "earlyprintk=serial,ttyS0 console=ttyS0 random.trust_cpu=on";
+
+    // COLD BOOT to userspace, timed — run in chunks so we snapshot a LIVE machine the moment it
+    // reaches the marker (not a halted one).
+    let t0 = Instant::now();
+    let mut orig = Cpu::boot_linux(512 * 1024 * 1024, &kernel, cmdline);
+    loop {
+        let h = orig.run(50_000_000);
+        if String::from_utf8_lossy(orig.console()).contains(MARKER) || h == Halt::Halted {
+            break;
+        }
+    }
+    let boot_time = t0.elapsed();
+    assert!(
+        String::from_utf8_lossy(orig.console()).contains(MARKER),
+        "the cold boot reached userspace"
+    );
+
+    // SNAPSHOT the running machine at userspace (content-addressed; unique pages dedup).
+    let store = MemKappaStore::new();
+    let snap = orig.snapshot_kappa(&store).expect("snapshot_kappa at userspace");
+    let (total, unique) = (snap.page_count(), store.approximate_count());
+
+    // RESUME into a fresh core, timed — verify every page (L5) + reconstruct. No guest execution.
+    let t1 = Instant::now();
+    let mut resumed = Cpu::new(0x1000);
+    assert!(resumed.restore_kappa(&snap, &store), "κ-resume verifies every page (L5) + reconstructs");
+    let resume_time = t1.elapsed();
+
+    // The decisive property: the resumed machine is ALREADY at userspace — the marker is in its
+    // restored console without running anything. Resume landed AT the state, it did not re-run.
+    assert!(
+        String::from_utf8_lossy(resumed.console()).contains(MARKER),
+        "the RESUMED machine is already at userspace — resume reconstructs the state, no re-boot"
+    );
+
+    let speedup = boot_time.as_secs_f64() / resume_time.as_secs_f64().max(1e-9);
+    eprintln!(
+        "\n==== RESUME, DON'T RE-RUN (Layer 1) ====\n\
+         cold boot to userspace : {boot_time:>10.2?}\n\
+         resume from κ-snapshot : {resume_time:>10.2?}   →  {speedup:.0}x faster, lands at userspace\n\
+         streamed {unique} unique pages (of {total}) + state — never the nominal RAM\n====\n",
+    );
+    assert!(resume_time < boot_time, "resume is faster than a cold boot ({resume_time:?} vs {boot_time:?})");
 }
 
 /// Fixture generator for the browser/node resume witness (Step 4): boots real amd64 Linux far

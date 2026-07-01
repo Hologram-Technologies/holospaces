@@ -39,11 +39,19 @@ net = ["std", "dep:ureq", "dep:sha2"]
 # live to stderr and samples `rip`/TSC periodically — boot-progress visibility
 # for the CC-44 long-mode bring-up. Never enabled in CI or the default build.
 cc44-trace = ["std"]
-# `jit` (off by default) enables the x86-64 block JIT's native executor (M2 Rung 3):
-# the `jit_exec` module runs `compile_tlb_flags` blocks via `wasmtime` over the live
-# `Cpu` state. A `std` host surface — the portable peer core never links it; the
-# browser peer executes the same blocks through `js_sys::WebAssembly` instead.
-jit = ["std", "dep:wasmtime", "dep:blake3"]
+# `jit` (off by default) enables the x86-64 JIT's PORTABLE half (M2 Rung 3): the
+# region codegen (`emulator::jit`, pure no_std byte-emission), the κ-keyed region
+# cache, the SHADOW→TRUST→COMMIT dispatch (`jit_run_region`), and the cross-crate
+# executor SEAM (`set_region_executor`). It needs NO wasm runtime — so the browser
+# peer (`holospaces-web`, wasm32) compiles it and injects its own `js_sys::WebAssembly`
+# executor through the seam. Needs `std` (thread-local caches) + `blake3` (the κ key).
+jit = ["std", "dep:blake3"]
+# `jit-native` (off by default) adds the NATIVE region/block executor (`jit_exec`),
+# which runs the emitted wasm via `wasmtime` over the live `Cpu` state — the native
+# path + the native fallback in `jit_run_region` + the block-JIT path (`jit_dispatch`).
+# This is the JIT command on the host: `--features jit-native`. The browser never
+# links it (wasmtime does not build for wasm32); it uses the seam instead.
+jit-native = ["jit", "dep:wasmtime"]
 
 [dependencies]
 # The native block-JIT executor (the `jit` feature). The JIT *codegen* is pure

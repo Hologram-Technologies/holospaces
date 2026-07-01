@@ -13,7 +13,10 @@
 
 use wasmtime::{Engine, Instance, Module, Store};
 
-use super::jit::{eff_addr, op_mem_addr, Op, GUEST_BASE, RFLAGS_MEM, TLB_BASE, TLB_SIZE};
+use super::jit::{
+    eff_addr, op_mem_addr, Op, EXIT_RIP_MEM, GUEST_BASE, MISS_MEM, RFLAGS_MEM, TLB_BASE, TLB_SIZE,
+    VADDR_MEM,
+};
 
 /// Pages in the executor's guest-RAM page pool (~256 KiB). A block touches only a handful;
 /// the pool holds its working set, indexed by `host_off` (a slot offset, NOT a physical
@@ -90,6 +93,162 @@ pub(crate) fn exec_block(
     *rflags = u64::from_le_bytes(fb);
     mem.read(&store, GUEST_BASE as usize, ram).unwrap();
     bail
+}
+
+/// Execute a compiled **region** (`super::jit::compile_region`) over the architectural state — the
+/// chaining executor. Like [`exec_block`] but the region wasm returns the i64 guest **exit rip**
+/// (where to resume in the interpreter) instead of a bail index. `regs`/`rflags`/`ram` are updated
+/// in place; `tlb` is the software-TLB image (the caller fills it from its mappings). The browser
+/// peer runs the same wasm through `js_sys::WebAssembly`. (Per-call instantiation here; the live
+/// `jit_dispatch` path caches the warm instance per region κ, like `exec_block_pooled`.)
+pub(crate) fn exec_region(
+    wasm: &[u8],
+    regs: &mut [u64; 16],
+    rflags: &mut u64,
+    ram: &mut [u8],
+    tlb: &[u8],
+) -> u64 {
+    let engine = Engine::default();
+    let module = Module::new(&engine, wasm).expect("region wasm is valid");
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).expect("instantiate");
+    let mem = instance.get_memory(&mut store, "mem").unwrap();
+    let need_pages = (GUEST_BASE as usize + ram.len()).div_ceil(0x10000);
+    let have_pages = mem.size(&store) as usize;
+    if need_pages > have_pages {
+        mem.grow(&mut store, (need_pages - have_pages) as u64).expect("grow guest RAM region");
+    }
+    let run = instance.get_typed_func::<(), ()>(&mut store, "run").unwrap();
+    for (i, v) in regs.iter().enumerate() {
+        mem.write(&mut store, i * 8, &v.to_le_bytes()).unwrap();
+    }
+    mem.write(&mut store, RFLAGS_MEM as usize, &(*rflags).to_le_bytes()).unwrap();
+    mem.write(&mut store, TLB_BASE as usize, tlb).unwrap();
+    mem.write(&mut store, GUEST_BASE as usize, ram).unwrap();
+    run.call(&mut store, ()).expect("run");
+    for (i, r) in regs.iter_mut().enumerate() {
+        let mut b = [0u8; 8];
+        mem.read(&store, i * 8, &mut b).unwrap();
+        *r = u64::from_le_bytes(b);
+    }
+    let mut fb = [0u8; 8];
+    mem.read(&store, RFLAGS_MEM as usize, &mut fb).unwrap();
+    *rflags = u64::from_le_bytes(fb);
+    mem.read(&store, GUEST_BASE as usize, ram).unwrap();
+    let mut eb = [0u8; 8];
+    mem.read(&store, EXIT_RIP_MEM as usize, &mut eb).unwrap();
+    u64::from_le_bytes(eb)
+}
+
+/// Execute a compiled **region** over the page pool — the chaining analogue of
+/// [`exec_block_pooled`]. The region runs DRY over a small pool (constant wasm memory regardless of
+/// guest RAM); on a TLB miss the region writes the faulting vaddr (`VADDR_MEM`) + `MISS_MEM=1` and
+/// exits, the executor fetches that page into the pool + TLB and **retries from the region entry**
+/// (idempotent — the region is deterministic from `entry_*` and re-stores the same values). A
+/// non-miss exit returns `Some((regs, rflags, dirty, exit_rip))` — the caller commits `dirty` and
+/// resumes the interpreter at `exit_rip` only for a *trusted* region. `None` = a real `#PF`, the
+/// pool fills, or a slot collision (the caller interprets instead).
+pub(crate) fn exec_region_pooled(
+    key: [u8; 32],
+    wasm: &[u8],
+    entry_regs: [u64; 16],
+    entry_rflags: u64,
+    fetch_page: impl Fn(u64) -> Option<(usize, Vec<u8>)>,
+) -> Option<([u64; 16], u64, Vec<(usize, Vec<u8>)>, u64)> {
+    JIT_WARM.with(|wm| {
+        let mut warms = wm.borrow_mut();
+        if !warms.contains_key(&key) {
+            let engine = JIT_ENGINE.with(Engine::clone);
+            let module = JIT_MODULES.with(|m| {
+                let mut map = m.borrow_mut();
+                if let Some(md) = map.get(&key) {
+                    Some(md.clone())
+                } else {
+                    let md = Module::new(&engine, wasm).ok()?;
+                    map.insert(key, md.clone());
+                    Some(md)
+                }
+            })?;
+            let mut store = Store::new(&engine, ());
+            let instance = Instance::new(&mut store, &module, &[]).ok()?;
+            let memory = instance.get_memory(&mut store, "mem").unwrap();
+            let need = (GUEST_BASE as usize + POOL_PAGES * PAGE).div_ceil(0x10000);
+            let have = memory.size(&store) as usize;
+            if need > have {
+                memory.grow(&mut store, (need - have) as u64).ok()?;
+            }
+            warms.insert(key, Warm { store, instance, memory });
+        }
+        let warm = warms.get_mut(&key).unwrap();
+        let (instance, mem) = (warm.instance, warm.memory);
+        let run = instance.get_typed_func::<(), ()>(&mut warm.store, "run").ok()?;
+        let store = &mut warm.store;
+
+        let mut tlb = vec![0u8; TLB_SIZE as usize * 16];
+        let mut pool: Vec<u8> = Vec::new();
+        let mut mapped: Vec<(u64, usize)> = Vec::new(); // slot -> (vpage, pa_frame)
+
+        for _ in 0..=POOL_PAGES {
+            for (i, v) in entry_regs.iter().enumerate() {
+                mem.write(&mut *store, i * 8, &v.to_le_bytes()).ok()?;
+            }
+            mem.write(&mut *store, RFLAGS_MEM as usize, &entry_rflags.to_le_bytes()).ok()?;
+            mem.write(&mut *store, TLB_BASE as usize, &tlb).ok()?;
+            if !pool.is_empty() {
+                mem.write(&mut *store, GUEST_BASE as usize, &pool).ok()?;
+            }
+            run.call(&mut *store, ()).ok()?;
+            let exit_rip = {
+                let mut eb = [0u8; 8];
+                mem.read(&*store, EXIT_RIP_MEM as usize, &mut eb).ok()?;
+                u64::from_le_bytes(eb)
+            };
+            let mut regs = [0u64; 16];
+            for (i, r) in regs.iter_mut().enumerate() {
+                let mut b = [0u8; 8];
+                mem.read(&*store, i * 8, &mut b).ok()?;
+                *r = u64::from_le_bytes(b);
+            }
+            let mut fb = [0u8; 8];
+            mem.read(&*store, RFLAGS_MEM as usize, &mut fb).ok()?;
+            let rflags = u64::from_le_bytes(fb);
+            let read_u64 = |off: u64, st: &Store<()>| -> u64 {
+                let mut b = [0u8; 8];
+                mem.read(st, off as usize, &mut b).unwrap();
+                u64::from_le_bytes(b)
+            };
+            let miss = read_u64(MISS_MEM, store);
+            if !pool.is_empty() {
+                mem.read(&*store, GUEST_BASE as usize, &mut pool).ok()?;
+            }
+            if miss == 0 {
+                // A real / yield exit — return the region's effects + where to resume.
+                let dirty = mapped
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, &(_vp, pa))| (pa, pool[slot * PAGE..slot * PAGE + PAGE].to_vec()))
+                    .collect();
+                return Some((regs, rflags, dirty, exit_rip));
+            }
+            // TLB miss — the region wrote the faulting vaddr; fetch its page + retry from entry.
+            let vaddr = read_u64(VADDR_MEM, store);
+            let vpage = vaddr >> 12;
+            if mapped.iter().any(|&(vp, _)| vp == vpage) || mapped.len() >= POOL_PAGES {
+                return None; // already mapped yet still missed / pool full
+            }
+            let (pa_frame, bytes) = fetch_page(vaddr)?; // None → real #PF → interpret
+            if bytes.len() != PAGE {
+                return None;
+            }
+            let slot = mapped.len();
+            pool.extend_from_slice(&bytes);
+            mapped.push((vpage, pa_frame));
+            let s = (vpage & (TLB_SIZE - 1)) as usize;
+            tlb[s * 16..s * 16 + 8].copy_from_slice(&vpage.to_le_bytes());
+            tlb[s * 16 + 8..s * 16 + 16].copy_from_slice(&((slot * PAGE) as u64).to_le_bytes());
+        }
+        None
+    })
 }
 
 /// Execute a compiled block over a small **page pool**, lazily filling guest pages on a

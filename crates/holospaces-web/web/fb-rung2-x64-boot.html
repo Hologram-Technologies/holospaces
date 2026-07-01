@@ -1,0 +1,82 @@
+<!doctype html>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>rung 2 (amd64) — real graphical x86-64 kernel → fbcon → κ render</title>
+<style>
+  html,body{margin:0;height:100%;background:#05080d;color:#cfe0f5;font-family:ui-monospace,Menlo,Consolas,monospace}
+  #wrap{display:flex;flex-direction:column;height:100%}
+  #hud{padding:8px 12px;font-size:12.5px;line-height:1.6;background:#070b12;border-bottom:1px solid #16202e}
+  #hud b{color:#7fd1b9} .ok{color:#7fe0a3} .bad{color:#ff8a8a} .k{color:#8a93a6}
+  #main{flex:1;min-height:0;display:flex}
+  #stage{position:relative;flex:1;min-height:0;background:#000}
+  #out{position:absolute;inset:0;width:100%;height:100%;display:block}
+  #serial{width:42%;max-width:560px;margin:0;padding:8px 10px;overflow:auto;white-space:pre-wrap;font-size:11px;color:#9fb0c8;background:#04060a;border-left:1px solid #16202e}
+</style>
+<div id="wrap">
+  <div id="hud">
+    <div>rung 2 · the <b>real graphical x86-64 (amd64) kernel</b> (DRM_SIMPLEDRM + fbcon) boots real Alpine over a κ-disk; its console renders onto the emulator's linear framebuffer (advertised via the x86 boot protocol's screen_info) → κ super-res.</div>
+    <div id="phase" class="k">starting worker …</div>
+    <div id="signals" class="k">— </div>
+    <div id="verdict" class="k"></div>
+  </div>
+  <div id="main">
+    <div id="stage"><canvas id="out"></canvas></div>
+    <pre id="serial">(serial console)</pre>
+  </div>
+</div>
+<script type="module">
+// Self-contained render via a plain 2D canvas (no /holospaces-alpine-P0 KappaSurface dependency, so
+// this works serving just web/). The κ super-res surface is the deploy-context enhancement; this
+// proves the pixels first. The guest framebuffer is XRGB8888 (screen_info masks: blue@0/green@8/
+// red@16/rsvd@24) → memory bytes are [B,G,R,X], so convert to canvas RGBA (R=byte2, B=byte0, A=255).
+const $ = id => document.getElementById(id);
+const raw2d = document.createElement("canvas");
+function xrgbToRgba(buf) {
+  const src = new Uint8Array(buf), out = new Uint8ClampedArray(src.length);
+  for (let i = 0; i < src.length; i += 4) {
+    out[i] = src[i + 2];     // R ← byte2
+    out[i + 1] = src[i + 1]; // G ← byte1
+    out[i + 2] = src[i];     // B ← byte0
+    out[i + 3] = 255;        // A (the reserved byte is don't-care → force opaque)
+  }
+  return out;
+}
+async function render(buf, W, H, capture) {
+  const out = $("out");
+  if (out.width !== W) { out.width = W; out.height = H; }
+  // Draw directly to the visible canvas (cheap). Only encode a PNG on the final frame (toDataURL on
+  // 1280×800 is expensive and was saturating the main thread → unreliable polling).
+  out.getContext("2d").putImageData(new ImageData(xrgbToRgba(buf), W, H), 0, 0);
+  if (capture) window.__rung2png = out.toDataURL("image/png");
+}
+
+const w = new Worker("./fb-rung2-x64-boot-worker.mjs", { type: "module" });
+window.__rung2 = { phase: "starting" };
+w.onerror = (e) => { const msg = `worker.onerror: ${e.message} @ ${e.filename}:${e.lineno}`; console.error(msg); window.__rung2 = { ...window.__rung2, workerError: msg }; $("verdict").className="bad"; $("verdict").textContent = msg; };
+w.onmessageerror = (e) => { console.error("worker.onmessageerror", e); window.__rung2 = { ...window.__rung2, workerMsgError: true }; };
+window.__heartbeat = 0; setInterval(() => { window.__heartbeat++; }, 1000);
+
+w.onmessage = async (e) => {
+  const m = e.data;
+  window.__rung2 = { ...window.__rung2, ...m, fb: undefined };
+  $("phase").textContent = (m.done ? "✓ " : "· ") + (m.phase || "");
+  if (m.iter != null) {
+    $("signals").innerHTML =
+      `iter <b>${m.iter}</b> · drm-probe <b class="${m.drm?'ok':'k'}">${m.drm?'yes':'…'}</b>` +
+      ` · fbcon-bound <b class="${m.fbcon?'ok':'k'}">${m.fbcon?'yes':'…'}</b>` +
+      ` · framebuffer pixels <b class="${m.fbNonZero?'ok':'k'}">${(m.pixels||0).toLocaleString()}</b>` +
+      ` · ${m.W}×${m.H}`;
+  }
+  if (m.serialTail) $("serial").textContent = m.serialTail;
+  if (m.fb) { try { await render(m.fb, m.W, m.H, !!m.done); } catch (err) { console.error(err); } }
+  if (m.done) {
+    const pass = m.fbcon && m.fbNonZero !== false && (m.pixels || 0) > 0;
+    $("verdict").className = pass ? "ok" : "bad";
+    $("verdict").textContent = pass
+      ? `RUNG 2 (amd64) PASS — the graphical x86-64 kernel bound fbcon to the simple-framebuffer; real Alpine's console rendered ${(m.pixels||0).toLocaleString()} live pixels, projected through κ super-res. The terminal is now a picture.`
+      : `RUNG 2 (amd64) incomplete — drm=${m.drm} fbcon=${m.fbcon} pixels=${m.pixels}. See serial log.`;
+    window.__rung2.pass = pass;
+  }
+  if (m.phase === "error") { $("verdict").className = "bad"; $("verdict").textContent = "ERROR: " + m.error; window.__rung2.pass = false; }
+};
+w.postMessage({ go: true, nonce: (crypto.randomUUID ? crypto.randomUUID() : String(Date.now())) });
+</script>

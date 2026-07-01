@@ -37,10 +37,17 @@ mod media {
     pub const INDEX: &str = "application/vnd.oci.image.index.v1+json";
     pub const MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
     pub const CONFIG: &str = "application/vnd.oci.image.config.v1+json";
-    /// Layer media types (gzip / plain / zstd), incl. non-distributable variants.
-    pub const LAYER_PREFIXES: [&str; 2] = [
+    // Docker schema2 equivalents (much of Docker Hub, esp. non-buildkit images) — accepted as
+    // OCI-equivalent at the ingest boundary; the content model is identical (the registry serves the same
+    // Merkle graph, verified by digest either way). CC-70.
+    pub const DOCKER_INDEX: &str = "application/vnd.docker.distribution.manifest.list.v2+json";
+    pub const DOCKER_MANIFEST: &str = "application/vnd.docker.distribution.manifest.v2+json";
+    pub const DOCKER_CONFIG: &str = "application/vnd.docker.container.image.v1+json";
+    /// Layer media types (gzip / plain / zstd), incl. non-distributable + Docker schema2 variants.
+    pub const LAYER_PREFIXES: [&str; 3] = [
         "application/vnd.oci.image.layer.",
         "application/vnd.oci.image.layer.nondistributable.",
+        "application/vnd.docker.image.rootfs.diff.tar",
     ];
 }
 
@@ -139,7 +146,7 @@ where
     // The index selects the image manifest (the first manifest descriptor).
     let index: Value = serde_json::from_slice(index_json).map_err(|_| OciError::BadIndex)?;
     if let Some(mt) = index.get("mediaType").and_then(Value::as_str) {
-        if mt != media::INDEX {
+        if mt != media::INDEX && mt != media::DOCKER_INDEX {
             return Err(OciError::UnexpectedMediaType(mt.to_owned()));
         }
     }
@@ -149,7 +156,7 @@ where
         .ok_or(OciError::NoManifest)?;
     let manifest_desc = select_manifest(manifests, arch)?;
     let manifest_digest = descriptor_digest(manifest_desc)?;
-    expect_media(manifest_desc, media::MANIFEST)?;
+    expect_media(manifest_desc, &[media::MANIFEST, media::DOCKER_MANIFEST])?;
 
     // Fetch + verify (Law L5) + store the manifest.
     let (manifest_bytes, manifest_k) = fetch_verified(store, &mut blob, &manifest_digest)?;
@@ -158,7 +165,7 @@ where
 
     // Config blob.
     let config_desc = manifest.get("config").ok_or(OciError::BadManifest)?;
-    expect_media(config_desc, media::CONFIG)?;
+    expect_media(config_desc, &[media::CONFIG, media::DOCKER_CONFIG])?;
     let config_digest = descriptor_digest(config_desc)?;
     let (_, config_k) = fetch_verified(store, &mut blob, &config_digest)?;
 
@@ -233,7 +240,12 @@ fn select_manifest(manifests: &[Value], arch: Arch) -> Result<&Value, OciError> 
     // Image manifests only — an index may also carry attestation descriptors.
     let images: Vec<&Value> = manifests
         .iter()
-        .filter(|d| d.get("mediaType").and_then(Value::as_str) == Some(media::MANIFEST))
+        .filter(|d| {
+            matches!(
+                d.get("mediaType").and_then(Value::as_str),
+                Some(media::MANIFEST) | Some(media::DOCKER_MANIFEST)
+            )
+        })
         .collect();
     match images.as_slice() {
         [] => Err(OciError::NoManifest),
@@ -279,10 +291,10 @@ fn descriptor_digest(desc: &Value) -> Result<String, OciError> {
         .ok_or(OciError::BadManifest)
 }
 
-/// Require a descriptor's `mediaType` to equal `want`.
-fn expect_media(desc: &Value, want: &str) -> Result<(), OciError> {
+/// Require a descriptor's `mediaType` to be one of `wants` (OCI type or its Docker schema2 equivalent).
+fn expect_media(desc: &Value, wants: &[&str]) -> Result<(), OciError> {
     match desc.get("mediaType").and_then(Value::as_str) {
-        Some(mt) if mt == want => Ok(()),
+        Some(mt) if wants.contains(&mt) => Ok(()),
         Some(mt) => Err(OciError::UnexpectedMediaType(mt.to_owned())),
         None => Err(OciError::BadManifest),
     }

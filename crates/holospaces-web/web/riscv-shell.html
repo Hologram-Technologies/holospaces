@@ -1,0 +1,13 @@
+<!doctype html><meta charset=utf8><title>riscv shell</title>
+<pre id=t style="margin:0;padding:10px;background:#07070c;color:#cfe;font:12px ui-monospace,monospace;white-space:pre-wrap"></pre>
+<script type=module>
+const t=document.getElementById('t');
+const w=new Worker('./riscv-interactive-worker.mjs',{type:'module'});
+w.onmessage=e=>{const m=e.data;
+ if(m.kind==='term'){t.textContent=m.text;window.__term=m.text;t.scrollTop=t.scrollHeight;}
+ else if(m.kind==='stage'){t.textContent+='['+m.s+']\n';window.__stage=m.s;}
+ else if(m.kind==='error'){window.__err=m.error;t.textContent+='\n[error] '+m.error;}
+ else if(m.kind==='halted'){window.__halted=true;}};
+window.__feed=s=>w.postMessage({kind:'input',data:s});
+w.postMessage({kind:'boot'});
+</script>

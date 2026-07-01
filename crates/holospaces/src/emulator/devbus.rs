@@ -20,7 +20,7 @@
 #[allow(unused_imports)]
 use alloc::{vec, vec::Vec};
 
-use super::{ninep, KappaBacking, Virtio9p, VirtioBlk, VirtioNet};
+use super::{ninep, KappaBacking, Virtio9p, VirtioBlk, VirtioInput, VirtioNet};
 
 // Split-virtqueue descriptor flags (OASIS VirtIO v1.2 §2.7).
 const VIRTQ_DESC_F_NEXT: u16 = 1;
@@ -619,4 +619,140 @@ fn net_scatter_rx(mem: &mut GuestRam, dev: &VirtioNet, q: usize, head: u16, fram
         idx = next;
     }
     written
+}
+
+// ── VirtIO input device (keyboard + relative pointer; CC-46) ─────────────────
+
+/// Read a `virtio-mmio` register or input-config field of the input device. The
+/// config space (offset ≥ 0x100) implements `struct virtio_input_config`: the
+/// `select`/`subsel` cursor (echoed back), the `size` byte, then the union — so
+/// the driver can enumerate the device's name, ids and EV_*/KEY_*/REL_* bitmaps.
+pub(super) fn input_mmio_read(dev: Option<&VirtioInput>, off: u64) -> u64 {
+    let Some(dev) = dev else {
+        return 0;
+    };
+    match off {
+        0x000 => 0x7472_6976, // MagicValue "virt"
+        0x004 => 2,           // Version (modern)
+        0x008 => 18,          // DeviceID = input (VIRTIO_ID_INPUT)
+        0x00c => 0x554d_4551, // VendorID "QEMU"
+        0x010 => match dev.device_features_sel {
+            // No device-specific feature bits; only VIRTIO_F_VERSION_1 (word 1).
+            1 => 1,
+            _ => 0,
+        },
+        0x034 => 1024, // QueueNumMax
+        0x044 => u64::from(dev.queue_ready[(dev.queue_sel.min(1)) as usize]),
+        0x060 => u64::from(dev.interrupt_status),
+        0x070 => u64::from(dev.status),
+        0x0fc => 0, // ConfigGeneration
+        // virtio_input_config: select(0x100), subsel(0x101), size(0x102), union(0x108..).
+        0x100 => u64::from(dev.cfg_select),
+        0x101 => u64::from(dev.cfg_subsel),
+        0x102 => {
+            let (_buf, size) = dev.config_payload();
+            u64::from(size)
+        }
+        _ if (0x108..0x188).contains(&off) => {
+            let (buf, _size) = dev.config_payload();
+            u64::from(buf[(off - 0x108) as usize])
+        }
+        _ => 0,
+    }
+}
+
+/// Write a `virtio-mmio` register of the input device. Returns `Some(q)` when the
+/// write was a `QueueNotify` of queue `q` (0 = eventq, 1 = statusq); the caller
+/// then services that queue.
+pub(super) fn input_mmio_write(dev: &mut VirtioInput, off: u64, value: u32) -> Option<u32> {
+    let q = (dev.queue_sel.min(1)) as usize;
+    match off {
+        0x014 => dev.device_features_sel = value,
+        0x020 => {
+            let w = dev.driver_features_sel.min(1) as usize;
+            dev.driver_features[w] = value;
+        }
+        0x024 => dev.driver_features_sel = value,
+        0x030 => dev.queue_sel = value,
+        0x038 => dev.queue_num[q] = value,
+        0x044 => dev.queue_ready[q] = value,
+        0x064 => dev.interrupt_status &= !value,
+        0x070 => dev.status = value,
+        0x080 => dev.desc_addr[q] = (dev.desc_addr[q] & !0xffff_ffff) | u64::from(value),
+        0x084 => dev.desc_addr[q] = (dev.desc_addr[q] & 0xffff_ffff) | (u64::from(value) << 32),
+        0x090 => dev.avail_addr[q] = (dev.avail_addr[q] & !0xffff_ffff) | u64::from(value),
+        0x094 => dev.avail_addr[q] = (dev.avail_addr[q] & 0xffff_ffff) | (u64::from(value) << 32),
+        0x0a0 => dev.used_addr[q] = (dev.used_addr[q] & !0xffff_ffff) | u64::from(value),
+        0x0a4 => dev.used_addr[q] = (dev.used_addr[q] & 0xffff_ffff) | (u64::from(value) << 32),
+        // Config-space cursor: the driver writes select then subsel as bytes.
+        0x100 => dev.cfg_select = value as u8,
+        0x101 => dev.cfg_subsel = value as u8,
+        0x050 => return Some(value), // QueueNotify: `value` is the notified queue index.
+        _ => {}
+    }
+    None
+}
+
+/// Drain queued host events into the eventq (queue 0): for each pending
+/// `virtio_input_event`, take one driver-posted buffer, write the 8-byte record,
+/// advance the used ring. Returns `true` if the device IRQ must be raised.
+pub(super) fn input_service_eventq(mem: &mut GuestRam, dev: &mut VirtioInput) -> bool {
+    let q = 0usize;
+    let qsz = dev.queue_num[q] as u16;
+    if dev.queue_ready[q] == 0 || qsz == 0 {
+        return false;
+    }
+    let mut raised = false;
+    while !dev.pending.is_empty() {
+        let avail_idx = mem.rd16(dev.avail_addr[q] + 2);
+        if dev.last_avail[q] == avail_idx {
+            break; // the driver has posted no free event buffer
+        }
+        let ev = dev.pending.pop_front().unwrap();
+        let slot = dev.last_avail[q] % qsz;
+        let head = mem.rd16(dev.avail_addr[q] + 4 + 2 * u64::from(slot));
+        let chain = mem.collect_chain(dev.desc_addr[q], head, dev.queue_num[q] as usize);
+        let written = if let Some(&(addr, len, _flags)) = chain.first() {
+            let n = (len as usize).min(ev.len());
+            mem.write_bytes(addr, &ev[..n]);
+            n as u32
+        } else {
+            0
+        };
+        let used_idx = mem.rd16(dev.used_addr[q] + 2);
+        let ring = dev.used_addr[q] + 4 + 8 * u64::from(used_idx % qsz);
+        mem.wr32(ring, u32::from(head));
+        mem.wr32(ring + 4, written);
+        mem.wr16(dev.used_addr[q] + 2, used_idx.wrapping_add(1));
+        dev.last_avail[q] = dev.last_avail[q].wrapping_add(1);
+        dev.interrupt_status |= 1;
+        raised = true;
+    }
+    raised
+}
+
+/// Drain the statusq (queue 1): the driver posts LED / repeat-config buffers we
+/// don't act on — just return them on the used ring so the driver doesn't stall.
+/// Returns `true` if the device IRQ must be raised.
+pub(super) fn input_service_statusq(mem: &mut GuestRam, dev: &mut VirtioInput) -> bool {
+    let q = 1usize;
+    let qsz = dev.queue_num[q] as u16;
+    if dev.queue_ready[q] == 0 || qsz == 0 {
+        return false;
+    }
+    let avail_idx = mem.rd16(dev.avail_addr[q] + 2);
+    let mut raised = false;
+    while dev.last_avail[q] != avail_idx {
+        let slot = dev.last_avail[q] % qsz;
+        let head = mem.rd16(dev.avail_addr[q] + 4 + 2 * u64::from(slot));
+        let used_idx = mem.rd16(dev.used_addr[q] + 2);
+        let ring = dev.used_addr[q] + 4 + 8 * u64::from(used_idx % qsz);
+        mem.wr32(ring, u32::from(head));
+        mem.wr32(ring + 4, 0);
+        mem.wr16(dev.used_addr[q] + 2, used_idx.wrapping_add(1));
+        dev.last_avail[q] = dev.last_avail[q].wrapping_add(1);
+        dev.interrupt_status |= 1;
+        raised = true;
+    }
+    raised
 }

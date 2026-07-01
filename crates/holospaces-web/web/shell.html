@@ -1,0 +1,39 @@
+<!doctype html><meta charset=utf8>
+<title>Holo · Alpine shell (resumed .holo)</title>
+<style>
+  html,body{margin:0;background:#06060b;height:100%;display:flex;flex-direction:column}
+  #bar{color:#8af;font:12px/1.6 system-ui,sans-serif;padding:6px 12px;border-bottom:1px solid #1a1a2a}
+  b{color:#cfe}
+  #t{flex:1;overflow:auto;color:#d8f0e0;padding:10px 12px;margin:0;white-space:pre-wrap;word-break:break-word;
+     font:13px/1.35 ui-monospace,Menlo,Consolas,monospace}
+  #cmd{display:flex;gap:8px;padding:8px 12px;border-top:1px solid #1a1a2a;background:#0a0a12}
+  #in{flex:1;background:#06060b;color:#cfe;border:1px solid #243;border-radius:5px;padding:8px 10px;
+      font:13px ui-monospace,Menlo,Consolas,monospace;outline:none}
+  #in:focus{border-color:#48a}
+  button{background:#16324a;color:#cfe;border:0;border-radius:5px;padding:8px 14px;cursor:pointer;font:13px system-ui}
+</style>
+<div id=bar><b>Holo Alpine shell</b> — a warm <b>.holo</b> resumed in your tab. <span id=st>resuming…</span></div>
+<pre id=t>resuming…</pre>
+<div id=cmd>
+  <input id=in autofocus autocomplete=off spellcheck=false placeholder="type a command (e.g. uname -m) and press Enter">
+  <button id=go>Run ⏎</button>
+</div>
+<script type=module>
+const t=document.getElementById('t'), st=document.getElementById('st');
+const inp=document.getElementById('in'), go=document.getElementById('go');
+const w=new Worker('./shell-worker.mjs',{type:'module'});
+w.onmessage=e=>{const d=e.data;
+  if(d.term!==undefined){t.textContent=d.term; t.scrollTop=t.scrollHeight;}
+  else if(d.resumeMs!==undefined){st.textContent='resumed in '+d.resumeMs+' ms — ready';}
+  else if(d.stage){st.textContent=d.stage+'…';}
+  else if(d.error){st.textContent='ERROR'; t.textContent='ERROR: '+d.error;}};
+w.onerror=e=>{st.textContent='WORKER ERROR'; t.textContent='WORKER ERROR: '+(e.message||(e.filename+':'+e.lineno));};
+const send=s=>w.postMessage({key:s});
+function run(){ const line=inp.value; send(line+'\n'); inp.value=''; inp.focus(); }
+go.onclick=run;
+inp.addEventListener('keydown',ev=>{
+  if(ev.key==='Enter'){ev.preventDefault(); run();}
+  else if(ev.ctrlKey && ev.key.length===1){ev.preventDefault(); send(String.fromCharCode(ev.key.toUpperCase().charCodeAt(0)&0x1f));} // Ctrl-C etc.
+});
+inp.focus();
+</script>

@@ -32,12 +32,12 @@
 //! instead use the `ecall` host boundary (console `write` / `exit`) when it
 //! installs no trap vector.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 #[cfg(not(feature = "std"))]
 #[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
 use hologram_store_mem::MemKappaStore;
-use hologram_substrate_core::{KappaLabel71, KappaStore};
+use hologram_substrate_core::{verify_kappa, Bytes, KappaLabel71, KappaStore, StoreError};
 
 pub mod net;
 
@@ -61,10 +61,11 @@ pub mod x64;
 /// loop (Step C). Conformance: `CC-43` (shares the x86-64 differential oracle).
 pub mod jit;
 
-/// The block JIT's **native executor** (the `jit` feature): runs `jit::compile_tlb_flags`
+/// The block JIT's **native executor** (the `jit-native` feature): runs `jit::compile_tlb_flags`
 /// blocks via `wasmtime` over the live `Cpu` state. A `std` host surface — the codegen stays
-/// `no_std`, only execution needs a runtime; the browser peer uses `js_sys::WebAssembly`.
-#[cfg(feature = "jit")]
+/// `no_std`, only execution needs a runtime; the browser peer uses `js_sys::WebAssembly`
+/// (injected through the `set_region_executor` seam), so it never links this module.
+#[cfg(feature = "jit-native")]
 pub mod jit_exec;
 
 /// The shared virtio-mmio device bus: the substrate-backed `virtio` devices and
@@ -678,6 +679,36 @@ impl Plic {
 /// The byte size of a disk sector (`virtio-blk` LBA unit).
 const DISK_SECTOR: usize = 512;
 
+/// Byte length of a serialized `KappaLabel71` (a BLAKE3 κ as stored in a snapshot).
+const KAPPA_LABEL_LEN: usize = 71;
+
+// Diagnostic: the κ-disk *working set* — the distinct sector κs a (resumed) session actually reads.
+// A lazy/streaming disk store fetches each distinct κ once on demand, so this count == the bytes a
+// resume would pull if the disk streamed by κ instead of being inlined. Measures the win of
+// disk-streaming before building it. `#[cfg(feature="std")]` → excluded from the no_std wasm build.
+#[cfg(feature = "std")]
+thread_local! {
+    static DISK_FETCH_KAPPAS: core::cell::RefCell<BTreeSet<[u8; KAPPA_LABEL_LEN]>> =
+        core::cell::RefCell::new(BTreeSet::new());
+    static DISK_READ_CALLS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+/// Reset the κ-disk working-set diagnostic.
+#[cfg(feature = "std")]
+pub fn reset_disk_fetch_stats() {
+    DISK_FETCH_KAPPAS.with(|s| s.borrow_mut().clear());
+    DISK_READ_CALLS.with(|c| c.set(0));
+}
+/// Drain `(distinct_sector_kappas_touched, total_read_sector_calls)` — the lazy-streaming fetch
+/// count vs the raw read volume (the gap is what the read cache + κ-dedup already absorb).
+#[cfg(feature = "std")]
+#[must_use]
+pub fn drain_disk_fetch_stats() -> (usize, u64) {
+    (
+        DISK_FETCH_KAPPAS.with(|s| s.borrow().len()),
+        DISK_READ_CALLS.with(core::cell::Cell::get),
+    )
+}
+
 /// The system emulator's block-device backing — the **κ-disk** (`CC-7`): every
 /// 512-byte sector is *content-addressed in an owned [`KappaStore`]*, not held as
 /// an in-RAM image. The KappaStore IS the memory (Law L3): identical sectors dedup
@@ -829,6 +860,14 @@ impl KappaBacking {
         let Some(k) = &self.index[i] else {
             return [0u8; DISK_SECTOR]; // sparse all-zero sector
         };
+        // Working-set diagnostic: a lazy/streaming store fetches each distinct κ exactly once.
+        #[cfg(feature = "std")]
+        {
+            DISK_READ_CALLS.with(|c| c.set(c.get() + 1));
+            DISK_FETCH_KAPPAS.with(|s| {
+                s.borrow_mut().insert(*k.as_array());
+            });
+        }
         if let Some(hit) = self.read_cache.borrow().get(k) {
             return *hit;
         }
@@ -880,6 +919,38 @@ impl KappaBacking {
         }
     }
 
+    /// Reconstruct a κ-disk from a per-sector κ INDEX over a caller-supplied store, fetching NO
+    /// sectors up front — the disk-STREAMING resume path. Paired with [`LazyKappaStore`], a read
+    /// pulls a sector by its κ on demand (only the working set crosses the wire — measured ~104 KiB
+    /// for a real session vs the ~10 MiB inline disk). The index is what the snapshot manifest
+    /// carries (small + content-addressed); the sectors stream by κ like RAM pages.
+    fn from_index(store: Box<dyn KappaStore>, index: Vec<Option<KappaLabel71>>) -> Self {
+        KappaBacking {
+            store,
+            index,
+            read_cache: core::cell::RefCell::new(SectorCache::new()),
+        }
+    }
+
+    /// The per-sector κ index (what a streaming snapshot manifest carries — small + content-addressed).
+    fn index_clone(&self) -> Vec<Option<KappaLabel71>> {
+        self.index.clone()
+    }
+
+    /// The disk's UNIQUE (κ, bytes) sectors (dedup'd; sparse omitted) — what a transport serves so a
+    /// streaming resume can fetch them by κ on demand.
+    fn unique_sectors(&self) -> Vec<(KappaLabel71, Vec<u8>)> {
+        let mut seen: BTreeSet<[u8; KAPPA_LABEL_LEN]> = BTreeSet::new();
+        let mut out = Vec::new();
+        for k in self.index.iter().flatten() {
+            if seen.insert(*k.as_array()) {
+                let bytes = self.store.get(k).ok().flatten().expect("κ-disk: a sector resolves");
+                out.push((*k, bytes.as_ref().to_vec()));
+            }
+        }
+        out
+    }
+
     /// Reconstruct the full disk image — the self-contained snapshot of the disk
     /// content (the live store dedups; the snapshot captures the bytes).
     fn to_image(&self) -> Vec<u8> {
@@ -896,6 +967,77 @@ impl KappaBacking {
             }
         }
         image
+    }
+}
+
+/// A **read-through κ-store for streaming the κ-disk**: a sector is served from a local in-memory
+/// store, and on a miss is fetched by its κ from `fetch` (the transport — the link bundle, a peer,
+/// or OPFS), **verified (L5)**, and cached locally; writes (`put`) go local. So a *resumed* disk
+/// pulls ONLY the sectors it actually touches (the working set, ~104 KiB for a real session) rather
+/// than the whole ~10 MiB inline disk — the disk streams by κ on demand, exactly like RAM pages.
+pub(crate) struct LazyKappaStore {
+    local: MemKappaStore,
+    fetch: Box<dyn Fn(&KappaLabel71) -> Option<Vec<u8>> + Send + Sync>,
+    /// Diagnostics: how many sectors were actually fetched from the transport (the wire cost).
+    /// Atomic so the type is `Send + Sync` (the `KappaStore` contract) without `unsafe`.
+    fetched: core::sync::atomic::AtomicU64,
+}
+
+impl LazyKappaStore {
+    pub(crate) fn new(fetch: Box<dyn Fn(&KappaLabel71) -> Option<Vec<u8>> + Send + Sync>) -> Self {
+        LazyKappaStore {
+            local: MemKappaStore::new(),
+            fetch,
+            fetched: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+    /// Sectors fetched from the transport so far (the bytes a streaming resume pulled).
+    pub(crate) fn fetched(&self) -> u64 {
+        self.fetched.load(core::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl KappaStore for LazyKappaStore {
+    fn put(&self, axis: &str, bytes: &[u8]) -> Result<KappaLabel71, StoreError> {
+        self.local.put(axis, bytes)
+    }
+    fn get(&self, kappa: &KappaLabel71) -> Result<Option<Bytes>, StoreError> {
+        if let Some(b) = self.local.get(kappa)? {
+            return Ok(Some(b)); // already resident (written, or previously fetched + cached)
+        }
+        match (self.fetch)(kappa) {
+            None => Ok(None),
+            Some(bytes) => {
+                // L5: a fetched sector that does not re-derive to its κ is a forgery — refuse it.
+                if !matches!(verify_kappa(&bytes, kappa), Ok(true)) {
+                    return Err(StoreError::InvalidKappa);
+                }
+                self.fetched.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                self.local.put("blake3", &bytes)?; // cache by content (key == kappa)
+                self.local.get(kappa)
+            }
+        }
+    }
+    fn contains(&self, kappa: &KappaLabel71) -> bool {
+        self.local.contains(kappa)
+    }
+    fn pin(&self, kappa: &KappaLabel71) -> Result<(), StoreError> {
+        self.local.pin(kappa)
+    }
+    fn unpin(&self, kappa: &KappaLabel71) -> Result<(), StoreError> {
+        self.local.unpin(kappa)
+    }
+    fn iterate(&self) -> Vec<KappaLabel71> {
+        self.local.iterate()
+    }
+    fn pinned_roots(&self) -> Vec<KappaLabel71> {
+        self.local.pinned_roots()
+    }
+    fn approximate_count(&self) -> usize {
+        self.local.approximate_count()
+    }
+    fn approximate_bytes(&self) -> u64 {
+        self.local.approximate_bytes()
     }
 }
 
@@ -967,6 +1109,173 @@ impl VirtioBlk {
     /// The disk capacity in 512-byte sectors (the `virtio_blk_config.capacity`).
     fn capacity_sectors(&self) -> u64 {
         self.disk.len() as u64 / 512
+    }
+
+    /// The disk's unique (κ, bytes) sectors — what a transport serves for a streaming-disk resume.
+    fn unique_sectors(&self) -> Vec<(KappaLabel71, Vec<u8>)> {
+        self.disk.unique_sectors()
+    }
+
+    /// Swap the κ-disk backing for a LAZY streaming one that fetches sectors by κ on demand via
+    /// `fetch` (verify-on-receipt L5 in [`LazyKappaStore`]), keeping the per-sector index and all
+    /// device registers. A resumed machine then pulls only the disk working set (~104 KiB measured)
+    /// instead of the whole ~10 MiB inline disk.
+    fn restream(&mut self, fetch: Box<dyn Fn(&KappaLabel71) -> Option<Vec<u8>> + Send + Sync>) {
+        let index = self.disk.index_clone();
+        self.disk = KappaBacking::from_index(Box::new(LazyKappaStore::new(fetch)), index);
+    }
+
+    /// Serialize the device for the κ-snapshot: the virtqueue/feature registers, then the κ-disk as
+    /// a **sparse, content-addressed, dedup'd, L5-verifiable sector manifest** — the same shape the
+    /// RAM-page blob uses. A resumed machine reconstructs a working disk (so a forked child can
+    /// demand-page from `/dev/vda` instead of hanging on an absent device). Self-contained: the
+    /// unique sector bytes travel inline; all-zero sectors stay sparse (one marker byte).
+    /// `inline_disk`: emit the unique sector BYTES inline (self-contained blob); when `false`
+    /// (the STREAMING manifest) emit only the per-sector κ index and `n_uniq = 0`, so the sectors
+    /// are fetched by κ on demand at resume (a light manifest + only the working set crosses the
+    /// wire). The format is identical either way — streaming is just "zero inline sectors" — so the
+    /// inline path stays byte-for-byte compatible (existing blobs/fixtures still restore).
+    fn snap(&self, o: &mut Vec<u8>, inline_disk: bool) {
+        for v in [
+            self.status,
+            self.device_features_sel,
+            self.driver_features_sel,
+            self.driver_features[0],
+            self.driver_features[1],
+            self.queue_sel,
+            self.queue_num,
+            self.queue_ready,
+            self.interrupt_status,
+        ] {
+            o.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [self.desc_addr, self.avail_addr, self.used_addr] {
+            o.extend_from_slice(&v.to_le_bytes());
+        }
+        o.extend_from_slice(&self.last_avail.to_le_bytes());
+        o.push(self.irq_pending as u8);
+        // The κ-disk: the per-sector index (None = sparse all-zero), then the unique sectors.
+        let idx = &self.disk.index;
+        o.extend_from_slice(&(idx.len() as u64).to_le_bytes());
+        for slot in idx {
+            match slot {
+                None => o.push(0),
+                Some(k) => {
+                    o.push(1);
+                    o.extend_from_slice(k.as_array());
+                }
+            }
+        }
+        if !inline_disk {
+            o.extend_from_slice(&0u64.to_le_bytes()); // streaming: no inline sectors (fetched by κ)
+            return;
+        }
+        let mut seen: BTreeSet<[u8; KAPPA_LABEL_LEN]> = BTreeSet::new();
+        let mut uniq: Vec<KappaLabel71> = Vec::new();
+        for slot in idx.iter().flatten() {
+            if seen.insert(*slot.as_array()) {
+                uniq.push(*slot);
+            }
+        }
+        o.extend_from_slice(&(uniq.len() as u64).to_le_bytes());
+        for k in &uniq {
+            let bytes = self
+                .disk
+                .store
+                .get(k)
+                .ok()
+                .flatten()
+                .expect("κ-disk snapshot: a sector resolves for its κ");
+            o.extend_from_slice(k.as_array());
+            o.extend_from_slice(bytes.as_ref()); // DISK_SECTOR bytes
+        }
+    }
+
+    /// Reconstruct a device from [`VirtioBlk::snap`] bytes, **verifying every sector (L5)** before
+    /// it enters the rebuilt κ-disk. Returns `None` on truncation or a sector that does not
+    /// re-derive to its κ (a tampered blob). The queue registers resume exactly where the guest
+    /// driver left them, so the already-initialized in-RAM driver finds its virtqueue live.
+    fn unsnap(b: &[u8]) -> Option<VirtioBlk> {
+        struct Rd<'a> {
+            b: &'a [u8],
+            p: usize,
+        }
+        impl<'a> Rd<'a> {
+            fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+                let s = self.b.get(self.p..self.p.checked_add(n)?)?;
+                self.p += n;
+                Some(s)
+            }
+            fn u8(&mut self) -> Option<u8> {
+                Some(self.take(1)?[0])
+            }
+            fn u16(&mut self) -> Option<u16> {
+                Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
+            }
+            fn u32(&mut self) -> Option<u32> {
+                Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+            }
+            fn u64(&mut self) -> Option<u64> {
+                Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+            }
+        }
+        let mut r = Rd { b, p: 0 };
+        let status = r.u32()?;
+        let device_features_sel = r.u32()?;
+        let driver_features_sel = r.u32()?;
+        let driver_features = [r.u32()?, r.u32()?];
+        let queue_sel = r.u32()?;
+        let queue_num = r.u32()?;
+        let queue_ready = r.u32()?;
+        let interrupt_status = r.u32()?;
+        let desc_addr = r.u64()?;
+        let avail_addr = r.u64()?;
+        let used_addr = r.u64()?;
+        let last_avail = r.u16()?;
+        let irq_pending = r.u8()? != 0;
+        let n = r.u64()? as usize;
+        let mut index: Vec<Option<KappaLabel71>> = Vec::with_capacity(n);
+        for _ in 0..n {
+            match r.u8()? {
+                0 => index.push(None),
+                _ => {
+                    let arr: [u8; KAPPA_LABEL_LEN] = r.take(KAPPA_LABEL_LEN)?.try_into().ok()?;
+                    index.push(Some(KappaLabel71::from_bytes(&arr).ok()?));
+                }
+            }
+        }
+        let store: Box<dyn KappaStore> = Box::new(MemKappaStore::new());
+        let n_uniq = r.u64()? as usize;
+        for _ in 0..n_uniq {
+            let arr: [u8; KAPPA_LABEL_LEN] = r.take(KAPPA_LABEL_LEN)?.try_into().ok()?;
+            let k = KappaLabel71::from_bytes(&arr).ok()?;
+            let bytes = r.take(DISK_SECTOR)?;
+            if !matches!(verify_kappa(bytes, &k), Ok(true)) {
+                return None; // L5: a sector that does not re-derive to its κ is refused
+            }
+            store.put("blake3", bytes).ok()?; // content-address back in (key == k)
+        }
+        let disk = KappaBacking {
+            store,
+            index,
+            read_cache: core::cell::RefCell::new(SectorCache::new()),
+        };
+        Some(VirtioBlk {
+            disk,
+            status,
+            device_features_sel,
+            driver_features_sel,
+            driver_features,
+            queue_sel,
+            queue_num,
+            queue_ready,
+            desc_addr,
+            avail_addr,
+            used_addr,
+            last_avail,
+            interrupt_status,
+            irq_pending,
+        })
     }
 }
 
@@ -1075,6 +1384,210 @@ impl VirtioNet {
             last_avail: [0; 2],
             interrupt_status: 0,
         }
+    }
+
+    /// Serialize the plain device-register state (the κ-snapshot path) — everything the driver
+    /// negotiated + the virtqueue addresses (which live in guest RAM) + `last_avail` (the device's
+    /// consumed position). The external transports (`nat`/`egress`/`ingress`) are NOT serialized: host
+    /// sockets and in-flight NAT connections can't cross a snapshot; they are re-attached fresh on
+    /// resume via [`Cpu::reattach_net_forward`](super::x64::Cpu::reattach_net_forward). An idle
+    /// listening server (the warm-snapshot case) has no live connections, so a fresh NAT is correct.
+    fn snap_regs(&self, o: &mut Vec<u8>) {
+        o.extend_from_slice(&self.mac);
+        o.extend_from_slice(&self.status.to_le_bytes());
+        o.extend_from_slice(&self.device_features_sel.to_le_bytes());
+        o.extend_from_slice(&self.driver_features_sel.to_le_bytes());
+        for v in self.driver_features {
+            o.extend_from_slice(&v.to_le_bytes());
+        }
+        o.extend_from_slice(&self.queue_sel.to_le_bytes());
+        for v in self.queue_num {
+            o.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in self.queue_ready {
+            o.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in self.desc_addr {
+            o.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in self.avail_addr {
+            o.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in self.used_addr {
+            o.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in self.last_avail {
+            o.extend_from_slice(&v.to_le_bytes());
+        }
+        o.extend_from_slice(&self.interrupt_status.to_le_bytes());
+    }
+
+    /// Reconstruct a device from snapshotted registers, with placeholder transports (`NoEgress`/
+    /// `NoIngress` + a fresh NAT). Call [`VirtioNet::set_transports`] to wire real ones after restore.
+    #[allow(clippy::too_many_arguments)]
+    fn from_snapshot(
+        mac: [u8; 6],
+        status: u32,
+        device_features_sel: u32,
+        driver_features_sel: u32,
+        driver_features: [u32; 2],
+        queue_sel: u32,
+        queue_num: [u32; 2],
+        queue_ready: [u32; 2],
+        desc_addr: [u64; 2],
+        avail_addr: [u64; 2],
+        used_addr: [u64; 2],
+        last_avail: [u16; 2],
+        interrupt_status: u32,
+    ) -> Self {
+        VirtioNet {
+            nat: net::Nat::new(),
+            egress: Box::new(net::NoEgress),
+            ingress: Box::new(net::NoIngress),
+            mac,
+            status,
+            device_features_sel,
+            driver_features_sel,
+            driver_features,
+            queue_sel,
+            queue_num,
+            queue_ready,
+            desc_addr,
+            avail_addr,
+            used_addr,
+            last_avail,
+            interrupt_status,
+        }
+    }
+
+    /// Swap in real transports on a device restored from a snapshot, preserving the negotiated register
+    /// state, and reset the NAT (host-side TCP connections do not survive a snapshot).
+    fn set_transports(&mut self, egress: Box<dyn net::Egress>, ingress: Box<dyn net::Ingress>) {
+        self.egress = egress;
+        self.ingress = ingress;
+        self.nat = net::Nat::new();
+    }
+}
+
+/// The VirtIO **input device** (OASIS VirtIO v1.2 §5.8) over the virtio-mmio
+/// transport — a combined keyboard + relative pointer. Two virtqueues: the
+/// **eventq** (index 0, device → driver, carrying evdev `virtio_input_event`
+/// records) and the **statusq** (index 1, driver → device: LED / repeat status,
+/// which we drain and ignore). The host enqueues events into `pending`; servicing
+/// the eventq drains them into the driver's posted buffers and raises the device
+/// IRQ. Delivering input is what wakes the X server's main loop — its block
+/// handler then runs the `modesetting` shadow → scanout flush, which is what
+/// finally paints client content (and carries real interactivity; `CC-46`).
+struct VirtioInput {
+    status: u32,
+    device_features_sel: u32,
+    driver_features_sel: u32,
+    driver_features: [u32; 2],
+    /// Selected queue (0 = eventq, 1 = statusq).
+    queue_sel: u32,
+    // Per-queue transport state (index 0 = eventq, 1 = statusq).
+    queue_num: [u32; 2],
+    queue_ready: [u32; 2],
+    desc_addr: [u64; 2],
+    avail_addr: [u64; 2],
+    used_addr: [u64; 2],
+    last_avail: [u16; 2],
+    interrupt_status: u32,
+    /// Config-space cursor (`virtio_input_config.select` / `.subsel`): the driver
+    /// writes these, then reads `size` + the union to enumerate the device's
+    /// capabilities (name, ids, the EV_*/KEY_*/REL_* bitmaps).
+    cfg_select: u8,
+    cfg_subsel: u8,
+    /// evdev events queued by the host, drained into the eventq in FIFO order.
+    pending: alloc::collections::VecDeque<[u8; 8]>,
+}
+
+impl VirtioInput {
+    fn new() -> Self {
+        VirtioInput {
+            status: 0,
+            device_features_sel: 0,
+            driver_features_sel: 0,
+            driver_features: [0; 2],
+            queue_sel: 0,
+            queue_num: [0; 2],
+            queue_ready: [0; 2],
+            desc_addr: [0; 2],
+            avail_addr: [0; 2],
+            used_addr: [0; 2],
+            last_avail: [0; 2],
+            interrupt_status: 0,
+            cfg_select: 0,
+            cfg_subsel: 0,
+            pending: alloc::collections::VecDeque::new(),
+        }
+    }
+
+    /// Encode a `virtio_input_event { __le16 type, __le16 code, __le32 value }`
+    /// (8 bytes, little-endian) and enqueue it for the eventq.
+    fn push_event(&mut self, etype: u16, code: u16, value: i32) {
+        let mut ev = [0u8; 8];
+        ev[0..2].copy_from_slice(&etype.to_le_bytes());
+        ev[2..4].copy_from_slice(&code.to_le_bytes());
+        ev[4..8].copy_from_slice(&(value as u32).to_le_bytes());
+        self.pending.push_back(ev);
+    }
+
+    /// The config-space answer for the current `(select, subsel)` cursor: the
+    /// `size` byte (number of valid union bytes) and the union payload itself.
+    /// Implements the keyboard + relative-pointer capability set the Linux
+    /// `virtio_input` driver enumerates (`drivers/virtio/virtio_input.c`).
+    fn config_payload(&self) -> ([u8; 128], u8) {
+        // VIRTIO_INPUT_CFG_* selects.
+        const CFG_ID_NAME: u8 = 0x01;
+        const CFG_ID_DEVIDS: u8 = 0x03;
+        const CFG_PROP_BITS: u8 = 0x10;
+        const CFG_EV_BITS: u8 = 0x11;
+        // evdev event types (subsel of EV_BITS).
+        const EV_KEY: u8 = 0x01;
+        const EV_REL: u8 = 0x02;
+
+        let mut buf = [0u8; 128];
+        let size: u8 = match self.cfg_select {
+            CFG_ID_NAME => {
+                let name = b"holospaces virtio-input";
+                buf[..name.len()].copy_from_slice(name);
+                name.len() as u8
+            }
+            CFG_ID_DEVIDS => {
+                // struct virtio_input_devids { __le16 bustype, vendor, product, version }.
+                const BUS_VIRTUAL: u16 = 0x06;
+                buf[0..2].copy_from_slice(&BUS_VIRTUAL.to_le_bytes());
+                buf[2..4].copy_from_slice(&0x1af4u16.to_le_bytes()); // Red Hat vendor
+                buf[4..6].copy_from_slice(&0x0001u16.to_le_bytes());
+                buf[6..8].copy_from_slice(&0x0001u16.to_le_bytes());
+                8
+            }
+            CFG_PROP_BITS => 0, // no INPUT_PROP_* bits
+            CFG_EV_BITS => match self.cfg_subsel {
+                EV_KEY => {
+                    // Advertise the standard keyboard key range [1, 255] plus the
+                    // mouse buttons BTN_LEFT/RIGHT/MIDDLE/SIDE/EXTRA (0x110..=0x114).
+                    // Bitmap is KEY_MAX(0x2ff)+1 bits = 96 bytes.
+                    for code in 1u16..=255 {
+                        buf[(code / 8) as usize] |= 1 << (code % 8);
+                    }
+                    for code in 0x110u16..=0x114 {
+                        buf[(code / 8) as usize] |= 1 << (code % 8);
+                    }
+                    96
+                }
+                EV_REL => {
+                    // REL_X(0), REL_Y(1), REL_WHEEL(8). REL_MAX(0x0f)+1 bits = 2 bytes.
+                    buf[0] |= (1 << 0) | (1 << 1);
+                    buf[1] |= 1 << 0; // REL_WHEEL = bit 8
+                    2
+                }
+                _ => 0,
+            },
+            _ => 0,
+        };
+        (buf, size)
     }
 }
 
@@ -5151,6 +5664,75 @@ fn j_imm(inst: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Disk STREAMING: a κ-disk reconstructed from a per-sector κ index over a [`LazyKappaStore`]
+    /// pulls ONLY the sectors it reads — the disk-streaming-by-κ resume. Proves: (1) on demand,
+    /// (2) cached (a re-read does not re-fetch), (3) byte-exact, (4) sparse sectors cost no fetch,
+    /// (5) L5 — a forged sector is refused.
+    #[test]
+    fn streaming_disk_fetches_only_the_sectors_it_touches() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        // A "remote" store holding a 64-sector disk: distinct content per non-zero sector, a few
+        // sparse (all-zero) sectors, and a duplicate (dedups to one κ).
+        let remote = Arc::new(MemKappaStore::new());
+        let nsectors = 64usize;
+        let mut index: Vec<Option<KappaLabel71>> = Vec::with_capacity(nsectors);
+        let sector_bytes = |i: usize| -> [u8; DISK_SECTOR] {
+            let mut s = [0u8; DISK_SECTOR];
+            if i % 8 != 0 {
+                // non-sparse: fill with a per-sector pattern (sector 40 duplicates sector 8)
+                let seed = if i == 40 { 8 } else { i } as u8;
+                for (j, b) in s.iter_mut().enumerate() {
+                    *b = seed ^ (j as u8);
+                }
+            }
+            s
+        };
+        for i in 0..nsectors {
+            let s = sector_bytes(i);
+            index.push(KappaBacking::store_sector(remote.as_ref(), &s));
+        }
+        let unique_nonsparse = index.iter().flatten().collect::<BTreeSet<_>>().len();
+
+        // Resume: a lazy store whose fetch pulls from `remote`, counting wire fetches externally.
+        let fetches = Arc::new(AtomicU64::new(0));
+        let (rc_remote, rc_fetches) = (remote.clone(), fetches.clone());
+        let lazy = LazyKappaStore::new(Box::new(move |k| {
+            rc_fetches.fetch_add(1, Ordering::Relaxed);
+            rc_remote.get(k).ok().flatten().map(|b| b.as_ref().to_vec())
+        }));
+        let disk = KappaBacking::from_index(Box::new(lazy), index.clone());
+
+        // Touch a handful of sectors (incl. a sparse one and the duplicate).
+        let touched = [3usize, 8, 40, 0 /* sparse */, 17, 3 /* re-read */, 17 /* re-read */];
+        for &i in &touched {
+            assert_eq!(disk.read_sector(i), sector_bytes(i), "sector {i} byte-exact");
+        }
+        // Distinct NON-SPARSE sectors actually read: 3, 8, 40(=8 content), 17 → 8 and 40 share a κ,
+        // so 3 distinct κs. Sparse sector 0 and the re-reads cost no fetch.
+        let distinct_touched_kappas = [3usize, 8, 40, 17]
+            .iter()
+            .filter_map(|&i| index[i].as_ref())
+            .collect::<BTreeSet<_>>()
+            .len();
+        let fetched = fetches.load(Ordering::Relaxed);
+        assert_eq!(
+            fetched,
+            distinct_touched_kappas as u64,
+            "streamed only the distinct touched sectors ({} of {} non-sparse)",
+            distinct_touched_kappas, unique_nonsparse,
+        );
+        assert!(
+            (fetched as usize) < unique_nonsparse,
+            "the working set is smaller than the whole disk (the streaming win)",
+        );
+
+        // L5: a forged sector (bytes that don't match the requested κ) is refused.
+        let some_k = index.iter().flatten().next().unwrap().clone();
+        let bad = LazyKappaStore::new(Box::new(|_k| Some(vec![0xaa; DISK_SECTOR])));
+        assert!(matches!(bad.get(&some_k), Err(StoreError::InvalidKappa)), "L5 refuses a forgery");
+    }
 
     /// The κ-disk backing (`CC-7` over the substrate store) round-trips byte
     /// ranges faithfully, keeps all-zero sectors sparse, and dedups identical

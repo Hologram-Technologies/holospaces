@@ -28,6 +28,7 @@
 //! reads and edits environment content by κ — the documented launch experience,
 //! realized on the browser peer.
 
+mod jit_web;
 mod opfs_store;
 mod webrtc;
 mod wsnet;
@@ -300,27 +301,19 @@ impl DevcontainerProvision {
         // Stream the ext4 image block-by-block into the OPFS file. Only non-zero
         // blocks are written (the free space stays sparse), so the wasm heap holds
         // the assembler's content working set, never the whole image.
-        let mut io_err: Option<JsValue> = None;
-        let geom = holospaces::assembly::stream_ext4_image_bootable_streamed_layers(
+        let mut cw = OpfsCoalescer::new(&rootfs_handle);
+        let geom = holospaces::assembly::stream_ext4_image_bootable_streamed_layers_lowmem(
             next_layer,
             holospaces::machine::REAL_IMAGE_INIT,
             disk_bytes as u64,
-            |block_index, bytes| {
-                if io_err.is_some() {
-                    return;
-                }
-                let opts = web_sys::FileSystemReadWriteOptions::new();
-                opts.set_at((block_index * bytes.len() as u64) as f64);
-                if let Err(e) = rootfs_handle.write_with_u8_array_and_options(bytes, &opts) {
-                    io_err = Some(e);
-                }
-            },
+            |block_index, bytes| cw.write(block_index, bytes),
         )
         .map_err(js_err)?;
         if let Some(e) = layer_err {
             return Err(e);
         }
-        if let Some(e) = io_err {
+        cw.flush();
+        if let Some(e) = cw.err.take() {
             return Err(e);
         }
         let image_len = geom.image_len();
@@ -461,24 +454,16 @@ impl DevcontainerImage {
             Ok(Some((mt.clone(), b.clone())))
         };
 
-        let mut io_err: Option<JsValue> = None;
-        let geom = holospaces::assembly::stream_ext4_image_bootable_streamed_layers(
+        let mut cw = OpfsCoalescer::new(&rootfs_handle);
+        let geom = holospaces::assembly::stream_ext4_image_bootable_streamed_layers_lowmem(
             next_layer,
             holospaces::machine::DEVCONTAINER_INIT,
             disk_bytes as u64,
-            |block_index, bytes| {
-                if io_err.is_some() {
-                    return;
-                }
-                let opts = web_sys::FileSystemReadWriteOptions::new();
-                opts.set_at((block_index * bytes.len() as u64) as f64);
-                if let Err(e) = rootfs_handle.write_with_u8_array_and_options(bytes, &opts) {
-                    io_err = Some(e);
-                }
-            },
+            |block_index, bytes| cw.write(block_index, bytes),
         )
         .map_err(js_err)?;
-        if let Some(e) = io_err {
+        cw.flush();
+        if let Some(e) = cw.err.take() {
             return Err(e);
         }
         let image_len = geom.image_len();
@@ -509,24 +494,16 @@ impl DevcontainerImage {
             layer_idx += 1;
             Ok(Some((mt.clone(), b.clone())))
         };
-        let mut io_err: Option<JsValue> = None;
-        let geom = holospaces::assembly::stream_ext4_image_bootable_streamed_layers(
+        let mut cw = OpfsCoalescer::new(&rootfs_handle);
+        let geom = holospaces::assembly::stream_ext4_image_bootable_streamed_layers_lowmem(
             next_layer,
             init,
             disk_bytes as u64,
-            |block_index, bytes| {
-                if io_err.is_some() {
-                    return;
-                }
-                let opts = web_sys::FileSystemReadWriteOptions::new();
-                opts.set_at((block_index * bytes.len() as u64) as f64);
-                if let Err(e) = rootfs_handle.write_with_u8_array_and_options(bytes, &opts) {
-                    io_err = Some(e);
-                }
-            },
+            |block_index, bytes| cw.write(block_index, bytes),
         )
         .map_err(js_err)?;
-        if let Some(e) = io_err {
+        cw.flush();
+        if let Some(e) = cw.err.take() {
             return Err(e);
         }
         let image_len = geom.image_len();
@@ -2057,6 +2034,65 @@ pub struct X64Workspace {
     snap_store: Option<MemKappaStore>,
 }
 
+/// Coalesces the sparse ext4 assembler's per-block `emit(block_index, bytes)` callbacks into a few
+/// BULK OPFS writes: contiguous blocks accumulate into one buffer, flushed on a gap (a sparse hole)
+/// or at 8 MiB. Turns the assembly's ~tens-of-thousands of per-4 KiB-block sync writes — the OPFS
+/// write wall that made a desktop-scale rootfs assemble slowly — into ~dozens of large writes.
+struct OpfsCoalescer<'a> {
+    handle: &'a web_sys::FileSystemSyncAccessHandle,
+    block_size: usize,
+    run: Vec<u8>,
+    run_base_block: u64,
+    next_block: u64,
+    err: Option<JsValue>,
+}
+
+impl<'a> OpfsCoalescer<'a> {
+    fn new(handle: &'a web_sys::FileSystemSyncAccessHandle) -> Self {
+        Self { handle, block_size: 0, run: Vec::new(), run_base_block: 0, next_block: 0, err: None }
+    }
+    fn write(&mut self, block_index: u64, bytes: &[u8]) {
+        if self.err.is_some() {
+            return;
+        }
+        if self.block_size == 0 {
+            self.block_size = bytes.len();
+        }
+        let contiguous =
+            !self.run.is_empty() && block_index == self.next_block && bytes.len() == self.block_size;
+        if !contiguous {
+            self.flush();
+            self.run_base_block = block_index;
+            self.next_block = block_index;
+        }
+        self.run.extend_from_slice(bytes);
+        self.next_block += 1;
+        if self.run.len() >= 8 * 1024 * 1024 {
+            self.flush();
+        }
+    }
+    fn flush(&mut self) {
+        if self.run.is_empty() || self.err.is_some() {
+            return;
+        }
+        let at = self.run_base_block * self.block_size as u64;
+        let opts = web_sys::FileSystemReadWriteOptions::new();
+        opts.set_at(at as f64);
+        if let Err(e) = self.handle.write_with_u8_array_and_options(&self.run, &opts) {
+            self.err = Some(e);
+        }
+        self.run.clear();
+    }
+}
+
+thread_local! {
+    /// The reason the x64 core last stopped, captured by [`X64Workspace::run`] and read back via
+    /// [`X64Workspace::halt_reason`]. Diagnostic: `Undefined(rip)` pinpoints an unimplemented
+    /// instruction (the rip), `Halted` is a hlt/power-off. Single-threaded wasm → a thread-local
+    /// avoids threading a field through every constructor.
+    static LAST_X64_HALT: core::cell::RefCell<String> = const { core::cell::RefCell::new(String::new()) };
+}
+
 #[wasm_bindgen]
 impl X64Workspace {
     /// Boot a provisioned amd64 image, **streaming** its κ-disk from OPFS (no full
@@ -2089,6 +2125,70 @@ impl X64Workspace {
         );
         // The κ-disk is fully ingested up front; release the rootfs's exclusive OPFS
         // lock so re-provisioning/removal isn't blocked and the handle doesn't leak.
+        rootfs_handle.close();
+        Ok(X64Workspace {
+            cpu,
+            halted: false,
+            console_cursor: 0,
+            snap_store: None,
+        })
+    }
+
+    /// Boot the **graphical** disk-root Alpine kernel (DRM_SIMPLEDRM + fbcon): identical to
+    /// [`boot_devcontainer_opfs_streamed`](X64Workspace::boot_devcontainer_opfs_streamed) but adds
+    /// `console=tty0`, so fbcon drives the VT (the boot console + shell prompt) onto the emulator's
+    /// linear framebuffer — which [`framebuffer`](X64Workspace::framebuffer) reads out for the κ
+    /// render stack. `console=ttyS0` stays for the logs + the existing input path. The x64 analogue
+    /// of [`Aarch64Workspace::boot_devcontainer_opfs_streamed_graphical`].
+    pub fn boot_devcontainer_opfs_streamed_graphical(
+        kernel: &[u8],
+        rootfs_handle: web_sys::FileSystemSyncAccessHandle,
+        disk_handle: web_sys::FileSystemSyncAccessHandle,
+    ) -> Result<X64Workspace, JsValue> {
+        let store = Box::new(opfs_store::OpfsKappaStore::new(disk_handle));
+        let total = rootfs_handle.get_size().map_err(js_err)? as u64;
+        let sector_count = total.div_ceil(512);
+        // Serve the eager κ-ingest's sequential sector reads from an 8 MiB sliding window instead of
+        // either a per-sector OPFS round-trip (~1ms each → minutes) OR a whole-disk RAM buffer (a
+        // GB-scale disk OOMs the tab). The window refills with ONE OPFS read per 8 MiB as
+        // `from_sectors` walks i=0,1,2,…; peak RAM is the 8 MiB window, OPFS reads ≈ disk/8MiB.
+        // (CHUNK is a multiple of 512 and reads are 512-aligned → a sector never straddles the edge.)
+        const CHUNK: usize = 8 * 1024 * 1024;
+        let rootfs = rootfs_handle.clone();
+        let mut window = vec![0u8; CHUNK];
+        let mut win_base: usize = usize::MAX; // byte offset of the window, MAX = unloaded
+        let mut win_len: usize = 0;
+        let read = move |i: u64, buf: &mut [u8]| {
+            let start = (i * 512) as usize;
+            if win_base == usize::MAX || start < win_base || start >= win_base + win_len {
+                let base = (start / CHUNK) * CHUNK;
+                let opts = web_sys::FileSystemReadWriteOptions::new();
+                opts.set_at(base as f64);
+                win_len = rootfs.read_with_u8_array_and_options(&mut window, &opts).unwrap_or(0.0) as usize;
+                win_base = base;
+            }
+            let off = start - win_base;
+            if off >= win_len { return; } // past EOF → leave zeros
+            let n = buf.len().min(win_len - off);
+            buf[..n].copy_from_slice(&window[off..off + n]);
+        };
+        let mut cpu = x64::Cpu::boot_linux_disk_streamed(
+            512 * 1024 * 1024,
+            kernel,
+            // virtio_mmio.device tells the kernel where the emulator's virtio-mmio block slot is
+            // (VIRTIO_BLK_BASE=0xd0000000, IRQ 11, 0x200-byte register block) — the x64 core exposes
+            // virtio over MMIO, not PCI, so without this the PCI scan finds nothing and root mount
+            // fails with unknown-block(0,0). The 2nd slot (0xd0000600, IRQ 5) is the virtio-input
+            // device (keyboard + pointer) the desktop binds for paint+interactivity (CC-46). tty0
+            // LAST → /dev/console = the framebuffer VT (fbcon).
+            "console=ttyS0 console=tty0 virtio_mmio.device=0x200@0xd0000000:11 virtio_mmio.device=0x200@0xd0000600:5 root=/dev/vda rw init=/init",
+            store,
+            sector_count,
+            read,
+        );
+        // Attach the virtio-input device before the first run so it is present when the kernel probes
+        // the virtio-mmio bus during early boot (the desktop's keyboard + pointer; CC-46).
+        cpu.attach_virtio_input();
         rootfs_handle.close();
         Ok(X64Workspace {
             cpu,
@@ -2141,10 +2241,49 @@ impl X64Workspace {
         if self.halted {
             return true;
         }
-        if !matches!(self.cpu.run(budget as u64), x64::Halt::OutOfBudget) {
-            self.halted = true;
+        // Arm the chaining region JIT (idempotent): inject the browser `WebAssembly` executor through
+        // the core's seam so hot guest loops run as one chained wasm region on the user's own CPU.
+        jit_web::arm();
+        match self.cpu.run(budget as u64) {
+            x64::Halt::OutOfBudget => {}
+            other => {
+                self.halted = true;
+                let detail = if let x64::Halt::Undefined(rip) = other {
+                    let b = self.cpu.peek_code(rip, 12);
+                    let hex: String = b.iter().map(|x| format!("{x:02x} ")).collect();
+                    format!("Undefined(rip={rip:#x}) opcode: {}", hex.trim_end())
+                } else {
+                    format!("{other:?}")
+                };
+                LAST_X64_HALT.with(|s| *s.borrow_mut() = detail);
+            }
         }
         self.halted
+    }
+
+    /// Why the core last stopped — `Halted` (a `hlt`/power-off) or `Undefined(rip)` (an
+    /// instruction the core doesn't yet implement, at that linear rip). Empty until the first
+    /// non-budget halt. A boot diagnostic: an `Undefined` rip names the gap to implement next.
+    #[must_use]
+    pub fn halt_reason(&self) -> String {
+        LAST_X64_HALT.with(|s| s.borrow().clone())
+    }
+
+    /// Enable/disable the chaining region JIT for THIS run. `notrust=true` is the correctness
+    /// diagnostic: every compiled region runs dry (NOT committed) and is shadow-compared to the
+    /// interpreter on every execution, recording the FIRST divergence (drain via `region_divergence`).
+    /// With `notrust=false` it's the real fast path (SHADOW→TRUST→COMMIT). The executor is armed in
+    /// `run` regardless; this flips the dispatch on.
+    pub fn set_region_jit(&self, on: bool, notrust: bool) {
+        x64::set_region_jit_on(on);
+        x64::set_region_notrust(notrust);
+    }
+
+    /// The first region↔interpreter divergence caught under `notrust` (rip + which field + the ops),
+    /// or empty if none — the region JIT is bit-identical so far. Drains the latch.
+    #[must_use]
+    pub fn region_divergence(&self) -> String {
+        x64::drain_region_divergence().unwrap_or_default()
     }
 
     /// The full console the guest has produced.
@@ -2168,11 +2307,70 @@ impl X64Workspace {
         self.cpu.feed_console(bytes);
     }
 
+    /// Feed a key (or mouse button) event to the guest's `virtio-input` device
+    /// (`CC-46`). `evdev_code` is a Linux `KEY_*` / `BTN_*` code — the worker maps
+    /// the browser `KeyboardEvent.code` to it. `down` = pressed. The device appends
+    /// the terminating `SYN_REPORT` and raises the IRQ, so the guest's input layer
+    /// and the X server see a complete event.
+    pub fn feed_key(&mut self, evdev_code: u32, down: bool) {
+        self.cpu.input_key(evdev_code as u16, down);
+    }
+
+    /// Feed a relative pointer motion (`dx`, `dy` in guest pixels) to the
+    /// `virtio-input` device. Map canvas → guest coordinates on the JS side
+    /// (accounting for `object-fit: contain`) before calling.
+    pub fn feed_pointer_motion(&mut self, dx: i32, dy: i32) {
+        self.cpu.input_motion(dx, dy);
+    }
+
+    /// Feed a mouse-button event: `button` is the browser `MouseEvent.button`
+    /// (0 = left, 1 = middle, 2 = right), mapped to the evdev `BTN_*` code.
+    pub fn feed_pointer_button(&mut self, button: u32, down: bool) {
+        let code: u16 = match button {
+            1 => 0x112, // BTN_MIDDLE
+            2 => 0x111, // BTN_RIGHT
+            _ => 0x110, // BTN_LEFT
+        };
+        self.cpu.input_key(code, down);
+    }
+
+    /// Feed a vertical scroll-wheel step (`+1` up / `-1` down) to the device.
+    pub fn feed_wheel(&mut self, clicks: i32) {
+        self.cpu.input_wheel(clicks);
+    }
+
     /// Whether the machine has powered off.
     #[wasm_bindgen(getter)]
     #[must_use]
     pub fn halted(&self) -> bool {
         self.halted
+    }
+
+    /// The guest's framebuffer scanout (RGBA/XRGB bytes) — the surface the κ render stack
+    /// super-res-projects (`KappaSurface.present({width,height,bytes})`). A slice of guest RAM the
+    /// guest's `efifb`/`simpledrm` driver draws into (advertised to the kernel via `screen_info`).
+    /// Empty/garbage until a graphics-capable kernel binds the framebuffer; the canvas loop polls it.
+    #[must_use]
+    pub fn framebuffer(&self) -> Vec<u8> {
+        self.cpu.read_framebuffer()
+    }
+
+    /// `[width, height, stride_bytes, format]` (format 0 = RGBA8888 — host swaps R/B if the guest
+    /// wrote XRGB, per the `screen_info` color masks).
+    #[must_use]
+    pub fn framebuffer_dims(&self) -> Vec<u32> {
+        vec![x64::Cpu::FB_W as u32, x64::Cpu::FB_H as u32, (x64::Cpu::FB_W * 4) as u32, 0]
+    }
+
+    /// Guest-physical base of the framebuffer (what `screen_info.lfb_base` advertises).
+    #[must_use]
+    pub fn framebuffer_base(&self) -> f64 {
+        self.cpu.fb_phys_base() as f64
+    }
+
+    /// Push pixels into the framebuffer region (a host-side draw / the smoke test before a graphical kernel).
+    pub fn fb_write(&mut self, bytes: &[u8]) {
+        self.cpu.write_framebuffer(bytes);
     }
 
     /// Dev: drain the guest CPU-exception trace (vectors < 32), newline-joined,
@@ -2240,6 +2438,34 @@ impl X64Workspace {
         })
     }
 
+    /// Enable the **in-tab loopback bridge** on the (resumed) machine's network device so the page can
+    /// [`dial_guest`](X64Workspace::dial_guest) a server running INSIDE the guest — no host socket, which a
+    /// wasm tab does not have. Works on a machine resumed from a warm `.holo` that carries a virtio-net
+    /// device (CC-73); returns `false` if none is attached. The x64 analogue of the loopback bridge already
+    /// on [`Aarch64Workspace`]/[`Workspace`] — the mechanism behind "open a κ-link, see the live app".
+    pub fn enable_loopback(&mut self) -> bool {
+        self.cpu.enable_loopback()
+    }
+
+    /// Dial the guest's server on `guest_port` over the loopback bridge; returns a connection id (or
+    /// `None` if the bridge isn't enabled). Pair with [`guest_send`](X64Workspace::guest_send) +
+    /// [`guest_recv`](X64Workspace::guest_recv) to make an HTTP request to the in-guest app and read its
+    /// real response, which the page renders.
+    pub fn dial_guest(&mut self, guest_port: u16) -> Option<u32> {
+        self.cpu.dial_guest(guest_port)
+    }
+
+    /// Send bytes on a loopback connection opened by [`dial_guest`](X64Workspace::dial_guest).
+    pub fn guest_send(&mut self, id: u32, data: &[u8]) {
+        self.cpu.guest_send(id, data);
+    }
+
+    /// Read whatever bytes the in-guest server has produced on connection `id` since the last call.
+    #[must_use]
+    pub fn guest_recv(&mut self, id: u32) -> Vec<u8> {
+        self.cpu.guest_recv(id)
+    }
+
     /// Seal the running machine for **streaming** sharing: content-address its RAM into an
     /// internal κ-store (only the unique pages) and return the small **manifest** (CPU+device
     /// state + the per-page κ list). A peer publishes the manifest (e.g. in a κ-link) and serves
@@ -2290,5 +2516,93 @@ impl X64Workspace {
             console_cursor: 0,
             snap_store: None,
         })
+    }
+
+    /// **Instant desktop resume** (`CC-46`): the browser NEVER cold-boots — it fetches the prebuilt
+    /// painted-desktop artifact and rebuilds the disk from the layer it already has. Args (fetched by
+    /// the worker from `web/snap/`):
+    /// - `manifest`  = `snapshot_kappa_manifest_streaming_disk` bytes (disk = κ index; RAM = κ list).
+    /// - `pages_bin` = concatenated unique 4096-B RAM pages; `pages_idx` = the 71-char κ string per
+    ///   page, `\n`-separated, in `pages_bin` order.
+    /// - `disk_image` = the layer-assembled ext4 (full disk) — assembled in-browser exactly as for a
+    ///   cold boot (deterministic → identical sector κ), so unchanged sectors resolve locally.
+    /// - `delta_bin`/`delta_idx` = the boot-modified sectors (`"<hexκ>:<len>"` per line) absent from
+    ///   the layer. Every RAM page + disk sector is verified against its κ before use (L5).
+    #[allow(clippy::too_many_arguments)]
+    pub fn resume_desktop_from_layer(
+        manifest: &[u8],
+        pages_bin: Vec<u8>,
+        pages_idx: String,
+        disk_image: Vec<u8>,
+        delta_bin: Vec<u8>,
+        delta_idx: String,
+    ) -> Result<X64Workspace, JsValue> {
+        use std::collections::HashMap;
+        const L: usize = 71; // KAPPA_LABEL_LEN — a κ string "blake3:" + 64 hex = 71 bytes.
+        const SECT: usize = 512;
+        const PAGE: usize = 4096;
+
+        // RAM: κ-bytes → byte offset in pages_bin (the 71-char κ string IS the 71-byte label).
+        let mut ram_off: HashMap<[u8; L], usize> = HashMap::new();
+        for (i, line) in pages_idx.lines().enumerate() {
+            let b = line.as_bytes();
+            if b.len() == L {
+                let mut k = [0u8; L];
+                k.copy_from_slice(b);
+                ram_off.entry(k).or_insert(i * PAGE);
+            }
+        }
+        // Disk DELTA: κ-bytes → owned sector bytes (parsed from delta_bin via the idx).
+        let mut delta_map: HashMap<[u8; L], Vec<u8>> = HashMap::new();
+        let mut off = 0usize;
+        for line in delta_idx.lines() {
+            let Some((hexk, lens)) = line.split_once(':') else { continue };
+            let Ok(len) = lens.parse::<usize>() else { continue };
+            if hexk.len() == 2 * L && off + len <= delta_bin.len() {
+                let mut k = [0u8; L];
+                let mut ok = true;
+                for j in 0..L {
+                    match u8::from_str_radix(&hexk[2 * j..2 * j + 2], 16) {
+                        Ok(v) => k[j] = v,
+                        Err(_) => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    delta_map.insert(k, delta_bin[off..off + len].to_vec());
+                }
+            }
+            off += len;
+        }
+        // Layer disk: κ-bytes → offset in disk_image (content-address each non-zero 512-B sector, as
+        // KappaBacking does). Unchanged sectors resolve here; the delta overrides where the boot wrote.
+        let mut layer_off: HashMap<[u8; L], usize> = HashMap::new();
+        let mut s = 0usize;
+        while s + SECT <= disk_image.len() {
+            let sec = &disk_image[s..s + SECT];
+            if sec.iter().any(|&b| b != 0) {
+                let k = *hologram_substrate_core::address_bytes(sec).as_array();
+                layer_off.entry(k).or_insert(s);
+            }
+            s += SECT;
+        }
+
+        // Resume: RAM from pages; disk from delta-then-layer. The heavy buffers move into the closures
+        // and stay resident for the machine's lifetime (the lazy disk faults sectors in on demand).
+        let mut cpu = x64::Cpu::new(0x1000);
+        let ram_fetch = move |k: &[u8; L]| ram_off.get(k).map(|&o| pages_bin[o..o + PAGE].to_vec());
+        let disk_fetch: Box<dyn Fn(&[u8; L]) -> Option<Vec<u8>> + Send + Sync> =
+            Box::new(move |k: &[u8; L]| {
+                if let Some(b) = delta_map.get(k) {
+                    return Some(b.clone());
+                }
+                layer_off.get(k).map(|&o| disk_image[o..o + SECT].to_vec())
+            });
+        if !cpu.restore_kappa_streaming_lazy_disk(manifest, ram_fetch, disk_fetch) {
+            return Err(js_err("desktop resume failed (bad manifest / missing RAM page or disk sector)"));
+        }
+        Ok(X64Workspace { cpu, halted: false, console_cursor: 0, snap_store: None })
     }
 }

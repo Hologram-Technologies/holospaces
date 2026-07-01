@@ -1,0 +1,14 @@
+# V&V fixtures are byte-exact content (κ-addressed blobs, gzip'd OCI layers,
+# kernels, warm κ-snapshots). They MUST NOT be line-ending-filtered: an autocrlf
+# checkout on Windows rewrites LF→CRLF and corrupts a binary blob so its content no
+# longer matches its sha256 name (a DigestMismatch on OCI ingest, CC-10/14/61).
+# Mark every binary fixture class as binary so it round-trips byte-for-byte.
+vv/artifacts/**/blobs/** binary
+*.gz binary
+*.kblob binary
+*.img binary
+*.ext4 binary
+*.tar binary
+vmlinux* binary
+bzImage* binary
+Image* binary

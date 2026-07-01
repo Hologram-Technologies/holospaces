@@ -25,8 +25,21 @@ use web_sys::{FileSystemReadWriteOptions, FileSystemSyncAccessHandle};
 pub struct OpfsKappaStore {
     handle: FileSystemSyncAccessHandle,
     index: RefCell<BTreeMap<[u8; 71], (f64, usize)>>,
+    /// Logical end offset = `pending_base + pending.len()` (the next blob's offset).
     append_at: RefCell<f64>,
+    /// Write-coalescing staging buffer: blobs are appended here and flushed to OPFS in big
+    /// chunks, turning the κ-disk ingest's ~one-OPFS-write-per-512 B-sector (hundreds of
+    /// thousands of sync writes for a desktop-scale rootfs — the constructor wall) into a few
+    /// dozen bulk writes. A blob whose logical offset is ≥ `pending_base` lives here (served by
+    /// `get` directly) until flushed; flushed blobs sit at OPFS offset == their logical offset.
+    pending: RefCell<Vec<u8>>,
+    /// The OPFS/logical offset at which `pending` begins (everything below is already in OPFS).
+    pending_base: RefCell<f64>,
 }
+
+/// Flush the staging buffer once it reaches this size — bounds peak staging RAM while amortizing
+/// the per-write OPFS overhead over many sectors.
+const FLUSH_THRESHOLD: usize = 8 * 1024 * 1024;
 
 // The browser peer is single-threaded (wasm has no threads), and the sync access
 // handle is never shared across threads — so the `Send + Sync` the `KappaStore`
@@ -42,12 +55,37 @@ impl OpfsKappaStore {
             handle,
             index: RefCell::new(BTreeMap::new()),
             append_at: RefCell::new(0.0),
+            pending: RefCell::new(Vec::new()),
+            pending_base: RefCell::new(0.0),
         }
     }
 
     fn axis_arr(axis: &str, bytes: &[u8]) -> Result<[u8; 71], StoreError> {
         let label = address_bytes_axis(axis, bytes).map_err(|_| StoreError::UnknownAxis)?;
         <[u8; 71]>::try_from(label.as_slice()).map_err(|_| StoreError::UnknownAxis)
+    }
+
+    /// Write the staging buffer to OPFS in one call at `pending_base`, then advance the base and
+    /// clear the buffer. Flushed blobs end up at OPFS offset == their logical offset (so `get`'s
+    /// flushed-path read is correct). Idempotent when `pending` is empty.
+    fn flush(&self) -> Result<(), StoreError> {
+        let mut pending = self.pending.borrow_mut();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let base = *self.pending_base.borrow();
+        let opts = FileSystemReadWriteOptions::new();
+        opts.set_at(base);
+        let wrote = self
+            .handle
+            .write_with_u8_array_and_options(&pending, &opts)
+            .map_err(|_| StoreError::BackendFailure("opfs flush write"))?;
+        if wrote as usize != pending.len() {
+            return Err(StoreError::BackendFailure("opfs flush short write"));
+        }
+        *self.pending_base.borrow_mut() = base + pending.len() as f64;
+        pending.clear();
+        Ok(())
     }
 }
 
@@ -57,18 +95,15 @@ impl KappaStore for OpfsKappaStore {
         let kappa = KappaLabel::from_bytes(&arr).map_err(|_| StoreError::InvalidKappa)?;
         // Idempotent: an already-held κ is not rewritten (dedup, Law L3).
         if !self.index.borrow().contains_key(&arr) {
+            // Stage into the coalescing buffer at the current logical offset; the actual OPFS
+            // write happens in bulk on flush. The blob is `get`-able immediately (from `pending`).
             let at = *self.append_at.borrow();
-            let opts = FileSystemReadWriteOptions::new();
-            opts.set_at(at);
-            let wrote = self
-                .handle
-                .write_with_u8_array_and_options(bytes, &opts)
-                .map_err(|_| StoreError::BackendFailure("opfs write"))?;
-            if wrote as usize != bytes.len() {
-                return Err(StoreError::BackendFailure("opfs short write"));
-            }
+            self.pending.borrow_mut().extend_from_slice(bytes);
             self.index.borrow_mut().insert(arr, (at, bytes.len()));
             *self.append_at.borrow_mut() = at + bytes.len() as f64;
+            if self.pending.borrow().len() >= FLUSH_THRESHOLD {
+                self.flush()?;
+            }
         }
         Ok(kappa)
     }
@@ -78,6 +113,17 @@ impl KappaStore for OpfsKappaStore {
             Some(&v) => v,
             None => return Ok(None),
         };
+        // Serve a not-yet-flushed blob straight from the staging buffer (its logical offset is
+        // ≥ pending_base) so reads during/after ingest see staged content without a flush.
+        let base = *self.pending_base.borrow();
+        if at >= base {
+            let off = (at - base) as usize;
+            let pending = self.pending.borrow();
+            if off + len <= pending.len() {
+                return Ok(Some(Bytes::from(pending[off..off + len].to_vec())));
+            }
+            return Err(StoreError::BackendFailure("opfs staged read OOB"));
+        }
         let mut buf = vec![0u8; len];
         let opts = FileSystemReadWriteOptions::new();
         opts.set_at(at);

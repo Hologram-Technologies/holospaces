@@ -1,0 +1,6 @@
+# CC-76 generated fixtures (large binary; regenerate via cc76 generate_browser_server_fixture)
+fixtures/*.holo
+fixtures/store/
+cc76-open-kappa.png
+pkg/
+cc76-nginx.png

@@ -254,6 +254,24 @@ where
     stream_tree_image(tree, init, disk_bytes, emit)
 }
 
+/// Like [`stream_ext4_image_bootable_streamed_layers`] but overlays each gzip layer through the
+/// STREAMING gunzip tar reader ([`overlay_layers_streamed_lowmem`]), so the full decompressed tar is
+/// never resident — peak working memory is the filesystem tree plus a few-MiB inflate window, not
+/// tree + whole-tar. Byte-identical image (Law L1). This is the path a browser peer uses to assemble
+/// a GB-scale desktop rootfs without OOMing the tab.
+pub fn stream_ext4_image_bootable_streamed_layers_lowmem<F>(
+    next_layer: F,
+    init: &[u8],
+    disk_bytes: u64,
+    emit: impl FnMut(u64, &[u8]),
+) -> Result<ext4::ImageGeometry, AssemblyError>
+where
+    F: FnMut() -> Result<Option<(String, Vec<u8>)>, AssemblyError>,
+{
+    let tree = overlay_layers_streamed_lowmem(next_layer)?;
+    stream_tree_image(tree, init, disk_bytes, emit)
+}
+
 /// Inject `/init`, size the filesystem, and stream the overlaid `tree`'s sparse
 /// non-zero blocks to `emit` — the shared tail of the raw-stream bootable
 /// assemblers, byte-identical by construction (Law L1).
@@ -536,6 +554,33 @@ where
     Ok(builder.finish())
 }
 
+/// Like [`overlay_layers_streamed`] but, for gzip layers, parses the tar through the STREAMING
+/// gunzip reader ([`tar::stream_gz_entries`]) so the full decompressed tar is never held alongside
+/// the tree — peak working memory drops from `tar + tree` (~1.4 GiB for a 700 MiB rootfs) to
+/// `tree + a few-MiB inflate window`. Non-gzip layers (plain tar / zstd) fall back to the
+/// whole-buffer path. The resulting tree is byte-identical to [`overlay_layers_streamed`].
+pub fn overlay_layers_streamed_lowmem<F>(mut next: F) -> Result<Tree, AssemblyError>
+where
+    F: FnMut() -> Result<Option<(String, Vec<u8>)>, AssemblyError>,
+{
+    let mut builder = TreeBuilder::new();
+    while let Some((media_type, blob)) = next()? {
+        let is_gz = blob.len() >= 2 && blob[0] == 0x1f && blob[1] == 0x8b;
+        if is_gz || media_type.contains("gzip") {
+            // Stream the gunzip→tar so the 700 MiB decompressed tar is never resident; the
+            // compressed `blob` stays borrowed (and live) only for this layer's streaming pass.
+            tar::stream_gz_entries(gz_deflate(&blob)?, |e| builder.apply_entry(e))?;
+        } else {
+            let tar = decompress(&Layer {
+                media_type: &media_type,
+                blob: &blob,
+            })?;
+            builder.apply_layer(&tar)?;
+        }
+    }
+    Ok(builder.finish())
+}
+
 /// Decompress a layer (or repository archive) blob to its raw tar bytes. The
 /// codec is chosen from the compression magic first (authoritative — gzip's
 /// `1f 8b`, zstd's `28 b5 2f fd`), then the media type — so an OCI `tar+gzip`
@@ -577,8 +622,11 @@ fn unzstd(_data: &[u8], mt: &str) -> Result<Vec<u8>, AssemblyError> {
     Err(AssemblyError::UnsupportedMediaType(mt.to_string()))
 }
 
-/// Inflate a gzip member (RFC 1952 framing + RFC 1951 DEFLATE) to bytes.
-fn gunzip(data: &[u8]) -> Result<Vec<u8>, AssemblyError> {
+/// The raw DEFLATE stream inside a gzip member — between the RFC 1952 header
+/// (fixed + optional FEXTRA/FNAME/FCOMMENT/FHCRC) and the 8-byte trailer (CRC32 +
+/// ISIZE). Shared by the whole-buffer [`gunzip`] and the streaming tar reader so
+/// both skip the header identically.
+fn gz_deflate(data: &[u8]) -> Result<&[u8], AssemblyError> {
     if data.len() < 18 || data[0] != 0x1f || data[1] != 0x8b {
         return Err(AssemblyError::BadGzip("bad magic".to_string()));
     }
@@ -596,12 +644,10 @@ fn gunzip(data: &[u8]) -> Result<Vec<u8>, AssemblyError> {
         pos += 2 + xlen;
     }
     if flg & 0x08 != 0 {
-        // FNAME: NUL-terminated.
-        pos = skip_cstr(data, pos)?;
+        pos = skip_cstr(data, pos)?; // FNAME: NUL-terminated.
     }
     if flg & 0x10 != 0 {
-        // FCOMMENT: NUL-terminated.
-        pos = skip_cstr(data, pos)?;
+        pos = skip_cstr(data, pos)?; // FCOMMENT: NUL-terminated.
     }
     if flg & 0x02 != 0 {
         pos += 2; // FHCRC
@@ -609,9 +655,12 @@ fn gunzip(data: &[u8]) -> Result<Vec<u8>, AssemblyError> {
     if pos > data.len() {
         return Err(AssemblyError::BadGzip("truncated header".to_string()));
     }
-    // The DEFLATE stream is between the header and the 8-byte trailer (CRC32 + ISIZE).
-    let deflate = &data[pos..data.len() - 8];
-    miniz_oxide::inflate::decompress_to_vec(deflate)
+    Ok(&data[pos..data.len() - 8])
+}
+
+/// Inflate a gzip member (RFC 1952 framing + RFC 1951 DEFLATE) to bytes.
+fn gunzip(data: &[u8]) -> Result<Vec<u8>, AssemblyError> {
+    miniz_oxide::inflate::decompress_to_vec(gz_deflate(data)?)
         .map_err(|e| AssemblyError::BadGzip(alloc::format!("inflate: {:?}", e.status)))
 }
 
@@ -1008,42 +1057,46 @@ mod tar {
 
     impl<'a> Reader<'a> {
         fn parse_pax(&mut self, data: &[u8]) -> Result<(), AssemblyError> {
-            // Records: "<len> <key>=<value>\n", len counts the whole record.
-            let mut i = 0;
-            while i < data.len() {
-                let start = i;
-                // Read the decimal length prefix.
-                let mut len = 0usize;
-                while i < data.len() && data[i].is_ascii_digit() {
-                    len = len * 10 + (data[i] - b'0') as usize;
-                    i += 1;
-                }
-                if len == 0 || start + len > data.len() || i >= data.len() || data[i] != b' ' {
-                    break; // tolerate trailing padding
-                }
-                let record = &data[start..start + len];
-                // Skip "<len> "
-                let kv = &record[(i - start + 1)..record.len().saturating_sub(1)]; // drop trailing \n
-                if let Some(eq) = kv.iter().position(|&b| b == b'=') {
-                    let key = &kv[..eq];
-                    let val = &kv[eq + 1..];
-                    match key {
-                        b"path" => self.pax_path = Some(String::from_utf8_lossy(val).into_owned()),
-                        b"linkpath" => {
-                            self.pax_link = Some(String::from_utf8_lossy(val).into_owned())
-                        }
-                        b"size" => {
-                            self.pax_size = core::str::from_utf8(val)
-                                .ok()
-                                .and_then(|s| s.parse::<u64>().ok());
-                        }
-                        _ => {}
-                    }
-                }
-                i = start + len;
-            }
-            Ok(())
+            parse_pax_into(data, &mut self.pax_path, &mut self.pax_link, &mut self.pax_size)
         }
+    }
+
+    /// Parse PAX extended-header records ("<len> <key>=<value>\n") into the path/link/size
+    /// overrides that apply to the next regular header. Shared by the slice [`Reader`] and the
+    /// streaming gz reader so both honor PAX identically.
+    fn parse_pax_into(
+        data: &[u8],
+        pax_path: &mut Option<String>,
+        pax_link: &mut Option<String>,
+        pax_size: &mut Option<u64>,
+    ) -> Result<(), AssemblyError> {
+        let mut i = 0;
+        while i < data.len() {
+            let start = i;
+            let mut len = 0usize;
+            while i < data.len() && data[i].is_ascii_digit() {
+                len = len * 10 + (data[i] - b'0') as usize;
+                i += 1;
+            }
+            if len == 0 || start + len > data.len() || i >= data.len() || data[i] != b' ' {
+                break; // tolerate trailing padding
+            }
+            let record = &data[start..start + len];
+            let kv = &record[(i - start + 1)..record.len().saturating_sub(1)]; // drop trailing \n
+            if let Some(eq) = kv.iter().position(|&b| b == b'=') {
+                let (key, val) = (&kv[..eq], &kv[eq + 1..]);
+                match key {
+                    b"path" => *pax_path = Some(String::from_utf8_lossy(val).into_owned()),
+                    b"linkpath" => *pax_link = Some(String::from_utf8_lossy(val).into_owned()),
+                    b"size" => {
+                        *pax_size = core::str::from_utf8(val).ok().and_then(|s| s.parse::<u64>().ok());
+                    }
+                    _ => {}
+                }
+            }
+            i = start + len;
+        }
+        Ok(())
     }
 
     fn header_name(hdr: &[u8]) -> String {
@@ -1096,6 +1149,158 @@ mod tar {
 
     fn parse_size(hdr: &[u8]) -> Result<u64, AssemblyError> {
         octal(&hdr[124..136]).ok_or_else(|| AssemblyError::BadTar("bad size".to_string()))
+    }
+
+    /// A streaming gunzip source: inflates a gzip member's DEFLATE body incrementally into a small
+    /// rolling buffer, so the WHOLE decompressed tar is never resident (a 700 MiB rootfs assembles
+    /// in ~tens of MiB rather than ~1.4 GiB). `read_exact` pulls the next `n` bytes, inflating on
+    /// demand and compacting the consumed prefix.
+    struct GzSource<'a> {
+        deflate: &'a [u8],
+        in_pos: usize,
+        state: alloc::boxed::Box<miniz_oxide::inflate::stream::InflateState>,
+        out: Vec<u8>,
+        cur: usize,
+        done: bool,
+    }
+
+    impl<'a> GzSource<'a> {
+        fn new(deflate: &'a [u8]) -> Self {
+            GzSource {
+                deflate,
+                in_pos: 0,
+                state: miniz_oxide::inflate::stream::InflateState::new_boxed(
+                    miniz_oxide::DataFormat::Raw,
+                ),
+                out: Vec::new(),
+                cur: 0,
+                done: false,
+            }
+        }
+
+        fn pump(&mut self) -> Result<(), AssemblyError> {
+            use miniz_oxide::inflate::stream::inflate;
+            use miniz_oxide::{MZFlush, MZStatus};
+            let mut tmp = vec![0u8; 256 * 1024];
+            let res = inflate(&mut self.state, &self.deflate[self.in_pos..], &mut tmp, MZFlush::None);
+            self.in_pos += res.bytes_consumed;
+            self.out.extend_from_slice(&tmp[..res.bytes_written]);
+            match res.status {
+                Ok(MZStatus::StreamEnd) => self.done = true,
+                // No progress (input exhausted without an end marker) → treat as end, tolerant.
+                Ok(_) if res.bytes_consumed == 0 && res.bytes_written == 0 => self.done = true,
+                Ok(_) => {}
+                Err(e) => return Err(AssemblyError::BadGzip(alloc::format!("inflate: {e:?}"))),
+            }
+            Ok(())
+        }
+
+        /// The next `n` decompressed bytes, or `None` at a clean stream end on a record boundary.
+        fn read_exact(&mut self, n: usize) -> Result<Option<Vec<u8>>, AssemblyError> {
+            while self.out.len() - self.cur < n && !self.done {
+                self.pump()?;
+            }
+            if self.out.len() - self.cur < n {
+                if self.out.len() == self.cur {
+                    return Ok(None); // clean EOF exactly at a boundary
+                }
+                return Err(AssemblyError::BadTar("truncated tar (gzip ended mid-record)".to_string()));
+            }
+            let v = self.out[self.cur..self.cur + n].to_vec();
+            self.cur += n;
+            if self.cur >= 8 * 1024 * 1024 {
+                self.out.drain(..self.cur);
+                self.cur = 0;
+            }
+            Ok(Some(v))
+        }
+    }
+
+    /// Stream a gzip'd tar's entries to `on_entry` WITHOUT materializing the decompressed tar — the
+    /// byte-for-byte twin of iterating [`Reader`] over the fully-inflated bytes (same headers, PAX,
+    /// GNU long names, typeflags, and `Entry` fields; verified by `streaming_gz_tar_matches_slice`).
+    pub fn stream_gz_entries(
+        raw_deflate: &[u8],
+        mut on_entry: impl FnMut(Entry) -> Result<(), AssemblyError>,
+    ) -> Result<(), AssemblyError> {
+        let mut src = GzSource::new(raw_deflate);
+        let mut pax_path: Option<String> = None;
+        let mut pax_link: Option<String> = None;
+        let mut pax_size: Option<u64> = None;
+        let mut gnu_long_name: Option<String> = None;
+        let mut gnu_long_link: Option<String> = None;
+        loop {
+            let hdr = match src.read_exact(512)? {
+                Some(h) => h,
+                None => return Ok(()), // ran out of blocks — tolerate a missing end marker
+            };
+            if hdr.iter().all(|&b| b == 0) {
+                return Ok(()); // end marker
+            }
+            let typeflag = hdr[156];
+            let size = match pax_size.take().or_else(|| parse_size(&hdr).ok()) {
+                Some(s) => s as usize,
+                None => return Err(AssemblyError::BadTar("bad size field".to_string())),
+            };
+            let data = match src.read_exact(size)? {
+                Some(d) => d,
+                None => return Err(AssemblyError::BadTar("truncated body".to_string())),
+            };
+            let pad = size.div_ceil(512) * 512 - size;
+            if pad > 0 {
+                let _ = src.read_exact(pad); // padding; tolerate a truncated final block
+            }
+            match typeflag {
+                b'x' | b'X' => {
+                    parse_pax_into(&data, &mut pax_path, &mut pax_link, &mut pax_size)?;
+                    continue;
+                }
+                b'g' => continue,
+                b'L' => {
+                    gnu_long_name = Some(cstr(&data));
+                    continue;
+                }
+                b'K' => {
+                    gnu_long_link = Some(cstr(&data));
+                    continue;
+                }
+                _ => {}
+            }
+            let kind = match typeflag {
+                b'0' | 0 | b'7' => Kind::File,
+                b'5' => Kind::Dir,
+                b'2' => Kind::Symlink,
+                b'1' => Kind::HardLink,
+                b'3' => Kind::Char,
+                b'4' => Kind::Block,
+                b'6' => Kind::Fifo,
+                other => {
+                    return Err(AssemblyError::BadTar(alloc::format!(
+                        "unsupported typeflag {other:#x}"
+                    )))
+                }
+            };
+            let path = pax_path
+                .take()
+                .or_else(|| gnu_long_name.take())
+                .unwrap_or_else(|| header_name(&hdr));
+            let link = pax_link
+                .take()
+                .or_else(|| gnu_long_link.take())
+                .unwrap_or_else(|| cstr_field(&hdr[157..257]));
+            on_entry(Entry {
+                path,
+                link,
+                kind,
+                mode: (octal(&hdr[100..108]).unwrap_or(0) & 0o7777) as u16,
+                uid: octal(&hdr[108..116]).unwrap_or(0) as u32,
+                gid: octal(&hdr[116..124]).unwrap_or(0) as u32,
+                mtime: octal(&hdr[136..148]).unwrap_or(0) as u32,
+                devmajor: octal(&hdr[329..337]).unwrap_or(0) as u32,
+                devminor: octal(&hdr[337..345]).unwrap_or(0) as u32,
+                data: if kind == Kind::File { data } else { vec![] },
+            })?;
+        }
     }
 }
 
