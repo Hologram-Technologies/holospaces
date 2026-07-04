@@ -1071,3 +1071,88 @@ fn the_amd64_devcontainer_shares_the_9p_workspace_with_the_editor() {
         "nested-path read sees the written file"
     );
 }
+
+/// Reproduce/guard the amd64 guest-stability defect the 9p witness surfaced:
+/// after ~1.4k task-agent poll cycles (each: a 9p glob + a fork/exec `sleep`),
+/// the glibc-static busybox shell's heap corrupts ("malloc(): unsorted double
+/// linked list corrupted") and PID 1 panics. This witness compresses the same
+/// workload into seconds — first the 9p-glob churn WITHOUT forks, then the
+/// fork/exec churn — so the failing subsystem is identified (and, once fixed,
+/// stays fixed). A usable devcontainer must survive its own idle loop.
+#[test]
+#[ignore = "boots a real amd64 Linux + stress-runs the agent workload (~release) — CC-45 vv suite"]
+fn the_amd64_guest_survives_agent_churn() {
+    use holospaces::assembly::{assemble_ext4_bootable, Layer};
+
+    let busybox = std::fs::read(cc45_dir().join("rootfs/layer.tar.gz")).expect("busybox layer");
+    let layers = [Layer {
+        media_type: "application/vnd.oci.image.layer.v1.tar+gzip",
+        blob: &busybox,
+    }];
+    let rootfs = assemble_ext4_bootable(
+        &layers,
+        holospaces::machine::DEVCONTAINER_INIT,
+        64 * 1024 * 1024,
+    )
+    .expect("assemble the amd64 rootfs");
+    let kernel = gunzip(&cc45_dir().join("linux/vmlinux.gz"));
+    let mut cpu = Cpu::boot_linux_disk(
+        512 * 1024 * 1024,
+        &kernel,
+        rootfs,
+        "console=ttyS0 root=/dev/vda rw init=/init \
+         virtio_mmio.device=0x200@0xd0000000:11 \
+         virtio_mmio.device=0x200@0xd0000200:10 random.trust_cpu=on",
+    );
+
+    let mut booted = false;
+    for _ in 0..30 {
+        cpu.run(1_000_000_000);
+        if String::from_utf8_lossy(cpu.console()).contains("holospace devcontainer ready") {
+            booted = true;
+            break;
+        }
+    }
+    assert!(booted, "the amd64 devcontainer booted");
+
+    let run_until = |cpu: &mut Cpu, marker: &str, slices: u32| -> bool {
+        for _ in 0..slices {
+            cpu.run(1_000_000_000);
+            let c = String::from_utf8_lossy(cpu.console());
+            if c.contains(marker) {
+                return true;
+            }
+            if c.contains("malloc(") || c.contains("Kernel panic") {
+                return false;
+            }
+        }
+        false
+    };
+
+    // Phase 1 — the agent's 9p churn, compressed, NO forks: glob + [ -e ] over
+    // the share 3000 times (what the poll loop does when no task is queued).
+    cpu.feed_console(
+        b"i=0; while [ $i -lt 3000 ]; do set -- /workspace/.hs-tasks/*.cmd; \
+          [ -e \"$1\" ]; i=$((i+1)); done; echo GLOB-CHURN-OK\n",
+    );
+    let glob_ok = run_until(&mut cpu, "GLOB-CHURN-OK", 60);
+    let console = String::from_utf8_lossy(cpu.console()).into_owned();
+    assert!(
+        glob_ok,
+        "3000 no-fork 9p glob cycles left the shell heap intact; console tail:\n{}",
+        &console[console.len().saturating_sub(1200)..]
+    );
+
+    // Phase 2 — the fork/exec churn: what `sleep 1` does each poll, 3000 times
+    // fast (fork + execve + wait + exit), the COW-heavy half of the workload.
+    cpu.feed_console(
+        b"i=0; while [ $i -lt 3000 ]; do /bin/busybox true; i=$((i+1)); done; echo FORK-CHURN-OK\n",
+    );
+    let fork_ok = run_until(&mut cpu, "FORK-CHURN-OK", 120);
+    let console = String::from_utf8_lossy(cpu.console()).into_owned();
+    assert!(
+        fork_ok,
+        "3000 fork/exec cycles left the shell heap intact; console tail:\n{}",
+        &console[console.len().saturating_sub(1200)..]
+    );
+}
