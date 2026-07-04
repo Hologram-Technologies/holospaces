@@ -28,15 +28,16 @@ import { execSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
 import path from "node:path";
-import { composeWorkbenchHtml, WORKBENCH_PIN } from "./build-workbench.mjs";
+import { composeWorkbenchHtml, WORKBENCH_PIN, BUILTIN_EXTENSIONS } from "./build-workbench.mjs";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(DIR, "../../..");
 const BOOTSTRAP = "@vscode/test-web@0.0.80";
 const distDir = path.join(DIR, "node_modules/vscode-web/dist");
 const twDir = path.join(DIR, "node_modules/@vscode/test-web");
-const extFsDir = path.join(DIR, "builtin-extensions/holospace-fs");
-const extScmDir = path.join(DIR, "builtin-extensions/holospace-scm");
+// Serve EVERY builtin the composed workbench declares (BUILTIN_EXTENSIONS) —
+// a declared-but-unserved builtin 404s and destabilizes the extension host.
+const extDir = (name) => path.join(DIR, "builtin-extensions", name);
 const cc16 = path.join(ROOT, "vv/artifacts/cc16");
 const cc18 = path.join(ROOT, "vv/artifacts/cc18");
 
@@ -130,8 +131,10 @@ const server = http.createServer(async (req, res) => {
   const send = (b, ct) => { res.writeHead(200, { "content-type": ct || "application/octet-stream" }); res.end(b); };
   try {
     if (rel === "/" || rel === "/workbench.html") return send(html, "text/html");
-    if (rel.startsWith("/ext/holospace-fs/")) return send(await readFile(path.join(extFsDir, rel.slice("/ext/holospace-fs/".length))), TYPES[path.extname(rel)]);
-    if (rel.startsWith("/ext/holospace-scm/")) return send(await readFile(path.join(extScmDir, rel.slice("/ext/holospace-scm/".length))), TYPES[path.extname(rel)]);
+    for (const name of BUILTIN_EXTENSIONS) {
+      const pre = `/ext/${name}/`;
+      if (rel.startsWith(pre)) return send(await readFile(path.join(extDir(name), rel.slice(pre.length))), TYPES[path.extname(rel)]);
+    }
     if (rel.startsWith("/pkg/")) return send(await readFile(path.join(DIR, rel)), TYPES[path.extname(rel)]);
     if (rel === "/devcontainer-net-kernel.gz") return send(await readFile(path.join(cc16, "kernel/Image.gz")), "application/gzip");
     if (rel === "/devcontainer-lsp-layer.tar.gz") return send(await readFile(path.join(cc18, "image/blobs/sha256", cc18Layer)), "application/gzip");

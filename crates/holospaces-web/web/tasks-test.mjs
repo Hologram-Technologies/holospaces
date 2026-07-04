@@ -14,7 +14,13 @@
 //      captured from the guest agent's `<id>.exit` over 9p;
 //   3. its problem matcher produces a DIAGNOSTIC in the Problems panel — the
 //      task emits `main.rs:2:5: warning: …`, and the contributed matcher turns
-//      it into a problem on main.rs.
+//      it into a problem on main.rs;
+//   4. the devcontainer's LIFECYCLE commands (CC-22) surface as re-runnable
+//      tasks — the seeded devcontainer.json's postCreateCommand runs in the
+//      guest and exits 0;
+//   5. a BACKGROUND/watch task runs WITHOUT blocking — while the long-running
+//      watch task streams in the guest, the build task runs to its exit
+//      (concurrent guest execution; the UI + task system stay usable).
 //
 // The fast core (tasks.json parse, command build, exec protocol) is proven by
 // builtin-extensions/holospace-tasks/tasks-core.test.cjs; this proves it wired
@@ -25,19 +31,17 @@ import { createHash } from "node:crypto";
 import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { composeWorkbenchHtml, WORKBENCH_PIN } from "./build-workbench.mjs";
+import { composeWorkbenchHtml, WORKBENCH_PIN, BUILTIN_EXTENSIONS } from "./build-workbench.mjs";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(DIR, "../../..");
 const BOOTSTRAP = "@vscode/test-web@0.0.80";
 const distDir = path.join(DIR, "node_modules/vscode-web/dist");
 const twDir = path.join(DIR, "node_modules/@vscode/test-web");
-const extDirs = {
-  "holospace-fs": path.join(DIR, "builtin-extensions/holospace-fs"),
-  "holospace-scm": path.join(DIR, "builtin-extensions/holospace-scm"),
-  "holospace-search": path.join(DIR, "builtin-extensions/holospace-search"),
-  "holospace-tasks": path.join(DIR, "builtin-extensions/holospace-tasks"),
-};
+// Serve every builtin the composed workbench declares — one shared list.
+const extDirs = Object.fromEntries(
+  BUILTIN_EXTENSIONS.map((n) => [n, path.join(DIR, "builtin-extensions", n)]),
+);
 const cc16 = path.join(ROOT, "vv/artifacts/cc16");
 const cc18 = path.join(ROOT, "vv/artifacts/cc18");
 
@@ -117,11 +121,26 @@ async function runCommand(title) {
   await page.waitForTimeout(700);
   const idx = await page.evaluate((t) => {
     const norm = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-    const tokens = norm(t).split(" ").filter(Boolean);
+    const want = norm(t);
+    const tokens = want.split(" ").filter(Boolean);
     const rows = [...document.querySelectorAll(".quick-input-list .monaco-list-row")];
-    return rows.findIndex((r) => { const x = norm(r.innerText); return tokens.every((tok) => x.includes(tok)); });
+    // EXACT normalized match first — a token match alone picks the wrong sibling
+    // ("Holospace: Run Task" tokens all appear in "Holospace: Run Build Task").
+    // The row text may append a keybinding/description, so fall back to prefix,
+    // then to the SHORTEST token-matching row (the plain title is the shortest).
+    const texts = rows.map((r) => norm(r.innerText));
+    let best = texts.findIndex((x) => x === want);
+    if (best < 0) best = texts.findIndex((x) => x.startsWith(want));
+    if (best < 0) {
+      const matches = texts.map((x, i) => ({ x, i })).filter(({ x }) => tokens.every((tok) => x.includes(tok)));
+      matches.sort((a, b) => a.x.length - b.x.length);
+      best = matches.length ? matches[0].i : -1;
+    }
+    return { best, texts: texts.slice(0, 8) };
   }, title);
-  if (idx >= 0) await page.locator(".quick-input-list .monaco-list-row").nth(idx).click();
+  const { best: idx2, texts } = idx;
+  if (idx2 < 0) console.log(`  palette rows for "${title}":`, JSON.stringify(texts));
+  if (idx2 >= 0) await page.locator(".quick-input-list .monaco-list-row").nth(idx2).click();
   else await page.keyboard.press("Enter");
   await page.waitForTimeout(700);
 }
@@ -134,9 +153,18 @@ async function pickQuick(label, timeout = 12000) {
   await page.waitForTimeout(600);
   const idx = await page.evaluate((t) => {
     const norm = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-    const tokens = norm(t).split(" ").filter(Boolean);
+    const want = norm(t);
+    const tokens = want.split(" ").filter(Boolean);
     const rows = [...document.querySelectorAll(".quick-input-list .monaco-list-row")];
-    return rows.findIndex((r) => { const x = norm(r.innerText); return tokens.every((tok) => x.includes(tok)); });
+    const texts = rows.map((r) => norm(r.innerText));
+    let best = texts.findIndex((x) => x === want);
+    if (best < 0) best = texts.findIndex((x) => x.startsWith(want));
+    if (best < 0) {
+      const matches = texts.map((x, i) => ({ x, i })).filter(({ x }) => tokens.every((tok) => x.includes(tok)));
+      matches.sort((a, b) => a.x.length - b.x.length);
+      best = matches.length ? matches[0].i : -1;
+    }
+    return best;
   }, label);
   if (idx >= 0) await page.locator(".quick-input-list .monaco-list-row").nth(idx).click();
   else await page.keyboard.press("Enter");
@@ -151,15 +179,17 @@ async function runBuildTask() {
   await page.waitForTimeout(500);
 }
 
-const waitLog = (re, timeout = 120000) =>
+const countLog = (re) => cclog.filter((l) => re.test(l)).length;
+const waitCount = (re, n, timeout = 120000) =>
   (async () => {
     const start = Date.now();
     while (Date.now() - start < timeout) {
-      if (cclog.some((l) => re.test(l))) return true;
+      if (countLog(re) >= n) return true;
       await page.waitForTimeout(500);
     }
     return false;
   })();
+const waitLog = (re, timeout = 120000) => waitCount(re, 1, timeout);
 
 try {
   await page.goto(`http://127.0.0.1:${port}/workbench.html`);
@@ -194,10 +224,35 @@ try {
     .then(() => true).catch(() => false);
   check(diag, "the task's problem matcher produces a DIAGNOSTIC in the Problems panel (main.rs:2:5: warning: TODO found here)");
 
+  // (4) The devcontainer's LIFECYCLE commands (CC-22) surface as re-runnable
+  // tasks: run the seeded devcontainer.json's postCreateCommand through the task
+  // system and see it exit 0 in the guest.
+  await runCommand("Holospace: Run Task");
+  await pickQuick("lifecycle postCreateCommand");
+  const lifecycle = await waitLog(/HOLOSPACE-TASK-EXIT label=lifecycle: postCreateCommand code=0/, 45000);
+  check(lifecycle, "the devcontainer.json lifecycle command surfaces as a task and RUNS in the guest (lifecycle: postCreateCommand → exit 0, CC-22)");
+
+  // (5) A BACKGROUND/watch task runs WITHOUT blocking: start the long-running
+  // watch task; once the guest streams its first output (it is running), run the
+  // build task again — its exit must surface WHILE watch is still running (the
+  // guest agent executes tasks concurrently; the UI + task system stay usable).
+  await runCommand("Holospace: Run Task");
+  await pickQuick("watch");
+  const watching = await waitLog(/HOLOSPACE-TASK-OUT label=watch/, 45000);
+  check(watching, "the background watch task is RUNNING in the guest (first output streamed)");
+  const buildExitsBefore = countLog(/HOLOSPACE-TASK-EXIT label=build code=2/);
+  await runBuildTask();
+  const buildAgain = await waitCount(/HOLOSPACE-TASK-EXIT label=build code=2/, buildExitsBefore + 1, 60000);
+  const watchStillRunning = countLog(/HOLOSPACE-TASK-EXIT label=watch/) === 0;
+  check(
+    buildAgain && watchStillRunning,
+    "a background task runs WITHOUT blocking — the build task ran to its exit while watch kept running (concurrent guest execution, non-blocking UI)",
+  );
+
   console.log(
     failed
       ? "TASKS-TEST: FAILED"
-      : "TASKS-TEST: PASS (tasks.json tasks run in the devcontainer over the holospace's own primitives — a real guest run with output + exit status captured over 9p, and a problem matcher producing a diagnostic, no server outside the holospace)",
+      : "TASKS-TEST: PASS (tasks.json tasks run in the devcontainer over the holospace's own primitives — a real guest run with output + exit status captured over 9p, a problem matcher producing a diagnostic, the devcontainer lifecycle commands surfaced as tasks, and a background task running without blocking — no server outside the holospace)",
   );
 } catch (e) {
   failed = true;

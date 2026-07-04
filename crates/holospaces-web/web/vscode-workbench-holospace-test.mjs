@@ -31,7 +31,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { chromium } from "playwright";
 
-import { composeWorkbenchHtml, WORKBENCH_PIN } from "./build-workbench.mjs";
+import { BUILTIN_EXTENSIONS, composeWorkbenchHtml, WORKBENCH_PIN } from "./build-workbench.mjs";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(DIR, "../../..");
@@ -89,9 +89,10 @@ const server = http.createServer(async (req, res) => {
     if (rel === "/" || rel.startsWith("/?")) {
       return send(await composeWorkbenchHtml({ distDir, twDir: path.join(DIR, "node_modules/@vscode/test-web"), baseUrl: ".", origin: `http://127.0.0.1:${port}` }), "text/html");
     }
-    if (rel.startsWith("/ext/holospace-fs")) {
-      let sub = rel.slice("/ext/holospace-fs".length); if (sub === "" || sub === "/") sub = "/package.json";
-      return send(await readFile(path.join(extDir, sub)), TYPES[path.extname(sub)]);
+    for (const name of BUILTIN_EXTENSIONS) {
+      if (!rel.startsWith(`/ext/${name}`)) continue;
+      let sub = rel.slice(`/ext/${name}`.length); if (sub === "" || sub === "/") sub = "/package.json";
+      return send(await readFile(path.join(DIR, "builtin-extensions", name, sub)), TYPES[path.extname(sub)]);
     }
     if (rel.startsWith("/pkg/")) return send(await readFile(path.join(DIR, rel)), TYPES[path.extname(rel)]);
     if (rel === "/devcontainer-kernel.gz") return send(await readFile(path.join(cc14, "kernel/Image.gz")), "application/gzip");

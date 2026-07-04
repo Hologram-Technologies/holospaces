@@ -44,8 +44,8 @@ function holospaceFolder() {
   return (vscode.workspace.workspaceFolders || []).find((f) => f.uri.scheme === SCHEME);
 }
 
-async function readTasksJson(folderUri) {
-  for (const rel of [".vscode/tasks.json", "tasks.json"]) {
+async function readFirst(folderUri, rels) {
+  for (const rel of rels) {
     try {
       const bytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(folderUri, ...rel.split("/")));
       return dec.decode(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
@@ -53,6 +53,10 @@ async function readTasksJson(folderUri) {
   }
   return null;
 }
+const readTasksJson = (folderUri) => readFirst(folderUri, [".vscode/tasks.json", "tasks.json"]);
+// The devcontainer spec's config locations, most specific first.
+const readDevcontainerJson = (folderUri) =>
+  readFirst(folderUri, [".devcontainer/devcontainer.json", ".devcontainer.json", "devcontainer.json"]);
 
 // Map a tasks.json `problemMatcher` to the string names the Task API accepts. A
 // named matcher ("$tsc", "$holospace-generic") passes through; an inline-object
@@ -103,6 +107,7 @@ class GuestPty {
 
     const id = core.newTaskId();
     const cmdU = uri(core.cmdPath(id)), outU = uri(core.outPath(id)), exitU = uri(core.exitPath(id));
+    const killU = uri(`${core.TASKS_DIR}/${id}.kill`);
     try { await vscode.workspace.fs.createDirectory(uri(core.TASKS_DIR)); } catch { /* the agent also mkdirs it */ }
 
     this._write.fire(`\x1b[2m$ ${this.command}\x1b[0m\r\n`);
@@ -114,14 +119,24 @@ class GuestPty {
     const emitNew = async () => {
       const b = await readOrNull(outU);
       if (b && b.length > outLen) {
+        if (outLen === 0) log(`HOLOSPACE-TASK-OUT label=${this.label} (first output from the guest)`);
         this._write.fire(dec.decode(b.subarray(outLen)).replace(/\r?\n/g, "\r\n"));
         outLen = b.length;
       }
     };
 
-    // Poll for streamed output + the exit sentinel (up to ~10 min; a watch task
-    // the user stops ends via close()).
-    for (let i = 0; i < 1200 && !this._closed; i++) {
+    // Poll for streamed output + the exit sentinel (up to ~10 min of activity; a
+    // watch task the user stops is KILLED for real: close() → the `<id>.kill`
+    // sentinel → the guest agent kills the task's process → it writes `<id>.exit`
+    // with the wait status — so terminating a task genuinely stops the guest
+    // process, not just the terminal.
+    let killSentAt = -1;
+    for (let i = 0; i < 1200; i++) {
+      if (this._closed && killSentAt < 0) {
+        killSentAt = i;
+        try { await vscode.workspace.fs.writeFile(killU, enc.encode("1\n")); } catch { /* best effort */ }
+        log(`task "${this.label}" terminate requested — kill sentinel written (${id})`);
+      }
       await emitNew();
       const exitBytes = await readOrNull(exitU);
       const code = exitBytes ? core.parseExit(dec.decode(exitBytes)) : null;
@@ -133,10 +148,12 @@ class GuestPty {
         this._close.fire(code);
         return;
       }
+      // The terminal is gone; give the agent ~20s to honour the kill, then stop.
+      if (killSentAt >= 0 && i - killSentAt > 50) break;
       await sleep(400);
     }
-    // Cancelled or timed out.
-    await del(cmdU); await del(outU); await del(exitU);
+    // Timed out (or terminated without an exit report) — clean up the channel.
+    await del(cmdU); await del(outU); await del(exitU); await del(killU);
     this._close.fire(this._closed ? undefined : 0);
   }
 }
@@ -164,12 +181,20 @@ function makeTask(t, folderUri) {
 async function buildTasks() {
   const folder = holospaceFolder();
   if (!folder) return [];
+  const specs = [];
   const text = await readTasksJson(folder.uri);
-  if (!text) return [];
-  let parsed;
-  try { parsed = core.parseTasksJson(text); }
-  catch (e) { log("tasks.json parse error: " + (e && e.message)); return []; }
-  return parsed.map((t) => makeTask(t, folder.uri));
+  if (text) {
+    try { specs.push(...core.parseTasksJson(text)); }
+    catch (e) { log("tasks.json parse error: " + (e && e.message)); }
+  }
+  // Surface the devcontainer's lifecycle commands (CC-22) as re-runnable tasks —
+  // the same commands the container ran on create/start, one "Run Task" away.
+  const dc = await readDevcontainerJson(folder.uri);
+  if (dc) {
+    try { specs.push(...core.parseDevcontainerLifecycle(dc)); }
+    catch (e) { log("devcontainer.json parse error: " + (e && e.message)); }
+  }
+  return specs.map((t) => makeTask(t, folder.uri));
 }
 
 function activate(context) {
@@ -187,7 +212,7 @@ function activate(context) {
       const folder = holospaceFolder();
       log("provideTasks folder=" + (folder ? folder.uri.toString() : "NONE"));
       const tasks = await buildTasks();
-      log(`provideTasks → ${tasks.length} task(s) from tasks.json`);
+      log(`provideTasks → ${tasks.length} task(s): ${tasks.map((t) => t.name).join(", ")}`);
       return tasks;
     },
     async resolveTask(task) {
