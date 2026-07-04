@@ -90,9 +90,9 @@
             </select>
           </div>
           <button id="create" class="primary">Launch repository</button>
-          <button id="createBlank" class="sm" title="A scratchpad devcontainer on the usable default image — no repository; open, get a shell, work.">New blank holospace</button>
+          <button id="createBlank" class="sm" title="A ready-to-use scratchpad — boots instantly from a bundled image, no repository and no extension needed. Open, get a shell + editor, work.">New blank holospace</button>
         </div>
-        <p class="hint">Name a git repository — like Codespaces or Gitpod. holospaces fetches its <code>.devcontainer/devcontainer.json</code> (verified on receipt, Law L5) and runs it; a repository with <em>no</em> devcontainer opens in the <strong>usable default</strong> image (<span id="defimg" class="k">…</span> — curl, git over apt), so any repo just works. The architecture is chosen once, at launch (part of the holospace's identity, ADR-021); everything else is editable per guest in its settings.</p>
+        <p class="hint">Name a git repository — like Codespaces or Gitpod. holospaces fetches its <code>.devcontainer/devcontainer.json</code> (verified on receipt, Law L5) and runs it; a repository with <em>no</em> devcontainer opens in the <strong>usable default</strong> image (<span id="defimg" class="k">…</span> — curl, git over apt), so any repo just works. Or click <strong>New blank holospace</strong> for an instant scratchpad — it boots from a bundled image, no repository and no extension needed. The architecture (amd64 by default) is chosen once, at launch (part of the holospace's identity, ADR-021); everything else is editable per guest in its settings.</p>
         <details>
           <summary class="muted" style="cursor:pointer; font-size:0.85em">Advanced — paste a devcontainer.json instead</summary>
           <div class="row" style="margin-top:0.5rem">
@@ -718,14 +718,18 @@
       $("createBlank").onclick = () => {
         const arch = $("harch").value;
         try {
-          const config = JSON.stringify({ name: "blank", image: default_devcontainer_image() });
+          // A blank holospace declares NO image: it boots the deploy's BUNDLED
+          // per-arch busybox layer in-RAM (no registry pull, no router) — so it
+          // launches instantly. (Leaving `image` unset is exactly what makes
+          // Enter open it directly, skipping the provision-via-router gate.)
+          const config = JSON.stringify({ name: "blank" });
           const k = console0.provision_devcontainer(new TextEncoder().encode(config), arch, PROVISION_QUOTA_BYTES);
           meta.set(k, {
-            name: "blank", arch, image: default_devcontainer_image(),
+            name: "blank", arch,
             source: "blank scratchpad", status: "stopped", extensions: [],
           });
           render();
-          toast("provisioned a blank holospace (" + arch + ") → " + k.slice(0, 22) + "…");
+          toast("created a blank " + arch + " scratchpad → " + k.slice(0, 22) + "… — Enter to boot (no extension needed)");
         } catch (e) {
           toast("blank holospace failed: " + e);
         }

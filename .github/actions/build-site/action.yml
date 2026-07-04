@@ -85,10 +85,22 @@ runs:
         # paged from OPFS).
         cp vv/artifacts/cc37/linux/Image.gz "$SITE"/devcontainer-arm64-kernel.gz
         # The real amd64 vmlinux (uncompressed ELF, gzipped for transport) booted on
-        # the x64 core (CC-44) — the kernel holospace-fs fetches when the holospace's
+        # the x64 core — the kernel holospace-fs fetches when the holospace's
         # arch is x64 (the X64Workspace boots it, paged from OPFS). amd64 is the
-        # ubiquitous registry/Codespaces architecture.
-        cp vv/artifacts/cc44/linux/vmlinux.gz "$SITE"/devcontainer-x64-kernel.gz
+        # DEFAULT (registry/Codespaces) architecture. This MUST be the CC-45
+        # kernel: disk-root (no embedded initramfs) + virtio-net/9p. The CC-44
+        # kernel embeds a boot-check initramfs whose /init POWERS OFF the
+        # machine — deploying it made every launched amd64 devcontainer "boot
+        # then immediately halt" (it never mounted the provisioned image).
+        cp vv/artifacts/cc45/linux/vmlinux.gz "$SITE"/devcontainer-x64-kernel.gz
+        # The BUNDLED per-arch rootfs layers — a small stock busybox for each
+        # architecture — so a BLANK/scratchpad holospace boots with NO registry
+        # pull and NO router extension (the editor + terminal + tasks + search
+        # over the 9p workspace, immediately). Repository devcontainers with a
+        # real registry image still provision via the router; the blank one does
+        # not. (riscv64 already ships devcontainer-net-layer.tar.gz below.)
+        cp vv/artifacts/cc45/rootfs/layer.tar.gz "$SITE"/devcontainer-x64-layer.tar.gz
+        cp vv/artifacts/cc37/rootfs/layer.tar.gz "$SITE"/devcontainer-arm64-layer.tar.gz
         nmfdig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['manifests'][0]['digest'].split(':')[1])" vv/artifacts/cc16/image/index.json)
         nldig=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['layers'][0]['digest'].split(':')[1])" "vv/artifacts/cc16/image/blobs/sha256/$nmfdig")
         cp "vv/artifacts/cc16/image/blobs/sha256/$nldig" "$SITE"/devcontainer-net-layer.tar.gz

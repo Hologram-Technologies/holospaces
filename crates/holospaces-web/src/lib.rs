@@ -1995,6 +1995,30 @@ impl Aarch64Workspace {
         })
     }
 
+    /// Boot a devcontainer from an **in-RAM** assembled rootfs (`rootfs`) — the
+    /// no-provisioning, no-router path a **blank/bundled** holospace takes: the
+    /// deploy ships a small `arm64` layer, the page assembles it here, and this
+    /// boots it directly with the full device surface (9p workspace + router-
+    /// backed net + bridge), identical to the streamed path but sourced from RAM.
+    pub fn boot_devcontainer(kernel: &[u8], rootfs: Vec<u8>) -> Result<Aarch64Workspace, JsValue> {
+        let mut cpu = aarch64::Cpu::boot_linux_disk(
+            512 * 1024 * 1024,
+            kernel,
+            rootfs,
+            "console=ttyAMA0 root=/dev/vda rw init=/init ip=dhcp",
+        );
+        cpu.attach_workspace(&[]);
+        let (egress, router) = net::ChannelEgress::new();
+        cpu.attach_net(Box::new(egress));
+        cpu.enable_loopback();
+        Ok(Aarch64Workspace {
+            cpu,
+            halted: false,
+            console_cursor: 0,
+            router: Some(router),
+        })
+    }
+
     /// Run a chunk of guest execution; returns `true` once the machine halts.
     pub fn run(&mut self, budget: f64) -> bool {
         if self.halted {
@@ -2365,6 +2389,32 @@ impl X64Workspace {
         // Net parity with the other cores: the router-backed egress (the page
         // pumps frames to the extension / an egress node) + the in-process
         // loopback bridge (CC-33) for reaching guest servers from the tab.
+        let (egress, router) = net::ChannelEgress::new();
+        cpu.attach_net(Box::new(egress));
+        cpu.enable_loopback();
+        Ok(X64Workspace {
+            cpu,
+            halted: false,
+            console_cursor: 0,
+            router: Some(router),
+        })
+    }
+
+    /// Boot a devcontainer from an **in-RAM** assembled rootfs (`rootfs`) — the
+    /// no-provisioning, no-router path a **blank/bundled** holospace takes: the
+    /// deploy ships a small `amd64` layer, the page assembles it here, and this
+    /// boots it directly with the full device surface (9p workspace + router-
+    /// backed net + bridge), identical to the paged path but sourced from RAM.
+    pub fn boot_devcontainer(kernel: &[u8], rootfs: Vec<u8>) -> Result<X64Workspace, JsValue> {
+        let mut cpu = x64::Cpu::boot_linux_disk(
+            512 * 1024 * 1024,
+            kernel,
+            rootfs,
+            "console=ttyS0 root=/dev/vda rw init=/init ip=dhcp \
+             virtio_mmio.device=0x200@0xd0000000:11 \
+             virtio_mmio.device=0x200@0xd0000200:10 \
+             virtio_mmio.device=0x200@0xd0000400:12 random.trust_cpu=on",
+        );
         let (egress, router) = net::ChannelEgress::new();
         cpu.attach_net(Box::new(egress));
         cpu.enable_loopback();

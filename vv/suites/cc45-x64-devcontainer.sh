@@ -160,6 +160,22 @@ if [ -f "$CC45/cc45.sha256" ] && [ -f "$CC45/linux/vmlinux.gz" ] && [ -f "$CC45/
     else
         echo "cc45-x64-devcontainer: qemu-system-x86_64 absent — differential pinned by the in-emulator witness (per cc45/SOURCE.txt)"
     fi
+
+    # ── The DEPLOYED amd64 path, in a real browser ────────────────────────────
+    # Chromium boots the X64Workspace exactly as the Pages deploy does — the
+    # PRODUCTION kernel artifact under the PRODUCTION name (the CC-44 boot-check
+    # kernel once shipped here and powered every amd64 devcontainer off at boot;
+    # this witness pins the deployed artifact so that drift cannot recur) — and
+    # the deployed workspace surface round-trips editor→guest over 9p.
+    WEB="$ROOT/crates/holospaces-web/web"
+    if command -v node >/dev/null 2>&1 && command -v wasm-pack >/dev/null 2>&1; then
+        if [ ! -f "$WEB/pkg/holospaces_web_bg.wasm" ]; then
+            "$ROOT/vv/lib/build-wasm-peer.sh" "$ROOT" || exit 1
+        fi
+        ( cd "$WEB" && node cc45-x64-boot-test.mjs ) || exit 1
+    else
+        echo "cc45-x64-devcontainer: node/wasm-pack absent — deployed browser witness skipped (SKIP)"
+    fi
     exit 0
 fi
 
