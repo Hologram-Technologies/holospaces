@@ -33,7 +33,7 @@ import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import path from "node:path";
-import { composeWorkbenchHtml, WORKBENCH_PIN } from "./build-workbench.mjs";
+import { composeWorkbenchHtml, WORKBENCH_PIN, BUILTIN_EXTENSIONS } from "./build-workbench.mjs";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(DIR, "../../..");
@@ -129,7 +129,10 @@ const server = http.createServer(async (req, res) => {
   const send = (b, ct) => { res.writeHead(200, { "content-type": ct || "application/octet-stream" }); res.end(b); };
   try {
     if (rel === "/" || rel === "/workbench.html") return send(html, "text/html");
-    if (rel.startsWith("/ext/holospace-fs/")) return send(await readFile(path.join(extDir, rel.slice("/ext/holospace-fs/".length))), TYPES[path.extname(rel)]);
+    for (const name of BUILTIN_EXTENSIONS) {
+      const pre = `/ext/${name}/`;
+      if (rel.startsWith(pre)) return send(await readFile(path.join(DIR, "builtin-extensions", name, rel.slice(pre.length))), TYPES[path.extname(rel)]);
+    }
     if (rel.startsWith("/pkg/")) return send(await readFile(path.join(DIR, rel)), TYPES[path.extname(rel)]);
     if (rel === "/devcontainer-net-kernel.gz") return send(await readFile(path.join(cc16, "kernel/Image.gz")), "application/gzip");
     if (rel === "/devcontainer-lsp-layer.tar.gz") return send(await readFile(path.join(cc18, "image/blobs/sha256", cc18Layer)), "application/gzip");

@@ -51,10 +51,15 @@ const DTB_OFFSET: u64 = 0x0700_0000;
 ///
 /// It also starts the **task-runner agent** (`CC-53`): a tiny `/bin/sh` loop
 /// that watches `/workspace/.hs-tasks/` (on the shared `virtio-9p` workspace) for
-/// `<id>.cmd` request files, runs each in the devcontainer (`sh <id>.cmd`,
-/// stdout+stderr → `<id>.out`, exit code → `<id>.exit`), and cleans up. The
-/// workbench's `holospace-tasks` provider drives `tasks.json` tasks through this
-/// file channel — a real run in the guest, output + exit captured, no server
+/// `<id>.cmd` request files and runs each in the devcontainer (`sh <id>.cmd`,
+/// stdout+stderr → `<id>.out`, exit code → `<id>.exit`), then cleans up. Each
+/// task runs in its **own background subshell**, so tasks run *concurrently* — a
+/// long-running background/watch task does not block the next task. While a task
+/// runs, its subshell watches for a `<id>.kill` sentinel and kills the task's
+/// process when it appears — so terminating a task in the workbench genuinely
+/// stops the guest process (its `wait` status then becomes the reported exit).
+/// The workbench's `holospace-tasks` provider drives `tasks.json` tasks through
+/// this file channel — a real run in the guest, output + exit captured, no server
 /// outside the holospace. Image-agnostic: it needs only `sh` and the share.
 ///
 /// The base image must provide a static `/bin/busybox` with the `setsid`/`stty`
@@ -71,7 +76,7 @@ export PATH=/bin:/sbin:/usr/bin:/usr/sbin HOME=/root PS1='holospace:$PWD\\$ '\n\
 cd /workspace\n\
 [ -x /usr/bin/lsp-demo ] && /usr/bin/lsp-demo --listen 7000 &\n\
 mkdir -p /workspace/.hs-tasks 2>/dev/null\n\
-( while true; do for f in /workspace/.hs-tasks/*.cmd; do [ -e $f ] || continue; b=${f%.cmd}; mv $f $b.run 2>/dev/null || continue; ( cd /workspace 2>/dev/null; sh $b.run > $b.out 2>&1; echo $? > $b.exit ); rm -f $b.run; done; sleep 1; done ) &\n\
+( while true; do for f in /workspace/.hs-tasks/*.cmd; do [ -e $f ] || continue; b=${f%.cmd}; mv $f $b.run 2>/dev/null || continue; ( cd /workspace 2>/dev/null; sh $b.run > $b.out 2>&1 & p=$!; while kill -0 $p 2>/dev/null; do [ -e $b.kill ] && kill $p 2>/dev/null; sleep 1; done; wait $p; echo $? > $b.exit; rm -f $b.run $b.kill ) & done; sleep 1; done ) &\n\
 /bin/busybox echo 'holospace devcontainer ready \xe2\x80\x94 /workspace is your shared workspace'\n\
 exec /bin/busybox setsid -c /bin/busybox sh\n";
 
@@ -103,7 +108,7 @@ mount -t 9p -o trans=virtio,version=9p2000.L,msize=65536 hsworkspace /workspace 
 export HOME=/root TERM=xterm PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin PS1='holospace:$PWD\\$ '\n\
 cd /workspace 2>/dev/null || cd /root 2>/dev/null || cd /\n\
 mkdir -p /workspace/.hs-tasks 2>/dev/null\n\
-( while true; do for f in /workspace/.hs-tasks/*.cmd; do [ -e $f ] || continue; b=${f%.cmd}; mv $f $b.run 2>/dev/null || continue; ( cd /workspace 2>/dev/null; sh $b.run > $b.out 2>&1; echo $? > $b.exit ); rm -f $b.run; done; sleep 1; done ) &\n\
+( while true; do for f in /workspace/.hs-tasks/*.cmd; do [ -e $f ] || continue; b=${f%.cmd}; mv $f $b.run 2>/dev/null || continue; ( cd /workspace 2>/dev/null; sh $b.run > $b.out 2>&1 & p=$!; while kill -0 $p 2>/dev/null; do [ -e $b.kill ] && kill $p 2>/dev/null; sleep 1; done; wait $p; echo $? > $b.exit; rm -f $b.run $b.kill ) & done; sleep 1; done ) &\n\
 echo 'holospace devcontainer ready \xe2\x80\x94 the repository image; /workspace is shared with the editor'\n\
 while : ; do if [ -x /bin/bash ]; then setsid -c /bin/bash -l 2>/dev/null || /bin/bash -l; else setsid -c /bin/sh 2>/dev/null || /bin/sh; fi; sleep 1; done\n";
 

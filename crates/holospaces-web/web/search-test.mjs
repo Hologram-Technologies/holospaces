@@ -24,16 +24,16 @@ import { createHash } from "node:crypto";
 import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { composeWorkbenchHtml, WORKBENCH_PIN } from "./build-workbench.mjs";
+import { composeWorkbenchHtml, WORKBENCH_PIN, BUILTIN_EXTENSIONS } from "./build-workbench.mjs";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(DIR, "../../..");
 const BOOTSTRAP = "@vscode/test-web@0.0.80";
 const distDir = path.join(DIR, "node_modules/vscode-web/dist");
 const twDir = path.join(DIR, "node_modules/@vscode/test-web");
-const extFsDir = path.join(DIR, "builtin-extensions/holospace-fs");
-const extScmDir = path.join(DIR, "builtin-extensions/holospace-scm");
-const extSearchDir = path.join(DIR, "builtin-extensions/holospace-search");
+// Serve EVERY builtin the composed workbench declares (BUILTIN_EXTENSIONS) —
+// a declared-but-unserved builtin 404s and destabilizes the extension host.
+const extDir = (name) => path.join(DIR, "builtin-extensions", name);
 const cc16 = path.join(ROOT, "vv/artifacts/cc16");
 const cc18 = path.join(ROOT, "vv/artifacts/cc18");
 
@@ -83,9 +83,10 @@ const server = http.createServer(async (req, res) => {
   const send = (b, ct) => { res.writeHead(200, { "content-type": ct || "application/octet-stream" }); res.end(b); };
   try {
     if (rel === "/" || rel === "/workbench.html") return send(html, "text/html");
-    if (rel.startsWith("/ext/holospace-fs/")) return send(await readFile(path.join(extFsDir, rel.slice("/ext/holospace-fs/".length))), TYPES[path.extname(rel)]);
-    if (rel.startsWith("/ext/holospace-scm/")) return send(await readFile(path.join(extScmDir, rel.slice("/ext/holospace-scm/".length))), TYPES[path.extname(rel)]);
-    if (rel.startsWith("/ext/holospace-search/")) return send(await readFile(path.join(extSearchDir, rel.slice("/ext/holospace-search/".length))), TYPES[path.extname(rel)]);
+    for (const name of BUILTIN_EXTENSIONS) {
+      const pre = `/ext/${name}/`;
+      if (rel.startsWith(pre)) return send(await readFile(path.join(extDir(name), rel.slice(pre.length))), TYPES[path.extname(rel)]);
+    }
     if (rel.startsWith("/pkg/")) return send(await readFile(path.join(DIR, rel)), TYPES[path.extname(rel)]);
     if (rel === "/devcontainer-net-kernel.gz") return send(await readFile(path.join(cc16, "kernel/Image.gz")), "application/gzip");
     if (rel === "/devcontainer-lsp-layer.tar.gz") return send(await readFile(path.join(cc18, "image/blobs/sha256", cc18Layer)), "application/gzip");
@@ -100,7 +101,20 @@ const ctx = await browser.newContext();
 const page = await ctx.newPage();
 page.on("pageerror", (e) => console.error("SEARCH-TEST: pageerror —", e.message, (e.stack || "").split("\n").slice(0, 3).join(" | ")));
 const cclog = [];
-page.on("console", (m) => { const t = m.text(); if (t.includes("[CC52]")) { cclog.push(t); console.log("  " + t); } });
+const allLog = [];
+page.on("console", async (m) => { allLog.push(`${m.type()}: ${m.text().slice(0, 240)}`); if (allLog.length > 12000) allLog.shift();
+  const t = m.text();
+  if (t.includes("[CC52]")) { cclog.push(t); console.log("  " + t); return; }
+  if (m.type() === "error" || /is not a function|TypeError|Error:/.test(t)) {
+    console.log("  [page-err] " + t.slice(0, 300));
+    for (const a of m.args()) {
+      try {
+        const st = await a.evaluate((e) => (e && e.stack) ? String(e.stack) : null).catch(() => null);
+        if (st) console.log("  [page-err-stack] " + st.split("\n").slice(0, 8).join("\n    "));
+      } catch { /* ignore */ }
+    }
+  }
+});
 
 // Type into the focused Search input (clearing first).
 async function typeInto(selector, text) {
@@ -110,6 +124,10 @@ async function typeInto(selector, text) {
   await page.keyboard.press("Control+A");
   await page.keyboard.press("Delete");
   await page.keyboard.type(text);
+  // No Enter here: with search-on-type, Enter + the type-debounce would start TWO
+  // search sessions — the second cancels the first MID-STREAM and the landed
+  // partial count lingers while the live session re-walks. One session settles
+  // cleanly. (The replace flow presses Enter itself, where submit is required.)
   await page.waitForTimeout(400);
 }
 
@@ -118,23 +136,29 @@ async function typeInto(selector, text) {
 // results found"). This is authoritative (it reflects what the user sees) and
 // independent of how many times VS Code re-invokes the provider, which it caches
 // for an unchanged query. Returns null if the view never settles in time.
-async function runSearch(searchInput, pattern, timeout = 20000) {
+// Type the query ONCE, then wait for a STABLE result count — the same count on
+// two samples ≥900ms apart. Matches stream from the ext host in batches, and a
+// retype starts a NEW search session that cancels the old one MID-STREAM — so an
+// impatient reader sees partial counts (and a hasty retype loop keeps every
+// session partial forever). A user reads the settled view; so does the witness.
+async function runSearch(searchInput, pattern, timeout = 30000) {
   await typeInto(searchInput, pattern);
   const start = Date.now();
+  let prev = null;
+  let prevAt = 0;
   while (Date.now() - start < timeout) {
     const txt = await page.locator(".search-view").first().innerText().catch(() => "");
-    if (/No results found/i.test(txt)) return 0;
-    const mm = /(\d+)\s+results?\s+in\s+\d+\s+files?/i.exec(txt) || /^\s*(\d+)\s+results?\b/im.exec(txt);
-    if (mm) {
-      await page.waitForTimeout(500); // let a transient count (e.g. a landing edit) settle
-      const t2 = await page.locator(".search-view").first().innerText().catch(() => txt);
-      if (/No results found/i.test(t2)) return 0;
-      const m2 = /(\d+)\s+results?\s+in\s+\d+\s+files?/i.exec(t2) || /^\s*(\d+)\s+results?\b/im.exec(t2);
-      return parseInt((m2 || mm)[1], 10);
+    let n = null;
+    if (/No results found/i.test(txt)) n = 0;
+    else {
+      const mm = /(\d+)\s+results?\s+in\s+\d+\s+files?/i.exec(txt) || /^\s*(\d+)\s+results?\b/im.exec(txt);
+      if (mm) n = parseInt(mm[1], 10);
     }
-    await page.waitForTimeout(400);
+    if (n != null && n === prev && Date.now() - prevAt >= 2000) return n;
+    if (n !== prev) { prev = n; prevAt = Date.now(); }
+    await page.waitForTimeout(500);
   }
-  return null;
+  return prev; // the last observed count (null if no result state ever rendered)
 }
 
 try {
@@ -157,10 +181,35 @@ try {
   // readiness, and main.rs is seeded after the devcontainer boots). `runSearch`
   // clears + retypes, so each call forces a fresh query (a new provider log).
   let n = null;
-  for (let i = 0; i < 40 && n !== 3; i++) {
-    n = await runSearch(searchInput, "greet", 6000);
+  for (let i = 0; i < 8 && n !== 3; i++) {
+    n = await runSearch(searchInput, "greet", 25000);
     if (n === 3) break;
-    await page.waitForTimeout(1500); // let the boot advance before re-querying
+    await page.waitForTimeout(2000); // let the boot advance before re-querying
+  }
+  if (n !== 3) {
+    const metrics = await page.evaluate(() => {
+      const v = document.querySelector(".search-view");
+      const list = v && v.querySelector(".monaco-list");
+      const msgs = v && v.querySelector(".messages");
+      const rowsEl = list && list.querySelectorAll(".monaco-list-row");
+      const style = v && getComputedStyle(v);
+      return {
+        viewDisplay: style && style.display, viewH: v && v.clientHeight,
+        listH: list && list.clientHeight, listScrollH: list && list.scrollHeight,
+        rows: rowsEl ? rowsEl.length : -1,
+        ariaRows: list ? list.getAttribute("aria-rowcount") : null,
+        msgs: msgs ? msgs.innerText.slice(0, 200) : null,
+      };
+    }).catch((e) => ({ err: String(e) }));
+    console.log("SEARCH-VIEW-METRICS:", JSON.stringify(metrics));
+    console.log("=== RPC/TRACE TAIL (search/cancel/config/task) ===");
+    const interesting = allLog.filter((l) => /earch|cancel|Cancel|onfiguration|\$startTextSearch|Task|task/.test(l) && !/textSearch "greet"/.test(l));
+    for (const l of interesting.slice(-160)) console.log("  |", l.slice(0, 220));
+    const viewText = await page.locator(".search-view").first().innerText().catch(() => "(no view)");
+    console.log("SEARCH-VIEW-TEXT:", JSON.stringify(viewText.slice(0, 600)));
+    const notifs = await page.locator(".notifications-toasts, .notification-toast").allInnerTexts().catch(() => []);
+    console.log("NOTIFICATIONS:", JSON.stringify(notifs).slice(0, 400));
+    await page.screenshot({ path: path.join(DIR, "search-test-failure.png") }).catch(() => {});
   }
   check(n === 3, `find-in-files returns the EXPECTED matches — "greet" → 3 matches in main.rs (got ${n})`);
   const rows = await page.locator(".search-view .monaco-list-row").count();
@@ -195,6 +244,26 @@ try {
     setOk = (await replaceBox.inputValue().catch(() => "")) === "hello";
   }
   check(setOk, "a replace term is entered in the Search view's Replace box");
+  // Replace-all must act on the SETTLED result set, exactly as a user does — a
+  // click while the result stream is mid-flight acts on a PARTIAL set (the
+  // ext-host streams matches in batches; a fresh query session replaces the
+  // previous one on retype/Enter, so a hasty click replaces only the matches
+  // already landed and leaves the tail unreplaced).
+  const settled = await (async (want, timeout = 45000) => {
+    const start = Date.now();
+    let prev = null;
+    while (Date.now() - start < timeout) {
+      const txt = await page.locator(".search-view").first().innerText().catch(() => "");
+      const mm = /(\d+)\s+results?\s+in\s+\d+\s+files?/i.exec(txt);
+      const n = mm ? parseInt(mm[1], 10) : null;
+      if (n === want && prev === want) return true;
+      prev = n;
+      await page.waitForTimeout(1000);
+    }
+    return false;
+  })(3);
+  check(settled, "the search SETTLED at 3 results before Replace All (replace acts on the full result set)");
+
   // Wait until Replace All is enabled, then click it.
   await page.waitForFunction(() => {
     const e = document.querySelector(".search-view .codicon-search-replace-all");
@@ -229,8 +298,8 @@ try {
   // the workspace the guest shares (Law L1). Poll to ride out FileService cache
   // lag. (Search seeds the count from the workbench's own "N results" message.)
   let afterGreet = null;
-  for (let i = 0; i < 8 && afterGreet !== 0; i++) {
-    afterGreet = await runSearch(searchInput, "greet", 10000);
+  for (let i = 0; i < 4 && afterGreet !== 0; i++) {
+    afterGreet = await runSearch(searchInput, "greet", 25000);
     if (afterGreet === 0) break;
     await page.waitForTimeout(1500);
   }

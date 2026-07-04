@@ -445,13 +445,32 @@ async function bootHolospace() {
                 },
                 { label: "hello", type: "holospace", command: "echo 'Hello from the devcontainer'" },
                 {
+                  // A background/watch task: long-running (a watcher loop), with
+                  // begin/end patterns so the workbench shows the spinner while a
+                  // "build cycle" is active — and the UI stays usable meanwhile.
                   label: "watch",
                   type: "holospace",
                   isBackground: true,
-                  command: "echo BUILD-START; sleep 2; echo BUILD-DONE",
+                  command: "while true; do echo BUILD-START; sleep 3; echo BUILD-DONE; sleep 3; done",
                   problemMatcher: "$holospace-watch",
                 },
               ],
+            },
+            null,
+            2,
+          ) + "\n",
+        ),
+      );
+      // Seed a sample `.devcontainer/devcontainer.json` (CC-22/CC-53) — the
+      // holospace-tasks provider surfaces its lifecycle commands as re-runnable
+      // tasks, exactly as it would for any repository's devcontainer config.
+      ws.ws_write_path(
+        ".devcontainer/devcontainer.json",
+        new TextEncoder().encode(
+          JSON.stringify(
+            {
+              name: "holospace demo",
+              postCreateCommand: "echo 'lifecycle: environment prepared'",
             },
             null,
             2,

@@ -71,7 +71,23 @@ const pathMod = (() => {
     let i = 0; while (i < f.length && i < t.length && f[i] === t[i]) i++;
     return [...f.slice(i).map(() => ".."), ...t.slice(i)].join("/") || ".";
   };
-  return { sep: "/", delimiter: ":", normalize: norm, join, dirname, basename, extname, isAbsolute, resolve, relative, posix: null };
+  // Node's path.parse/format — guest extensions walk directory chains with
+  // `path.parse(p).root` (editorconfig et al.); a shim without them throws
+  // "path.parse is not a function" from inside the guest extension's listeners.
+  const parse = (p) => {
+    const root = p.startsWith("/") ? "/" : "";
+    const base = basename(p);
+    const ext = base === "." || base === ".." ? "" : extname(p);
+    const dir = dirname(p);
+    const d = p === "/" ? "/" : dir === "." && !p.startsWith("./") ? "" : dir;
+    return { root, dir: d, base, ext, name: ext ? base.slice(0, -ext.length) : base };
+  };
+  const format = (o) => {
+    const dir = o.dir || o.root || "";
+    const base = o.base != null ? o.base : (o.name || "") + (o.ext || "");
+    return dir && dir !== "/" ? `${dir}/${base}` : `${dir}${base}`;
+  };
+  return { sep: "/", delimiter: ":", normalize: norm, join, dirname, basename, extname, isAbsolute, resolve, relative, parse, format, posix: null };
 })();
 pathMod.posix = pathMod;
 
@@ -120,23 +136,57 @@ function makeFs(adapter, fileMap) {
     if (fm[key] != null) return fm[key];
     return null;
   };
+  // A guest extension branches on POSIX `err.code === "ENOENT"` for an absent
+  // file (the common probe-for-config pattern); the holospace FS throws vscode's
+  // FileSystemError ("FileNotFound"/"EntryNotFound"). Translate at this module
+  // boundary so absent files read as absent, not as an opaque failure.
+  const enoent = (p, op) => Object.assign(new Error(`ENOENT: no such file or directory, ${op} '${p}'`), { code: "ENOENT", errno: -2, path: String(p) });
+  const missing = (e) => e && (e.code === "FileNotFound" || e.code === "ENOENT" || /EntryNotFound|FileNotFound|ENOENT|entry not found/i.test(e.message || ""));
+  const posix = (op) => (fn) => async (p, ...rest) => {
+    try { return await fn(p, ...rest); }
+    catch (e) { throw missing(e) ? enoent(p, op) : e; }
+  };
   const promises = {
-    readFile: async (p, opts) => {
+    readFile: posix("open")(async (p, opts) => {
       const b = bundled(p);
       const bytes = b != null ? b : await a.readFile(String(p));
       const encoding = typeof opts === "string" ? opts : opts && opts.encoding;
       return encoding ? new TextDecoder().decode(bytes) : bytes;
-    },
+    }),
     writeFile: async (p, data) => a.writeFile(String(p), typeof data === "string" ? enc.encode(data) : data),
     mkdir: async (p, opts) => a.mkdir ? a.mkdir(String(p), opts) : undefined,
-    readdir: async (p) => (a.readdir ? a.readdir(String(p)) : []),
-    stat: async (p) => (a.stat ? a.stat(String(p)) : { isFile: () => true, isDirectory: () => false }),
-    access: async (p) => { if (a.exists && !(await a.exists(String(p)))) throw new Error("ENOENT: " + p); },
+    readdir: posix("scandir")(async (p) => (a.readdir ? a.readdir(String(p)) : [])),
+    stat: posix("stat")(async (p) => (a.stat ? a.stat(String(p)) : { isFile: () => true, isDirectory: () => false })),
+    access: async (p) => { if (a.exists && !(await a.exists(String(p)))) throw enoent(p, "access"); },
     rm: async (p, opts) => a.rm ? a.rm(String(p), opts) : undefined,
     unlink: async (p) => a.rm ? a.rm(String(p)) : undefined,
   };
+  promises.lstat = promises.stat;
+  promises.realpath = async (p) => String(p);
+  promises.readlink = async (p) => { throw Object.assign(new Error("EINVAL: not a symlink, readlink '" + p + "'"), { code: "EINVAL" }); };
+  // Node's CALLBACK-style fs API over the same impls — real extensions call
+  // `fs.readFile(p, cb)` / `fs.stat(p, cb)` (editorconfig et al.); a module
+  // object without them throws "fs.readFile is not a function" from inside the
+  // extension's listeners. Last argument is the callback; options are optional.
+  const cbify = (fn) => (...args) => {
+    const cb = args[args.length - 1];
+    if (typeof cb !== "function") throw new TypeError("fs callback API requires a callback");
+    fn(...args.slice(0, -1)).then((r) => cb(null, r), (e) => cb(e));
+  };
   return {
     promises,
+    readFile: cbify(promises.readFile),
+    writeFile: cbify(promises.writeFile),
+    mkdir: cbify(promises.mkdir),
+    readdir: cbify(promises.readdir),
+    stat: cbify(promises.stat),
+    lstat: cbify(promises.lstat),
+    access: cbify(promises.access),
+    unlink: cbify(promises.unlink),
+    rm: cbify(promises.rm),
+    realpath: cbify(promises.realpath),
+    readlink: cbify(promises.readlink),
+    exists: (p, cb) => promises.access(p).then(() => cb(true), () => cb(false)),
     existsSync: (p) => (bundled(p) != null ? true : a.existsSync ? !!a.existsSync(String(p)) : false),
     readFileSync: (p, opts) => {
       // Bundled extension resources (the unzipped .vsix) are in memory → real sync

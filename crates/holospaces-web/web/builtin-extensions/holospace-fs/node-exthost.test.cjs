@@ -106,9 +106,30 @@ const files = {
   assert.strictEqual(context.subscriptions.length, 2, "activation pushed its disposables");
 
   // The Node built-in surface is itself sound (path/os).
-  const { path, os } = require("./node-exthost.js");
+  const { path, os, makeFs } = require("./node-exthost.js");
   assert.strictEqual(path.join("/a", "b", "../c"), "/a/c", "path.join normalizes");
   assert.strictEqual(os.platform(), "linux", "os reports the holospace identity");
+  // path.parse/format — real extensions walk directory chains with
+  // `path.parse(p).root` (editorconfig); node-exact on the cases that matter.
+  assert.deepStrictEqual(
+    path.parse("/a/b/c.txt"),
+    { root: "/", dir: "/a/b", base: "c.txt", ext: ".txt", name: "c" },
+    "path.parse matches Node for an absolute file",
+  );
+  assert.strictEqual(path.parse("/x").root, "/", "path.parse exposes the root (the ancestor-walk terminator)");
+  assert.strictEqual(path.parse("rel/f.js").root, "", "path.parse of a relative path has no root");
+  assert.strictEqual(path.format({ dir: "/a", base: "b.txt" }), "/a/b.txt", "path.format round-trips");
+
+  // fs exposes Node's CALLBACK API over the adapter (editorconfig calls
+  // fs.readFile(p, enc, cb)), and an absent file surfaces as POSIX ENOENT —
+  // the branch every probe-for-config extension takes.
+  const cbfs = makeFs({
+    readFile: async (p) => { if (p !== "/w/ok.txt") { const e = new Error("EntryNotFound: " + p); e.code = "FileNotFound"; throw e; } return new TextEncoder().encode("data"); },
+  }, {});
+  const okRead = await new Promise((res, rej) => cbfs.readFile("/w/ok.txt", "utf8", (e, d) => (e ? rej(e) : res(d))));
+  assert.strictEqual(okRead, "data", "fs.readFile (callback form) reads through the adapter");
+  const missErr = await new Promise((res) => cbfs.readFile("/w/absent", "utf8", (e) => res(e)));
+  assert.strictEqual(missErr && missErr.code, "ENOENT", "an absent file is POSIX ENOENT (FileNotFound translated at the module boundary)");
 
   // ── unzipVsix(): a stored .vsix round-trips to its file map ─────────────────
   const zb = makeStoredZip({ "extension/package.json": '{"name":"z"}', "extension/out/a.js": "module.exports=1;" });

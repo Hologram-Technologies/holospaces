@@ -59,6 +59,28 @@ const ok = (c, m) => { if (!c) throw new Error("FAIL: " + m); pass++; console.lo
   ok(core.newTaskId() !== core.newTaskId(), "newTaskId is unique");
 }
 
+// ── devcontainer.json lifecycle commands surface as tasks (CC-22) ───────────
+{
+  const text = `{
+    // a real devcontainer.json shape
+    "image": "buildpack-deps:trixie-scm",
+    "initializeCommand": "echo host-side", // HOST-side — must NOT surface
+    "onCreateCommand": ["npm", "install", "--no-fund"],
+    "postCreateCommand": "make setup",
+    "postStartCommand": { "server": "npm start", "db": ["redis-server", "--port", "7777"] },
+  }`;
+  const ts = core.parseDevcontainerLifecycle(text);
+  ok(ts.length === 4, "string + argv + named-object lifecycle forms all surface (4 tasks)");
+  ok(!ts.some((t) => /initializeCommand/.test(t.label)), "initializeCommand (host-side) is NOT surfaced as a guest task");
+  const on = ts.find((t) => t.label === "lifecycle: onCreateCommand");
+  ok(on.command === "npm" && on.args.join(" ") === "install --no-fund", "argv-form lifecycle → command + args");
+  ok(ts.find((t) => t.label === "lifecycle: postCreateCommand").command === "make setup", "string-form lifecycle passes through as a shell snippet");
+  const db = ts.find((t) => t.label === "lifecycle: postStartCommand (db)");
+  ok(db && db.command === "redis-server" && db.args.join(" ") === "--port 7777", "named parallel commands each surface as their own task");
+  ok(core.buildCommand(on) === "npm 'install' '--no-fund'", "a lifecycle argv builds a safely-quoted guest command");
+  ok(core.parseDevcontainerLifecycle('{ "image": "x" }').length === 0, "a devcontainer with no lifecycle commands surfaces none");
+}
+
 // ── end-to-end protocol against an in-memory FS + a simulated guest agent ────
 {
   // The host writes <id>.cmd; a simulated agent runs it and writes <id>.out +

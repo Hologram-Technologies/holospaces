@@ -20,6 +20,18 @@ import path from "node:path";
 export const WORKBENCH_PIN = "vscode-web@1.91.1";
 const BOOTSTRAP_PIN = "@vscode/test-web@0.0.80";
 
+// The holospace builtin extensions the workbench declares (and the deploy
+// serves). ONE list: `runtimeConfig` derives `additionalBuiltinExtensions` from
+// it, `main()` copies each into the deploy, and every browser witness serves the
+// same set — so a witness's workbench never 404s a declared builtin (a
+// declared-but-unserved builtin destabilizes the extension host).
+export const BUILTIN_EXTENSIONS = [
+  "holospace-fs",
+  "holospace-scm",
+  "holospace-search",
+  "holospace-tasks",
+];
+
 // The runtime config-builder: it fills the workbench's web-configuration meta
 // from `window.location`, so the same HTML works at any origin/path (a user site
 // at the root, or a project site under `/<repo>/`). It opens the holospace
@@ -44,7 +56,7 @@ const BOOTSTRAP_PIN = "@vscode/test-web@0.0.80";
 // default slot.
 export function runtimeConfig(extensionIds) {
   const ids = JSON.stringify(extensionIds || []);
-  return `<script>(function(){var loc=window.location;var dir=loc.pathname.replace(/\\/[^/]*$/,"");var declared=${ids};var sp=new URLSearchParams(loc.search);var q=sp.get("ext");if(q){declared=declared.concat(q.split(",").filter(Boolean));}var id=sp.get("id")||"";var eg=sp.get("egress")||"";var arch=sp.get("arch")||"riscv64";var fq="arch="+encodeURIComponent(arch)+(eg?("&egress="+encodeURIComponent(eg)):"");var gallery=declared.map(function(id){return {id:id};});var sch=loc.protocol.replace(":","");var cfg={folderUri:{"$mid":1,scheme:"holospace",authority:id,path:"/workspace",query:fq},additionalBuiltinExtensions:[{scheme:sch,authority:loc.host,path:dir+"/ext/holospace-fs"},{scheme:sch,authority:loc.host,path:dir+"/ext/holospace-scm"},{scheme:sch,authority:loc.host,path:dir+"/ext/holospace-search"},{scheme:sch,authority:loc.host,path:dir+"/ext/holospace-tasks"}].concat(gallery),productConfiguration:{nameShort:"holospaces VS Code",nameLong:"holospaces VS Code",applicationName:"code-web",version:"1.91.1",extensionEnabledApiProposals:{"holospaces.holospace-search":["fileSearchProvider","textSearchProvider"]},extensionsGallery:{serviceUrl:"https://open-vsx.org/vscode/gallery",itemUrl:"https://open-vsx.org/vscode/item",resourceUrlTemplate:"https://open-vsx.org/vscode/unpkg/{publisher}/{name}/{version}/{path}"}}};document.getElementById("vscode-workbench-web-configuration").setAttribute("data-settings",JSON.stringify(cfg));})();</script>`;
+  return `<script>(function(){var loc=window.location;var dir=loc.pathname.replace(/\\/[^/]*$/,"");var declared=${ids};var sp=new URLSearchParams(loc.search);var q=sp.get("ext");if(q){declared=declared.concat(q.split(",").filter(Boolean));}var id=sp.get("id")||"";var eg=sp.get("egress")||"";var arch=sp.get("arch")||"riscv64";var fq="arch="+encodeURIComponent(arch)+(eg?("&egress="+encodeURIComponent(eg)):"");var gallery=declared.map(function(id){return {id:id};});var sch=loc.protocol.replace(":","");var cfg={folderUri:{"$mid":1,scheme:"holospace",authority:id,path:"/workspace",query:fq},additionalBuiltinExtensions:${JSON.stringify(BUILTIN_EXTENSIONS)}.map(function(n){return {scheme:sch,authority:loc.host,path:dir+"/ext/"+n};}).concat(gallery),productConfiguration:{nameShort:"holospaces VS Code",nameLong:"holospaces VS Code",applicationName:"code-web",version:"1.91.1",extensionEnabledApiProposals:{"holospaces.holospace-search":["fileSearchProvider","textSearchProvider"]},extensionsGallery:{serviceUrl:"https://open-vsx.org/vscode/gallery",itemUrl:"https://open-vsx.org/vscode/item",resourceUrlTemplate:"https://open-vsx.org/vscode/unpkg/{publisher}/{name}/{version}/{path}"}}};document.getElementById("vscode-workbench-web-configuration").setAttribute("data-settings",JSON.stringify(cfg));})();</script>`;
 }
 
 /**
@@ -117,10 +129,9 @@ async function main(siteDir) {
 
   await mkdir(path.join(siteDir, "workbench"), { recursive: true });
   await cp(distDir, path.join(siteDir, "workbench"), { recursive: true });
-  await cp(path.join(DIR, "builtin-extensions/holospace-fs"), path.join(siteDir, "ext/holospace-fs"), { recursive: true });
-  await cp(path.join(DIR, "builtin-extensions/holospace-scm"), path.join(siteDir, "ext/holospace-scm"), { recursive: true });
-  await cp(path.join(DIR, "builtin-extensions/holospace-search"), path.join(siteDir, "ext/holospace-search"), { recursive: true });
-  await cp(path.join(DIR, "builtin-extensions/holospace-tasks"), path.join(siteDir, "ext/holospace-tasks"), { recursive: true });
+  for (const name of BUILTIN_EXTENSIONS) {
+    await cp(path.join(DIR, "builtin-extensions", name), path.join(siteDir, "ext", name), { recursive: true });
+  }
   const html = await composeWorkbenchHtml({ distDir, twDir, baseUrl: "./workbench" });
   await writeFile(path.join(siteDir, "workbench.html"), html);
   console.log(`build-workbench: composed ${path.join(siteDir, "workbench.html")} (real workbench + holospace-fs + Open VSX)`);

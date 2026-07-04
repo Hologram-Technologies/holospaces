@@ -13,7 +13,7 @@ import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { chromium } from "playwright";
-import { composeWorkbenchHtml, WORKBENCH_PIN } from "./build-workbench.mjs";
+import { composeWorkbenchHtml, WORKBENCH_PIN, BUILTIN_EXTENSIONS } from "./build-workbench.mjs";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const BOOTSTRAP = "@vscode/test-web@0.0.80";
@@ -35,8 +35,9 @@ const server = http.createServer(async (req, res) => {
     return res.end(html);
   }
   // The holospace-fs builtin (so additionalBuiltinExtensions resolves) from source.
-  const file = rel.startsWith("/ext/holospace-fs/")
-    ? path.join(DIR, "builtin-extensions/holospace-fs", rel.slice("/ext/holospace-fs/".length))
+  const ext = BUILTIN_EXTENSIONS.find((n) => rel.startsWith(`/ext/${n}/`));
+  const file = ext
+    ? path.join(DIR, "builtin-extensions", ext, rel.slice(`/ext/${ext}/`.length))
     : path.join(distDir, rel);
   try {
     const body = await readFile(file);
