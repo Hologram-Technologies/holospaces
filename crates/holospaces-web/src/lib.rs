@@ -2067,6 +2067,101 @@ impl Aarch64Workspace {
         self.cpu.workspace_write(name, data);
     }
 
+    // ── the workbench FileSystemProvider surface (CC-15/CC-17/CC-51 parity) ──
+    // The SAME method names the riscv64 `Workspace` exposes, so `holospace-fs`
+    // binds the editor to any core purely by capability detection — one
+    // FileSystemProvider, three ISAs, no per-arch branches (Law L4).
+
+    /// The shared workspace's directory listing — a JSON array of
+    /// `{ name, dir, size }` (the workbench `FileSystemProvider.readDirectory`).
+    #[must_use]
+    pub fn ws_list(&self) -> String {
+        let entries: Vec<serde_json::Value> = self
+            .cpu
+            .workspace_list()
+            .into_iter()
+            .map(|(name, dir, size)| serde_json::json!({ "name": name, "dir": dir, "size": size }))
+            .collect();
+        serde_json::Value::Array(entries).to_string()
+    }
+
+    /// Read a file from the shared workspace. `undefined` if absent.
+    #[must_use]
+    pub fn ws_read(&self, name: &str) -> Option<Vec<u8>> {
+        self.cpu.workspace_file(name).map(<[u8]>::to_vec)
+    }
+
+    /// Write a file into the shared workspace. Returns the content's κ (Law L1/L2).
+    pub fn ws_write(&mut self, name: &str, content: &[u8]) -> String {
+        self.cpu.workspace_write(name, content);
+        address(content).as_str().to_owned()
+    }
+
+    /// Delete a file or folder from the shared workspace. `true` if it existed.
+    pub fn ws_delete(&mut self, name: &str) -> bool {
+        self.cpu.workspace_delete(name)
+    }
+
+    /// Rename a file or folder in the shared workspace. `true` if the source existed.
+    pub fn ws_rename(&mut self, from: &str, to: &str) -> bool {
+        self.cpu.workspace_rename(from, to)
+    }
+
+    /// Create a folder in the shared workspace.
+    pub fn ws_mkdir(&mut self, name: &str) {
+        self.cpu.workspace_mkdir(name);
+    }
+
+    /// Read a file by nested path (e.g. `.vscode/tasks.json`). `undefined` if
+    /// absent or a directory.
+    #[must_use]
+    pub fn ws_read_path(&self, path: &str) -> Option<Vec<u8>> {
+        self.cpu.workspace_file_path(path).map(<[u8]>::to_vec)
+    }
+
+    /// Write a file at a nested path, creating parent directories. Returns the
+    /// content's κ (its identity).
+    pub fn ws_write_path(&mut self, path: &str, content: &[u8]) -> String {
+        self.cpu.workspace_write_path(path, content);
+        address(content).as_str().to_owned()
+    }
+
+    /// List a directory by nested path — a JSON array `[{name,dir,size}]`, or
+    /// `null` if the path is absent or not a directory.
+    #[must_use]
+    pub fn ws_list_path(&self, path: &str) -> Option<String> {
+        self.cpu.workspace_list_path(path).map(|entries| {
+            let arr: Vec<serde_json::Value> = entries
+                .into_iter()
+                .map(|(name, dir, size)| serde_json::json!({ "name": name, "dir": dir, "size": size }))
+                .collect();
+            serde_json::Value::Array(arr).to_string()
+        })
+    }
+
+    /// Stat a nested path — a JSON object `{dir,size}`, or `null` if absent.
+    #[must_use]
+    pub fn ws_stat_path(&self, path: &str) -> Option<String> {
+        self.cpu
+            .workspace_stat_path(path)
+            .map(|(dir, size)| serde_json::json!({ "dir": dir, "size": size }).to_string())
+    }
+
+    /// `mkdir -p` at a nested path in the shared workspace.
+    pub fn ws_mkdir_path(&mut self, path: &str) {
+        self.cpu.workspace_mkdir_path(path);
+    }
+
+    /// Delete a file or folder (recursively) at a nested path. `true` if it existed.
+    pub fn ws_delete_path(&mut self, path: &str) -> bool {
+        self.cpu.workspace_delete_path(path)
+    }
+
+    /// Rename/move a file or folder at a nested path. `true` if the source existed.
+    pub fn ws_rename_path(&mut self, from: &str, to: &str) -> bool {
+        self.cpu.workspace_rename_path(from, to)
+    }
+
     /// Dial an in-process connection to a server inside the devcontainer over the
     /// loopback bridge (`CC-33`/`CC-46`). `None` if not a `*_full` boot.
     pub fn dial_guest(&mut self, guest_port: u16) -> Option<u32> {
@@ -2108,6 +2203,12 @@ pub struct X64Workspace {
     cpu: x64::Cpu,
     halted: bool,
     console_cursor: usize,
+    /// The router seam, present when the guest's egress is carried by an external
+    /// router (the extension / a node) over the egress protocol (net parity with
+    /// the other cores). The page pumps it via
+    /// [`egress_outbound`](X64Workspace::egress_outbound) /
+    /// [`egress_inbound`](X64Workspace::egress_inbound).
+    router: Option<net::RouterChannel>,
 }
 
 #[wasm_bindgen]
@@ -2138,11 +2239,13 @@ impl X64Workspace {
         // aarch64 peer discovers the same device from its DTB instead, hence the
         // shorter cmdline there. `random.trust_cpu=on` lets the RNG seed from RDRAND
         // so early userspace doesn't block on entropy.
-        let cpu = x64::Cpu::boot_linux_disk_streamed(
+        let mut cpu = x64::Cpu::boot_linux_disk_streamed(
             512 * 1024 * 1024,
             kernel,
-            "console=ttyS0 root=/dev/vda rw init=/init \
-             virtio_mmio.device=0x200@0xd0000000:11 random.trust_cpu=on",
+            "console=ttyS0 root=/dev/vda rw init=/init ip=dhcp \
+             virtio_mmio.device=0x200@0xd0000000:11 \
+             virtio_mmio.device=0x200@0xd0000200:10 \
+             virtio_mmio.device=0x200@0xd0000400:12 random.trust_cpu=on",
             store,
             sector_count,
             read,
@@ -2150,10 +2253,17 @@ impl X64Workspace {
         // The κ-disk is fully ingested up front; release the rootfs's exclusive OPFS
         // lock so re-provisioning/removal isn't blocked and the handle doesn't leak.
         rootfs_handle.close();
+        // Net parity with the other cores: the router-backed egress (the page
+        // pumps frames to the extension / an egress node) + the in-process
+        // loopback bridge (CC-33) for reaching guest servers from the tab.
+        let (egress, router) = net::ChannelEgress::new();
+        cpu.attach_net(Box::new(egress));
+        cpu.enable_loopback();
         Ok(X64Workspace {
             cpu,
             halted: false,
             console_cursor: 0,
+            router: Some(router),
         })
     }
 
@@ -2238,11 +2348,13 @@ impl X64Workspace {
         // cmdline as the streamed boot (x86-64 discovers the κ-disk from the cmdline,
         // having no device tree).
         const SECTORS_PER_BLOCK: u64 = 8;
-        let cpu = x64::Cpu::boot_linux_disk_occupancy_streamed(
+        let mut cpu = x64::Cpu::boot_linux_disk_occupancy_streamed(
             512 * 1024 * 1024,
             kernel,
-            "console=ttyS0 root=/dev/vda rw init=/init \
-             virtio_mmio.device=0x200@0xd0000000:11 random.trust_cpu=on",
+            "console=ttyS0 root=/dev/vda rw init=/init ip=dhcp \
+             virtio_mmio.device=0x200@0xd0000000:11 \
+             virtio_mmio.device=0x200@0xd0000200:10 \
+             virtio_mmio.device=0x200@0xd0000400:12 random.trust_cpu=on",
             store,
             sector_count,
             &occupied_blocks,
@@ -2250,10 +2362,17 @@ impl X64Workspace {
             read,
         );
         rootfs_handle.close();
+        // Net parity with the other cores: the router-backed egress (the page
+        // pumps frames to the extension / an egress node) + the in-process
+        // loopback bridge (CC-33) for reaching guest servers from the tab.
+        let (egress, router) = net::ChannelEgress::new();
+        cpu.attach_net(Box::new(egress));
+        cpu.enable_loopback();
         Ok(X64Workspace {
             cpu,
             halted: false,
             console_cursor: 0,
+            router: Some(router),
         })
     }
 
@@ -2287,6 +2406,147 @@ impl X64Workspace {
     /// Feed keystrokes to the guest's serial console.
     pub fn feed_input(&mut self, bytes: &[u8]) {
         self.cpu.feed_console(bytes);
+    }
+
+    // ── the router-backed network + the in-process bridge (net parity) ──────
+
+    /// Drain the next egress frame the guest produced, for the page to carry to
+    /// the router. `undefined` when none is queued.
+    #[must_use]
+    pub fn egress_outbound(&self) -> Option<Vec<u8>> {
+        self.router
+            .as_ref()
+            .and_then(net::RouterChannel::pop_outbound)
+    }
+
+    /// Deliver an egress frame the router returned into the guest's network.
+    pub fn egress_inbound(&self, frame: &[u8]) {
+        if let Some(r) = &self.router {
+            r.feed_inbound(frame);
+        }
+    }
+
+    /// Dial an in-process connection to a server inside the devcontainer over
+    /// the loopback bridge (`CC-33` parity). `None` if the bridge is off.
+    pub fn dial_guest(&mut self, guest_port: u16) -> Option<u32> {
+        self.cpu.dial_guest(guest_port)
+    }
+
+    /// Send bytes on a dialed in-process connection.
+    pub fn guest_send(&mut self, id: u32, data: &[u8]) {
+        self.cpu.guest_send(id, data);
+    }
+
+    /// Receive any bytes the guest server produced on a dialed connection.
+    #[must_use]
+    pub fn guest_recv(&mut self, id: u32) -> Vec<u8> {
+        self.cpu.guest_recv(id)
+    }
+
+    /// Close a dialed in-process connection.
+    pub fn guest_close(&mut self, id: u32) {
+        self.cpu.guest_close(id);
+    }
+
+    /// Whether a dialed in-process connection is open.
+    #[must_use]
+    pub fn guest_is_open(&self, id: u32) -> bool {
+        self.cpu.guest_is_open(id)
+    }
+
+    // ── the workbench FileSystemProvider surface (CC-15/CC-17/CC-51 parity) ──
+    // The SAME method names the riscv64 `Workspace` exposes, so `holospace-fs`
+    // binds the editor to any core purely by capability detection — one
+    // FileSystemProvider, three ISAs, no per-arch branches (Law L4).
+
+    /// The shared workspace's directory listing — a JSON array of
+    /// `{ name, dir, size }` (the workbench `FileSystemProvider.readDirectory`).
+    #[must_use]
+    pub fn ws_list(&self) -> String {
+        let entries: Vec<serde_json::Value> = self
+            .cpu
+            .workspace_list()
+            .into_iter()
+            .map(|(name, dir, size)| serde_json::json!({ "name": name, "dir": dir, "size": size }))
+            .collect();
+        serde_json::Value::Array(entries).to_string()
+    }
+
+    /// Read a file from the shared workspace. `undefined` if absent.
+    #[must_use]
+    pub fn ws_read(&self, name: &str) -> Option<Vec<u8>> {
+        self.cpu.workspace_file(name).map(<[u8]>::to_vec)
+    }
+
+    /// Write a file into the shared workspace. Returns the content's κ (Law L1/L2).
+    pub fn ws_write(&mut self, name: &str, content: &[u8]) -> String {
+        self.cpu.workspace_write(name, content);
+        address(content).as_str().to_owned()
+    }
+
+    /// Delete a file or folder from the shared workspace. `true` if it existed.
+    pub fn ws_delete(&mut self, name: &str) -> bool {
+        self.cpu.workspace_delete(name)
+    }
+
+    /// Rename a file or folder in the shared workspace. `true` if the source existed.
+    pub fn ws_rename(&mut self, from: &str, to: &str) -> bool {
+        self.cpu.workspace_rename(from, to)
+    }
+
+    /// Create a folder in the shared workspace.
+    pub fn ws_mkdir(&mut self, name: &str) {
+        self.cpu.workspace_mkdir(name);
+    }
+
+    /// Read a file by nested path (e.g. `.vscode/tasks.json`). `undefined` if
+    /// absent or a directory.
+    #[must_use]
+    pub fn ws_read_path(&self, path: &str) -> Option<Vec<u8>> {
+        self.cpu.workspace_file_path(path).map(<[u8]>::to_vec)
+    }
+
+    /// Write a file at a nested path, creating parent directories. Returns the
+    /// content's κ (its identity).
+    pub fn ws_write_path(&mut self, path: &str, content: &[u8]) -> String {
+        self.cpu.workspace_write_path(path, content);
+        address(content).as_str().to_owned()
+    }
+
+    /// List a directory by nested path — a JSON array `[{name,dir,size}]`, or
+    /// `null` if the path is absent or not a directory.
+    #[must_use]
+    pub fn ws_list_path(&self, path: &str) -> Option<String> {
+        self.cpu.workspace_list_path(path).map(|entries| {
+            let arr: Vec<serde_json::Value> = entries
+                .into_iter()
+                .map(|(name, dir, size)| serde_json::json!({ "name": name, "dir": dir, "size": size }))
+                .collect();
+            serde_json::Value::Array(arr).to_string()
+        })
+    }
+
+    /// Stat a nested path — a JSON object `{dir,size}`, or `null` if absent.
+    #[must_use]
+    pub fn ws_stat_path(&self, path: &str) -> Option<String> {
+        self.cpu
+            .workspace_stat_path(path)
+            .map(|(dir, size)| serde_json::json!({ "dir": dir, "size": size }).to_string())
+    }
+
+    /// `mkdir -p` at a nested path in the shared workspace.
+    pub fn ws_mkdir_path(&mut self, path: &str) {
+        self.cpu.workspace_mkdir_path(path);
+    }
+
+    /// Delete a file or folder (recursively) at a nested path. `true` if it existed.
+    pub fn ws_delete_path(&mut self, path: &str) -> bool {
+        self.cpu.workspace_delete_path(path)
+    }
+
+    /// Rename/move a file or folder at a nested path. `true` if the source existed.
+    pub fn ws_rename_path(&mut self, from: &str, to: &str) -> bool {
+        self.cpu.workspace_rename_path(from, to)
     }
 
     /// Whether the machine has powered off.

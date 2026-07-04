@@ -47,6 +47,13 @@ cargo test --release --manifest-path "$ROOT/Cargo.toml" -p holospaces \
     --test cc44_x64_boot an_amd64_linux_boots_from_an_occupancy_indexed_build_capable_disk \
     -- --ignored --nocapture || exit 1
 
+# The shared virtio-9p workspace on the amd64 core — what makes an x86-64
+# holospace a USABLE devcontainer (editor/tasks/search bind to the same content
+# the guest mounts), witnessed in both directions over a real amd64 Linux boot.
+cargo test --release --manifest-path "$ROOT/Cargo.toml" -p holospaces \
+    --test cc44_x64_boot the_amd64_devcontainer_shares_the_9p_workspace_with_the_editor \
+    -- --ignored --nocapture || exit 1
+
 # ── The stock linux-amd64 binary + arbitrary devcontainer (needs the fixture) ──
 if [ -f "$CC45/cc45.sha256" ] && [ -f "$CC45/linux/vmlinux.gz" ] && [ -f "$CC45/rootfs/layer.tar.gz" ]; then
     ( cd "$CC45" && sha256sum -c cc45.sha256 >/dev/null ) \

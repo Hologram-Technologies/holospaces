@@ -154,7 +154,19 @@ async function runSearch(searchInput, pattern, timeout = 30000) {
       const mm = /(\d+)\s+results?\s+in\s+\d+\s+files?/i.exec(txt) || /^\s*(\d+)\s+results?\b/im.exec(txt);
       if (mm) n = parseInt(mm[1], 10);
     }
-    if (n != null && n === prev && Date.now() - prevAt >= 2000) return n;
+    if (n != null && n === prev && Date.now() - prevAt >= 2000) {
+      // Grace re-check: a batch of streamed matches can land seconds late on a
+      // loaded machine, AFTER the count looks settled. Believe a settled count
+      // only if it survives an additional grace window.
+      await page.waitForTimeout(3000);
+      const t2 = await page.locator(".search-view").first().innerText().catch(() => "");
+      const m2 = /(\d+)\s+results?\s+in\s+\d+\s+files?/i.exec(t2) || /^\s*(\d+)\s+results?\b/im.exec(t2);
+      const n2 = /No results found/i.test(t2) ? 0 : m2 ? parseInt(m2[1], 10) : null;
+      if (n2 === n) return n;
+      prev = n2;
+      prevAt = Date.now();
+      continue;
+    }
     if (n !== prev) { prev = n; prevAt = Date.now(); }
     await page.waitForTimeout(500);
   }

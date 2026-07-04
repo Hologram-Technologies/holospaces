@@ -284,6 +284,9 @@ async function bootHolospace() {
     : new URLSearchParams();
   // The holospace's architecture (ADR-021) selects the guest kernel + the CPU
   // core; the per-guest egress node (CC-39), if set, rides the same folder query.
+  // The Manager launches amd64 by default (the registry/Codespaces architecture);
+  // a BARE workbench open (no Manager, no provisioned image) falls back to the
+  // self-contained riscv64 demo boot, which needs no router or provisioning.
   const arch = query.get("arch") || "riscv64";
   const egress = query.get("egress");
   // A real arm64 Linux for aarch64, a real amd64 vmlinux for x64, else the
@@ -299,10 +302,11 @@ async function bootHolospace() {
   );
 
   if (arch === "x64") {
-    // x86-64 holospace: boot the provisioned amd64 image on the x64 core, paged
-    // from OPFS (CC-43/CC-44/CC-45) — a real amd64 devcontainer to a terminal, the
-    // ubiquitous registry/Codespaces architecture. (The x64 core's net/9p parity
-    // is the continued build, as on aarch64; this path drives the terminal.)
+    // x86-64 holospace (the DEFAULT architecture): boot the provisioned amd64
+    // image on the x64 core, paged from OPFS (CC-43/CC-44/CC-45) — a real amd64
+    // devcontainer with the full device surface: terminal (CC-11), the shared
+    // virtio-9p workspace (CC-15 — editor, tasks, search, SCM all bind to it),
+    // and the router-backed network, identical to the other cores (Law L4).
     if (holoId) {
       const rootfsHandle = await openProvisionedHandle(holoId);
       if (rootfsHandle) {
@@ -330,9 +334,8 @@ async function bootHolospace() {
     }
   } else if (arch === "aarch64") {
     // aarch64 holospace: boot the provisioned arm64 image on the AArch64 core,
-    // paged from OPFS (CC-37) — a real arm64 devcontainer to a terminal. (The
-    // AArch64 core's net/9p parity is the continued build, so this path drives
-    // the terminal; the riscv64 path below adds the 9p workspace + routed egress.)
+    // paged from OPFS (CC-37/CC-46) — a real arm64 devcontainer with the same
+    // full device surface (terminal, virtio-9p workspace, router-backed network).
     if (holoId) {
       const rootfsHandle = await openProvisionedHandle(holoId);
       if (rootfsHandle) {
@@ -403,10 +406,26 @@ async function bootHolospace() {
   }
   } // end the riscv64 boot branch
 
-  // Seed the shared workspace (the editor + the OS both see these over virtio-9p,
-  // CC-15). The aarch64 terminal path has no 9p workspace yet, so guard on the
-  // capability rather than assume it.
-  if (ws && typeof ws.ws_write === "function") {
+  // Seed the shared workspace (the editor + the OS both see these over
+  // virtio-9p, CC-15 — every core exposes the same ws_* surface; the guards are
+  // pure capability detection). A REPOSITORY holospace gets a clone-ready
+  // welcome (its content is the repo's, not ours); a blank/demo one gets the
+  // scratchpad sample (a source file, a tasks.json, a devcontainer.json) so
+  // there is something to edit, run, and search immediately.
+  const repoUrl = query.get("repo");
+  if (ws && typeof ws.ws_write === "function" && repoUrl) {
+    ws.ws_write(
+      "WELCOME.md",
+      new TextEncoder().encode(
+        `# ${(repoUrl.replace(/\/+$/, "").match(/([^/]+?)(?:\.git)?$/) || [])[1] || "holospace"}\n\n` +
+          `This holospace runs the devcontainer of ${repoUrl}.\n\n` +
+          "Clone the repository into the shared workspace from the terminal:\n\n" +
+          "```sh\ngit clone " + repoUrl + " .\n```\n\n" +
+          "The editor and the devcontainer share this workspace over virtio-9p (CC-15) — " +
+          "files, tasks (Run Task), search, and source control all operate on the same content.\n",
+      ),
+    );
+  } else if (ws && typeof ws.ws_write === "function") {
     ws.ws_write(
       "WELCOME.md",
       new TextEncoder().encode(
@@ -850,8 +869,8 @@ function startRemoteExtensionHost(context, out) {
     // (b) The holospace backs the host: the booted holospace's own workspace is
     // reachable (virtio-9p, CC-15). We read the workspace listing the running OS
     // shares — the remote's filesystem backend is the holospace's content, not a
-    // stand-in. (The aarch64 terminal core has no 9p workspace yet; there the FS
-    // backend is the console/terminal — still the holospace's own primitive.)
+    // stand-in. (Every core now exposes the shared 9p workspace; the terminal
+    // fallback below survives a core that has not booted a workspace at all.)
     const fsBacked = has9p() || (ws && typeof ws.terminal === "function");
     if (!fsBacked) {
       out && out.appendLine("holospace: remote ext host not live — no holospace primitive is backing it yet");
