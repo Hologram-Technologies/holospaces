@@ -2487,6 +2487,109 @@ impl Cpu {
         }
     }
 
+    /// List the shared workspace's root entries — `(name, is_dir, size)` — the
+    /// editor's directory view over the running holospace (`CC-17`).
+    #[must_use]
+    pub fn workspace_list(&self) -> Vec<(String, bool, usize)> {
+        self.sys
+            .as_ref()
+            .and_then(|s| s.virtio9p.as_ref())
+            .map(|d| d.fs.list_root())
+            .unwrap_or_default()
+    }
+
+    /// Delete a file or folder at the share root (the editor's delete, `CC-17`).
+    /// `true` if it existed.
+    pub fn workspace_delete(&mut self, name: &str) -> bool {
+        self.sys
+            .as_mut()
+            .and_then(|s| s.virtio9p.as_mut())
+            .map(|d| d.fs.delete_file(name))
+            .unwrap_or(false)
+    }
+
+    /// Rename a file or folder at the share root (the editor's rename, `CC-17`).
+    /// `true` if the source existed.
+    pub fn workspace_rename(&mut self, from: &str, to: &str) -> bool {
+        self.sys
+            .as_mut()
+            .and_then(|s| s.virtio9p.as_mut())
+            .map(|d| d.fs.rename(from, to))
+            .unwrap_or(false)
+    }
+
+    /// Create a folder at the share root (the editor's new-folder, `CC-17`).
+    pub fn workspace_mkdir(&mut self, name: &str) {
+        if let Some(d) = self.sys.as_mut().and_then(|s| s.virtio9p.as_mut()) {
+            d.fs.make_dir(name);
+        }
+    }
+
+    // ── Nested-path workspace access (`CC-51` parity with the riscv64 core) ──
+    // The full tree the guest sees over `virtio-9p` — `src/…`, `.vscode/…`, a
+    // `.git` object store — addressed by nested path, so the workbench file
+    // explorer and the Git/tasks engines drive a real repository on every core.
+
+    /// Read a file by nested path. `None` if absent, a directory, or no share.
+    #[must_use]
+    pub fn workspace_file_path(&self, path: &str) -> Option<&[u8]> {
+        self.sys
+            .as_ref()
+            .and_then(|s| s.virtio9p.as_ref())
+            .and_then(|d| d.fs.read_path(path))
+    }
+
+    /// Stat a nested path: `(is_dir, size)`. `None` if absent / no share.
+    #[must_use]
+    pub fn workspace_stat_path(&self, path: &str) -> Option<(bool, usize)> {
+        self.sys
+            .as_ref()
+            .and_then(|s| s.virtio9p.as_ref())
+            .and_then(|d| d.fs.stat_path(path))
+    }
+
+    /// List a directory by nested path — `(name, is_dir, size)` per entry.
+    /// `None` if the path is absent or not a directory.
+    #[must_use]
+    pub fn workspace_list_path(&self, path: &str) -> Option<Vec<(String, bool, usize)>> {
+        self.sys
+            .as_ref()
+            .and_then(|s| s.virtio9p.as_ref())
+            .and_then(|d| d.fs.list_path(path))
+    }
+
+    /// Write a file at a nested path, creating parent directories.
+    pub fn workspace_write_path(&mut self, path: &str, data: &[u8]) {
+        if let Some(d) = self.sys.as_mut().and_then(|s| s.virtio9p.as_mut()) {
+            d.fs.write_path(path, data);
+        }
+    }
+
+    /// `mkdir -p` at a nested path.
+    pub fn workspace_mkdir_path(&mut self, path: &str) {
+        if let Some(d) = self.sys.as_mut().and_then(|s| s.virtio9p.as_mut()) {
+            d.fs.make_dir_path(path);
+        }
+    }
+
+    /// Delete a file or folder (recursively) at a nested path. `true` if it existed.
+    pub fn workspace_delete_path(&mut self, path: &str) -> bool {
+        self.sys
+            .as_mut()
+            .and_then(|s| s.virtio9p.as_mut())
+            .map(|d| d.fs.delete_path(path))
+            .unwrap_or(false)
+    }
+
+    /// Rename/move a file or folder at a nested path. `true` if the source existed.
+    pub fn workspace_rename_path(&mut self, from: &str, to: &str) -> bool {
+        self.sys
+            .as_mut()
+            .and_then(|s| s.virtio9p.as_mut())
+            .map(|d| d.fs.rename_path(from, to))
+            .unwrap_or(false)
+    }
+
     /// Attach the **VirtIO network device** + the userspace TCP/IP NAT (`CC-16`
     /// parity): the guest drives a real NIC, its frames terminate in the shared
     /// [`net`](super::net) NAT and stream out over `egress`.
@@ -3761,6 +3864,12 @@ impl Cpu {
         cpu.rflags = 0x2; // interrupts off, as on entry
         cpu.cpl = 0;
         cpu.sys_mut().virtio = disk;
+        // Every devcontainer machine carries the shared virtio-9p workspace
+        // (`CC-15` parity across the cores): the editor reads/writes it host-side
+        // from the moment of boot, and the guest mounts it when the command line
+        // declares the slot (`virtio_mmio.device=0x200@0xd0000200:10`). An
+        // undeclared slot is simply never probed.
+        cpu.attach_workspace(&[]);
         cpu
     }
 

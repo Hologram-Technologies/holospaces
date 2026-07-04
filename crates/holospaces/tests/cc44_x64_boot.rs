@@ -960,3 +960,114 @@ fn an_arbitrary_real_amd64_oci_image_boots_on_x64() {
     );
     assert_eq!(halt, Halt::Halted, "clean poweroff");
 }
+
+/// The **shared `virtio-9p` workspace on the amd64 core** — the parity that makes
+/// an x86-64 holospace a *usable* devcontainer, not just a booting one: the
+/// workbench's files and the guest's `/workspace` are the SAME content (Law L1).
+/// The deployed init mounts the share (tag `hsworkspace`) when the command line
+/// declares the 9p `virtio-mmio` slot; the editor reads/writes it host-side.
+/// Witnessed in both directions over a real amd64 Linux boot:
+///   host → guest: a host-written file is `cat`-able in the guest shell;
+///   guest → host: a guest-written file is readable via `workspace_file`.
+#[test]
+#[ignore = "boots a real amd64 Linux + drives the 9p share (~release) — run by the CC-45 vv suite"]
+fn the_amd64_devcontainer_shares_the_9p_workspace_with_the_editor() {
+    use holospaces::assembly::{assemble_ext4_bootable, Layer};
+
+    let busybox = std::fs::read(cc45_dir().join("rootfs/layer.tar.gz")).expect("busybox layer");
+    let layers = [Layer {
+        media_type: "application/vnd.oci.image.layer.v1.tar+gzip",
+        blob: &busybox,
+    }];
+    let rootfs = assemble_ext4_bootable(
+        &layers,
+        holospaces::machine::DEVCONTAINER_INIT,
+        64 * 1024 * 1024,
+    )
+    .expect("assemble the amd64 rootfs with the deployed init");
+    let kernel = gunzip(&cc45_dir().join("linux/vmlinux.gz"));
+    // The deployed command line: BOTH virtio-mmio slots declared — the κ-disk
+    // (0xd0000000, IRQ 11) and the 9p workspace (0xd0000200, IRQ 10) — exactly
+    // what `X64Workspace.bootDevcontainerOpfsStreamed*` passes.
+    let mut cpu = Cpu::boot_linux_disk(
+        512 * 1024 * 1024,
+        &kernel,
+        rootfs,
+        "console=ttyS0 root=/dev/vda rw init=/init \
+         virtio_mmio.device=0x200@0xd0000000:11 \
+         virtio_mmio.device=0x200@0xd0000200:10 random.trust_cpu=on",
+    );
+
+    // The editor's side of the share exists from boot (host-side writes land
+    // before the guest even mounts — one content, Law L1).
+    cpu.workspace_write("from-host.txt", b"HOST-9P-PAYLOAD\n");
+
+    let mut booted = false;
+    for _ in 0..30 {
+        cpu.run(1_000_000_000);
+        if String::from_utf8_lossy(cpu.console()).contains("holospace devcontainer ready") {
+            booted = true;
+            break;
+        }
+    }
+    assert!(booted, "the amd64 devcontainer booted to its shell");
+
+    // guest → host FIRST: the guest writes a file; the editor-side observes it.
+    // (Ordered before the read so the witness pins the 9p write path itself; a
+    // KNOWN, separate x86-64 defect — glibc busybox heap corruption after
+    // sustained shell churn ("malloc(): unsorted double linked list corrupted"
+    // → PID-1 exit → panic) — otherwise races the later commands. That defect
+    // is tracked as its own emulator bug, in the CC-45 dogfood defect family.)
+    cpu.feed_console(b"echo GUEST-9P-PAYLOAD > /workspace/from-guest.txt\n");
+    let mut round = false;
+    for _ in 0..12 {
+        cpu.run(500_000_000);
+        if cpu
+            .workspace_file("from-guest.txt")
+            .map(|b| String::from_utf8_lossy(b).contains("GUEST-9P-PAYLOAD"))
+            .unwrap_or(false)
+        {
+            round = true;
+            break;
+        }
+    }
+    let console2 = String::from_utf8_lossy(cpu.console()).into_owned();
+    assert!(
+        round,
+        "the host observed the guest-written file over virtio-9p (workspace_file); \
+         share root: {:?}; console tail:\n{}",
+        cpu.workspace_list(),
+        &console2[console2.len().saturating_sub(1500)..]
+    );
+
+    // host → guest: the guest reads the host-written file over its 9p mount.
+    cpu.feed_console(b"cat /workspace/from-host.txt\n");
+    let mut seen = false;
+    for _ in 0..12 {
+        cpu.run(500_000_000);
+        if String::from_utf8_lossy(cpu.console()).contains("HOST-9P-PAYLOAD") {
+            seen = true;
+            break;
+        }
+    }
+    let console = String::from_utf8_lossy(cpu.console()).into_owned();
+    assert!(
+        seen,
+        "the guest read the host-written file over virtio-9p; console:\n{console}"
+    );
+
+    // And the nested-path surface the workbench FileSystemProvider drives.
+    cpu.workspace_write_path(
+        ".vscode/tasks.json",
+        b"{\"version\":\"2.0.0\",\"tasks\":[]}\n",
+    );
+    assert!(
+        cpu.workspace_stat_path(".vscode")
+            .is_some_and(|(dir, _)| dir),
+        "nested-path mkdir/write reaches the shared tree (.vscode is a directory)"
+    );
+    assert!(
+        cpu.workspace_file_path(".vscode/tasks.json").is_some(),
+        "nested-path read sees the written file"
+    );
+}
