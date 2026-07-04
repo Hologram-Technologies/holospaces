@@ -166,10 +166,6 @@ struct Sys {
     /// config mechanism #1; the config-data port then returns all-ones (an empty
     /// bus — this machine's devices are virtio-mmio, not PCI).
     pci_addr: u32,
-    /// Modelled L1 data-cache tags (one line number per set; direct-mapped). A miss
-    /// charges [`DCACHE_MISS_CYCLES`] to the TSC, giving address-dependent access
-    /// timing — the jitter `jitterentropy` needs on an otherwise deterministic core.
-    dcache: Vec<u64>,
 }
 
 impl Sys {
@@ -205,7 +201,6 @@ impl Sys {
             rng: 0x9e37_79b9_7f4a_7c15,
             tdiv: 0,
             pci_addr: 0,
-            dcache: vec![u64::MAX; DCACHE_LINES],
         }
     }
 
@@ -565,19 +560,21 @@ const TICK_DIV: u64 = 16;
 /// advances every step for fine `sched_clock` resolution; only the down-counters
 /// are paced by `TICK_DIV`, so this factor sets `cpu_khz` independently of the
 /// delay-cost granularity above.
+///
+/// The TSC advances at this constant rate **per step** and nothing else perturbs
+/// it — the core models an **invariant TSC** (a constant-rate counter independent
+/// of cache misses / CPU frequency), which modern x86-64 provides and which Linux
+/// **requires** when it selects the TSC as its clocksource. A previous model
+/// charged extra TSC cycles on a data-cache miss (to fake the timing jitter
+/// `jitterentropy` harvests); that made the TSC rate address-dependent, so it
+/// drifted against the PIT-paced tick the kernel calibrated its TSC→ns conversion
+/// against, and after ~24 minutes of guest time the accumulated timekeeping error
+/// corrupted guest memory (`malloc(): unsorted double linked list corrupted` →
+/// PID-1 panic — the defect that made a long-running amd64 devcontainer unusable).
+/// The entropy that fake jitter fed is unnecessary here: every holospace boot
+/// passes `random.trust_cpu=on` and the core provides `RDRAND`, so the crng seeds
+/// from the hardware RNG and never falls back to `jitterentropy`.
 const TSC_PER_STEP: u64 = 128;
-
-/// Lines in the modelled L1 data cache (direct-mapped, 64-byte lines → 32 KiB).
-/// Smaller than the working sets entropy daemons deliberately stride across (the
-/// kernel's `jitterentropy` buffer is 64 KiB), so their walks miss and the access
-/// latency varies with the address pattern.
-const DCACHE_LINES: usize = 512;
-/// Extra TSC cycles charged on a data-cache miss — the microarchitectural timing
-/// variance a real CPU exhibits, and that `jitterentropy` harvests as its noise
-/// source. Without it the (otherwise perfectly deterministic) emulator gives a
-/// constant per-access latency: jitterentropy's health test sees no jitter and the
-/// crypto DRBG it seeds never initialises (the boot wedges before userspace).
-const DCACHE_MISS_CYCLES: u64 = 32;
 
 /// A direct-mapped software TLB entry: caches a virtual-page → physical-frame
 /// translation so a hot loop does not re-walk the 4-level page table on every
@@ -971,9 +968,23 @@ impl Cpu {
     /// instruction restart overwrites. This phys-0 scratch is load-bearing for the
     /// early boot's demand-paging: removing it (returning early from `rd`/`wr`)
     /// regresses the boot to a hang, so the scratch access is kept, not elided.
+    /// The scratch physical address a faulting access resolves to while its
+    /// `#PF` is latched (before `step` rolls the instruction back and vectors the
+    /// fault). It sits **one byte past guest RAM** — so `rd` reads `0` (its
+    /// `.get().unwrap_or(&0)`) and `wr` skips the store (its `pa + size <= len`
+    /// bound) — and below every device MMIO window, so the faulting access takes
+    /// no device side effect either. This must NOT be guest-physical `0`: frame 0
+    /// is usable RAM in the e820 map, so a faulting *write* scribbling it silently
+    /// corrupts whatever the kernel later allocates there (the "malloc(): unsorted
+    /// double linked list corrupted" a fork/exec-heavy guest hit after minutes).
+    #[inline]
+    fn fault_scratch_pa(&self) -> u64 {
+        self.ram.len() as u64
+    }
+
     fn translate_acc(&mut self, vaddr: u64, write: bool, user: bool) -> u64 {
         if self.fault.is_some() {
-            return 0; // a fault is already pending; do not double-latch
+            return self.fault_scratch_pa(); // a fault is already pending; don't double-latch
         }
         // Fast path: the software TLB caches present translations so a hot loop
         // does not re-walk the 4-level page table on every access (the dominant
@@ -1029,7 +1040,7 @@ impl Cpu {
                         let error = (if write { PF_ERR_WRITE } else { 0 })
                             | (if user { PF_ERR_USER } else { 0 });
                         self.fault = Some(PageFault { addr: vaddr, error });
-                        return 0;
+                        return self.fault_scratch_pa();
                     }
                 }
             }
@@ -1065,7 +1076,7 @@ impl Cpu {
                 | (if write { PF_ERR_WRITE } else { 0 })
                 | (if user { PF_ERR_USER } else { 0 });
             self.fault = Some(PageFault { addr: vaddr, error });
-            return 0;
+            return self.fault_scratch_pa();
         }
         // The access is permitted. On a TLB fill (a fresh walk), set the Accessed
         // (and Dirty, for a write) bit in the leaf entry — like real hardware — so
@@ -1095,20 +1106,6 @@ impl Cpu {
             (self.cr3 & 0xfff) as usize
         } else {
             0
-        }
-    }
-
-    /// Account a RAM access in the modelled L1 data cache: a miss installs the line
-    /// (evicting its set) and adds [`DCACHE_MISS_CYCLES`] to the TSC, so the access
-    /// latency varies with the address pattern — real microarchitectural jitter.
-    fn dcache_touch(&mut self, pa: u64) {
-        let line = pa >> 6;
-        let idx = (line as usize) & (DCACHE_LINES - 1);
-        if let Some(sys) = self.sys.as_mut() {
-            if sys.dcache[idx] != line {
-                sys.dcache[idx] = line;
-                sys.tsc = sys.tsc.wrapping_add(DCACHE_MISS_CYCLES);
-            }
         }
     }
 
@@ -1330,7 +1327,6 @@ impl Cpu {
         if (IOAPIC_BASE..IOAPIC_END).contains(&pa) {
             return u64::from(self.ioapic_read((pa - IOAPIC_BASE) as u32));
         }
-        self.dcache_touch(pa);
         // Same-page accesses (the common case) map to contiguous physical bytes
         // `pa..pa+size`; the first-byte translate above filled the TLB + A/D bits, so
         // the rest need no re-translation — byte-identical to the per-byte loop, one
@@ -1375,7 +1371,6 @@ impl Cpu {
             self.ioapic_write((pa - IOAPIC_BASE) as u32, val as u32);
             return;
         }
-        self.dcache_touch(pa);
         #[cfg(feature = "cc44-trace")]
         if TP_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
             && (0xffff_ffff_82a0_3e38..=0xffff_ffff_82a0_3e48).contains(&addr)
