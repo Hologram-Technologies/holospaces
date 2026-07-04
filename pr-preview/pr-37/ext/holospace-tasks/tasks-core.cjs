@@ -73,6 +73,54 @@ function normalizeTask(t) {
   };
 }
 
+// ── Devcontainer lifecycle commands as tasks (CC-22 surfacing) ────────────────
+// The devcontainer spec's lifecycle commands, in lifecycle order. Each may be a
+// string (a shell command), an array (an argv vector), or an object of *named*
+// commands (each string/array, run in parallel) — all three forms surface.
+// `initializeCommand` is omitted deliberately: the spec runs it on the HOST
+// before the container exists, so it is not a guest task (ADR-015: the boundary
+// stays explicit rather than silently running it in the wrong place).
+const LIFECYCLE_PROPS = [
+  "onCreateCommand",
+  "updateContentCommand",
+  "postCreateCommand",
+  "postStartCommand",
+  "postAttachCommand",
+];
+
+// One lifecycle command value (string | argv array) → {command, args} | null.
+function lifecycleCommand(v) {
+  if (typeof v === "string" && v.trim()) return { command: v, args: [] };
+  if (Array.isArray(v) && v.length && v.every((x) => typeof x === "string")) {
+    return { command: v[0], args: v.slice(1) };
+  }
+  return null;
+}
+
+// Parse a devcontainer.json (JSONC) into the lifecycle tasks it declares — the
+// CC-22 lifecycle commands, surfaced as re-runnable tasks (labelled
+// `lifecycle: postCreateCommand`, `lifecycle: postCreateCommand (name)`, …) so
+// the environment-preparing commands the container ran on create are one "Run
+// Task" away. Parametric over ANY devcontainer.json; [] when none are declared.
+function parseDevcontainerLifecycle(text) {
+  const doc = parseJsonc(text);
+  const out = [];
+  for (const prop of LIFECYCLE_PROPS) {
+    const v = doc && doc[prop];
+    if (v == null) continue;
+    if (typeof v === "object" && !Array.isArray(v)) {
+      for (const [name, sub] of Object.entries(v)) {
+        const c = lifecycleCommand(sub);
+        if (c) out.push({ label: `lifecycle: ${prop} (${name})`, type: "holospace", command: c.command, args: c.args, isBackground: false, group: null, problemMatcher: undefined, detail: `devcontainer.json ${prop}.${name}`, lifecycle: true });
+      }
+    } else {
+      const c = lifecycleCommand(v);
+      if (c) out.push({ label: `lifecycle: ${prop}`, type: "holospace", command: c.command, args: c.args, isBackground: false, group: null, problemMatcher: undefined, detail: `devcontainer.json ${prop}`, lifecycle: true });
+    }
+  }
+  return out;
+}
+
 // Quote a single shell argument for POSIX sh (single-quote, escaping embedded
 // single quotes) — so args with spaces / metacharacters pass through verbatim.
 function shQuote(s) {
@@ -121,6 +169,7 @@ function parseExit(text) {
 
 const api = {
   parseJsonc, parseTasksJson, normalizeTask, shQuote, buildCommand,
+  LIFECYCLE_PROPS, parseDevcontainerLifecycle,
   TASKS_DIR, newTaskId, cmdPath, outPath, exitPath, parseExit,
 };
 if (typeof module !== "undefined" && module.exports) module.exports = api;
