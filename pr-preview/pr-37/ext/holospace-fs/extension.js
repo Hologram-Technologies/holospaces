@@ -329,8 +329,17 @@ async function bootHolospace() {
         }
       }
     }
-    if (!ws && out) {
-      out.appendLine("holospace: an x64 holospace needs a provisioned image — Enter it from the Manager (with the router)");
+    if (!ws) {
+      // BLANK / no-provisioning fallback: boot the BUNDLED amd64 busybox layer
+      // in-RAM — no registry pull, no router extension. A user launches a blank
+      // amd64 scratchpad and gets a shell + editor + tasks + search immediately.
+      const layer = await fetchBytes(`${base}/devcontainer-x64-layer.tar.gz`);
+      const image = new wasm.DevcontainerImage();
+      image.add_layer("application/vnd.oci.image.layer.v1.tar+gzip", layer);
+      const rootfs = image.assemble_bootable(128 * 1024 * 1024);
+      ws = wasm.X64Workspace.boot_devcontainer(kernel, rootfs);
+      bridged = false;
+      out && out.appendLine("holospace: booted a blank amd64 devcontainer on the x64 core from the bundled layer (no router)");
     }
   } else if (arch === "aarch64") {
     // aarch64 holospace: boot the provisioned arm64 image on the AArch64 core,
@@ -349,8 +358,17 @@ async function bootHolospace() {
         }
       }
     }
-    if (!ws && out) {
-      out.appendLine("holospace: an aarch64 holospace needs a provisioned image — Enter it from the Manager (with the router)");
+    if (!ws) {
+      // BLANK / no-provisioning fallback: boot the BUNDLED arm64 busybox layer
+      // in-RAM — no registry pull, no router (parity with the x64 + riscv64
+      // blank paths).
+      const layer = await fetchBytes(`${base}/devcontainer-arm64-layer.tar.gz`);
+      const image = new wasm.DevcontainerImage();
+      image.add_layer("application/vnd.oci.image.layer.v1.tar+gzip", layer);
+      const rootfs = image.assemble_bootable(128 * 1024 * 1024);
+      ws = wasm.Aarch64Workspace.boot_devcontainer(kernel, rootfs);
+      bridged = false;
+      out && out.appendLine("holospace: booted a blank arm64 devcontainer on the AArch64 core from the bundled layer (no router)");
     }
   } else {
   // PREFERRED: the streaming **paged κ-disk**. Page the provisioned rootfs

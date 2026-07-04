@@ -26,6 +26,27 @@ export class Aarch64Workspace {
         wasm.__wbg_aarch64workspace_free(ptr, 0);
     }
     /**
+     * Boot a devcontainer from an **in-RAM** assembled rootfs (`rootfs`) — the
+     * no-provisioning, no-router path a **blank/bundled** holospace takes: the
+     * deploy ships a small `arm64` layer, the page assembles it here, and this
+     * boots it directly with the full device surface (9p workspace + router-
+     * backed net + bridge), identical to the streamed path but sourced from RAM.
+     * @param {Uint8Array} kernel
+     * @param {Uint8Array} rootfs
+     * @returns {Aarch64Workspace}
+     */
+    static boot_devcontainer(kernel, rootfs) {
+        const ptr0 = passArray8ToWasm0(kernel, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passArray8ToWasm0(rootfs, wasm.__wbindgen_malloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.aarch64workspace_boot_devcontainer(ptr0, len0, ptr1, len1);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return Aarch64Workspace.__wrap(ret[0]);
+    }
+    /**
      * Boot like [`boot_devcontainer_opfs_streamed`](Aarch64Workspace::boot_devcontainer_opfs_streamed),
      * additionally attaching the **shared workspace filesystem** (`virtio-9p`,
      * `CC-15`/`CC-46`), a **router-backed network** (`virtio-net` + the userspace
@@ -2349,6 +2370,27 @@ export class X64Workspace {
         const ptr0 = passArray8ToWasm0(kernel, wasm.__wbindgen_malloc);
         const len0 = WASM_VECTOR_LEN;
         const ret = wasm.x64workspace_bootDevcontainerOpfsStreamedOccupancy(ptr0, len0, rootfs_handle, occupancy_handle, disk_handle);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return X64Workspace.__wrap(ret[0]);
+    }
+    /**
+     * Boot a devcontainer from an **in-RAM** assembled rootfs (`rootfs`) — the
+     * no-provisioning, no-router path a **blank/bundled** holospace takes: the
+     * deploy ships a small `amd64` layer, the page assembles it here, and this
+     * boots it directly with the full device surface (9p workspace + router-
+     * backed net + bridge), identical to the paged path but sourced from RAM.
+     * @param {Uint8Array} kernel
+     * @param {Uint8Array} rootfs
+     * @returns {X64Workspace}
+     */
+    static boot_devcontainer(kernel, rootfs) {
+        const ptr0 = passArray8ToWasm0(kernel, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passArray8ToWasm0(rootfs, wasm.__wbindgen_malloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.x64workspace_boot_devcontainer(ptr0, len0, ptr1, len1);
         if (ret[2]) {
             throw takeFromExternrefTable0(ret[1]);
         }
