@@ -284,6 +284,9 @@ async function bootHolospace() {
     : new URLSearchParams();
   // The holospace's architecture (ADR-021) selects the guest kernel + the CPU
   // core; the per-guest egress node (CC-39), if set, rides the same folder query.
+  // The Manager launches amd64 by default (the registry/Codespaces architecture);
+  // a BARE workbench open (no Manager, no provisioned image) falls back to the
+  // self-contained riscv64 demo boot, which needs no router or provisioning.
   const arch = query.get("arch") || "riscv64";
   const egress = query.get("egress");
   // A real arm64 Linux for aarch64, a real amd64 vmlinux for x64, else the
@@ -299,10 +302,11 @@ async function bootHolospace() {
   );
 
   if (arch === "x64") {
-    // x86-64 holospace: boot the provisioned amd64 image on the x64 core, paged
-    // from OPFS (CC-43/CC-44/CC-45) — a real amd64 devcontainer to a terminal, the
-    // ubiquitous registry/Codespaces architecture. (The x64 core's net/9p parity
-    // is the continued build, as on aarch64; this path drives the terminal.)
+    // x86-64 holospace (the DEFAULT architecture): boot the provisioned amd64
+    // image on the x64 core, paged from OPFS (CC-43/CC-44/CC-45) — a real amd64
+    // devcontainer with the full device surface: terminal (CC-11), the shared
+    // virtio-9p workspace (CC-15 — editor, tasks, search, SCM all bind to it),
+    // and the router-backed network, identical to the other cores (Law L4).
     if (holoId) {
       const rootfsHandle = await openProvisionedHandle(holoId);
       if (rootfsHandle) {
@@ -325,14 +329,22 @@ async function bootHolospace() {
         }
       }
     }
-    if (!ws && out) {
-      out.appendLine("holospace: an x64 holospace needs a provisioned image — Enter it from the Manager (with the router)");
+    if (!ws) {
+      // BLANK / no-provisioning fallback: boot the BUNDLED amd64 busybox layer
+      // in-RAM — no registry pull, no router extension. A user launches a blank
+      // amd64 scratchpad and gets a shell + editor + tasks + search immediately.
+      const layer = await fetchBytes(`${base}/devcontainer-x64-layer.tar.gz`);
+      const image = new wasm.DevcontainerImage();
+      image.add_layer("application/vnd.oci.image.layer.v1.tar+gzip", layer);
+      const rootfs = image.assemble_bootable(128 * 1024 * 1024);
+      ws = wasm.X64Workspace.boot_devcontainer(kernel, rootfs);
+      bridged = false;
+      out && out.appendLine("holospace: booted a blank amd64 devcontainer on the x64 core from the bundled layer (no router)");
     }
   } else if (arch === "aarch64") {
     // aarch64 holospace: boot the provisioned arm64 image on the AArch64 core,
-    // paged from OPFS (CC-37) — a real arm64 devcontainer to a terminal. (The
-    // AArch64 core's net/9p parity is the continued build, so this path drives
-    // the terminal; the riscv64 path below adds the 9p workspace + routed egress.)
+    // paged from OPFS (CC-37/CC-46) — a real arm64 devcontainer with the same
+    // full device surface (terminal, virtio-9p workspace, router-backed network).
     if (holoId) {
       const rootfsHandle = await openProvisionedHandle(holoId);
       if (rootfsHandle) {
@@ -346,8 +358,17 @@ async function bootHolospace() {
         }
       }
     }
-    if (!ws && out) {
-      out.appendLine("holospace: an aarch64 holospace needs a provisioned image — Enter it from the Manager (with the router)");
+    if (!ws) {
+      // BLANK / no-provisioning fallback: boot the BUNDLED arm64 busybox layer
+      // in-RAM — no registry pull, no router (parity with the x64 + riscv64
+      // blank paths).
+      const layer = await fetchBytes(`${base}/devcontainer-arm64-layer.tar.gz`);
+      const image = new wasm.DevcontainerImage();
+      image.add_layer("application/vnd.oci.image.layer.v1.tar+gzip", layer);
+      const rootfs = image.assemble_bootable(128 * 1024 * 1024);
+      ws = wasm.Aarch64Workspace.boot_devcontainer(kernel, rootfs);
+      bridged = false;
+      out && out.appendLine("holospace: booted a blank arm64 devcontainer on the AArch64 core from the bundled layer (no router)");
     }
   } else {
   // PREFERRED: the streaming **paged κ-disk**. Page the provisioned rootfs
@@ -403,10 +424,26 @@ async function bootHolospace() {
   }
   } // end the riscv64 boot branch
 
-  // Seed the shared workspace (the editor + the OS both see these over virtio-9p,
-  // CC-15). The aarch64 terminal path has no 9p workspace yet, so guard on the
-  // capability rather than assume it.
-  if (ws && typeof ws.ws_write === "function") {
+  // Seed the shared workspace (the editor + the OS both see these over
+  // virtio-9p, CC-15 — every core exposes the same ws_* surface; the guards are
+  // pure capability detection). A REPOSITORY holospace gets a clone-ready
+  // welcome (its content is the repo's, not ours); a blank/demo one gets the
+  // scratchpad sample (a source file, a tasks.json, a devcontainer.json) so
+  // there is something to edit, run, and search immediately.
+  const repoUrl = query.get("repo");
+  if (ws && typeof ws.ws_write === "function" && repoUrl) {
+    ws.ws_write(
+      "WELCOME.md",
+      new TextEncoder().encode(
+        `# ${(repoUrl.replace(/\/+$/, "").match(/([^/]+?)(?:\.git)?$/) || [])[1] || "holospace"}\n\n` +
+          `This holospace runs the devcontainer of ${repoUrl}.\n\n` +
+          "Clone the repository into the shared workspace from the terminal:\n\n" +
+          "```sh\ngit clone " + repoUrl + " .\n```\n\n" +
+          "The editor and the devcontainer share this workspace over virtio-9p (CC-15) — " +
+          "files, tasks (Run Task), search, and source control all operate on the same content.\n",
+      ),
+    );
+  } else if (ws && typeof ws.ws_write === "function") {
     ws.ws_write(
       "WELCOME.md",
       new TextEncoder().encode(
@@ -420,6 +457,64 @@ async function bootHolospace() {
       "main.rs",
       new TextEncoder().encode("fn greet(name) {\n  // TODO: greet\n  return greet(name)\n}\n"),
     );
+    // Seed a sample `.vscode/tasks.json` (CC-53) — the holospace-tasks provider
+    // runs these in the devcontainer over 9p. A nested path, so use the
+    // nested-path API (the riscv64 Workspace has it; the guard above covers the
+    // cores that do not).
+    if (typeof ws.ws_write_path === "function") {
+      ws.ws_write_path(
+        ".vscode/tasks.json",
+        new TextEncoder().encode(
+          JSON.stringify(
+            {
+              version: "2.0.0",
+              tasks: [
+                {
+                  // The default build task (Ctrl+Shift+B): emits a problem line
+                  // (the matcher turns it into a diagnostic), some output, and a
+                  // non-zero exit — so output, exit status, and problem matchers
+                  // are all exercised by one run in the devcontainer.
+                  label: "build",
+                  type: "holospace",
+                  command: "echo 'main.rs:2:5: warning: TODO found here'; echo 'build complete'; exit 2",
+                  group: { kind: "build", isDefault: true },
+                  problemMatcher: "$holospace-generic",
+                },
+                { label: "hello", type: "holospace", command: "echo 'Hello from the devcontainer'" },
+                {
+                  // A background/watch task: long-running (a watcher loop), with
+                  // begin/end patterns so the workbench shows the spinner while a
+                  // "build cycle" is active — and the UI stays usable meanwhile.
+                  label: "watch",
+                  type: "holospace",
+                  isBackground: true,
+                  command: "while true; do echo BUILD-START; sleep 3; echo BUILD-DONE; sleep 3; done",
+                  problemMatcher: "$holospace-watch",
+                },
+              ],
+            },
+            null,
+            2,
+          ) + "\n",
+        ),
+      );
+      // Seed a sample `.devcontainer/devcontainer.json` (CC-22/CC-53) — the
+      // holospace-tasks provider surfaces its lifecycle commands as re-runnable
+      // tasks, exactly as it would for any repository's devcontainer config.
+      ws.ws_write_path(
+        ".devcontainer/devcontainer.json",
+        new TextEncoder().encode(
+          JSON.stringify(
+            {
+              name: "holospace demo",
+              postCreateCommand: "echo 'lifecycle: environment prepared'",
+            },
+            null,
+            2,
+          ) + "\n",
+        ),
+      );
+    }
   }
 }
 
@@ -792,8 +887,8 @@ function startRemoteExtensionHost(context, out) {
     // (b) The holospace backs the host: the booted holospace's own workspace is
     // reachable (virtio-9p, CC-15). We read the workspace listing the running OS
     // shares — the remote's filesystem backend is the holospace's content, not a
-    // stand-in. (The aarch64 terminal core has no 9p workspace yet; there the FS
-    // backend is the console/terminal — still the holospace's own primitive.)
+    // stand-in. (Every core now exposes the shared 9p workspace; the terminal
+    // fallback below survives a core that has not booted a workspace at all.)
     const fsBacked = has9p() || (ws && typeof ws.terminal === "function");
     if (!fsBacked) {
       out && out.appendLine("holospace: remote ext host not live — no holospace primitive is backing it yet");

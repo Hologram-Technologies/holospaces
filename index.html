@@ -66,8 +66,7 @@
       <span class="muted">manage your holospaces · enter one to work in it</span>
       <span class="op">
         <span id="ext-status" title="The local egress extension opens raw sockets a tab cannot (Direct Sockets, CC-41) — the guest's internet when no node is set.">egress extension <span id="ext-dot">○</span> <span id="ext-label" class="muted">checking…</span></span>
-        <button id="signin" class="primary sm">Sign in</button>
-        <span class="muted">operator</span> <span id="operator" class="k">(signed out)</span>
+        <span class="muted">operator</span> <span id="operator" class="k">…</span>
       </span>
     </header>
     <main>
@@ -76,23 +75,24 @@
         <div class="row">
           <div style="flex:1; min-width:18rem">
             <label for="hrepo">Repository URL</label>
-            <input id="hrepo" placeholder="https://github.com/owner/repo" value="https://github.com/octocat/Hello-World" style="width:100%" />
+            <input id="hrepo" placeholder="https://github.com/owner/repo" style="width:100%" />
           </div>
           <div style="width:9rem">
             <label for="href">Reference</label>
-            <input id="href" value="master" style="width:100%" />
+            <input id="href" placeholder="main" style="width:100%" />
           </div>
           <div>
             <label for="harch">Architecture</label>
-            <select id="harch" title="The guest's instruction-set architecture — fixed for its life (part of its content-addressed identity, Law L1 / ADR-021).">
-              <option value="riscv64">riscv64 (RV64GC)</option>
+            <select id="harch" title="The guest's instruction-set architecture — fixed for its life (part of its content-addressed identity, Law L1 / ADR-021). amd64 is the default — the architecture registry images and Codespaces use.">
+              <option value="x64" selected>x86-64 (amd64)</option>
               <option value="aarch64">aarch64 (ARMv8-A)</option>
-              <option value="x64">x86-64 (amd64)</option>
+              <option value="riscv64">riscv64 (RV64GC)</option>
             </select>
           </div>
-          <button id="create" class="primary" disabled>Launch repository</button>
+          <button id="create" class="primary">Launch repository</button>
+          <button id="createBlank" class="sm" title="A ready-to-use scratchpad — boots instantly from a bundled image, no repository and no extension needed. Open, get a shell + editor, work.">New blank holospace</button>
         </div>
-        <p class="hint">Name a git repository — like Codespaces or Gitpod. holospaces fetches its <code>.devcontainer/devcontainer.json</code> (verified on receipt, Law L5) and runs it; a repository with <em>no</em> devcontainer opens in the <strong>usable default</strong> image (<span id="defimg" class="k">…</span> — curl, git over apt), so any repo just works. The architecture is chosen once, at launch (part of the holospace's identity, ADR-021); everything else is editable per guest in its settings.</p>
+        <p class="hint">Name a git repository — like Codespaces or Gitpod. holospaces fetches its <code>.devcontainer/devcontainer.json</code> (verified on receipt, Law L5) and runs it; a repository with <em>no</em> devcontainer opens in the <strong>usable default</strong> image (<span id="defimg" class="k">…</span> — curl, git over apt), so any repo just works. Or click <strong>New blank holospace</strong> for an instant scratchpad — it boots from a bundled image, no repository and no extension needed. The architecture (amd64 by default) is chosen once, at launch (part of the holospace's identity, ADR-021); everything else is editable per guest in its settings.</p>
         <details>
           <summary class="muted" style="cursor:pointer; font-size:0.85em">Advanced — paste a devcontainer.json instead</summary>
           <div class="row" style="margin-top:0.5rem">
@@ -100,7 +100,7 @@
               <label for="hname">Name</label>
               <input id="hname" value="my-devcontainer" style="width:100%" />
             </div>
-            <button id="createPaste" class="sm" disabled>Create from pasted config</button>
+            <button id="createPaste" class="sm">Create from pasted config</button>
           </div>
           <label for="dcjson">devcontainer.json (validated against the Dev Container spec — CC-4)</label>
           <textarea id="dcjson" spellcheck="false">{
@@ -117,7 +117,7 @@
           <tr><th>Name</th><th>Arch</th><th>Source</th><th>Identity</th><th>Status</th><th style="width:20rem">Actions</th></tr>
         </thead>
         <tbody id="rows">
-          <tr><td colspan="6" class="muted">No holospaces yet — sign in and create one.</td></tr>
+          <tr><td colspan="6" class="muted">No holospaces yet — launch a repository or create a blank one above.</td></tr>
         </tbody>
       </table>
       <p class="muted" style="margin-top:1rem">
@@ -277,6 +277,10 @@
       setInterval(refreshExtStatus, 3000);
 
       const console0 = new Console();
+      // Per-holospace provisioning quota (config + κ-addressed artifacts staged at
+      // provision time; the IMAGE layers stream to OPFS separately and the guest
+      // DISK is sized per architecture in provisionDiskBytes).
+      const PROVISION_QUOTA_BYTES = 128 * 1024 * 1024;
       const $ = (id) => document.getElementById(id);
       // Presentation metadata for the console (name · arch · source · status); the
       // canonical state is the holospace κ + roster in the store (Law L3).
@@ -294,16 +298,16 @@
         $("roster").textContent = console0.roster_kappa() || "—";
         const tbody = $("rows");
         if (v.holospaces.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="6" class="muted">No holospaces yet — sign in and create one.</td></tr>';
+          tbody.innerHTML = '<tr><td colspan="6" class="muted">No holospaces yet — launch a repository or create a blank one above.</td></tr>';
           return;
         }
         tbody.innerHTML = v.holospaces.map((k) => {
-          const m = meta.get(k) || { name: "holospace", arch: "riscv64", source: "devcontainer", status: "stopped" };
+          const m = meta.get(k) || { name: "holospace", arch: "x64", source: "devcontainer", status: "stopped" };
           const enter = m.status === "stopped" || m.status === "suspended";
           return `<tr>
             <td>${m.name}</td>
             <td><span class="badge arch">${m.arch}</span></td>
-            <td class="muted">${m.source}</td>
+            <td class="muted">${m.source}${m.lifecycle ? `<br /><span class="k" style="font-size:0.78em" title="postCreateCommand — runs on create; re-runnable in the workbench as the task ‘lifecycle: postCreateCommand’ (Run Task)">postCreate: ${String(m.lifecycle).slice(0, 48)}</span>` : ""}</td>
             <td class="k">${k.slice(0, 24)}…</td>
             <td><span class="badge ${m.status}">${m.status}</span></td>
             <td>
@@ -442,7 +446,8 @@
           // holospace — CC-17; ADR-012 supersedes the CC-13 Monaco fallback).
           const ext = m.extensions && m.extensions.length ? "&ext=" + encodeURIComponent(m.extensions.join(",")) : "";
           const egress = m.egress ? "&egress=" + encodeURIComponent(m.egress) : "";
-          const url = `workbench.html?id=${encodeURIComponent(k)}&name=${encodeURIComponent(m.name)}&arch=${encodeURIComponent(m.arch)}${ext}${egress}`;
+          const repoQ = m.repo ? `&repo=${encodeURIComponent(m.repo)}` : "";
+        const url = `workbench.html?id=${encodeURIComponent(k)}&name=${encodeURIComponent(m.name)}&arch=${encodeURIComponent(m.arch)}${repoQ}${ext}${egress}`;
           // Open the tab NOW, in the click gesture. (A window.open AFTER the
           // provisioning `await` is treated as non-user-initiated and pop-up
           // blocked — so for a repo we open a placeholder tab synchronously, then
@@ -597,13 +602,11 @@
         }
       }
 
-      $("signin").onclick = () => {
-        console0.sign_in(new TextEncoder().encode("operator-self-sovereign-key"));
-        $("create").disabled = false;
-        $("createPaste").disabled = false;
-        render();
-        toast("signed in — a self-sovereign, content-addressed identity (CC-1)");
-      };
+      // The operator identity is SELF-SOVEREIGN and local — derived at load, not
+      // logged into: there is no account, no server, nothing to authenticate
+      // against (Law L4). The identity is content (CC-1); the roster it signs is
+      // this browser-peer's own.
+      console0.sign_in(new TextEncoder().encode("operator-self-sovereign-key"));
 
       // ── Repository devcontainer discovery (the import boundary, Law L5) ───────
       // Derive the raw-content URL(s) for a repository's devcontainer.json at a
@@ -674,25 +677,61 @@
           }
           // (repo, reference, config, arch) is the source → the holospace's
           // content-addressed identity (Law L1; reproducible, repo/ref/arch-distinct).
-          const k = console0.provision_repo(repo, ref, configPath, configBytes, arch, 128 * 1024 * 1024);
-          let extensions = [], image = default_devcontainer_image();
+          const k = console0.provision_repo(repo, ref, configPath, configBytes, arch, PROVISION_QUOTA_BYTES);
+          let extensions = [], image = default_devcontainer_image(), builds = false, lifecycle = null, cfgName = null;
           try {
-            const cfg = JSON.parse(new TextDecoder().decode(configBytes));
+            const cfg = JSON.parse(new TextDecoder().decode(configBytes).replace(/\/\*[^]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, ""));
             extensions = cfg?.customizations?.vscode?.extensions || [];
             if (typeof cfg?.image === "string" && cfg.image) image = cfg.image;
+            if (typeof cfg?.name === "string" && cfg.name) cfgName = cfg.name;
+            // A Dockerfile-build devcontainer: the image build is not run
+            // in-browser (yet) — the holospace opens on the base image instead.
+            // Said out loud, never a silent substitution (ADR-015).
+            builds = !cfg?.image && !!(cfg?.build || cfg?.dockerFile);
+            // The lifecycle command the container runs on create — surfaced on
+            // the card, and re-runnable as a task in the workbench (CC-53).
+            const lc = cfg?.postCreateCommand;
+            if (typeof lc === "string" && lc) lifecycle = lc;
+            else if (Array.isArray(lc)) lifecycle = lc.join(" ");
           } catch {}
+          const source = usedDefault ? "repo · default image"
+            : builds ? "repo · base image (Dockerfile build not run in-browser)"
+            : "repo";
           meta.set(k, {
-            name: repoName(repo), repo, reference: ref, arch, image,
-            source: usedDefault ? "repo · default image" : "repo",
-            status: "stopped", extensions,
+            name: cfgName || repoName(repo), repo, reference: ref, arch, image,
+            source, status: "stopped", extensions, lifecycle,
           });
           render();
-          toast("provisioned " + repoName(repo) + " (" + arch + ")" +
-            (usedDefault ? " · usable default image" : " · " + configPath) + " → " + k.slice(0, 22) + "…");
+          toast("provisioned " + (cfgName || repoName(repo)) + " (" + arch + ")" +
+            (usedDefault ? " · usable default image" : builds ? " · devcontainer builds a Dockerfile — opening on the base image " + image : " · " + configPath) +
+            " → " + k.slice(0, 22) + "…");
         } catch (e) {
           toast("launch failed: " + e);
         } finally {
           $("create").disabled = false;
+        }
+      };
+
+      // A BLANK holospace — a scratchpad devcontainer on the usable default
+      // image (curl/git-capable), no repository: open, get a shell, work. The
+      // same provisioning path as any devcontainer; only the source differs.
+      $("createBlank").onclick = () => {
+        const arch = $("harch").value;
+        try {
+          // A blank holospace declares NO image: it boots the deploy's BUNDLED
+          // per-arch busybox layer in-RAM (no registry pull, no router) — so it
+          // launches instantly. (Leaving `image` unset is exactly what makes
+          // Enter open it directly, skipping the provision-via-router gate.)
+          const config = JSON.stringify({ name: "blank" });
+          const k = console0.provision_devcontainer(new TextEncoder().encode(config), arch, PROVISION_QUOTA_BYTES);
+          meta.set(k, {
+            name: "blank", arch,
+            source: "blank scratchpad", status: "stopped", extensions: [],
+          });
+          render();
+          toast("created a blank " + arch + " scratchpad → " + k.slice(0, 22) + "… — Enter to boot (no extension needed)");
+        } catch (e) {
+          toast("blank holospace failed: " + e);
         }
       };
 
@@ -703,7 +742,7 @@
         const text = $("dcjson").value;
         const json = new TextEncoder().encode(text);
         try {
-          const k = console0.provision_devcontainer(json, arch, 128 * 1024 * 1024);
+          const k = console0.provision_devcontainer(json, arch, PROVISION_QUOTA_BYTES);
           let extensions = [];
           try { extensions = JSON.parse(text)?.customizations?.vscode?.extensions || []; } catch {}
           meta.set(k, { name, arch, source: "devcontainer (pasted)", status: "stopped", extensions });
