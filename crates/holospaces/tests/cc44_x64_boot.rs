@@ -1156,3 +1156,82 @@ fn the_amd64_guest_survives_agent_churn() {
         &console[console.len().saturating_sub(1200)..]
     );
 }
+
+/// The amd64 guest survives sustained fork/exec load past the point the ifetch
+/// cache stale-code bug used to corrupt it (~1500 s of real execution → a
+/// `malloc(): unsorted double linked list corrupted` and a dead process). With
+/// INVLPG invalidating the instruction-fetch cache on a remapped code page, the
+/// guest runs indefinitely. Drives a heavy fork/exec churn well past the old
+/// crash window, failing the instant any corruption/panic appears, then confirms
+/// the shell is still responsive and computes correctly.
+#[test]
+#[ignore = "boots a real amd64 Linux + fork/exec-churns past the old corruption point (~release) — CC-45 vv suite"]
+fn the_amd64_guest_survives_sustained_fork_exec_churn() {
+    use holospaces::assembly::{assemble_ext4_bootable, Layer};
+    let busybox = std::fs::read(cc45_dir().join("rootfs/layer.tar.gz")).expect("busybox layer");
+    let layers = [Layer {
+        media_type: "application/vnd.oci.image.layer.v1.tar+gzip",
+        blob: &busybox,
+    }];
+    let rootfs = assemble_ext4_bootable(
+        &layers,
+        holospaces::machine::DEVCONTAINER_INIT,
+        64 * 1024 * 1024,
+    )
+    .unwrap();
+    let kernel = gunzip(&cc45_dir().join("linux/vmlinux.gz"));
+    let mut cpu = Cpu::boot_linux_disk(
+        512 * 1024 * 1024,
+        &kernel,
+        rootfs,
+        "console=ttyS0 root=/dev/vda rw init=/init \
+         virtio_mmio.device=0x200@0xd0000000:11 \
+         virtio_mmio.device=0x200@0xd0000200:10 random.trust_cpu=on",
+    );
+    let mut booted = false;
+    for _ in 0..30 {
+        cpu.run(1_000_000_000);
+        if String::from_utf8_lossy(cpu.console()).contains("holospace devcontainer ready") {
+            booted = true;
+            break;
+        }
+    }
+    assert!(booted, "booted");
+    // A terminating fork/exec churn of 800 rounds — comfortably past the
+    // ~280-round (~2.85e10-step / ~1500 s guest-time) point where the stale
+    // ifetch cache corrupted the guest heap and killed a process.
+    cpu.feed_console(b"i=0; while [ $i -lt 800 ]; do ( c=CHILD_$i$i$i$i$i; export c; /bin/busybox true ); i=$((i+1)); done; echo CHURN-DONE\n");
+    let mut done = false;
+    for slice in 0..150 {
+        cpu.run(1_000_000_000);
+        let c = String::from_utf8_lossy(cpu.console());
+        if c.contains("CHURN-DONE") {
+            done = true;
+            break;
+        }
+        assert!(
+            !c.contains("malloc(") && !c.contains("Kernel panic") && !c.contains("Attempted to kill init"),
+            "the guest corrupted/panicked at slice {slice} under fork/exec churn (ifetch-cache regression); tail:\n{}",
+            &c[c.len().saturating_sub(1200)..]
+        );
+    }
+    assert!(
+        done,
+        "the fork/exec churn ran to completion past the old corruption point without corruption"
+    );
+    // The shell is still alive AND computing correctly after the sustained load
+    // (a wrong ifetch would have produced a mangled process, not a working shell).
+    cpu.feed_console(b"echo STILL-ALIVE-$((6*7))\n");
+    let mut alive = false;
+    for _ in 0..30 {
+        cpu.run(500_000_000);
+        if String::from_utf8_lossy(cpu.console()).contains("STILL-ALIVE-42") {
+            alive = true;
+            break;
+        }
+    }
+    assert!(
+        alive,
+        "the shell is responsive and correct after sustained fork/exec load"
+    );
+}

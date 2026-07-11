@@ -5004,6 +5004,18 @@ impl Cpu {
                 let page = addr & !0xfff;
                 let set = (page >> 12) as usize & (TLB_SETS - 1);
                 self.tlb[set].valid = false;
+                // The instruction-fetch cache holds one page's VA→frame mapping,
+                // validated only against `tlb_gen`/`pcid_gen` — which a *precise*
+                // INVLPG does NOT bump. So an INVLPG that targets the cached code
+                // page must invalidate the ifetch cache too, or a remapped code
+                // page (the kernel unmaps the old text and maps the new binary's
+                // on `exec`, then INVLPGs it) would keep fetching the OLD frame's
+                // bytes — executing a different program's instructions, silently
+                // corrupting guest memory. (Data reads re-walk via the TLB set
+                // cleared above; instruction fetches had no such invalidation.)
+                if self.ifetch_tag == page {
+                    self.ifetch_tag = u64::MAX; // never equals a real `page & !0xfff`
+                }
             }
             _ => {}
         }

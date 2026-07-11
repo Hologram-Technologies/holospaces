@@ -54,6 +54,15 @@ cargo test --release --manifest-path "$ROOT/Cargo.toml" -p holospaces \
     --test cc44_x64_boot the_amd64_devcontainer_shares_the_9p_workspace_with_the_editor \
     -- --ignored --nocapture || exit 1
 
+# Long-running stability: the amd64 guest survives sustained fork/exec churn well
+# past the point the INVLPG/ifetch-cache defect used to corrupt the heap, and the
+# shell is still responsive + arithmetic-correct afterward. This is the regression
+# witness for the root-caused stale-instruction-fetch bug (INVLPG now invalidates
+# the ifetch cache for a remapped code page).
+cargo test --release --manifest-path "$ROOT/Cargo.toml" -p holospaces \
+    --test cc44_x64_boot the_amd64_guest_survives_sustained_fork_exec_churn \
+    -- --ignored --nocapture || exit 1
+
 # ── The stock linux-amd64 binary + arbitrary devcontainer (needs the fixture) ──
 if [ -f "$CC45/cc45.sha256" ] && [ -f "$CC45/linux/vmlinux.gz" ] && [ -f "$CC45/rootfs/layer.tar.gz" ]; then
     ( cd "$CC45" && sha256sum -c cc45.sha256 >/dev/null ) \
