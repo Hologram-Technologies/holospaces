@@ -1,0 +1,26 @@
+{
+ "payload": {
+  "v": 1,
+  "name": "holospaces-web",
+  "channel": "resolver",
+  "seq": 3,
+  "assets": {
+   "glue": {
+    "blake3": "8dc3d2908766bc799b1c1a8005c471cb85d169fd23edc5e6d729cd6afe465736",
+    "sha256": "5917a7f674b0d3cc3a0b5c817fdf48df9accad856784a833dcb5cd0446dc1e42",
+    "bytes": 147952,
+    "hint": "../pkg/holospaces_web.js"
+   },
+   "wasm": {
+    "blake3": "2d507c028233ad5a0985d12c52b4dc762a1c2bdeeab43ad21a3335c45187f638",
+    "sha256": "7a25a77c7344c778c9a9da7177b399c6edc8a4ddc64b1cdad0f7e328d1e2b540",
+    "bytes": 3148213,
+    "hint": "../pkg/holospaces_web_bg.wasm"
+   }
+  },
+  "at": "2026-07-12T10:15:00.000Z"
+ },
+ "sig": "9H/8ZQtoWzsD/8z3PlzRsYJxy5lQdhRCQjaqlXfQT828uUUTp14X40fdDfvn1mJrhQz+MSwAFCNLDiFqcdoeCQ==",
+ "pub": "snYY6y35gdZ1ngOE5E+G1BGFjlTo2MfpfP8h6yc7r+M=",
+ "alg": "Ed25519"
+}
