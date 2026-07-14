@@ -21,30 +21,30 @@ repository = "https://github.com/Hologram-Technologies/holospaces"
 # The lib-core hologram crates are no_std-capable (hologram's own `just embedded`
 # builds them for thumbv7em). holospaces takes them with default features off so
 # its core compiles for bare-metal / browser peers; the `std` feature re-enables.
-hologram-substrate-core = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-substrate-core", default-features = false }
-hologram-realizations   = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-realizations", default-features = false }
-hologram-substrate-tck  = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-substrate-tck" }
-hologram-store-mem      = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-store-mem", default-features = false }
-hologram-store-native   = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-store-native" }
-hologram-net-http       = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-net-http" }
-hologram-exec           = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-exec", default-features = false }
-hologram-compiler       = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-compiler" }
-hologram-backend        = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-backend", default-features = false }
-hologram-graph          = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-graph" }
-hologram-archive        = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-archive" }
-hologram-runtime        = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-runtime" }
-hologram-runtime-wasmtime = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-runtime-wasmtime" }
-hologram-runtime-bare   = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-runtime-bare", default-features = false }
+hologram-substrate-core = { git = "https://github.com/Hologram-Technologies/hologram", rev = "22b0ce136ca7cf9c9d356657d870881fa169b0a1", package = "hologram-substrate-core", default-features = false }
+hologram-realizations   = { git = "https://github.com/Hologram-Technologies/hologram", rev = "22b0ce136ca7cf9c9d356657d870881fa169b0a1", package = "hologram-realizations", default-features = false }
+hologram-substrate-tck  = { git = "https://github.com/Hologram-Technologies/hologram", rev = "22b0ce136ca7cf9c9d356657d870881fa169b0a1", package = "hologram-substrate-tck" }
+hologram-store-mem      = { git = "https://github.com/Hologram-Technologies/hologram", rev = "22b0ce136ca7cf9c9d356657d870881fa169b0a1", package = "hologram-store-mem", default-features = false }
+hologram-store-native   = { git = "https://github.com/Hologram-Technologies/hologram", rev = "22b0ce136ca7cf9c9d356657d870881fa169b0a1", package = "hologram-store-native" }
+hologram-net-http       = { git = "https://github.com/Hologram-Technologies/hologram", rev = "22b0ce136ca7cf9c9d356657d870881fa169b0a1", package = "hologram-net-http" }
+hologram-exec           = { git = "https://github.com/Hologram-Technologies/hologram", rev = "22b0ce136ca7cf9c9d356657d870881fa169b0a1", package = "hologram-exec", default-features = false }
+hologram-compiler       = { git = "https://github.com/Hologram-Technologies/hologram", rev = "22b0ce136ca7cf9c9d356657d870881fa169b0a1", package = "hologram-compiler" }
+hologram-backend        = { git = "https://github.com/Hologram-Technologies/hologram", rev = "22b0ce136ca7cf9c9d356657d870881fa169b0a1", package = "hologram-backend", default-features = false }
+hologram-graph          = { git = "https://github.com/Hologram-Technologies/hologram", rev = "22b0ce136ca7cf9c9d356657d870881fa169b0a1", package = "hologram-graph" }
+hologram-archive        = { git = "https://github.com/Hologram-Technologies/hologram", rev = "22b0ce136ca7cf9c9d356657d870881fa169b0a1", package = "hologram-archive" }
+hologram-runtime        = { git = "https://github.com/Hologram-Technologies/hologram", rev = "22b0ce136ca7cf9c9d356657d870881fa169b0a1", package = "hologram-runtime" }
+hologram-runtime-wasmtime = { git = "https://github.com/Hologram-Technologies/hologram", rev = "22b0ce136ca7cf9c9d356657d870881fa169b0a1", package = "hologram-runtime-wasmtime" }
+hologram-runtime-bare   = { git = "https://github.com/Hologram-Technologies/hologram", rev = "22b0ce136ca7cf9c9d356657d870881fa169b0a1", package = "hologram-runtime-bare", default-features = false }
 # The bare-metal HAL seam (BlockDevice / NetworkInterface) the κ-disk implements —
 # no_std + alloc, so the κ-disk is part of the portable peer core. Consumed by
 # reference (ADR-006).
-hologram-bare-hal       = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-bare-hal", default-features = false }
+hologram-bare-hal       = { git = "https://github.com/Hologram-Technologies/hologram", rev = "22b0ce136ca7cf9c9d356657d870881fa169b0a1", package = "hologram-bare-hal", default-features = false }
 # The substrate's no_std content-addressed network — `BareNetSync`, a `KappaSync`
 # over the `NetworkInterface` HAL (the uor-native fetch/announce/discover frame
 # protocol, verify-on-receipt). The SAME implementation a browser peer and a
 # bare-metal peer use, so they interoperate by construction (the "browser as a
 # router" content network). no_std + alloc — part of the portable peer core.
-hologram-net-bare       = { git = "https://github.com/Hologram-Technologies/hologram", rev = "18f553d8578997ce32e7b653786a0bcf9b09a2c0", package = "hologram-net-bare", default-features = false }
+hologram-net-bare       = { git = "https://github.com/Hologram-Technologies/hologram", rev = "22b0ce136ca7cf9c9d356657d870881fa169b0a1", package = "hologram-net-bare", default-features = false }
 prism                   = { version = "0.4", package = "uor-prism" }
 # The async trait emitter the HAL traits use, and a no_std spin lock for the
 # κ-disk's in-memory sector index — versions matched to hologram's own.
